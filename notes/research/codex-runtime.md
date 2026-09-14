@@ -55,3 +55,13 @@ That software license is separate from permission to use OpenAI's hosted service
 2. **Personal subscription container:** use a user-owned private `CODEX_HOME` with file-backed `auth.json`; serialize access and persist refreshes. Prefer device-code setup over copying credentials when available.
 3. **Custom client:** use app-server over local stdio/Unix socket; complete managed ChatGPT/device login through its account endpoints, or use experimental external-token mode only when the host owns refresh. Use SDK rather than reverse-engineering CLI internals for CI orchestration.
 4. **Multi-agent:** cap concurrency, isolate write-heavy workers (separate worktrees/containers), and collect durable outputs/checkpoints rather than relying on an open process.
+
+## Rapido decision
+
+Rapido uses one local-stdio app-server instead of launching `codex exec` per lane. This gives the
+supervisor one auth-file owner, independently interruptible ephemeral threads, a single exact model
+catalogue, concurrent dynamic-tool requests, and structured turn events. The native V8
+`code_mode_host` remains enabled only as the app-server's dynamic-tool broker: acceptance testing
+showed those bounded calls become unavailable when it is disabled. Unified execution, TTY execution,
+shell, browser, network, plugins, apps, and nested agents remain disabled; every callable operation is
+still dispatched by Rapido's workspace-confined allowlist.

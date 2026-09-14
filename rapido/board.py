@@ -1,7 +1,7 @@
 """Bounded CTFd/IN-CYPHER Board transport.
 
 Challenge targets never pass through this client. API redirects are refused; only challenge-file
-downloads may follow a small number of HTTPS redirects, and the Board token never leaves its origin.
+downloads may follow a small number of same-origin HTTPS redirects.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ BROWSER_USER_AGENT = (
 )
 FLAG_RE = re.compile(r"(?:INCYPHER|flag)\{[^{}\r\n]{1,512}\}")
 API_RESPONSE_LIMIT = 4 * 1024 * 1024
+MAX_CHALLENGE_DESCRIPTION_BYTES = 256 * 1024
 
 
 class BoardError(RuntimeError):
@@ -215,9 +216,23 @@ class BoardClient:
 
     def identity(self) -> dict[str, Any]:
         value = self._document(self._request("GET", "/api/v1/users/me"), "identity")
-        if not isinstance(value, dict) or type(value.get("id")) is not int:
+        if not isinstance(value, dict) or type(value.get("id")) is not int or value["id"] <= 0:
             raise BoardError("identity returned an invalid shape")
         return value
+
+    def anonymous_identity_is_rejected(self) -> bool:
+        """Negative auth control using the same origin/transport without credentials."""
+        request = urllib.request.Request(
+            self.origin + "/api/v1/users/me",
+            method="GET",
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        response = self._transport(request, self.timeout, self.response_limit)
+        return response.status in {401, 403}
 
     def list_challenges(self) -> list[dict[str, Any]]:
         value = self._document(self._request("GET", "/api/v1/challenges"), "challenge list")
@@ -238,7 +253,8 @@ class BoardClient:
 
         def text(name: str, default: str = "") -> str:
             value = raw.get(name, default)
-            if not isinstance(value, str) or len(value) > 2_000_000:
+            limit = MAX_CHALLENGE_DESCRIPTION_BYTES if name == "description" else 4096
+            if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
                 raise BoardError(f"challenge {name} is invalid")
             return value
 
@@ -262,6 +278,9 @@ class BoardClient:
         shared = raw.get("shared")
         if shared is not None and type(shared) is not bool:
             raise BoardError("challenge shared value is invalid")
+        solved = raw.get("solved_by_me", raw.get("solved", False))
+        if type(solved) is not bool:
+            raise BoardError("challenge solved value is invalid")
         return Challenge(
             id=challenge_id,
             name=text("name"),
@@ -270,7 +289,7 @@ class BoardClient:
             description=text("description"),
             value=value,
             files=tuple(files),
-            solved=bool(raw.get("solved_by_me", raw.get("solved", False))),
+            solved=solved,
             max_attempts=max_attempts,
             attempts=attempts,
             timeout=timeout,
@@ -344,16 +363,21 @@ class BoardClient:
             "message": str(document.get("message", ""))[:512],
         }
 
-    def download(self, file_ref: str, destination: Path) -> dict[str, Any]:
+    def download(
+        self, file_ref: str, destination: Path, *, byte_limit: int | None = None
+    ) -> dict[str, Any]:
         if not isinstance(file_ref, str) or not file_ref or len(file_ref) > 8192:
             raise BoardError("challenge file reference is invalid")
         url = urllib.parse.urljoin(self.origin + "/", file_ref)
         _https_url(url)
         if not self._same_origin(url):
             raise BoardError("initial challenge file URL must use the Board origin")
+        limit = self.artifact_limit if byte_limit is None else byte_limit
+        if not 0 < limit <= self.artifact_limit:
+            raise BoardError("challenge file byte limit is invalid")
         chain: list[str] = []
         for _ in range(5):
-            response = self._request("GET", url, byte_limit=self.artifact_limit)
+            response = self._request("GET", url, byte_limit=limit)
             host = urllib.parse.urlsplit(url).hostname or ""
             chain.append(host)
             if response.status in {301, 302, 303, 307, 308}:
@@ -361,6 +385,8 @@ class BoardClient:
                     raise BoardError("challenge file redirect lacked a destination")
                 url = urllib.parse.urljoin(url, response.location)
                 _https_url(url)
+                if not self._same_origin(url):
+                    raise BoardError("off-origin challenge file redirect is not permitted")
                 continue
             if response.status != 200:
                 raise BoardError(f"challenge file returned HTTP {response.status}")

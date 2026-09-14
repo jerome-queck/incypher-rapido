@@ -52,6 +52,13 @@ def test_lists_and_reads_challenge_with_exact_auth_shape() -> None:
         assert request.get_header("Content-type") == "application/json"
 
 
+def test_anonymous_identity_negative_control_never_sends_token() -> None:
+    fake = FakeTransport([HttpResponse(403, b"")])
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    assert board.anonymous_identity_is_rejected()
+    assert fake.requests[0].get_header("Authorization") is None
+
+
 def test_api_never_follows_or_exposes_redirect_body() -> None:
     fake = FakeTransport([HttpResponse(302, b"secret-shaped-body", "/login")])
     board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
@@ -60,20 +67,19 @@ def test_api_never_follows_or_exposes_redirect_body() -> None:
     assert "secret-shaped-body" not in str(error.value)
 
 
-def test_download_drops_board_token_after_off_origin_redirect(tmp_path: Path) -> None:
+def test_download_rejects_off_origin_redirect_before_request(tmp_path: Path) -> None:
     fake = FakeTransport(
         [
             HttpResponse(302, b"", "https://objects.example/artifact.bin"),
-            HttpResponse(200, b"payload"),
         ]
     )
     board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
     output = tmp_path / "artifact.bin"
-    result = board.download("/files/artifact.bin", output)
-    assert output.read_bytes() == b"payload"
-    assert result["redirect_hosts"] == ["hackathon.in-cypher.com", "objects.example"]
+    with pytest.raises(BoardError, match="off-origin"):
+        board.download("/files/artifact.bin", output)
+    assert not output.exists()
     assert fake.requests[0].get_header("Authorization") == "Token secret"
-    assert fake.requests[1].get_header("Authorization") is None
+    assert len(fake.requests) == 1
 
 
 def test_rejects_non_https_file_redirect(tmp_path: Path) -> None:
@@ -143,3 +149,26 @@ def test_download_rejects_off_origin_initial_url(tmp_path: Path) -> None:
     with pytest.raises(BoardError, match="initial challenge file URL"):
         board.download("https://objects.example/untrusted", tmp_path / "a")
     assert fake.requests == []
+
+
+def test_rejects_non_boolean_solved_field() -> None:
+    fake = FakeTransport(
+        [
+            envelope(
+                {
+                    "id": 7,
+                    "name": "Puzzle",
+                    "category": "crypto",
+                    "type": "standard",
+                    "description": "decode it",
+                    "value": 100,
+                    "files": [],
+                    "solved_by_me": "false",
+                    "attempts": 0,
+                }
+            )
+        ]
+    )
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    with pytest.raises(BoardError, match="solved value"):
+        board.challenge(7)
