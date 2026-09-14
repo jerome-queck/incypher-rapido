@@ -426,9 +426,10 @@ def test_non_overlapping_lanes_are_rejected(tmp_path: Path) -> None:
     answer = "INCYPHER{serial}"
     board = FakeBoard([challenge(1)])
     store = StateStore(tmp_path / "state.sqlite3")
+    cfg = replace(config(tmp_path), concurrency=1)
     report = asyncio.run(
         Orchestrator(
-            config(tmp_path),
+            cfg,
             board,
             store,
             SerialRuntime({1: {0: answer, 1: answer}}),
