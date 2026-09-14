@@ -167,10 +167,15 @@ class ShortTimeoutBoard(FakeBoard):
     timeout = 0.1
 
 
-class DelayedRuntime(FakeRuntime):
+class TransportBecomesTooSlowRuntime(FakeRuntime):
+    def __init__(self, candidates, board: ShortTimeoutBoard) -> None:
+        super().__init__(candidates)
+        self.board = board
+
     async def solve(self, workspace, prompt, **kwargs):
-        await asyncio.sleep(0.18)
-        return await super().solve(workspace, prompt, **kwargs)
+        turn = await super().solve(workspace, prompt, **kwargs)
+        self.board.timeout = 60.0
+        return turn
 
 
 class BudgetBoard(FakeBoard):
@@ -390,11 +395,16 @@ def test_candidate_is_withheld_when_transport_cannot_finish_before_deadline(
     tmp_path: Path,
 ) -> None:
     answer = "INCYPHER{deadline_guard}"
-    cfg = replace(config(tmp_path), run_seconds=0.25)
+    cfg = config(tmp_path)
     board = ShortTimeoutBoard([challenge(1)])
     store = StateStore(tmp_path / "state.sqlite3")
     report = asyncio.run(
-        Orchestrator(cfg, board, store, DelayedRuntime({1: {0: answer, 1: answer}})).run()
+        Orchestrator(
+            cfg,
+            board,
+            store,
+            TransportBecomesTooSlowRuntime({1: {0: answer, 1: answer}}, board),
+        ).run()
     )
     assert report.candidates == 1
     assert board.submissions == []
