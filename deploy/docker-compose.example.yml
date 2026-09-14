@@ -1,0 +1,27 @@
+name: rapido
+
+services:
+  rapido:
+    image: rapido:local
+    init: true
+    read_only: true
+    user: "10001:10001"
+    env_file:
+      - /path/to/rapido.env
+    volumes:
+      - type: bind
+        source: /private/path/rapido-state
+        target: /state
+      - type: bind
+        source: /private/path/rapido-codex-home
+        target: /auth/codex
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+    stop_signal: SIGTERM
