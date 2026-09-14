@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!rapido/
+!rapido/*.py
+!tests/
+!tests/*.py
