@@ -22,7 +22,7 @@
 
 ## Runtime and Board
 
-- Run Board work through the final container with supervisor-owned credentials, bounded allowlisted access, autonomous submission, and verified cleanup. Never manually enter or relay a flag.
+- Run Board work through the final container with supervisor-owned credentials, bounded allowlisted access, and verified cleanup. Live solver runs are authorized to enable autonomous submission for candidates that satisfy the repository's qualification policy. Never manually enter or relay a flag, and never submit a deliberate probe.
 - Use up to 8 CPUs, 24 GiB RAM, and 500 GiB external storage when measurement supports it. Storage has no smaller artificial quota.
 - Start every evaluation from fresh external solver state. After sanitized evidence is durable, remove prior test containers and run volumes while preserving authentication and repository evidence.
 - Live-verify Board assumptions when needed. Increase dynamic-instance concurrency cautiously until an observed or documented boundary.
