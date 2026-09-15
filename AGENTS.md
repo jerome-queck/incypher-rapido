@@ -10,7 +10,7 @@
 
 - The main agent owns requirements, architecture decisions, shared edits, Board effects, GitHub state, integration, and merges.
 - Delegate bounded, non-overlapping lanes for research, alternatives, implementation, focused tests, and independent review. Give each lane an evidence-based completion criterion and explicit file ownership; wait for and distill all results before deciding.
-- Use `gpt-5.6-luna` at `xhigh` for narrow routine investigation, coding, fixtures, and focused tests. Use `gpt-5.6-sol` at `xhigh` for ambiguous architecture, synthesis, or demanding review. Use `gpt-daybreak-blue-latest` at `xhigh` only for the final clean-state competition simulation after feature work and reviews pass.
+- Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-daybreak-blue-latest` at `xhigh` for demanding bounded implementation or review and for every live solver or Board run. Use `gpt-5.6-luna` at `xhigh` only for narrow build-time investigation, coding, fixtures, and non-live tests; never use Luna in a live solver run.
 - Record effective model and effort. Treat unavailable selections as failures; never silently fall back.
 
 ## Delivery
@@ -22,12 +22,12 @@
 
 ## Runtime and Board
 
-- Run Board work through the final container with supervisor-owned credentials, bounded allowlisted access, autonomous submission, and verified cleanup. Never manually enter or relay a flag.
+- Run Board work through the final container with supervisor-owned credentials, bounded allowlisted access, and verified cleanup. Live solver runs are authorized to enable autonomous submission for candidates that satisfy the repository's qualification policy. Never manually enter or relay a flag, and never submit a deliberate probe.
 - Use up to 8 CPUs, 24 GiB RAM, and 500 GiB external storage when measurement supports it. Storage has no smaller artificial quota.
-- Start every evaluation from fresh external solver state. After sanitized evidence is durable, remove prior test containers and run volumes while preserving authentication and repository evidence.
+- Start every live solver run with a newly created empty state/workspace, download challenge material afresh, and reuse no prior attempt database, artifact, answer, or evidence. After sanitized evidence is durable, delete that run's containers, volumes, and workspaces while preserving authentication and repository evidence. Score every live run from 0/15: analyze and submit freshly derived qualified candidates for all 15 challenges, including challenges the Board already marks solved. Count only a candidate-validating verdict or independent deterministic verification, never a generic already-solved response.
 - Live-verify Board assumptions when needed. Increase dynamic-instance concurrency cautiously until an observed or documented boundary.
 
 ## Completion
 
-- Pre-register a numeric solve-improvement threshold against the prior 1/15 Board baseline before the final run.
+- Pre-register a numeric run-local solve-improvement threshold against the prior 1/15 autonomous baseline before the final run.
 - Finish only after an unattended Daybreak/xhigh final-image run attempts all 15 challenges from fresh solver state, meets that threshold, and shows no manual answer relay, stuck work, leaked process/instance, or lifecycle regression.
