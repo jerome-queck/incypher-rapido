@@ -62,7 +62,7 @@ Important settings:
 
 | Variable | Default | Contract |
 |---|---:|---|
-| `RAPIDO_MODEL` | `gpt-5.6-luna` | Exact app-server catalogue match; no fallback |
+| `RAPIDO_MODEL` | `gpt-6-astra` | Exact app-server catalogue match; no fallback |
 | `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by that model |
 | `RAPIDO_CONCURRENCY` | `2` | Minimum two; reserved for queue policy |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `2` | Independent concurrent lanes |
@@ -70,7 +70,7 @@ Important settings:
 | `RAPIDO_RUN_SECONDS` | `19800` | Work-admission deadline (5.5 hours) |
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | Maximum one downloaded artifact |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source bytes before lane copies |
-| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Source, lane copies, and cumulative workspace-file cap |
+| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Full 500-GiB runtime-volume ceiling; not a small working quota |
 | `RAPIDO_CHALLENGE_IDS` | empty | Optional unique comma-separated qualified challenge IDs; empty means full catalogue |
 | `RAPIDO_SUBMIT_CANDIDATES` | `false` | Serial exact-agreement submissions when true |
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Global ceiling for wrong or indeterminate effects |

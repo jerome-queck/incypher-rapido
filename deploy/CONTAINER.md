@@ -30,17 +30,23 @@ docker run --rm \
   --name rapido \
   --init \
   --read-only \
-  --cpus=2 \
-  --memory=2g \
+  --cpus=8 \
+  --memory=24g \
   --pids-limit=256 \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
   --env-file=/path/to/rapido.env \
   --mount type=bind,src=/private/path/rapido-state,dst=/state \
   --mount type=bind,src=/private/path/rapido-codex-home,dst=/auth/codex \
-  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev \
   rapido:local
 ```
+
+This competition profile gives the solver all 8 CPUs and 24 GiB of RAM assigned
+to its runtime host. Set `RAPIDO_MAX_WORKSPACE_BYTES=536870912000` on a dedicated
+roughly 500-GiB state volume so the former small workspace quota does not constrain
+analysis. The workspace ceiling follows the allocated volume; bounded downloads,
+individual tool outputs, deadlines, and the PID ceiling remain safety controls.
 
 The dedicated Codex home has a single app-server central auth owner.
 Run exactly one app-server instance with write access to it; workers,
@@ -63,10 +69,10 @@ volume contents, and any host bind paths outside the image and outside source
 control. `.dockerignore` rejects common auth, credential, Codex-home, secret, and
 state paths, but external placement remains the primary control. The optional
 Compose example mirrors the same constraints for one app-server instance.
-Per-artifact, aggregate-challenge, per-lane, and cumulative workspace byte
-ceilings bound memory/disk amplification; completed challenge workspaces and
+Per-artifact, aggregate-challenge, per-lane, and full-volume workspace byte
+ceilings bound amplification without imposing a small working quota; completed challenge workspaces and
 recognized stale run roots are deleted without following symlinks. Put an
-independent host/storage quota on the state bind mount for defense in depth.
+appropriately sized dedicated volume under the state bind mount.
 
 `RAPIDO_RUN_SECONDS` is the work-admission budget beginning before recovery and
 native startup. An in-flight Board call or target operation can add at most its
