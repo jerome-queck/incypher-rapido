@@ -7,9 +7,10 @@ Rapido keeps Board credentials in the supervisor only. One native app-server own
 authentication, while at least two independent threads analyze separate workspace copies through a
 small allowlist of workspace tools and Board-endpoint-bound HTTP/TCP clients. Unified execution,
 shell, browser, general network, app, computer-use, and nested multi-agent tools are disabled. The
-retained native V8 broker can invoke only Rapido's bounded dynamic-tool allowlist. A candidate is
-submitted only when two lanes derive the same
-non-placeholder value observed in a successful source-bound tool result.
+retained native V8 broker can invoke only Rapido's bounded dynamic-tool allowlist. The running
+container's supervisor submits a candidate autonomously only when two lanes derive the same
+non-placeholder value observed in a successful source-bound tool result; an operator never enters
+or relays an answer.
 
 ## Current boundary
 

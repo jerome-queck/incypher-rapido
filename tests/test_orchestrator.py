@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from rapido.board import BoardError, Challenge, Verdict
+from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.orchestrator import Orchestrator
 from rapido.state import StateStore
@@ -248,6 +248,48 @@ class AmbiguousSubmitBoard(FakeBoard):
 
 class ShortTimeoutBoard(FakeBoard):
     timeout = 0.1
+
+
+class FlakyIdentityBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.identity_calls = 0
+
+    def identity(self):
+        self.identity_calls += 1
+        if self.identity_calls == 1:
+            raise BoardTransportError("Board transport failed")
+        return super().identity()
+
+
+class AlwaysFailingIdentityBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge], error: BoardError) -> None:
+        super().__init__(challenges)
+        self.error = error
+        self.identity_calls = 0
+
+    def identity(self):
+        self.identity_calls += 1
+        raise self.error
+
+
+class FlakyCreateTransportBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.post_calls = 0
+
+    def instance(self, method: str, challenge_id: int):
+        if method == "POST":
+            self.post_calls += 1
+            self.instance_calls.append((method, challenge_id))
+            raise BoardTransportError("Board transport failed")
+        return super().instance(method, challenge_id)
 
 
 class TransportBecomesTooSlowRuntime(FakeRuntime):
@@ -725,6 +767,67 @@ def test_empty_board_catalogue_fails_closed(tmp_path: Path) -> None:
         asyncio.run(Orchestrator(config(tmp_path), FakeBoard([]), store, FakeRuntime({})).run())
     row = store._connection.execute("SELECT status FROM runs").fetchone()
     assert row["status"] == "failed"
+    store.close()
+
+
+def test_transient_identity_transport_is_retried_without_operator_restart(tmp_path: Path) -> None:
+    board = FlakyIdentityBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert report.status == "completed"
+    assert board.identity_calls == 4
+    store.close()
+
+
+def test_board_read_transport_retry_is_bounded_to_three_attempts(tmp_path: Path) -> None:
+    board = AlwaysFailingIdentityBoard(
+        [challenge(1)], BoardTransportError("Board transport failed")
+    )
+    store = StateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(BoardTransportError):
+        asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert board.identity_calls == 3
+    store.close()
+
+
+def test_semantic_board_error_is_not_retried(tmp_path: Path) -> None:
+    board = AlwaysFailingIdentityBoard([challenge(1)], BoardError("invalid response"))
+    store = StateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(BoardError, match="invalid response"):
+        asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert board.identity_calls == 1
+    store.close()
+
+
+def test_instance_create_transport_is_never_retried(tmp_path: Path) -> None:
+    board = FlakyCreateTransportBoard([challenge(2, challenge_type="dynamic_iac")])
+    store = StateStore(tmp_path / "state.sqlite3")
+    cfg = replace(config(tmp_path), manage_dynamic_instances=True)
+    report = asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    assert report.errors == 1
+    assert board.post_calls == 1
+    store.close()
+
+
+def test_dynamic_readiness_retry_uses_the_120_second_deadline(tmp_path: Path) -> None:
+    class RecordingOrchestrator(Orchestrator):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.instance_get_deadlines: list[float] = []
+
+        async def _board_read(self, deadline, function, /, *args, **kwargs):
+            if getattr(function, "__name__", "") == "instance" and args[:1] == ("GET",):
+                self.instance_get_deadlines.append(deadline)
+            return await super()._board_read(deadline, function, *args, **kwargs)
+
+    board = FakeBoard([challenge(2, challenge_type="dynamic_iac")])
+    store = StateStore(tmp_path / "state.sqlite3")
+    cfg = replace(config(tmp_path), manage_dynamic_instances=True, run_seconds=300)
+    orchestrator = RecordingOrchestrator(cfg, board, store, FakeRuntime({}))
+    report = asyncio.run(orchestrator.run())
+    assert report.status == "completed"
+    preflight_deadline, readiness_deadline = orchestrator.instance_get_deadlines[:2]
+    assert preflight_deadline - readiness_deadline > 150
     store.close()
 
 

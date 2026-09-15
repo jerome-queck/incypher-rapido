@@ -32,6 +32,10 @@ class BoardError(RuntimeError):
     """A deliberately sanitized Board failure."""
 
 
+class BoardTransportError(BoardError):
+    """A retryable failure that occurred before a readable Board response."""
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status: int
@@ -159,7 +163,7 @@ def _default_transport(
     except BoardError:
         raise
     except (OSError, TimeoutError, UnicodeError, ValueError, ssl.SSLError) as exc:
-        raise BoardError("Board transport failed") from exc
+        raise BoardTransportError("Board transport failed") from exc
     finally:
         if sock is not None:
             try:

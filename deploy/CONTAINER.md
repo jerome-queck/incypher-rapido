@@ -29,6 +29,7 @@ This template uses placeholders only:
 docker run --rm \
   --name rapido \
   --init \
+  --stop-timeout=180 \
   --read-only \
   --cpus=8 \
   --memory=24g \
@@ -47,6 +48,12 @@ to its runtime host. Set `RAPIDO_MAX_WORKSPACE_BYTES=536870912000` on a dedicate
 roughly 500-GiB state volume so the former small workspace quota does not constrain
 analysis. The workspace ceiling follows the allocated volume; bounded downloads,
 individual tool outputs, deadlines, and the PID ceiling remain safety controls.
+
+Rapido admits at most one active tool request per turn. The 180-second stop grace is
+sized for the longest admitted TCP-open drain (bounded connect, banner, PoW, and
+service-read stages), the separate 45-second receipt-bound instance cleanup window,
+native-process termination, and scheduling margin. Abrupt daemon or host failure still
+relies on durable restart recovery.
 
 The dedicated Codex home has a single app-server central auth owner.
 Run exactly one app-server instance with write access to it; workers,

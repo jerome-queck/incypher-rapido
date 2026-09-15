@@ -5,7 +5,13 @@ from unittest import mock
 
 import pytest
 
-from rapido.board import BoardClient, BoardError, HttpResponse, _default_transport
+from rapido.board import (
+    BoardClient,
+    BoardError,
+    BoardTransportError,
+    HttpResponse,
+    _default_transport,
+)
 
 
 class FakeTransport:
@@ -81,6 +87,15 @@ def test_default_board_transport_preserves_bounded_long_location() -> None:
     ):
         response = _default_transport(request, 1.0, 1024)
     assert response.location == location
+
+
+def test_default_board_transport_classifies_retryable_connection_failure() -> None:
+    request = urllib.request.Request("https://hackathon.in-cypher.com/api/v1/challenges")
+    with (
+        mock.patch("rapido.board._connect_target", side_effect=OSError("reset")),
+        pytest.raises(BoardTransportError, match="Board transport failed"),
+    ):
+        _default_transport(request, 1.0, 1024)
 
 
 def envelope(data: object, status: int = 200) -> HttpResponse:

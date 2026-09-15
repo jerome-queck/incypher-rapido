@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .board import BoardClient, BoardError, Challenge, Verdict
+from .board import BoardClient, BoardError, BoardTransportError, Challenge, Verdict
 from .config import RuntimeConfig
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
@@ -273,6 +273,23 @@ class Orchestrator:
                 await task
             raise
 
+    async def _board_read(
+        self, deadline: float, function: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Retry only idempotent Board reads after transport-level failures."""
+        transport_timeout = float(getattr(self.board, "timeout", 15.0))
+        for attempt in range(3):
+            try:
+                return await self._board_call(deadline, function, *args, **kwargs)
+            except BoardTransportError:
+                if attempt == 2:
+                    raise
+                delay = 0.25 * (2**attempt)
+                if deadline - time.monotonic() <= transport_timeout + delay:
+                    raise
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable Board read retry state")
+
     async def _cleanup_owned_instances(self, deadline: float) -> None:
         for record in self.state.owned_instances():
             await self._cleanup_instance_record(record, deadline)
@@ -290,7 +307,7 @@ class Orchestrator:
                 reason="restart_recovery",
             )
         try:
-            current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+            current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
         except (BoardError, RunDeadlineReached):
             self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
             self.state.event(
@@ -327,7 +344,7 @@ class Orchestrator:
         """Request deletion and verify remote absence without abandoning ownership."""
         self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
         try:
-            current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+            current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
         except (BoardError, RunDeadlineReached):
             self.state.event(
                 run_id,
@@ -394,7 +411,7 @@ class Orchestrator:
             return False
         while deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
             try:
-                current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+                current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
             except (BoardError, RunDeadlineReached):
                 break
             if current.get("status") == 404:
@@ -419,7 +436,7 @@ class Orchestrator:
         self, run_id: str, challenge: Challenge, deadline: float
     ) -> tuple[tuple[TargetEndpoint, ...], str]:
         """Persist intent, create once, poll boundedly, and parse Board-issued endpoints."""
-        existing = await self._board_call(deadline, self.board.instance, "GET", challenge.id)
+        existing = await self._board_read(deadline, self.board.instance, "GET", challenge.id)
         if existing.get("success") is True:
             raise BoardError("dynamic instance is already active without runtime ownership")
         if existing.get("status") != 404:
@@ -473,7 +490,9 @@ class Orchestrator:
             raise cancelled
         ready_deadline = min(deadline, time.monotonic() + 120.0)
         while ready_deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
-            current = await self._board_call(deadline, self.board.instance, "GET", challenge.id)
+            current = await self._board_read(
+                ready_deadline, self.board.instance, "GET", challenge.id
+            )
             info = current.get("connection_info")
             if current.get("success") is True and isinstance(info, str) and info:
                 try:
@@ -505,13 +524,13 @@ class Orchestrator:
         raise BoardError("dynamic instance did not become ready before the bounded deadline")
 
     async def _qualified_identity(self, deadline: float) -> tuple[int, int]:
-        anonymous_rejected = await self._board_call(
+        anonymous_rejected = await self._board_read(
             deadline, self.board.anonymous_identity_is_rejected
         )
         if anonymous_rejected is not True:
             raise BoardError("anonymous Board identity negative control failed")
-        identity = await self._board_call(deadline, self.board.identity)
-        confirmation = await self._board_call(deadline, self.board.identity)
+        identity = await self._board_read(deadline, self.board.identity)
+        confirmation = await self._board_read(deadline, self.board.identity)
         user_id = identity.get("id")
         team_id = identity.get("team_id")
         if type(user_id) is not int or user_id <= 0:
@@ -527,8 +546,8 @@ class Orchestrator:
         self, deadline: float, identity: tuple[int, int]
     ) -> list[Challenge]:
         reads = [
-            await self._board_call(deadline, self.board.list_challenges),
-            await self._board_call(deadline, self.board.list_challenges),
+            await self._board_read(deadline, self.board.list_challenges),
+            await self._board_read(deadline, self.board.list_challenges),
         ]
         id_reads: list[list[int]] = []
         for rows in reads:
@@ -549,12 +568,12 @@ class Orchestrator:
                 raise BoardError("challenge list contains an invalid id")
         details: list[Challenge] = []
         for challenge_id in ids:
-            detail = await self._board_call(deadline, self.board.challenge, challenge_id)
-            confirmation = await self._board_call(deadline, self.board.challenge, challenge_id)
+            detail = await self._board_read(deadline, self.board.challenge, challenge_id)
+            confirmation = await self._board_read(deadline, self.board.challenge, challenge_id)
             if _challenge_coherence_key(detail) != _challenge_coherence_key(confirmation):
                 raise BoardError("consecutive challenge details were incoherent")
             details.append(detail)
-        final_rows = await self._board_call(deadline, self.board.list_challenges)
+        final_rows = await self._board_read(deadline, self.board.list_challenges)
         final_ids = [row.get("id") for row in final_rows]
         if (
             any(type(value) is not int or value <= 0 for value in final_ids)
@@ -562,7 +581,7 @@ class Orchestrator:
             or sorted(final_ids) != sorted(ids)
         ):
             raise BoardError("challenge list changed during qualification")
-        final_identity = await self._board_call(deadline, self.board.identity)
+        final_identity = await self._board_read(deadline, self.board.identity)
         if final_identity.get("id") != identity[0] or final_identity.get("team_id") != identity[1]:
             raise BoardError("Board identity changed during qualification")
         details.sort(

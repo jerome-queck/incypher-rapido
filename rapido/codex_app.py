@@ -300,6 +300,7 @@ class _TurnState:
     provenance_bytes: int = 0
     tainted_candidates: set[str] = field(default_factory=set)
     tainted_target_inputs: set[str] = field(default_factory=set)
+    tool_request_active: bool = False
     last_event: dict[str, Any] = field(default_factory=dict)
 
 
@@ -862,6 +863,32 @@ class CodexAppClient:
                 },
             )
             return
+        if state.tool_request_active:
+            await self._send_response(
+                message_id,
+                result={
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": '{"error":{"code":"tool_busy","message":"one tool request is already active for this turn"}}',
+                        }
+                    ],
+                },
+            )
+            return
+        state.tool_request_active = True
+        current_task = asyncio.current_task()
+        if current_task is None:
+            state.tool_request_active = False
+            await self._send_response(
+                message_id,
+                error={"code": -32603, "message": "tool request task unavailable"},
+            )
+            return
+        current_task.add_done_callback(
+            lambda _task, turn_state=state: setattr(turn_state, "tool_request_active", False)
+        )
         source_bound = _source_bound_tool_call(state, name, arguments)
         current_supplied = _supplied_candidate_values(name, arguments) if source_bound else set()
         canonical_name = ALIASES.get(name, name)
@@ -893,8 +920,15 @@ class CodexAppClient:
                 except asyncio.CancelledError:
                     # Python worker threads cannot be killed. Drain this bounded tool
                     # before close returns so workspace cleanup cannot race it.
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:  # noqa: BLE001 - preserve caller cancellation
+                            break
                     with suppress(Exception):
-                        await worker
+                        worker.result()
                     raise
             if inspect.isawaitable(result):
                 result = await result

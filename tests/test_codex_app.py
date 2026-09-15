@@ -694,6 +694,7 @@ async def test_tool_call_and_structured_tool_error(
             },
         }
     )
+    await asyncio.gather(*client._server_tasks)
     await client._route_message(
         {
             "id": 91,
@@ -784,43 +785,38 @@ async def test_delayed_target_response_cannot_turn_prior_input_into_candidate_pr
 
 
 @run_async
-async def test_overlapping_target_response_cannot_reorder_candidate_provenance(
+async def test_aliased_pending_turn_tool_request_is_rejected_without_queuing_worker(
     fake_process: FakeProcess, tmp_path: Path
 ) -> None:
-    class ReorderedReflectionRegistry(ToolStub):
+    class BlockingRegistry(ToolStub):
         def __init__(self) -> None:
             self.first_started = threading.Event()
             self.release_first = threading.Event()
-            self.delayed = ""
+            self.calls = 0
 
         def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            if arguments.get("data"):
-                self.delayed = base64.b64decode(arguments["data"], validate=True).decode()
-                self.release_first.set()
-                return {"observed": "accepted"}
+            self.calls += 1
             self.first_started.set()
             assert self.release_first.wait(timeout=2)
-            return {"delayed": self.delayed}
+            return {"observed": "completed"}
 
-    registry = ReorderedReflectionRegistry()
+    registry = BlockingRegistry()
     client = make_client(fake_process, tmp_path, tool_registry=registry)
     await client.start()
     client._thread_registries["thread-1"] = registry
     state = _TurnState(
         thread_id="thread-1",
-        turn_id="turn-1",
         completion=asyncio.get_running_loop().create_future(),
     )
-    client._thread_turns[("thread-1", "turn-1")] = state
-    supplied = "flag{concurrent_model_supplied}"
+    client._pending_turns["thread-1"] = state
     await client._route_message(
         {
             "id": 95,
             "method": "item/tool/call",
             "params": {
                 "threadId": "thread-1",
-                "turnId": "turn-1",
-                "callId": "read-first-finish-last",
+                "turnId": "provisional-a",
+                "callId": "first",
                 "tool": {"name": "tcp_exchange"},
                 "arguments": {"data": ""},
             },
@@ -833,20 +829,100 @@ async def test_overlapping_target_response_cannot_reorder_candidate_provenance(
             "method": "item/tool/call",
             "params": {
                 "threadId": "thread-1",
-                "turnId": "turn-1",
-                "callId": "supply-second-finish-first",
+                "turnId": "provisional-b",
+                "callId": "second",
                 "tool": {"name": "tcp_exchange"},
-                "arguments": {
-                    "data": base64.b64encode(supplied.encode()).decode(),
-                    "encoding": "base64",
-                },
+                "arguments": {"data": ""},
             },
         }
     )
+    for _ in range(20):
+        if any(item["id"] == 96 for item in fake_process.responses):
+            break
+        await asyncio.sleep(0)
+    busy = next(item for item in fake_process.responses if item["id"] == 96)
+    assert busy["result"]["success"] is False
+    assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
+    assert registry.calls == 1
+    assert len(state.tool_calls) == 1
+    registry.release_first.set()
     await asyncio.gather(*client._server_tasks)
-    fingerprint = hashlib.sha256(supplied.encode()).hexdigest()
-    assert fingerprint not in state.tool_calls[0]["candidate_sha256s"]
-    assert fingerprint in state.tool_calls[1]["supplied_candidate_sha256s"]
+    assert state.tool_request_active is False
+    await client.close()
+
+
+@run_async
+async def test_repeated_cancellation_retains_tool_admission_until_worker_finishes(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class BlockingRegistry(ToolStub):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            self.finished.set()
+            raise ToolError("injected_failure", "worker failed during cancellation drain")
+
+    registry = BlockingRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._pending_turns["thread-1"] = state
+    await client._route_message(
+        {
+            "id": 97,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-a",
+                "callId": "first",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    assert await asyncio.to_thread(registry.started.wait, 1)
+    handler = next(iter(client._server_tasks))
+    handler.cancel()
+    await asyncio.sleep(0)
+    handler.cancel()
+    await asyncio.sleep(0)
+    assert not handler.done()
+    assert state.tool_request_active is True
+
+    await client._route_message(
+        {
+            "id": 98,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-b",
+                "callId": "second",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    for _ in range(20):
+        if any(item["id"] == 98 for item in fake_process.responses):
+            break
+        await asyncio.sleep(0)
+    busy = next(item for item in fake_process.responses if item["id"] == 98)
+    assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
+
+    registry.release.set()
+    result = await asyncio.gather(handler, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert registry.finished.is_set()
+    assert state.tool_request_active is False
     await client.close()
 
 
@@ -994,6 +1070,7 @@ async def test_turn_item_and_tool_audits_are_aggregate_bounded(
                 },
             }
         )
+        await asyncio.gather(*client._server_tasks)
     await asyncio.gather(*client._server_tasks)
     assert len(state.items) <= MAX_TURN_ITEMS
     assert state.item_bytes <= MAX_TURN_ITEM_BYTES
