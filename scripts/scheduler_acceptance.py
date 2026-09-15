@@ -169,10 +169,10 @@ def _config(root: Path, arm: Arm) -> RuntimeConfig:
     )
 
 
-async def _run_arm(root: Path, arm: Arm) -> dict[str, Any]:
+async def _run_arm(root: Path, arm: Arm, turn_delay_seconds: float) -> dict[str, Any]:
     config = _config(root, arm)
     board = SyntheticCatalogue()
-    runtime = SyntheticRuntime()
+    runtime = SyntheticRuntime(turn_delay_seconds)
     state = StateStore(config.state_path)
     started = time.perf_counter()
     try:
@@ -244,13 +244,13 @@ def _gate(arms: dict[str, dict[str, Any]], ratio: float) -> list[str]:
     return failures
 
 
-def run_benchmark() -> dict[str, Any]:
+def run_benchmark(turn_delay_seconds: float = TURN_DELAY_SECONDS) -> dict[str, Any]:
     """Run both arms in fresh temporary state and return JSON-compatible evidence."""
     with tempfile.TemporaryDirectory(prefix="rapido-scheduler-acceptance-") as temporary:
         root = Path(temporary)
         results: dict[str, dict[str, Any]] = {}
         for arm in ARMS:
-            results[arm.name] = asyncio.run(_run_arm(root / arm.name, arm))
+            results[arm.name] = asyncio.run(_run_arm(root / arm.name, arm, turn_delay_seconds))
     ratio = results["C"]["elapsed_seconds"] / results["A"]["elapsed_seconds"]
     failures = _gate(results, ratio)
     return {
@@ -258,7 +258,7 @@ def run_benchmark() -> dict[str, Any]:
             "challenges": CHALLENGE_COUNT,
             "lanes": LANES,
             "episodes": EPISODES,
-            "runtime_wait_seconds": TURN_DELAY_SECONDS,
+            "runtime_wait_seconds": turn_delay_seconds,
             "model": "gpt-5.6-luna",
             "reasoning_effort": "xhigh",
             "fallback": False,

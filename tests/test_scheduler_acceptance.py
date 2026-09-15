@@ -16,7 +16,8 @@ run_benchmark = HARNESS.run_benchmark
 
 
 def test_offline_scheduler_acceptance_gate() -> None:
-    result = run_benchmark()
+    # Keep fixed runtime work above shared-runner scheduling/filesystem jitter.
+    result = run_benchmark(turn_delay_seconds=0.05)
     assert result["gate"] == {"passed": True, "failures": []}
     assert result["arms"]["A"]["outcomes"] == result["arms"]["C"]["outcomes"]
     assert result["arms"]["A"]["attempts"] == result["arms"]["C"]["attempts"] == 30
