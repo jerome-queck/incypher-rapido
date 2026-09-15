@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -9,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 CONTAINER_DOC = ROOT / "deploy" / "CONTAINER.md"
 DOCKERIGNORE = ROOT / ".dockerignore"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+TOOLING_ACCEPTANCE = ROOT / "scripts" / "tooling_acceptance.py"
 
 
 def test_image_is_target_platform_python_and_pinned_codex() -> None:
@@ -24,7 +27,8 @@ def test_image_is_target_platform_python_and_pinned_codex() -> None:
         '= "0.154.0"'
     )
     assert version_check in text
-    assert "ca-certificates file binutils" in text
+    for package in ("ca-certificates", "file", "binutils", "e2fsprogs", "tesseract-ocr"):
+        assert package in text
 
 
 def test_image_has_no_secret_like_arg_or_env() -> None:
@@ -102,3 +106,133 @@ def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
     assert "stop_signal: SIGTERM" in text
     assert "stop_grace_period: 180s" in text
     assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()
+
+
+def test_amd64_ci_runs_hardened_offline_tooling_acceptance() -> None:
+    text = CI_WORKFLOW.read_text()
+    for value in (
+        "scripts/tooling_acceptance.py",
+        "--network none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--entrypoint /opt/venv/bin/python rapido:ci",
+    ):
+        assert value in text
+    assert re.search(
+        r"- if: matrix\.platform == 'linux/amd64'\n"
+        r"\s+run: >-\n"
+        r"\s+docker run .*--network none .*tooling_acceptance\.py",
+        text,
+        re.DOTALL,
+    )
+    assert not re.search(
+        r"- if: matrix\.platform == 'linux/arm64'[\s\S]{0,500}tooling_acceptance\.py",
+        text,
+    )
+
+
+def test_tooling_acceptance_does_not_claim_model_execution() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert '"model": "gpt-' not in text
+    assert '"reasoning_effort": "xhigh"' not in text
+    assert '"fallback"' not in text
+    assert '"inference": False' in text
+    assert '"model": None' in text
+    assert '"reasoning_effort": None' in text
+    assert "no model inference is performed" in text
+
+
+def test_tooling_acceptance_reports_computed_visible_schema_size() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert '"schema_count": len(visible_specs)' in text
+    assert '"schema_bytes": len(_json_bytes(visible_specs))' in text
+
+
+def test_tooling_acceptance_dispatches_every_visible_tool() -> None:
+    tree = ast.parse(TOOLING_ACCEPTANCE.read_text())
+    expected_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "EXPECTED_TOOLS"
+            for target in node.targets
+        )
+    )
+    expected = set(ast.literal_eval(expected_node.value))
+    operations = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_operations"
+    )
+    dispatched = {
+        call.args[0].value
+        for call in ast.walk(operations)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "dispatch"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+    }
+    assert expected <= dispatched, (
+        f"advertised tools missing from acceptance: {expected - dispatched}"
+    )
+
+
+def test_tooling_acceptance_covers_declared_artifact_adapters_and_views() -> None:
+    tree = ast.parse(TOOLING_ACCEPTANCE.read_text())
+    operations = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_operations"
+    )
+    requests: set[tuple[str, str, str | None]] = set()
+    for call in ast.walk(operations):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "dispatch"
+            and len(call.args) >= 2
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "inspect_artifact"
+            and isinstance(call.args[1], ast.Dict)
+        ):
+            continue
+        fields = {
+            key.value: value.value
+            for key, value in zip(call.args[1].keys, call.args[1].values)
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and isinstance(value, ast.Constant)
+        }
+        path, view = fields.get("path"), fields.get("view")
+        if isinstance(path, str) and isinstance(view, str):
+            requests.add((path, view, fields.get("selection")))
+
+    required = {
+        ("fixture.pcapng", "text", "packets"),
+        ("fixture.exe", "structure", "imports"),
+        ("fixture.exe", "structure", "exports"),
+        ("archive.tar", "structure", "entries"),
+        ("payload.gz", "structure", "entries"),
+        ("opaque.bin", "text", None),
+        ("opaque.bin", "bytes", None),
+    }
+    assert required <= requests, f"artifact coverage missing: {required - requests}"
+
+
+def test_agent_archive_extraction_schema_excludes_unisolated_tar_materialization() -> None:
+    from rapido.tools import tool_schemas
+
+    extract = next(spec for spec in tool_schemas() if spec["name"] == "extract_archive")
+    assert extract["inputSchema"]["properties"]["format"]["enum"] == ["auto", "zip"]
+
+
+def test_tooling_acceptance_tracks_sandbox_descendant_and_native_x32_gate() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert 'result.get("detachment_probe_pid")' in text
+    assert "_wait_process_gone(descendant_pid)" in text
+    assert 'result.get("x32_socket_errno") == errno.EACCES' in text
+    assert 'result.get("x32_connect_errno") == errno.EACCES' in text

@@ -9,6 +9,10 @@ The image is a Linux multi-stage build. Python 3.12 and Node base images are dig
 Codex `0.154.0` is installed with the target-native package. Buildx supports `linux/amd64` and
 `linux/arm64` only. Any macOS, Linux, or Windows/WSL2 Docker host may build either target:
 
+The build also installs pinned Python artifact parsers and the image's OCR executable. They are
+downloaded into the image at build time; the live container never installs packages and teammates
+need no analyzer tools on the host.
+
 | Host | Usual target | Caveat |
 |---|---|---|
 | x86-64 host/VM | `linux/amd64` | Native on x86-64; emulation on ARM64 hosts. |
@@ -80,6 +84,14 @@ The hardened launch contract retains `--env-file=/path/to/rapido.env`, `--init`,
 `--mount type=bind,src=/private/path/rapido-state,dst=/state`, and
 `--mount type=bind,src=/private/path/rapido-codex-home,dst=/auth/codex`. The 180 seconds cover the
 longest admitted TCP-open drain. Keep a single app-server central auth owner.
+
+Optional artifact parsers run in a killable descriptor-only worker. Linux Landlock restricts its
+filesystem to runtime libraries, the already-open source, and one private per-call scratch
+directory. Seccomp denies networking and process-group detachment for the worker and descendants;
+amd64 rejects the x32 syscall ABI before its native syscall allow path. Model-visible TAR inventory
+uses the same isolated worker; archive materialization is ZIP-only. Scratch is deleted by the
+supervisor on every success or failure path. A kernel without the required confinement returns
+`tool_unavailable` instead of running the parser with wider authority.
 
 ## Entrypoint and Compose
 

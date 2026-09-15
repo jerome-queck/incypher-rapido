@@ -46,10 +46,10 @@ Engine/Desktop, and Windows through WSL2 with Docker Desktop integration. Run fr
 The wizard checks Docker/Buildx, selects `linux/amd64` or `linux/arm64`, creates private state,
 runs a dedicated containerized Codex login, captures Board credentials without echoing them,
 builds the final image, smoke-tests Codex/Rapido, and performs read-only Board preflight. It prints
-the hardened live command but never starts the solver. The Dockerfile downloads every current
-runtime tool—pinned Codex, Rapido, `file`, `binutils`, and `e2fsprogs`; teammates install none of
-those on the host. Measured solver tools added later belong in the Dockerfile and therefore follow
-the same automatic setup.
+the hardened live command but never starts the solver. The Dockerfile downloads every runtime
+tool—including pinned Codex/Rapido, pinned Python parsers, and the image's file, binary, OCR, and
+filesystem analyzers; teammates install none on the host. Rebuilding through the wizard updates
+the image from the repository's declared dependency set.
 
 By default, private material lives outside the repository at:
 
@@ -139,6 +139,11 @@ evidence first, then remove only the run's containers, volumes, and workspaces a
   ensure Docker Desktop shares the host path and has enough VM disk.
 - `exec format error` or unsupported architecture: build and run the same explicit Linux platform;
   only amd64 and arm64 are supported.
+- Artifact-parser `tool_unavailable` errors: update the Docker Engine/Desktop Linux VM to a kernel
+  that supports Landlock and seccomp. Optional untrusted-file parsing fails closed without both;
+  isolated workers also deny networking, process-group detachment, and the amd64 x32 syscall ABI.
+- TAR inventory is available through `inspect_artifact`; model-visible archive materialization is
+  ZIP-only until TAR extraction can remain inside the same confinement boundary.
 - Supervisor/auth lease errors: stop the competing container; never share one auth home between
   app-server owners.
 - `preflight` errors: check the official HTTPS origin, token, authenticated identity, and stable

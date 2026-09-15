@@ -32,7 +32,12 @@ FROM ${PYTHON_IMAGE} AS runtime
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates file binutils e2fsprogs \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        file \
+        binutils \
+        e2fsprogs \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # node is copied from a target-platform stage; Codex's native optional package

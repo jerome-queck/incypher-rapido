@@ -12,8 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from rapido.tools import (
+    AGENT_TOOL_NAMES,
     MAX_ARCHIVE_ENTRIES,
-    MAX_ARCHIVE_MEMBER_BYTES,
     MAX_COMMAND_OUTPUT_BYTES,
     MAX_SCAN_BYTES,
     ToolError,
@@ -71,8 +71,22 @@ class ToolFixture(unittest.TestCase):
 
     def test_dynamic_registry_is_workspace_bound(self) -> None:
         registry = ToolRegistry(self.workspace)
-        names = {spec["name"] for spec in registry.dynamic_tool_specs}
-        self.assertIn("inspect_file", names)
+        specs = {spec["name"]: spec for spec in registry.dynamic_tool_specs}
+        names = set(specs)
+        self.assertEqual(names, set(AGENT_TOOL_NAMES))
+        self.assertIn("inspect_artifact", names)
+        self.assertNotIn("inspect_file", names)
+        self.assertEqual(specs["search_text"]["inputSchema"]["required"], ["path", "query"])
+        self.assertEqual(
+            specs["decompress_gzip"]["inputSchema"]["required"], ["path", "destination"]
+        )
+        self.assertEqual(
+            specs["decode_hex"]["inputSchema"]["oneOf"],
+            [{"required": ["data"]}, {"required": ["path"]}],
+        )
+        filesystem_schema = specs["inspect_filesystem"]["inputSchema"]
+        self.assertEqual(filesystem_schema["required"], ["path"])
+        self.assertEqual(filesystem_schema["oneOf"][1]["required"], ["action", "filesystem_path"])
         self.assertEqual(registry.dispatch("hash", {"path": "note.txt"})["path"], "note.txt")
 
     def test_large_files_use_ranges_streaming_hashes_and_bounded_scans(self) -> None:
@@ -133,7 +147,7 @@ class ToolFixture(unittest.TestCase):
             {"data": "00", "path": "blob.bin"},
         )
 
-    def test_zip_and_tar_safe_listing_and_extraction(self) -> None:
+    def test_zip_extraction_and_tar_compatibility_listing(self) -> None:
         with zipfile.ZipFile(self.root / "good.zip", "w") as archive:
             archive.writestr("dir/value.txt", "value")
         self.assertEqual(
@@ -162,6 +176,14 @@ class ToolFixture(unittest.TestCase):
             call_tool(self.workspace, "list_tar", {"path": "good.tar"})["entries"][0]["name"],
             "inside.txt",
         )
+        self.assertToolError(
+            "unsupported_archive",
+            call_tool,
+            self.workspace,
+            "extract_archive",
+            {"path": "good.tar", "destination": "tar-out", "format": "tar"},
+        )
+        self.assertFalse((self.root / "tar-out").exists())
 
     def test_gzip_decompression_is_bounded_and_non_overwriting(self) -> None:
         with gzip.open(self.root / "disk.img.gz", "wb") as archive:
@@ -289,32 +311,6 @@ class ToolFixture(unittest.TestCase):
         )
         self.assertFalse((self.root.parent / "outside.txt").exists())
 
-        with tarfile.open(self.root / "bomb.tar", "w") as archive:
-            info = tarfile.TarInfo("huge.bin")
-            info.size = MAX_ARCHIVE_MEMBER_BYTES + 1
-            archive.addfile(info, io.BytesIO(b"x" * info.size))
-        self.assertToolError(
-            "archive_too_large",
-            call_tool,
-            self.workspace,
-            "extract_archive",
-            {"path": "bomb.tar", "destination": "bomb-out"},
-        )
-        self.assertFalse((self.root / "bomb-out/huge.bin").exists())
-
-        with tarfile.open(self.root / "link.tar", "w") as archive:
-            info = tarfile.TarInfo("link")
-            info.type = tarfile.SYMTYPE
-            info.linkname = "/etc/passwd"
-            archive.addfile(info)
-        self.assertToolError(
-            "unsafe_archive",
-            call_tool,
-            self.workspace,
-            "extract_archive",
-            {"path": "link.tar", "destination": "link-out"},
-        )
-
     def test_archive_entry_caps_precede_materialization_or_writes(self) -> None:
         with zipfile.ZipFile(self.root / "many.zip", "w") as archive:
             for index in range(MAX_ARCHIVE_ENTRIES + 1):
@@ -323,18 +319,6 @@ class ToolFixture(unittest.TestCase):
             self.assertToolError(
                 "archive_too_large", call_tool, self.workspace, "list_zip", {"path": "many.zip"}
             )
-
-        with tarfile.open(self.root / "many.tar", "w") as archive:
-            for index in range(MAX_ARCHIVE_ENTRIES + 1):
-                archive.addfile(tarfile.TarInfo(f"{index}.txt"), io.BytesIO())
-        self.assertToolError(
-            "archive_too_large",
-            call_tool,
-            self.workspace,
-            "extract_archive",
-            {"path": "many.tar", "destination": "many-out", "format": "tar"},
-        )
-        self.assertFalse((self.root / "many-out").exists())
 
     def test_registry_enforces_cumulative_workspace_quota_and_rolls_back(self) -> None:
         with zipfile.ZipFile(self.root / "quota.zip", "w") as archive:

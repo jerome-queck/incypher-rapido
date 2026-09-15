@@ -216,7 +216,11 @@ async def _run_arm(root: Path, arm: Arm, turn_delay_seconds: float) -> dict[str,
     }
 
 
-def _gate(arms: dict[str, dict[str, Any]], ratio: float) -> list[str]:
+def _gate(
+    arms: dict[str, dict[str, Any]],
+    ratio: float,
+    max_elapsed_ratio: float | None,
+) -> list[str]:
     a = arms["A"]
     c = arms["C"]
     failures: list[str] = []
@@ -239,20 +243,29 @@ def _gate(arms: dict[str, dict[str, Any]], ratio: float) -> list[str]:
             failures.append(f"arm {name} did not complete")
         if result["catalogue_downloads"] or result["catalogue_submissions"]:
             failures.append(f"arm {name} touched forbidden external seams")
-    if ratio > 0.70:
-        failures.append("arm C elapsed ratio exceeded 0.70")
+    if max_elapsed_ratio is not None and ratio > max_elapsed_ratio:
+        failures.append(f"arm C elapsed ratio exceeded {max_elapsed_ratio:.2f}")
     return failures
 
 
-def run_benchmark(turn_delay_seconds: float = TURN_DELAY_SECONDS) -> dict[str, Any]:
-    """Run both arms in fresh temporary state and return JSON-compatible evidence."""
+def run_benchmark(
+    turn_delay_seconds: float = TURN_DELAY_SECONDS,
+    *,
+    max_elapsed_ratio: float | None = 0.70,
+) -> dict[str, Any]:
+    """Run both arms in fresh temporary state and return JSON-compatible evidence.
+
+    ``max_elapsed_ratio=None`` checks only deterministic scheduler/lifecycle
+    contracts. Wall-clock acceptance remains enabled for deliberate benchmark
+    runs, but must not gate CI on a contended shared runner.
+    """
     with tempfile.TemporaryDirectory(prefix="rapido-scheduler-acceptance-") as temporary:
         root = Path(temporary)
         results: dict[str, dict[str, Any]] = {}
         for arm in ARMS:
             results[arm.name] = asyncio.run(_run_arm(root / arm.name, arm, turn_delay_seconds))
     ratio = results["C"]["elapsed_seconds"] / results["A"]["elapsed_seconds"]
-    failures = _gate(results, ratio)
+    failures = _gate(results, ratio, max_elapsed_ratio)
     return {
         "fixture": {
             "challenges": CHALLENGE_COUNT,
@@ -262,6 +275,7 @@ def run_benchmark(turn_delay_seconds: float = TURN_DELAY_SECONDS) -> dict[str, A
             "model": "gpt-5.6-luna",
             "reasoning_effort": "xhigh",
             "fallback": False,
+            "max_elapsed_ratio": max_elapsed_ratio,
         },
         "arms": results,
         "ratio": ratio,

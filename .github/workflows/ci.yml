@@ -49,3 +49,10 @@ jobs:
         run: docker run --rm --entrypoint codex rapido:ci --version
       - if: matrix.platform == 'linux/amd64'
         run: docker inspect rapido:ci --format '{{json .Config.User}} {{json .Config.Entrypoint}}'
+      - if: matrix.platform == 'linux/amd64'
+        run: >-
+          docker run --rm --init --network none --cpus=1 --memory=1g --pids-limit=128
+          --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev --cap-drop=ALL
+          --security-opt=no-new-privileges:true
+          --mount type=bind,src="$PWD/scripts/tooling_acceptance.py",dst=/tmp/tooling_acceptance.py,readonly
+          --entrypoint /opt/venv/bin/python rapido:ci /tmp/tooling_acceptance.py
