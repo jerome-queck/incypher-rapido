@@ -10,7 +10,7 @@
 
 - The main agent owns requirements, architecture decisions, shared edits, Board effects, GitHub state, integration, and merges.
 - Delegate bounded, non-overlapping lanes for research, alternatives, implementation, focused tests, and independent review. Give each lane an evidence-based completion criterion and explicit file ownership; wait for and distill all results before deciding.
-- Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-5.6-sol` at `xhigh` for demanding bounded implementation or review, and `gpt-5.6-luna` at `xhigh` for narrow routine investigation, coding, fixtures, and focused tests. Use `gpt-daybreak-blue-latest` at `xhigh` only for the final clean-state competition simulation after feature work and reviews pass.
+- Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-daybreak-blue-latest` at `xhigh` for demanding bounded implementation or review and for every live solver or Board run. Use `gpt-5.6-luna` at `xhigh` only for narrow build-time investigation, coding, fixtures, and non-live tests; never use Luna in a live solver run.
 - Record effective model and effort. Treat unavailable selections as failures; never silently fall back.
 
 ## Delivery
