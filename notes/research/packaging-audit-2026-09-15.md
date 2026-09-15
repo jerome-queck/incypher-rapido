@@ -1,5 +1,32 @@
 # Packaging audit — 2026-09-15
 
+> Historical source-only baseline. Its gap list is retained as an audit trail and is superseded where
+> explicitly closed by the post-audit acceptance result below.
+
+## Post-audit packaging acceptance result
+
+- Final tested ARM64 image:
+  `rapido@sha256:e8c14d8e28ddfbefcc5cc96571e2d382eccfdc654f8140d0948ab10d95a28ebb`;
+  UID/GID 10001; exec-form `rapido run`; read-only root; all capabilities dropped;
+  no-new-privileges; PID limit 256; 8 CPUs; 24 GiB RAM; roughly 492 GiB writable state capacity.
+- The former 512-MiB workspace quota was replaced by a 500-GiB ceiling matching the allocated
+  volume. Per-artifact, per-challenge, output, PID, and deadline bounds remain. `/tmp` had roughly
+  11.7 GiB available under the 24-GiB runtime rather than a small fixed tmpfs cap.
+- Project/Codex Apache-2.0 terms, third-party notices, Node license, and Debian package records are
+  present. Seven exact Board/auth secret values matched zero of 46 tracked files and zero bytes in a
+  streamed 229,159,936-byte image archive; image history had zero sensitive markers. Live Node and
+  Codex environments contained no Board credential variable names.
+- Ordinary SIGTERM during two active lanes and a live Board instance exited 130 in 2.59 seconds,
+  preserved integrity, cancelled both lanes, and removed the target. Deployment templates now give
+  the bounded tool-drain plus cleanup path 180 seconds. Abrupt SIGKILL followed by same-volume
+  restart also recovered cleanly.
+- The final image completed one 1-hour-3-minute-43-second whole-catalogue sweep without error, OOM,
+  or restart. All 14 unsolved waves overlapped; all nine dynamic targets were independently absent
+  afterward. 240 tests, Ruff, formatting, and whitespace checks pass.
+- CI still cross-builds both architectures, but authenticated native runtime evidence here is ARM64.
+  Organizer architecture, mount, healthcheck, and final command requirements remain unpublished;
+  the unavailable starter/ADK is still the precise packaging-contract prerequisite.
+
 ## Scope and evidence limits
 
 Read-only source/container-contract audit; only this report was added. No Board operations, credentials, private endpoints, model inference, or container runs were used. Repository state was inspected directly; previous acceptance claims were not treated as proof.

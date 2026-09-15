@@ -1,5 +1,31 @@
 # Implementation audit — 2026-09-15
 
+> Historical baseline at commit `15b5813`. Its present-tense gap conclusions are superseded by the
+> post-audit implementation and acceptance result below; the original text is retained as an audit
+> trail.
+
+## Post-audit implementation and acceptance result
+
+- Dynamic lifecycle, fixed-authority HTTP/TCP, supervisor-held team-key PoW, receipt-bound cleanup,
+  transport-only retries for idempotent Board reads, strict candidate provenance, closed native
+  failure classification, one-active-tool-per-turn admission, cancellation-safe app-server cleanup,
+  and expanded artifact tools were implemented and independently reviewed.
+- One exact-final-image whole-catalogue run qualified all 15 challenges, skipped the solved one, and
+  completed all 14 remaining two-lane waves with real tools and zero errors. One earlier container
+  autonomously made the single qualified correct submission; no operator entered or relayed an
+  answer.
+- Accelerated evidence now includes 1 hour 3 minutes 43 seconds of exact-final-image catalogue work,
+  nine dynamic create/ready/remove cycles, exact-image SIGTERM during an active target, exact-image
+  SIGKILL plus durable restart recovery, and the 96-cycle synthetic harness. See
+  [dynamic acceptance](dynamic-acceptance-2026-09-15.md) and
+  [sustainability acceptance](sustainability-acceptance-2026-09-15.md).
+- The final tested image is
+  `rapido@sha256:e8c14d8e28ddfbefcc5cc96571e2d382eccfdc654f8140d0948ab10d95a28ebb`,
+  built from runtime commit `673bddc`; 240 tests, Ruff, formatting, and whitespace checks pass.
+- The organizer starter/ADK and final packaging/startup contract remain unavailable. The documented
+  narrow Board generation read/delete race also remains because the Board exposes no atomic
+  conditional-delete operation. No full 5.5-hour rehearsal is claimed.
+
 ## Scope and evidence
 
 Read-only source audit of commit `15b58136200ec805233bbaec3194df60074c695a`, plus local secret-free tests. Only this report was added. No credentials, private Board data, existing runtime databases, authenticated model sessions, or challenge endpoints were accessed. No final image was built or exercised in this lane. External-contract and real-service claims remain unverified here.
