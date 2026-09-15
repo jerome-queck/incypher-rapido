@@ -141,6 +141,33 @@ telemetry or improve solving; adding arbitrary metric plugins would enlarge the 
 there is measured need. Recommend this small audit Module as the first evidence slice, while keeping
 live scheduling, tactics, and automated submission outside this proposal.
 
+## Scheduler implementation update
+
+The later measured decision kept the existing `Orchestrator` seam instead of adding the proposed
+audit framework. A secret-free production-path fixture compared one active challenge/two turns
+(arm A) with two active challenges/four turns (arm C), over all 15 catalogue entries. Arm C took
+0.1994 seconds versus 0.3597 seconds for A (ratio 0.5544), with identical outcomes, 30 attempts,
+SQLite integrity `ok`, and no residual task or workspace. The pre-registered gate was ratio ≤0.70.
+`scripts/scheduler_acceptance.py` reproduces the measurement.
+
+Selected defaults are two active challenges, two independent lanes, four lane slots, two FIFO
+episodes, and one dynamic instance. Initial episode coverage precedes retries; one challenge never
+has overlapping episodes; carry is lane-local; workspace capacity is partitioned across the active
+set. Configuration rejects capacity that cannot admit every complete lane wave. Board-solved
+metadata never skips work or contributes run-local score; `already_solved` is not a validating
+verdict.
+
+Post-implementation Daybreak/xhigh review reproduced and then drove fixes for partial-wave
+admission and repeated-cancellation lease release. The final non-live suite has 286 passing tests;
+96 sustainability cycles passed; the ARM64 final image is Linux/ARM64, UID/GID 10001, contains
+Codex 0.154.0, and reports the selected defaults. The contributor wizard uses Docker for pinned
+tool installation and supports macOS, Linux, and Windows through WSL2. No live Board/model run is
+claimed by this update.
+
+Effective routing: architecture/research `gpt-6-astra`/`xhigh`; implementation fixtures and
+measurement `gpt-5.6-luna`/`xhigh`; focused testing and independent review
+`gpt-daybreak-blue-latest`/`xhigh`; no fallback.
+
 ## Sources
 
 [I11]: https://github.com/jerome-queck/incypher-rapido/issues/11

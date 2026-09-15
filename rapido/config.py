@@ -131,6 +131,9 @@ class RuntimeConfig:
     model: str
     reasoning_effort: str
     concurrency: int
+    active_challenges: int
+    episodes_per_challenge: int
+    dynamic_concurrency: int
     attempts_per_challenge: int
     attempt_seconds: int
     run_seconds: int
@@ -173,6 +176,14 @@ class RuntimeConfig:
         if profile not in {"economy", "practice", "competition"}:
             raise ConfigError("RAPIDO_PROFILE must be economy, practice, or competition")
 
+        active_challenges = _integer(values, "RAPIDO_ACTIVE_CHALLENGES", 2, minimum=1, maximum=4)
+        episodes_per_challenge = _integer(
+            values, "RAPIDO_EPISODES_PER_CHALLENGE", 2, minimum=1, maximum=4
+        )
+        dynamic_concurrency = _integer(
+            values, "RAPIDO_DYNAMIC_CONCURRENCY", 1, minimum=1, maximum=1
+        )
+
         max_artifact_bytes = _integer(
             values,
             "RAPIDO_MAX_ARTIFACT_BYTES",
@@ -192,6 +203,13 @@ class RuntimeConfig:
         attempts_per_challenge = _integer(
             values, "RAPIDO_ATTEMPTS_PER_CHALLENGE", 2, minimum=2, maximum=8
         )
+        concurrency = _integer(values, "RAPIDO_CONCURRENCY", 4, minimum=2, maximum=8)
+        required_concurrency = active_challenges * attempts_per_challenge
+        if concurrency < required_concurrency:
+            raise ConfigError(
+                "RAPIDO_CONCURRENCY must cover every lane in each active challenge wave "
+                f"({required_concurrency} required)"
+            )
         max_workspace_bytes = _integer(
             values,
             "RAPIDO_MAX_WORKSPACE_BYTES",
@@ -199,10 +217,13 @@ class RuntimeConfig:
             minimum=3 * 1024,
             maximum=500 * 1024 * 1024 * 1024,
         )
-        minimum_workspace_bytes = max_challenge_bytes * (attempts_per_challenge + 1)
+        minimum_workspace_bytes = (
+            active_challenges * max_challenge_bytes * (attempts_per_challenge + 1)
+        )
         if max_workspace_bytes < minimum_workspace_bytes:
             raise ConfigError(
-                "RAPIDO_MAX_WORKSPACE_BYTES must cover source plus every lane artifact copy"
+                "RAPIDO_MAX_WORKSPACE_BYTES must cover source plus every lane artifact copy "
+                "for all active challenges"
             )
 
         return cls(
@@ -211,7 +232,10 @@ class RuntimeConfig:
             team_key=team_key,
             model=_text(values, "RAPIDO_MODEL", "gpt-daybreak-blue-latest"),
             reasoning_effort=effort,
-            concurrency=_integer(values, "RAPIDO_CONCURRENCY", 2, minimum=2, maximum=8),
+            concurrency=concurrency,
+            active_challenges=active_challenges,
+            episodes_per_challenge=episodes_per_challenge,
+            dynamic_concurrency=dynamic_concurrency,
             attempts_per_challenge=attempts_per_challenge,
             attempt_seconds=_integer(
                 values, "RAPIDO_ATTEMPT_SECONDS", 900, minimum=15, maximum=7200
@@ -229,8 +253,8 @@ class RuntimeConfig:
             wrong_submission_ceiling=_integer(
                 values, "RAPIDO_WRONG_SUBMISSION_CEILING", 2, minimum=0, maximum=10
             ),
-            submit_candidates=_boolean(values, "RAPIDO_SUBMIT_CANDIDATES", False),
-            manage_dynamic_instances=_boolean(values, "RAPIDO_MANAGE_DYNAMIC_INSTANCES", False),
+            submit_candidates=_boolean(values, "RAPIDO_SUBMIT_CANDIDATES", True),
+            manage_dynamic_instances=_boolean(values, "RAPIDO_MANAGE_DYNAMIC_INSTANCES", True),
         )
 
     def public_record(self) -> dict[str, object]:
@@ -240,12 +264,16 @@ class RuntimeConfig:
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "concurrency": self.concurrency,
+            "active_challenges": self.active_challenges,
+            "episodes_per_challenge": self.episodes_per_challenge,
+            "dynamic_concurrency": self.dynamic_concurrency,
             "attempts_per_challenge": self.attempts_per_challenge,
             "attempt_seconds": self.attempt_seconds,
             "run_seconds": self.run_seconds,
             "max_artifact_bytes": self.max_artifact_bytes,
             "max_challenge_bytes": self.max_challenge_bytes,
             "max_workspace_bytes": self.max_workspace_bytes,
+            "max_challenge_workspace_bytes": self.max_challenge_workspace_bytes,
             "max_lane_workspace_bytes": self.max_lane_workspace_bytes,
             "state_path": str(self.state_path),
             "work_root": str(self.work_root),
@@ -262,4 +290,11 @@ class RuntimeConfig:
     @property
     def max_lane_workspace_bytes(self) -> int:
         """Conservative lane cap preserving the aggregate challenge workspace cap."""
-        return (self.max_workspace_bytes - self.max_challenge_bytes) // self.attempts_per_challenge
+        return (
+            self.max_challenge_workspace_bytes - self.max_challenge_bytes
+        ) // self.attempts_per_challenge
+
+    @property
+    def max_challenge_workspace_bytes(self) -> int:
+        """Per-challenge workspace cap within the run-wide workspace ceiling."""
+        return self.max_workspace_bytes // self.active_challenges

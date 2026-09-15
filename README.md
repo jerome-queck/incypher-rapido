@@ -1,113 +1,152 @@
 # IN-CYPHER Rapido
 
-Autonomous, restartable IN-CYPHER challenge analysis through the native Codex app-server and a
-ChatGPT subscription. No OpenAI API key or direct model API is supported.
+Rapido is a restartable IN-CYPHER solver using the native Codex app-server and a ChatGPT
+subscription. It does not use an OpenAI API key or direct model API.
 
-Rapido keeps Board credentials in the supervisor only. One native app-server owns subscription
-authentication, while at least two independent threads analyze separate workspace copies through a
-small allowlist of workspace tools and Board-endpoint-bound HTTP/TCP clients. Unified execution,
-shell, browser, general network, app, computer-use, and nested multi-agent tools are disabled. The
-retained native V8 broker can invoke only Rapido's bounded dynamic-tool allowlist. The running
-container's supervisor submits a candidate autonomously only when two lanes derive the same
-non-placeholder value observed in a successful source-bound tool result; an operator never enters
-or relays an answer.
+Keep two workflows separate:
 
-## Current boundary
+- **Secret-free checks** use local Python, fakes, and the synthetic state harness. They do not
+  need Codex login, Board credentials, a Board, or challenge data.
+- **Authenticated work** uses a dedicated writable Codex home and an external Board env file.
+  `preflight` is read-only; `run` is the autonomous solver. Qualified submissions and managed
+  dynamic instances are enabled by default.
 
-The runtime analyzes supplied descriptions, artifacts, and assigned dynamic targets. With instance
-management enabled, Rapido preflights absence, creates one Board instance, polls readiness, binds
-HTTP/TCP tools to only the issued authorities, completes the observed team-key PoW when requested,
-and verifies receipt-matched teardown. General scanning and arbitrary destinations remain outside
-scope. The defaults withhold submissions and instance writes; enable either only for an authorized
-run.
+The model process receives no Board credentials. Never enter, copy, relay, or probe an answer by
+hand. Use only Board-issued dynamic authorities; arbitrary scanning is outside scope.
 
-## Local setup
+## Teammate quick start
 
-Requires Python 3.11+, the native `codex` executable, and a dedicated private writable Codex home
-containing file-backed ChatGPT subscription auth. Do not add a Codex config, MCP configuration, or
-another app-server owner to this home:
+### Secret-free host checks
+
+Python 3.11+ is required (CI checks 3.11 and 3.12). The host must have `venv`, `pip`, and the
+development commands installed; no credentials are read by these commands. Windows contributors
+run these commands inside WSL2.
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -e . pytest ruff
-chmod 700 /private/path/codex-home
-chmod 600 /private/path/codex-home/auth.json
-mkdir -p /private/path/state/work
-chmod 700 /private/path/state /private/path/state/work
-```
-
-Keep Board values in an external mode-0600 env file:
-
-```text
-CTFD_URL=https://hackathon.in-cypher.com
-CTFD_API_TOKEN=...
-TEAM_KEY=...
-RAPIDO_CODEX_HOME=/private/path/codex-home
-RAPIDO_STATE_PATH=/private/path/state/rapido.sqlite3
-RAPIDO_WORK_ROOT=/private/path/state/work
-RAPIDO_CODEX_BINARY=/absolute/path/to/codex
-```
-
-Run read-only Board preflight, inspect non-secret config, then start the queue:
-
-```sh
-set -a
-. /private/path/board.env
-set +a
-rapido preflight
-rapido config
-rapido run
-```
-
-Important settings:
-
-| Variable | Default | Contract |
-|---|---:|---|
-| `RAPIDO_MODEL` | `gpt-daybreak-blue-latest` | Security-focused exact app-server catalogue match; no fallback |
-| `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by that model |
-| `RAPIDO_CONCURRENCY` | `2` | Minimum two; reserved for queue policy |
-| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `2` | Independent concurrent lanes |
-| `RAPIDO_ATTEMPT_SECONDS` | `900` | Interrupt deadline per lane |
-| `RAPIDO_RUN_SECONDS` | `19800` | Work-admission deadline (5.5 hours) |
-| `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | Maximum one downloaded artifact |
-| `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source bytes before lane copies |
-| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Full 500-GiB runtime-volume ceiling; not a small working quota |
-| `RAPIDO_CHALLENGE_IDS` | empty | Optional unique comma-separated qualified challenge IDs; empty means full catalogue |
-| `RAPIDO_SUBMIT_CANDIDATES` | `false` | Serial exact-agreement submissions when true |
-| `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Global ceiling for wrong or indeterminate effects |
-| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `false` | Create, access, and receipt-check/delete `dynamic_iac` instances |
-
-## Verification
-
-```sh
 .venv/bin/ruff check rapido tests scripts
+.venv/bin/ruff format --check rapido tests scripts
 PYTHONPATH=. .venv/bin/pytest -q
 PYTHONPATH=. .venv/bin/python scripts/sustainability_acceptance.py --cycles 96
-docker build -t rapido:local .
 ```
 
-The run clock starts before restart cleanup and native startup. No new Board call starts unless its
-full transport timeout fits. Cancellation drains an in-flight Board call (at most its 15-second
-transport timeout) and any bounded tool before deleting workspaces; wall-clock shutdown can extend
-beyond the work-admission deadline by bounded teardown.
+The sustainability script is synthetic StateStore/queue evidence only. It is not a native-model,
+container, Board, or 5.5-hour acceptance run.
 
-Container mounts, resource limits, and auth ownership are documented in
-[`deploy/CONTAINER.md`](deploy/CONTAINER.md). Research decisions are under [`notes/research`](notes/research).
+### Universal container setup
 
-State is an external mode-0600 SQLite database under an owned mode-0700 directory. It records runs,
-attempts, interruption recovery, candidate agreement/provenance, and pre-effect submission
-reservations/fingerprints/verdicts without Board credentials. Use `rapido pending` and explicit
-`rapido reconcile --challenge-id ... --candidate-sha256 ... --outcome correct|incorrect|not-delivered`
-after independently
-checking an ambiguous submission; Rapido never guesses whether a timed-out POST landed. Instance
-reconciliation quarantines receipt-less ambiguous creates. Receipt-bound cleanup re-reads and matches
-the generation immediately before DELETE; the Board contract still lacks an atomic conditional
-generation delete, so a narrow read/delete race remains documented. State-path, shared Codex-home,
-and shared work-root leases
-enforce one supervisor/app-server/workspace owner. Challenge workspaces and recognized stale run roots
-are removed without
-following symlinks. Never publish state/work directories: attempt state can contain candidate values.
+This works on any x86-64 or ARM64 machine able to run Linux containers: macOS or Linux with Docker
+Engine/Desktop, and Windows through WSL2 with Docker Desktop integration. Run from Bash/WSL2:
 
-CI is deliberately secret-free: it runs lint/tests and builds both architectures, with an amd64
-runtime smoke check. Authenticated Board/native-subscription, ARM64 runtime, sustained-operation, and
-restart evidence are manual external acceptance surfaces; no auth or hidden fixture enters CI.
+```sh
+./scripts/setup_container.sh
+```
+
+The wizard checks Docker/Buildx, selects `linux/amd64` or `linux/arm64`, creates private state,
+runs a dedicated containerized Codex login, captures Board credentials without echoing them,
+builds the final image, smoke-tests Codex/Rapido, and performs read-only Board preflight. It prints
+the hardened live command but never starts the solver. The Dockerfile downloads every current
+runtime tool—pinned Codex, Rapido, `file`, `binutils`, and `e2fsprogs`; teammates install none of
+those on the host. Measured solver tools added later belong in the Dockerfile and therefore follow
+the same automatic setup.
+
+By default, private material lives outside the repository at:
+
+```text
+$HOME/.local/share/incypher-rapido/
+├── rapido.env       # Board secrets + container paths; mode 0600
+├── codex-home/      # dedicated writable auth.json; mode 0700/0600
+└── state/           # SQLite and fresh run workspaces
+```
+
+On Windows, `$HOME` means the WSL2 Linux home; avoid `/mnt/c` for private modes and large solver
+state. Override the location with `RAPIDO_SETUP_ROOT=/absolute/path`. Re-run safely to refresh the
+image or credentials. Keep one supervisor per state/auth pair. The generated env file deliberately
+uses container paths (`/state`, `/auth/codex`), not host paths.
+
+`preflight` requires `CTFD_API_TOKEN`, reads the Board, and does not start Codex, submit, or manage
+instances. `run` requires valid native auth and defaults to autonomous qualified submissions and
+managed dynamic instances. Explicit `false` overrides exist only for synthetic/read-only developer
+runs. Every live acceptance run still needs newly empty external state and fresh downloads.
+
+Manual mount, Compose, resource, and platform details stay in the single advanced reference:
+[`deploy/CONTAINER.md`](deploy/CONTAINER.md).
+
+## Settings that affect a run
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `RAPIDO_MODEL` | `gpt-daybreak-blue-latest` | Exact app-server catalogue match; no fallback. |
+| `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by the selected model. |
+| `RAPIDO_CONCURRENCY` | `4` | Lane admission bound, measured for two complete 2-lane waves; range 2–8. |
+| `RAPIDO_ACTIVE_CHALLENGES` | `2` | Configured active-set partition; accepted range 1–4. |
+| `RAPIDO_EPISODES_PER_CHALLENGE` | `2` | Configured episode bound; accepted range 1–4. |
+| `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
+| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `2` | Independent lane count; accepted range 2–8. |
+| `RAPIDO_ATTEMPT_SECONDS` | `900` | Per-lane interrupt deadline. |
+| `RAPIDO_RUN_SECONDS` | `19800` | Work-admission budget (5.5 hours). |
+| `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | One artifact ceiling. |
+| `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source-byte ceiling. |
+| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Run-wide ceiling; active challenges partition it. |
+| `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
+| `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
+| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Serial exact-agreement submissions; explicit false is developer-only. |
+| `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Wrong/indeterminate submission-risk ceiling. |
+| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Managed receipt-bound dynamic instance lifecycle. |
+
+The effective non-secret configuration is printed by `config`. Never publish state/work folders:
+attempt rows can contain candidate values, while submission records retain fingerprints and
+verdicts. `RAPIDO_CONCURRENCY` must cover
+`RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
+
+## Stop, restart, and cleanup
+
+Use the 180-second grace period so bounded target drains, native shutdown, and instance cleanup can
+finish:
+
+```sh
+docker stop --time 180 rapido
+```
+
+With `--rm`, rerun the same `docker run` command against the same state/auth mounts after a crash;
+Rapido recovers interrupted attempts and recognized stale work roots. Do not start a second
+supervisor against the same state, work root, or Codex home. `docker --rm` removes only the stopped
+container; mounted state and auth persist.
+
+For an ambiguous submission, inspect the Board independently, then record the exact outcome; never
+blindly retry:
+
+```sh
+docker run --rm --entrypoint rapido --env-file=/private/path/rapido.env \
+  --mount type=bind,src=/private/path/rapido-state,dst=/state rapido:local pending
+docker run --rm --entrypoint rapido --env-file=/private/path/rapido.env \
+  --mount type=bind,src=/private/path/rapido-state,dst=/state rapido:local reconcile \
+  --challenge-id ID --candidate-sha256 SHA256 \
+  --outcome correct
+```
+
+Use exactly one supported outcome: `correct`, `incorrect`, or `not-delivered`.
+
+Do not use broad Docker prune/delete commands on the state or auth volume. Preserve sanitized
+evidence first, then remove only the run's containers, volumes, and workspaces as authorized.
+
+## Troubleshooting and security
+
+- `RAPIDO_CODEX_HOME` errors: require a real writable directory (`0700`), regular writable
+  `auth.json` (`0600`), no symlinks, and no `config.toml`, `config.json`, or `mcp.json`.
+- Permission errors on `/state` or `/auth/codex`: use UID/GID `10001:10001`, or a named volume;
+  ensure Docker Desktop shares the host path and has enough VM disk.
+- `exec format error` or unsupported architecture: build and run the same explicit Linux platform;
+  only amd64 and arm64 are supported.
+- Supervisor/auth lease errors: stop the competing container; never share one auth home between
+  app-server owners.
+- `preflight` errors: check the official HTTPS origin, token, authenticated identity, and stable
+  challenge catalogue. It intentionally fails on incoherence.
+- `pending` output means a submission effect is unresolved. Reconcile explicitly; do not rerun it.
+- Keep env files, auth, state, logs, and Docker daemon access private. Docker env metadata is
+  visible to the daemon administrator. `.dockerignore` is defense in depth, not a substitute for
+  external secret placement.
+
+Advanced platform, mount, UID/mode, resource, entrypoint, Compose, and cleanup details live in
+[`deploy/CONTAINER.md`](deploy/CONTAINER.md). Research evidence is under [`notes/research`](notes/research).

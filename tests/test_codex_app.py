@@ -400,6 +400,28 @@ async def test_cancellation_waits_for_stale_process_cleanup(tmp_path: Path) -> N
     assert client.process is None
 
 
+@run_async
+async def test_repeated_close_cancellation_waits_for_native_process(tmp_path: Path) -> None:
+    process = DelayedWaitProcess()
+    client = make_client(process, tmp_path)
+    await client.start()
+
+    closing = asyncio.create_task(client.close())
+    await asyncio.wait_for(process.wait_started.wait(), 1)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert client.process is process
+
+    process.release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert client.process is None
+    assert client._close_waiter is None
+
+
 @pytest.mark.parametrize(
     "name",
     (
@@ -506,7 +528,7 @@ async def test_handshake_args_env_and_concurrent_requests(
 
 
 @run_async
-async def test_solve_uses_distinct_thread_ids_and_registers_workspace(
+async def test_solve_uses_distinct_thread_ids_and_retires_workspace(
     fake_process: FakeProcess, tmp_path: Path
 ) -> None:
     registry = WorkspaceThreadRegistry()
@@ -527,8 +549,8 @@ async def test_solve_uses_distinct_thread_ids_and_registers_workspace(
         item for item in fake_process.stdin.writes if item.get("method") == "turn/start"
     ]
     assert {item["params"]["threadId"] for item in turn_requests} == {"thread-1", "thread-2"}
-    assert registry.get(tmp_path / "one") == "thread-1"
-    assert registry.get(tmp_path / "two") == "thread-2"
+    assert registry.get(tmp_path / "one") is None
+    assert registry.get(tmp_path / "two") is None
     await client.close()
 
 
@@ -663,8 +685,8 @@ async def test_default_tool_registries_are_workspace_bound(
         client.solve(one, "first"),
         client.solve(two, "second"),
     )
-    assert client._thread_registries[first.thread_id].workspace.root == one.resolve()
-    assert client._thread_registries[second.thread_id].workspace.root == two.resolve()
+    assert first.thread_id not in client._thread_registries
+    assert second.thread_id not in client._thread_registries
     await client.close()
 
 
