@@ -3,7 +3,14 @@ import json
 import pytest
 
 from rapido.board import Challenge
-from rapido.solver import SolverFinding, SolverOutputError, admitted_candidate, build_turn_prompt
+from rapido.solver import (
+    DEVELOPER_INSTRUCTIONS,
+    OFFLINE_DEVELOPER_INSTRUCTIONS,
+    SolverFinding,
+    SolverOutputError,
+    admitted_candidate,
+    build_turn_prompt,
+)
 
 
 def finding(candidate: str | None, confidence: float = 0.9) -> SolverFinding:
@@ -66,3 +73,15 @@ def test_turn_prompt_labels_untrusted_data_and_exposes_no_transport_fields() -> 
     encoded = json.dumps(prompt)
     assert "token" not in encoded.lower()
     assert "https://" not in encoded
+
+
+def test_developer_instructions_truthfully_bound_authorized_ctf_scope() -> None:
+    normalized = " ".join(DEVELOPER_INSTRUCTIONS.lower().split())
+    assert "official in-cypher practice ctf" in normalized
+    assert "organizer explicitly provides" in normalized
+    assert "board-issued target" in normalized
+    assert "never probe, discover, or interact with any outside system" in normalized
+    offline = " ".join(OFFLINE_DEVELOPER_INSTRUCTIONS.lower().split())
+    assert "synthetic, offline acceptance fixture" in offline
+    assert "no external target access is authorized or provided" in offline
+    assert "organizer explicitly provides" not in offline
