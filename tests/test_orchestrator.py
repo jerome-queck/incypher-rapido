@@ -605,12 +605,13 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
             NoProvenanceRuntime({1: {0: answer, 1: answer}}),
         ).run()
     )
-    assert report.errors == 1
+    assert report.unsolved == 1
+    assert report.errors == 0
     assert board.submissions == []
     failure = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
     ).fetchone()
-    assert '"reason":"solver_output"' in failure["data_json"]
+    assert '"reason":"candidate_provenance"' in failure["data_json"]
     store.close()
 
 
@@ -626,7 +627,8 @@ def test_candidate_rejects_model_supplied_value_reflected_by_tool(tmp_path: Path
             ReflectedCandidateRuntime({1: {0: answer, 1: answer}}),
         ).run()
     )
-    assert report.errors == 1
+    assert report.unsolved == 1
+    assert report.errors == 0
     assert board.submissions == []
     store.close()
 

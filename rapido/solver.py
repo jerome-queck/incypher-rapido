@@ -69,6 +69,10 @@ class SolverOutputError(ValueError):
     """A final model message did not satisfy the solver contract."""
 
 
+class CandidateProvenanceError(SolverOutputError):
+    """A flag-shaped hypothesis lacked candidate-specific host provenance."""
+
+
 @dataclass(frozen=True)
 class SolverFinding:
     status: str
@@ -189,6 +193,7 @@ __all__ = [
     "DEVELOPER_INSTRUCTIONS",
     "MAX_AGENT_MESSAGE_BYTES",
     "SOLVER_OUTPUT_SCHEMA",
+    "CandidateProvenanceError",
     "SolverFinding",
     "SolverOutputError",
     "admitted_candidate",

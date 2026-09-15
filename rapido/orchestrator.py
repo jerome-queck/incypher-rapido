@@ -22,6 +22,7 @@ from .config import RuntimeConfig
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
     SOLVER_OUTPUT_SCHEMA,
+    CandidateProvenanceError,
     SolverFinding,
     SolverOutputError,
     admitted_candidate,
@@ -706,11 +707,13 @@ class Orchestrator:
                     if call.success is True and call.source_bound:
                         candidate_observed |= candidate_fingerprint in call.candidate_sha256s
                 if not candidate_observed:
-                    raise SolverOutputError(
+                    raise CandidateProvenanceError(
                         "candidate was not observed in a successful source-bound tool result"
                     )
                 if candidate_supplied:
-                    raise SolverOutputError("candidate originated in model-supplied tool input")
+                    raise CandidateProvenanceError(
+                        "candidate originated in model-supplied tool input"
+                    )
             terminal = "candidate" if finding.status == "candidate" else finding.status
             self.state.finish_attempt(
                 attempt_id,
@@ -726,6 +729,19 @@ class Orchestrator:
         except asyncio.CancelledError:
             self.state.finish_attempt(attempt_id, "cancelled", summary="run shutdown")
             raise
+        except CandidateProvenanceError:
+            finding = None
+            terminal = "unsolved"
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="flag-shaped hypothesis rejected by provenance policy",
+            )
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {"challenge_id": challenge.id, "lane": lane, "reason": "candidate_provenance"},
+            )
         except SolverOutputError:
             finding = None
             terminal = "failed"
