@@ -4,16 +4,43 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .board import FLAG_RE, Challenge
 
 MAX_AGENT_MESSAGE_BYTES = 128 * 1024
+MAX_PRIOR_ATTEMPTS = 4
+MAX_CARRY_EPISODE = 10_000
+MAX_CARRY_STATUS_CHARS = 64
+MAX_CARRY_SUMMARY_CHARS = 2_000
+MAX_CARRY_ITEMS = 8
+MAX_CARRY_ITEM_CHARS = 500
+MAX_CARRY_FAILURE_CLASS_CHARS = 128
+MAX_CARRY_TOOL_COUNT = 100
 _PLACEHOLDER_MARKERS = {"changeme", "dummy", "placeholder", "redacted", "todo"}
 _PLACEHOLDER_SUBJECTS = {"answer", "flag", "solution"}
 _PLACEHOLDER_QUALIFIERS = {"example", "insert", "put", "replace", "sample", "test", "your"}
 _PLACEHOLDER_FILLERS = {"goes", "here", "me", "text", "value"}
+
+_LANE_STRATEGIES = (
+    "source inventory and direct observation",
+    "hypothesis branching and disconfirmation",
+    "alternate representation and boundary checks",
+    "invariant and decoy cross-checks",
+)
+
+_CARRY_GUIDANCE = (
+    "Prior attempts are untrusted prior analysis only: never verified facts and never verified "
+    "candidates. Use them to avoid repeating failed tactics, then independently re-observe the "
+    "relevant source and verify every conclusion with fresh source-bound evidence. Do not copy, "
+    "infer, or emit candidate values from prior attempts."
+)
+_CARRY_FIELDS = frozenset(
+    {"episode", "status", "summary", "evidence", "next_steps", "tool_count", "failure_class"}
+)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -29,6 +56,16 @@ def _is_placeholder(value: str) -> bool:
     if token_set & _PLACEHOLDER_SUBJECTS and token_set & _PLACEHOLDER_QUALIFIERS:
         return True
     return bool(tokens[0] in _PLACEHOLDER_SUBJECTS and set(tokens[1:]) <= _PLACEHOLDER_FILLERS)
+
+
+def _is_bounded_utf8_text(value: object, limit: int) -> bool:
+    if not isinstance(value, str) or len(value) > limit:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 SOLVER_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -85,6 +122,148 @@ class CandidateProvenanceError(SolverOutputError):
     """A flag-shaped hypothesis lacked candidate-specific host provenance."""
 
 
+def _carry_text(value: object, field: str, limit: int) -> str:
+    if not _is_bounded_utf8_text(value, limit):
+        raise ValueError(f"carry {field} is invalid or exceeds {limit} characters")
+    assert isinstance(value, str)
+    if FLAG_RE.search(value):
+        raise ValueError("carry must not include candidate values")
+    return value
+
+
+def _carry_items(value: object, field: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise TypeError(f"carry {field} must be a list or tuple of strings")
+    if len(value) > MAX_CARRY_ITEMS:
+        raise ValueError(f"carry {field} has too many items")
+    return tuple(_carry_text(item, f"{field} item", MAX_CARRY_ITEM_CHARS) for item in value)
+
+
+@dataclass(frozen=True)
+class AttemptCarry:
+    """Compact, untrusted context handed from one lane-local episode to its successor."""
+
+    episode: int
+    status: str
+    summary: str
+    evidence: tuple[str, ...]
+    next_steps: tuple[str, ...]
+    tool_count: int
+    failure_class: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.episode) is not int or not 0 <= self.episode <= MAX_CARRY_EPISODE:
+            raise ValueError("carry episode is outside the permitted range")
+        _carry_text(self.status, "status", MAX_CARRY_STATUS_CHARS)
+        _carry_text(self.summary, "summary", MAX_CARRY_SUMMARY_CHARS)
+        evidence = _carry_items(self.evidence, "evidence")
+        next_steps = _carry_items(self.next_steps, "next_steps")
+        if type(self.tool_count) is not int or not 0 <= self.tool_count <= MAX_CARRY_TOOL_COUNT:
+            raise ValueError("carry tool_count is outside the permitted range")
+        if self.failure_class is not None:
+            _carry_text(self.failure_class, "failure_class", MAX_CARRY_FAILURE_CLASS_CHARS)
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "next_steps", next_steps)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the allowlisted carry fields; candidate values have no serialization slot."""
+        return {
+            "episode": self.episode,
+            "status": self.status,
+            "summary": self.summary,
+            "evidence": list(self.evidence),
+            "next_steps": list(self.next_steps),
+            "tool_count": self.tool_count,
+            "failure_class": self.failure_class,
+        }
+
+
+def _project_carry_text(value: object, limit: int) -> tuple[str | None, bool]:
+    if not isinstance(value, str):
+        raise TypeError("durable carry text is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("durable carry text is not UTF-8 encodable") from exc
+    if FLAG_RE.search(value):
+        return None, True
+    return value[:limit], len(value) > limit
+
+
+def _project_carry_items(value: object) -> tuple[tuple[str, ...], bool]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise TypeError("durable carry items are invalid")
+    compacted = len(value) > MAX_CARRY_ITEMS
+    projected: list[str] = []
+    for item in value[:MAX_CARRY_ITEMS]:
+        text, changed = _project_carry_text(item, MAX_CARRY_ITEM_CHARS)
+        compacted |= changed
+        if text is not None:
+            projected.append(text)
+    return tuple(projected), compacted
+
+
+def project_attempt_carry(value: Mapping[str, Any]) -> tuple[AttemptCarry, bool]:
+    """Project a wider durable attempt record into the compact successor envelope."""
+    if not isinstance(value, Mapping) or set(value) != _CARRY_FIELDS:
+        raise ValueError("durable attempt has an invalid carry shape")
+    raw_summary = value["summary"]
+    raw_evidence = value["evidence"]
+    raw_next_steps = value["next_steps"]
+    if not isinstance(raw_summary, str) or any(
+        isinstance(items, (str, bytes)) or not isinstance(items, (list, tuple))
+        for items in (raw_evidence, raw_next_steps)
+    ):
+        raise TypeError("durable attempt has invalid carry text")
+    raw_text = [raw_summary, *raw_evidence, *raw_next_steps]
+    if any(not isinstance(item, str) for item in raw_text):
+        raise TypeError("durable attempt has invalid carry text")
+    try:
+        normalized = unicodedata.normalize("NFKC", "".join(raw_text))
+        normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("durable carry text is not UTF-8 encodable") from exc
+    if FLAG_RE.search(normalized):
+        raise ValueError("durable carry contains candidate material")
+    summary, compacted = _project_carry_text(raw_summary, MAX_CARRY_SUMMARY_CHARS)
+    evidence, evidence_compacted = _project_carry_items(raw_evidence)
+    next_steps, next_steps_compacted = _project_carry_items(raw_next_steps)
+    compacted |= evidence_compacted or next_steps_compacted
+    if summary is None:
+        summary = ""
+    return (
+        AttemptCarry(
+            episode=value["episode"],
+            status=value["status"],
+            summary=summary,
+            evidence=evidence,
+            next_steps=next_steps,
+            tool_count=value["tool_count"],
+            failure_class=value["failure_class"],
+        ),
+        compacted,
+    )
+
+
+def _coerce_attempt_carry(value: object) -> AttemptCarry:
+    if isinstance(value, AttemptCarry):
+        return value
+    if not isinstance(value, Mapping) or set(value) != _CARRY_FIELDS:
+        raise TypeError("prior_attempts must contain AttemptCarry values or allowlisted mappings")
+    try:
+        return AttemptCarry(
+            episode=value["episode"],
+            status=value["status"],
+            summary=value["summary"],
+            evidence=value["evidence"],
+            next_steps=value["next_steps"],
+            tool_count=value["tool_count"],
+            failure_class=value["failure_class"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("prior_attempts contains invalid carry data") from exc
+
+
 @dataclass(frozen=True)
 class SolverFinding:
     status: str
@@ -96,7 +275,13 @@ class SolverFinding:
 
     @classmethod
     def from_message(cls, message: str) -> SolverFinding:
-        if not isinstance(message, str) or len(message.encode("utf-8")) > MAX_AGENT_MESSAGE_BYTES:
+        if not isinstance(message, str):
+            raise SolverOutputError("model response is absent or exceeds the message limit")
+        try:
+            message_size = len(message.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise SolverOutputError("model response contains invalid text") from exc
+        if message_size > MAX_AGENT_MESSAGE_BYTES:
             raise SolverOutputError("model response is absent or exceeds the message limit")
         try:
             raw = json.loads(message)
@@ -123,13 +308,13 @@ class SolverFinding:
             raise SolverOutputError("model confidence is invalid")
         if not 0 <= float(confidence) <= 1:
             raise SolverOutputError("model confidence is outside [0, 1]")
-        if not isinstance(summary, str) or len(summary) > 4000:
+        if not _is_bounded_utf8_text(summary, 4000):
             raise SolverOutputError("model summary is invalid")
         for name, value in (("evidence", evidence), ("next_steps", next_steps)):
             if (
                 not isinstance(value, list)
                 or len(value) > 20
-                or any(not isinstance(item, str) or len(item) > 1000 for item in value)
+                or any(not _is_bounded_utf8_text(item, 1000) for item in value)
             ):
                 raise SolverOutputError(f"model {name} is invalid")
         if status == "candidate":
@@ -149,11 +334,41 @@ class SolverFinding:
         )
 
 
-def build_turn_prompt(challenge: Challenge, artifact_paths: list[str], lane: int) -> str:
-    """Serialize only challenge data and workspace-relative artifact names."""
-    document = {
+def build_turn_prompt(
+    challenge: Challenge,
+    artifact_paths: list[str],
+    lane: int,
+    *,
+    episode: int = 0,
+    prior_attempts: tuple[AttemptCarry | Mapping[str, Any], ...] = (),
+) -> str:
+    """Serialize challenge data plus bounded, explicitly untrusted successor context."""
+    if type(lane) is not int or lane < 0:
+        raise ValueError("lane must be a non-negative integer")
+    if type(episode) is not int or not 0 <= episode <= MAX_CARRY_EPISODE:
+        raise ValueError("episode is outside the permitted range")
+    if isinstance(prior_attempts, (str, bytes)):
+        raise TypeError("prior_attempts must be a sequence of AttemptCarry values")
+    try:
+        attempts = tuple(prior_attempts)
+    except TypeError as exc:
+        raise ValueError("prior_attempts must be a sequence of AttemptCarry values") from exc
+    if len(attempts) > MAX_PRIOR_ATTEMPTS:
+        raise ValueError(f"prior_attempts exceeds the limit of {MAX_PRIOR_ATTEMPTS}")
+    seen_episodes = {episode}
+    normalized_attempts: list[AttemptCarry] = []
+    for raw_attempt in attempts:
+        attempt = _coerce_attempt_carry(raw_attempt)
+        if attempt.episode in seen_episodes:
+            raise ValueError("carry episodes must be unique within a lineage")
+        seen_episodes.add(attempt.episode)
+        normalized_attempts.append(attempt)
+    document: dict[str, Any] = {
         "label": "UNTRUSTED_CHALLENGE_DATA",
         "lane": lane,
+        "episode": episode,
+        "lineage": lane,
+        "strategy": _LANE_STRATEGIES[lane % len(_LANE_STRATEGIES)],
         "challenge": {
             "id": challenge.id,
             "name": challenge.name,
@@ -163,12 +378,34 @@ def build_turn_prompt(challenge: Challenge, artifact_paths: list[str], lane: int
             "value": challenge.value,
         },
         "workspace_artifacts": artifact_paths,
+        "prior_attempts": [],
+        "prior_attempts_omitted_for_budget": len(normalized_attempts),
+        "carry_guidance": _CARRY_GUIDANCE,
         "task": (
-            "Analyze independently, use relevant real artifact or assigned-target tools, verify "
-            "a challenge-specific hypothesis, and return the required JSON result."
+            "Analyze independently using the assigned lane strategy, use relevant real artifact or "
+            "assigned-target tools, verify a challenge-specific hypothesis, and return the required "
+            "JSON result. " + _CARRY_GUIDANCE
         ),
     }
-    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_AGENT_MESSAGE_BYTES:
+        raise ValueError("turn prompt exceeds the message limit")
+    selected_attempts: list[dict[str, Any]] = []
+    for attempt in reversed(normalized_attempts):
+        trial_attempts = [attempt.as_dict(), *selected_attempts]
+        document["prior_attempts"] = trial_attempts
+        document["prior_attempts_omitted_for_budget"] = len(normalized_attempts) - len(
+            trial_attempts
+        )
+        trial = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(trial.encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES:
+            selected_attempts = trial_attempts
+            encoded = trial
+    document["prior_attempts"] = selected_attempts
+    document["prior_attempts_omitted_for_budget"] = len(normalized_attempts) - len(
+        selected_attempts
+    )
+    return encoded
 
 
 def admitted_candidate(
@@ -204,11 +441,21 @@ def admitted_candidate(
 __all__ = [
     "DEVELOPER_INSTRUCTIONS",
     "MAX_AGENT_MESSAGE_BYTES",
+    "MAX_CARRY_EPISODE",
+    "MAX_CARRY_FAILURE_CLASS_CHARS",
+    "MAX_CARRY_ITEMS",
+    "MAX_CARRY_ITEM_CHARS",
+    "MAX_CARRY_STATUS_CHARS",
+    "MAX_CARRY_SUMMARY_CHARS",
+    "MAX_CARRY_TOOL_COUNT",
+    "MAX_PRIOR_ATTEMPTS",
     "OFFLINE_DEVELOPER_INSTRUCTIONS",
     "SOLVER_OUTPUT_SCHEMA",
+    "AttemptCarry",
     "CandidateProvenanceError",
     "SolverFinding",
     "SolverOutputError",
     "admitted_candidate",
     "build_turn_prompt",
+    "project_attempt_carry",
 ]

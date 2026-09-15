@@ -181,6 +181,31 @@ class FailedTurnRuntime(FakeRuntime):
         return turn
 
 
+class ManyToolCallsRuntime(FakeRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        turn.text = json.dumps(
+            {
+                "status": "unsolved",
+                "candidate": None,
+                "confidence": 0.25,
+                "summary": "bounded analysis remains unresolved",
+                "evidence": ["archive header verified", "candidate path rejected"],
+                "next_steps": ["inspect the remaining encoded member"],
+            }
+        )
+        turn.tool_calls = [
+            {
+                "name": "inspect_file",
+                "success": True,
+                "source_bound": True,
+                "candidate_sha256s": [],
+            }
+            for _ in range(12)
+        ]
+        return turn
+
+
 class HangingStartRuntime(FakeRuntime):
     async def start(self) -> None:
         await asyncio.sleep(60)
@@ -196,6 +221,15 @@ class NoProvenanceRuntime(FakeRuntime):
         turn = await super().solve(workspace, prompt, **kwargs)
         turn.tool_calls[0]["candidate_sha256s"] = []
         turn.tool_calls[0]["source_bound"] = False
+        return turn
+
+
+class MalformedEvidenceRuntime(NoProvenanceRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        document = json.loads(turn.text)
+        document["evidence"] = ["bad-surrogate-\ud800"]
+        turn.text = json.dumps(document)
         return turn
 
 
@@ -404,6 +438,40 @@ def test_two_lanes_overlap_agree_submit_once_and_persist_without_plain_candidate
     assert '"source_bound":true' in wave["data_json"]
     assert hashlib.sha256(answer.encode()).hexdigest() in wave["data_json"]
     assert runtime.started and runtime.closed
+    store.close()
+
+
+def test_finding_carry_and_uncensored_tool_count_are_durable_with_capped_wave_detail(
+    tmp_path: Path,
+) -> None:
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(config(tmp_path, submit=False), board, store, ManyToolCallsRuntime({})).run()
+    )
+    attempts = store.attempts_for_challenge(report.run_id, 1)
+    assert len(attempts) == 2
+    assert all(row["episode"] == 0 for row in attempts)
+    assert all(row["id"].endswith(f":0:{row['lane']}") for row in attempts)
+    assert all(row["tool_count"] == 12 for row in attempts)
+    assert all(
+        json.loads(row["evidence_json"]) == ["archive header verified", "candidate path rejected"]
+        for row in attempts
+    )
+    assert all(
+        json.loads(row["next_steps_json"]) == ["inspect the remaining encoded member"]
+        for row in attempts
+    )
+    wave_row = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_wave'"
+    ).fetchone()
+    wave = json.loads(wave_row["data_json"])
+    assert wave["episode"] == 0
+    assert all(item["episode"] == 0 for item in wave["tool_calls"])
+    assert all(item["tool_call_count"] == 12 for item in wave["tool_calls"])
+    assert all(item["retained_tool_call_count"] == 10 for item in wave["tool_calls"])
+    assert all(item["tool_calls_truncated"] is True for item in wave["tool_calls"])
+    assert all(len(item["calls"]) == 10 for item in wave["tool_calls"])
     store.close()
 
 
@@ -673,6 +741,51 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
     store.close()
 
 
+def test_malformed_model_text_terminalizes_every_attempt(tmp_path: Path) -> None:
+    answer = "INCYPHER{fabricated}"
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path),
+            board,
+            store,
+            MalformedEvidenceRuntime({1: {0: answer, 1: answer}}),
+        ).run()
+    )
+    assert report.errors == 1
+    assert store.active_attempts() == []
+    attempts = store.attempts_for_challenge(report.run_id, 1)
+    assert all(row["status"] == "failed" for row in attempts)
+    assert all(row["failure_class"] == "solver_output" for row in attempts)
+    store.close()
+
+
+def test_oversized_prior_attempt_is_compacted_before_successor(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    runtime = FakeRuntime({1: {0: None}})
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.start_attempt("attempt-0", "run-1", 1, 0, 0, "model", "high")
+    store.finish_attempt("attempt-0", "unsolved", summary="x" * 4000)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+
+    result = asyncio.run(
+        Orchestrator(config(tmp_path), board, store, runtime)._lane(
+            "run-1", challenge(1), 1, 0, workspace, [], 10
+        )
+    )
+    assert result.terminal_status == "unsolved"
+    assert store.active_attempts() == []
+    event = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_carry_sanitized'"
+    ).fetchone()
+    assert json.loads(event["data_json"])["compacted_records"] == 1
+    store.close()
+
+
 def test_failed_native_turn_persists_closed_class_and_tool_evidence(tmp_path: Path) -> None:
     board = FakeBoard([challenge(1)])
     store = StateStore(tmp_path / "state.sqlite3")
@@ -695,6 +808,9 @@ def test_failed_native_turn_persists_closed_class_and_tool_evidence(tmp_path: Pa
     assert all('"reason":"native_turn_incomplete"' in event for event in failures)
     assert all('"status":"failed"' in event for event in failures)
     assert all('"failure_class":"usage_limit_exceeded"' in event for event in failures)
+    attempts = store.attempts_for_challenge(report.run_id, 1)
+    assert all(row["failure_class"] == "usage_limit_exceeded" for row in attempts)
+    assert all(row["tool_count"] == 2 for row in attempts)
     wave = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='attempt_wave'"
     ).fetchone()

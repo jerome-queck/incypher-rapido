@@ -1,3 +1,4 @@
+import sqlite3
 import stat
 from pathlib import Path
 
@@ -239,3 +240,213 @@ def test_legacy_external_effects_cannot_be_adopted_by_first_new_identity(tmp_pat
     with pytest.raises(RuntimeError, match="legacy state has unbound external effects"):
         store.bind_board_identity(10, 20)
     store.close()
+
+
+def test_attempt_episodes_allow_same_lane_and_persist_bounded_carry(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.start_attempt("attempt-0", "run-1", 1, 0, 0, "model", "high")
+    store.finish_attempt(
+        "attempt-0",
+        "unsolved",
+        summary="first try",
+        evidence=("offset 12",),
+        next_steps=["inspect bytes"],
+        tool_count=3,
+        failure_class="timeout",
+    )
+    store.start_attempt("attempt-1", "run-1", 1, 1, 0, "model", "high")
+    store.finish_attempt(
+        "attempt-1",
+        "candidate",
+        candidate="INCYPHER{private}",
+        evidence=["verified output"],
+    )
+
+    rows = store.prior_attempts_for_lane("run-1", 1, 0)
+    assert [row["episode"] for row in rows] == [0]
+    assert rows[0]["evidence"] == ["offset 12"]
+    assert rows[0]["next_steps"] == ["inspect bytes"]
+    assert rows[0]["tool_count"] == 3
+    assert rows[0]["failure_class"] == "timeout"
+    assert all(
+        set(row)
+        == {
+            "episode",
+            "status",
+            "summary",
+            "evidence",
+            "next_steps",
+            "tool_count",
+            "failure_class",
+        }
+        for row in rows
+    )
+    assert all("candidate" not in row for row in rows)
+    store.close()
+
+
+def test_prior_attempt_carry_is_terminal_prior_and_newest_bounded(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    for episode in range(6):
+        attempt_id = f"attempt-{episode}"
+        store.start_attempt(attempt_id, "run-1", 1, episode, 0, "model", "high")
+        store.finish_attempt(attempt_id, "unsolved", summary=attempt_id)
+    store.start_attempt("candidate", "run-1", 1, 6, 0, "model", "high")
+    store.finish_attempt("candidate", "candidate", candidate="INCYPHER{private}")
+    store.start_attempt("running", "run-1", 1, 7, 0, "model", "high")
+
+    rows = store.prior_attempts_for_lane("run-1", 1, 0, before_episode=8, limit=4)
+    assert [row["episode"] for row in rows] == [2, 3, 4, 5]
+    assert all(row["status"] == "unsolved" for row in rows)
+    store.close()
+
+
+def test_prior_attempts_are_same_run_challenge_and_lane_local(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.start_run("run-2", {})
+    for challenge_id in (1, 2):
+        store.upsert_challenge(challenge_id, f"A{challenge_id}", "crypto", "standard", 100)
+    for attempt_id, run_id, challenge_id, episode, lane in (
+        ("wanted", "run-1", 1, 0, 2),
+        ("other-lane", "run-1", 1, 0, 3),
+        ("other-challenge", "run-1", 2, 0, 2),
+        ("other-run", "run-2", 1, 0, 2),
+    ):
+        store.start_attempt(attempt_id, run_id, challenge_id, episode, lane, "model", "high")
+        store.finish_attempt(attempt_id, "unsolved", summary=attempt_id)
+    assert store.prior_attempts_for_lane("run-1", 1, 2) == [
+        {
+            "episode": 0,
+            "status": "unsolved",
+            "summary": "wanted",
+            "evidence": [],
+            "next_steps": [],
+            "tool_count": 0,
+            "failure_class": None,
+        }
+    ]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("evidence", ["x"] * 21),
+        ("next_steps", ["x"] * 21),
+        ("evidence", ["x" * 1001]),
+        ("next_steps", {"x"}),
+        ("tool_count", -1),
+        ("tool_count", 101),
+        ("tool_count", True),
+        ("failure_class", "provider leaked details"),
+    ),
+)
+def test_attempt_finish_rejects_unbounded_or_open_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.start_attempt("attempt-1", "run-1", 1, 0, 0, "model", "high")
+    with pytest.raises(ValueError):
+        store.finish_attempt("attempt-1", "failed", **{field: value})
+    assert store.active_attempts()[0]["id"] == "attempt-1"
+    store.close()
+
+
+def test_pre_episode_attempts_migrate_without_loss_and_reopen_idempotently(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            config_json TEXT NOT NULL
+        );
+        CREATE TABLE challenges (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            challenge_type TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE attempts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+            lane INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            model TEXT NOT NULL,
+            effort TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            candidate TEXT,
+            confidence REAL,
+            UNIQUE(run_id, challenge_id, lane)
+        );
+        INSERT INTO runs VALUES ('run-1', '2026-01-01', NULL, 'running', '{}');
+        INSERT INTO challenges VALUES (1, 'A', 'crypto', 'standard', 100, 'running', '2026-01-01');
+        INSERT INTO attempts VALUES (
+            'legacy-finished', 'run-1', 1, 0, '2026-01-01', '2026-01-02',
+            'candidate', 'old-model', 'high', 'legacy summary', 'INCYPHER{legacy}', 0.75
+        );
+        INSERT INTO attempts VALUES (
+            'legacy-running', 'run-1', 1, 1, '2026-01-03', NULL,
+            'running', 'old-model', 'high', '', NULL, NULL
+        );
+        """
+    )
+    connection.close()
+
+    store = StateStore(path)
+    rows = [
+        dict(row)
+        for row in store._connection.execute(
+            "SELECT id, episode, lane, status, summary, candidate, evidence_json, "
+            "next_steps_json, tool_count, failure_class FROM attempts ORDER BY id"
+        )
+    ]
+    assert rows == [
+        {
+            "id": "legacy-finished",
+            "episode": 0,
+            "lane": 0,
+            "status": "candidate",
+            "summary": "legacy summary",
+            "candidate": "INCYPHER{legacy}",
+            "evidence_json": "[]",
+            "next_steps_json": "[]",
+            "tool_count": 0,
+            "failure_class": None,
+        },
+        {
+            "id": "legacy-running",
+            "episode": 0,
+            "lane": 1,
+            "status": "running",
+            "summary": "",
+            "candidate": None,
+            "evidence_json": "[]",
+            "next_steps_json": "[]",
+            "tool_count": 0,
+            "failure_class": None,
+        },
+    ]
+    store.close()
+
+    reopened = StateStore(path)
+    assert reopened._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 2
+    reopened.start_attempt("new-episode", "run-1", 1, 1, 0, "new-model", "high")
+    assert reopened._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 3
+    reopened.close()

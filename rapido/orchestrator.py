@@ -21,12 +21,14 @@ from .board import BoardClient, BoardError, BoardTransportError, Challenge, Verd
 from .config import RuntimeConfig
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
+    MAX_PRIOR_ATTEMPTS,
     SOLVER_OUTPUT_SCHEMA,
     CandidateProvenanceError,
     SolverFinding,
     SolverOutputError,
     admitted_candidate,
     build_turn_prompt,
+    project_attempt_carry,
 )
 from .state import StateStore
 from .target import TargetEndpoint, TargetToolRegistry, parse_connection_info
@@ -107,11 +109,13 @@ class NativeTurnIncompleteError(RuntimeError):
 
 @dataclass(frozen=True)
 class LaneResult:
+    episode: int
     lane: int
     started: float
     finished: float
     finding: SolverFinding | None
     terminal_status: str
+    tool_call_count: int
     tool_calls: tuple[ToolCallEvidence, ...]
 
 
@@ -716,38 +720,79 @@ class Orchestrator:
         self,
         run_id: str,
         challenge: Challenge,
+        episode: int,
         lane: int,
         workspace: Path,
         artifact_paths: list[str],
         timeout_seconds: float,
         target_endpoints: tuple[TargetEndpoint, ...] = (),
     ) -> LaneResult:
-        attempt_id = f"{run_id}:{challenge.id}:{lane}"
+        attempt_id = f"{run_id}:{challenge.id}:{episode}:{lane}"
         self.state.start_attempt(
             attempt_id,
             run_id,
             challenge.id,
+            episode,
             lane,
             self.config.model,
             self.config.reasoning_effort,
         )
         started = time.monotonic()
+        tool_call_count = 0
         tool_calls: tuple[ToolCallEvidence, ...] = ()
-        target_registry = (
-            TargetToolRegistry(
-                workspace,
-                target_endpoints,
-                team_key=self.config.team_key,
-                max_workspace_bytes=self.config.max_lane_workspace_bytes,
-            )
-            if target_endpoints
-            else None
-        )
+        target_registry = None
         try:
+            if target_endpoints:
+                target_registry = TargetToolRegistry(
+                    workspace,
+                    target_endpoints,
+                    team_key=self.config.team_key,
+                    max_workspace_bytes=self.config.max_lane_workspace_bytes,
+                )
+            prior_attempts = []
+            compacted_records = 0
+            rejected_records = 0
+            for record in self.state.prior_attempts_for_lane(
+                run_id,
+                challenge.id,
+                lane,
+                before_episode=episode,
+                limit=MAX_PRIOR_ATTEMPTS,
+            ):
+                try:
+                    projected, compacted = project_attempt_carry(record)
+                except (TypeError, ValueError):
+                    rejected_records += 1
+                    continue
+                prior_attempts.append(projected)
+                compacted_records += int(compacted)
+            turn_prompt = build_turn_prompt(
+                challenge,
+                artifact_paths,
+                lane,
+                episode=episode,
+                prior_attempts=tuple(prior_attempts),
+            )
+            omitted_for_budget = len(prior_attempts) - len(
+                json.loads(turn_prompt)["prior_attempts"]
+            )
+            if compacted_records or rejected_records or omitted_for_budget:
+                self.state.event(
+                    run_id,
+                    "attempt_carry_sanitized",
+                    {
+                        "challenge_id": challenge.id,
+                        "episode": episode,
+                        "lane": lane,
+                        "compacted_records": compacted_records,
+                        "rejected_records": rejected_records,
+                        "omitted_for_prompt_budget": omitted_for_budget,
+                    },
+                )
             turn = await asyncio.wait_for(
                 self.runtime.solve(
                     workspace,
-                    build_turn_prompt(challenge, artifact_paths, lane),
+                    turn_prompt,
                     developer_instructions=DEVELOPER_INSTRUCTIONS,
                     model=self.config.model,
                     reasoning_effort=self.config.reasoning_effort,
@@ -757,8 +802,9 @@ class Orchestrator:
                 ),
                 timeout=timeout_seconds + 5,
             )
+            tool_call_count = len(turn.tool_calls)
             call_evidence: list[ToolCallEvidence] = []
-            for call in turn.tool_calls[:100]:
+            for call in turn.tool_calls:
                 if not isinstance(call, dict) or not isinstance(
                     call.get("success"), (bool, type(None))
                 ):
@@ -822,13 +868,28 @@ class Orchestrator:
                 summary=finding.summary,
                 candidate=finding.candidate,
                 confidence=finding.confidence,
+                evidence=finding.evidence,
+                next_steps=finding.next_steps,
+                tool_count=tool_call_count,
             )
         except TimeoutError:
             finding = None
             terminal = "timeout"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn exceeded deadline")
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn exceeded deadline",
+                tool_count=tool_call_count,
+                failure_class="timeout",
+            )
         except asyncio.CancelledError:
-            self.state.finish_attempt(attempt_id, "cancelled", summary="run shutdown")
+            self.state.finish_attempt(
+                attempt_id,
+                "cancelled",
+                summary="run shutdown",
+                tool_count=tool_call_count,
+                failure_class="cancelled",
+            )
             raise
         except CandidateProvenanceError:
             finding = None
@@ -837,30 +898,55 @@ class Orchestrator:
                 attempt_id,
                 terminal,
                 summary="flag-shaped hypothesis rejected by provenance policy",
+                tool_count=tool_call_count,
+                failure_class="candidate_provenance",
             )
-            self.state.event(
-                run_id,
-                "attempt_failure",
-                {"challenge_id": challenge.id, "lane": lane, "reason": "candidate_provenance"},
-            )
-        except SolverOutputError:
-            finding = None
-            terminal = "failed"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
-            self.state.event(
-                run_id,
-                "attempt_failure",
-                {"challenge_id": challenge.id, "lane": lane, "reason": "solver_output"},
-            )
-        except NativeTurnIncompleteError as exc:
-            finding = None
-            terminal = "failed"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
             self.state.event(
                 run_id,
                 "attempt_failure",
                 {
                     "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "reason": "candidate_provenance",
+                },
+            )
+        except SolverOutputError:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn failed safely",
+                tool_count=tool_call_count,
+                failure_class="solver_output",
+            )
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "reason": "solver_output",
+                },
+            )
+        except NativeTurnIncompleteError as exc:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn failed safely",
+                tool_count=tool_call_count,
+                failure_class=exc.failure_class,
+            )
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
                     "lane": lane,
                     "reason": "native_turn_incomplete",
                     "status": exc.status,
@@ -870,34 +956,76 @@ class Orchestrator:
         except RuntimeError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn failed safely",
+                tool_count=tool_call_count,
+                failure_class="native_runtime",
+            )
             self.state.event(
                 run_id,
                 "attempt_failure",
-                {"challenge_id": challenge.id, "lane": lane, "reason": "native_runtime"},
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "reason": "native_runtime",
+                },
             )
         except OSError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn failed safely",
+                tool_count=tool_call_count,
+                failure_class="operating_system",
+            )
             self.state.event(
                 run_id,
                 "attempt_failure",
-                {"challenge_id": challenge.id, "lane": lane, "reason": "operating_system"},
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "reason": "operating_system",
+                },
             )
         except ValueError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.finish_attempt(
+                attempt_id,
+                terminal,
+                summary="native turn failed safely",
+                tool_count=tool_call_count,
+                failure_class="invalid_value",
+            )
             self.state.event(
                 run_id,
                 "attempt_failure",
-                {"challenge_id": challenge.id, "lane": lane, "reason": "invalid_value"},
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "reason": "invalid_value",
+                },
             )
         finally:
             if target_registry is not None:
                 target_registry.close()
-        return LaneResult(lane, started, time.monotonic(), finding, terminal, tool_calls)
+        return LaneResult(
+            episode,
+            lane,
+            started,
+            time.monotonic(),
+            finding,
+            terminal,
+            tool_call_count,
+            tool_calls,
+        )
 
     async def _solve_challenge(
         self,
@@ -922,11 +1050,14 @@ class Orchestrator:
             self.state.set_challenge_status(challenge.id, "unsolved")
             return "unsolved"
 
+        episode = 0
+
         async def scheduled_lane(lane: int, workspace: Path, artifacts: list[str]) -> LaneResult:
             async with self._slots:
                 return await self._lane(
                     run_id,
                     challenge,
+                    episode,
                     lane,
                     workspace,
                     artifacts,
@@ -966,6 +1097,7 @@ class Orchestrator:
             "attempt_wave",
             {
                 "challenge_id": challenge.id,
+                "episode": episode,
                 "lanes": len(results),
                 "max_parallel": parallel,
                 "overlap": parallel >= 2,
@@ -973,7 +1105,14 @@ class Orchestrator:
                 "durations_seconds": [round(item.finished - item.started, 3) for item in results],
                 "tool_calls": [
                     {
+                        "episode": item.episode,
                         "lane": item.lane,
+                        "tool_call_count": item.tool_call_count,
+                        "retained_tool_call_count": min(
+                            len(item.tool_calls), _MAX_DURABLE_TOOL_CALLS
+                        ),
+                        "tool_calls_truncated": item.tool_call_count
+                        > min(len(item.tool_calls), _MAX_DURABLE_TOOL_CALLS),
                         "calls": [
                             {
                                 "name": call.name,
