@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import threading
 from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar
@@ -524,6 +525,10 @@ async def test_delayed_target_response_cannot_turn_prior_input_into_candidate_pr
     )
     await asyncio.gather(*client._server_tasks)
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert (
+        hashlib.sha256(supplied.encode()).hexdigest()
+        in state.tool_calls[0]["supplied_candidate_sha256s"]
+    )
     hashes = state.tool_calls[1]["candidate_sha256s"]
     assert hashlib.sha256(supplied.encode()).hexdigest() not in hashes
     assert hashlib.sha256(b"flag{server_observation}").hexdigest() in hashes
@@ -531,6 +536,73 @@ async def test_delayed_target_response_cannot_turn_prior_input_into_candidate_pr
         supplied not in output and encoded not in output for output in state.provenance_outputs
     )
     assert not _source_bound_tool_call(state, "decode_base64", {"data": encoded})
+    await client.close()
+
+
+@run_async
+async def test_overlapping_target_response_cannot_reorder_candidate_provenance(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class ReorderedReflectionRegistry(ToolStub):
+        def __init__(self) -> None:
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.delayed = ""
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if arguments.get("data"):
+                self.delayed = base64.b64decode(arguments["data"], validate=True).decode()
+                self.release_first.set()
+                return {"observed": "accepted"}
+            self.first_started.set()
+            assert self.release_first.wait(timeout=2)
+            return {"delayed": self.delayed}
+
+    registry = ReorderedReflectionRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    supplied = "flag{concurrent_model_supplied}"
+    await client._route_message(
+        {
+            "id": 95,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "read-first-finish-last",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    assert await asyncio.to_thread(registry.first_started.wait, 1)
+    await client._route_message(
+        {
+            "id": 96,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "supply-second-finish-first",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {
+                    "data": base64.b64encode(supplied.encode()).decode(),
+                    "encoding": "base64",
+                },
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+    fingerprint = hashlib.sha256(supplied.encode()).hexdigest()
+    assert fingerprint not in state.tool_calls[0]["candidate_sha256s"]
+    assert fingerprint in state.tool_calls[1]["supplied_candidate_sha256s"]
     await client.close()
 
 

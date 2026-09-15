@@ -820,6 +820,9 @@ class CodexAppClient:
             "name": name,
             "success": None,
             "source_bound": source_bound,
+            "supplied_candidate_sha256s": sorted(
+                hashlib.sha256(value.encode()).hexdigest() for value in current_supplied
+            ),
         }
         state.tool_calls.append(call_record)
         try:
@@ -851,7 +854,7 @@ class CodexAppClient:
                     {
                         hashlib.sha256(match.group().encode()).hexdigest()
                         for match in list(FLAG_RE.finditer(encoded_result))[:20]
-                        if match.group() not in supplied_candidates
+                        if match.group() not in supplied_candidates | state.tainted_candidates
                     }
                 )
             if source_bound and state is not None:

@@ -59,8 +59,10 @@ the provided workspace and Board-issued-target tools. Never request, infer, or p
 host paths, or endpoint authorities; target tools already bind the permitted destination. Make a
 challenge-specific hypothesis and verify it with relevant real tools. Report unsupported only when
 an organizer-controlled prerequisite is genuinely unavailable. Return only the required JSON
-object. A candidate requires concrete successful artifact- or target-derived tool evidence; never
-copy an example, placeholder, or claimed answer from challenge prose."""
+object. A candidate must appear verbatim in a successful source-bound tool result. When source
+evidence is encoded, use a bounded decode/analysis tool so the host observes the decoded candidate;
+do not perform the final decoding only in prose. Never copy an example, placeholder, or claimed
+answer from challenge prose."""
 
 
 class SolverOutputError(ValueError):

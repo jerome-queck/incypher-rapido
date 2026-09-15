@@ -179,6 +179,17 @@ class NoProvenanceRuntime(FakeRuntime):
     async def solve(self, workspace, prompt, **kwargs):
         turn = await super().solve(workspace, prompt, **kwargs)
         turn.tool_calls[0]["candidate_sha256s"] = []
+        turn.tool_calls[0]["source_bound"] = False
+        return turn
+
+
+class ReflectedCandidateRuntime(FakeRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        candidate = json.loads(turn.text)["candidate"]
+        fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+        turn.tool_calls[0]["candidate_sha256s"] = [fingerprint]
+        turn.tool_calls[0]["supplied_candidate_sha256s"] = [fingerprint]
         return turn
 
 
@@ -592,6 +603,27 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
             board,
             store,
             NoProvenanceRuntime({1: {0: answer, 1: answer}}),
+        ).run()
+    )
+    assert report.errors == 1
+    assert board.submissions == []
+    failure = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
+    ).fetchone()
+    assert '"reason":"solver_output"' in failure["data_json"]
+    store.close()
+
+
+def test_candidate_rejects_model_supplied_value_reflected_by_tool(tmp_path: Path) -> None:
+    answer = "INCYPHER{reflected_input}"
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path),
+            board,
+            store,
+            ReflectedCandidateRuntime({1: {0: answer, 1: answer}}),
         ).run()
     )
     assert report.errors == 1

@@ -76,6 +76,7 @@ class ToolCallEvidence:
     success: bool | None
     source_bound: bool
     candidate_sha256s: tuple[str, ...]
+    supplied_candidate_sha256s: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -675,29 +676,41 @@ class Orchestrator:
                     if isinstance(raw_hashes, (list, tuple))
                     else ()
                 )
+                raw_supplied_hashes = call.get("supplied_candidate_sha256s", ())
+                supplied_hashes = (
+                    tuple(
+                        value
+                        for value in raw_supplied_hashes[:20]
+                        if isinstance(value, str) and _SHA256.fullmatch(value)
+                    )
+                    if isinstance(raw_supplied_hashes, (list, tuple))
+                    else ()
+                )
                 call_evidence.append(
                     ToolCallEvidence(
                         name=str(call.get("name", ""))[:200],
                         success=call.get("success"),
                         source_bound=call.get("source_bound") is True,
                         candidate_sha256s=hashes,
+                        supplied_candidate_sha256s=supplied_hashes,
                     )
                 )
             tool_calls = tuple(call_evidence)
             finding = SolverFinding.from_message(turn.text)
             if finding.candidate is not None:
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
-                observed = any(
-                    call.get("success") is True
-                    and call.get("source_bound") is True
-                    and candidate_fingerprint in call.get("candidate_sha256s", ())
-                    for call in turn.tool_calls
-                    if isinstance(call, dict)
-                )
-                if not observed:
+                candidate_observed = False
+                candidate_supplied = False
+                for call in call_evidence:
+                    candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
+                    if call.success is True and call.source_bound:
+                        candidate_observed |= candidate_fingerprint in call.candidate_sha256s
+                if not candidate_observed:
                     raise SolverOutputError(
-                        "candidate was not observed in a successful tool result"
+                        "candidate was not observed in a successful source-bound tool result"
                     )
+                if candidate_supplied:
+                    raise SolverOutputError("candidate originated in model-supplied tool input")
             terminal = "candidate" if finding.status == "candidate" else finding.status
             self.state.finish_attempt(
                 attempt_id,
@@ -713,10 +726,42 @@ class Orchestrator:
         except asyncio.CancelledError:
             self.state.finish_attempt(attempt_id, "cancelled", summary="run shutdown")
             raise
-        except (SolverOutputError, RuntimeError, OSError, ValueError):
+        except SolverOutputError:
             finding = None
             terminal = "failed"
             self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {"challenge_id": challenge.id, "lane": lane, "reason": "solver_output"},
+            )
+        except RuntimeError:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {"challenge_id": challenge.id, "lane": lane, "reason": "native_runtime"},
+            )
+        except OSError:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {"challenge_id": challenge.id, "lane": lane, "reason": "operating_system"},
+            )
+        except ValueError:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {"challenge_id": challenge.id, "lane": lane, "reason": "invalid_value"},
+            )
         finally:
             if target_registry is not None:
                 target_registry.close()
@@ -804,6 +849,9 @@ class Orchestrator:
                                 "source_bound": call.source_bound,
                                 "candidate_sha256s": list(
                                     call.candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
+                                ),
+                                "supplied_candidate_sha256s": list(
+                                    call.supplied_candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
                                 ),
                             }
                             for call in item.tool_calls[:_MAX_DURABLE_TOOL_CALLS]
