@@ -1267,25 +1267,34 @@ class CodexAppClient:
         selected_effort = reasoning_effort or self.reasoning_effort
         if not selected_model or not selected_effort:
             raise ModelValidationError("model and reasoning_effort are required")
+
+        # A concurrent lane can enter after the subprocess is assigned but
+        # before initialization completes.  This caller does not own that
+        # startup, so its cancellation or deadline must not fence the shared
+        # process underneath the owner lane.
+        if self._start_waiter is not None:
+            await asyncio.wait_for(asyncio.shield(self._start_waiter), timeout=remaining())
+
+        # ``start`` already fences an owner-side failure.  Keep every possible
+        # join path outside the thread-setup handler: two first entrants can
+        # both reach this call before either start coroutine claims ownership.
+        reader_stopped = self._reader_task is not None and self._reader_task.done()
+        process_stopped = self.process is not None and self.process.returncode is not None
+        if self.process is not None and (reader_stopped or process_stopped or not self._started):
+            await self._close_before_restart()
+        if self.process is None or not self._started:
+            await asyncio.wait_for(
+                self.start(
+                    model=selected_model,
+                    reasoning_effort=selected_effort,
+                    cwd=workspace,
+                    developer_instructions=developer_instructions,
+                    tool_registry=tool_registry,
+                    workspace_registry=workspace_registry,
+                ),
+                timeout=remaining(),
+            )
         try:
-            reader_stopped = self._reader_task is not None and self._reader_task.done()
-            process_stopped = self.process is not None and self.process.returncode is not None
-            if self.process is not None and (
-                reader_stopped or process_stopped or not self._started
-            ):
-                await self.close()
-            if self.process is None or not self._started:
-                await asyncio.wait_for(
-                    self.start(
-                        model=selected_model,
-                        reasoning_effort=selected_effort,
-                        cwd=workspace,
-                        developer_instructions=developer_instructions,
-                        tool_registry=tool_registry,
-                        workspace_registry=workspace_registry,
-                    ),
-                    timeout=remaining(),
-                )
             thread_id = await asyncio.wait_for(
                 self.start_thread(
                     model=selected_model,
@@ -1298,8 +1307,8 @@ class CodexAppClient:
                 timeout=remaining(),
             )
         except (TimeoutError, asyncio.CancelledError, CodexAppError):
-            # No turn id exists during setup, so interrupt is impossible. Fence the
-            # whole app-server before the caller can delete the lane workspace.
+            # No turn id exists during thread setup, so interrupt is impossible.
+            # Fence the app-server before the caller can delete the lane workspace.
             await self.close()
             raise
         turn_timeout = remaining()
@@ -1431,6 +1440,19 @@ class CodexAppClient:
             task.cancel()
         if targets:
             await asyncio.gather(*targets, return_exceptions=True)
+
+    async def _close_before_restart(self) -> None:
+        """Finish stale-process cleanup before propagating caller cancellation."""
+        close_task = asyncio.create_task(self.close())
+        interrupted = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                interrupted = True
+        close_task.result()
+        if interrupted:
+            raise asyncio.CancelledError
 
     def _fail_pending(self, error: BaseException) -> None:
         for future in tuple(self._pending.values()):

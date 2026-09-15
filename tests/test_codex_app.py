@@ -22,6 +22,7 @@ from rapido.codex_app import (
     CodexAppError,
     ModelValidationError,
     ProtocolError,
+    TurnResult,
     TurnTimeoutError,
     WorkspaceThreadRegistry,
     _source_bound_tool_call,
@@ -154,6 +155,40 @@ class FakeProcess:
         return self.returncode
 
 
+class DelayedInitializeProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.initialize_seen = asyncio.Event()
+        self.release_initialize = asyncio.Event()
+
+    def handle(self, message: dict[str, Any]) -> None:
+        if message.get("method") != "initialize":
+            super().handle(message)
+            return
+        request_id = message.get("id")
+        if request_id is None:
+            return
+        self.initialize_seen.set()
+
+        async def respond() -> None:
+            await self.release_initialize.wait()
+            await self.stdout.push({"id": request_id, "result": {}})
+
+        asyncio.create_task(respond())
+
+
+class DelayedWaitProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_started = asyncio.Event()
+        self.release_wait = asyncio.Event()
+
+    async def wait(self) -> int:
+        self.wait_started.set()
+        await self.release_wait.wait()
+        return await super().wait()
+
+
 class ToolStub:
     dynamic_tool_specs: ClassVar[list[dict[str, Any]]] = [
         {"name": "echo", "inputSchema": {"type": "object"}}
@@ -194,6 +229,176 @@ def make_client(process: FakeProcess, tmp_path: Path, **kwargs: Any) -> CodexApp
         reasoning_effort="high",
         **kwargs,
     )
+
+
+@run_async
+async def test_concurrent_solve_waits_for_shared_startup(tmp_path: Path) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    workspaces = [tmp_path / "lane-0", tmp_path / "lane-1"]
+    for workspace in workspaces:
+        workspace.mkdir()
+
+    first = asyncio.create_task(
+        client.solve(workspaces[0], "first", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    second = asyncio.create_task(
+        client.solve(workspaces[1], "second", tool_registry=ToolRegistry(workspaces[1]))
+    )
+    await asyncio.sleep(0)
+    process.release_initialize.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True),
+        1,
+    )
+
+    assert [type(result) for result in results] == [TurnResult, TurnResult]
+    assert [result.status for result in results] == ["completed", "completed"]
+    await client.close()
+
+
+@pytest.mark.parametrize("mode", ("timeout", "cancel"))
+@run_async
+async def test_join_interruption_does_not_fence_shared_startup(
+    tmp_path: Path, mode: str
+) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    workspaces = [tmp_path / "owner", tmp_path / "joiner"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    owner = asyncio.create_task(
+        client.solve(workspaces[0], "owner", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    joiner = asyncio.create_task(
+        client.solve(
+            workspaces[1],
+            "joiner",
+            tool_registry=ToolRegistry(workspaces[1]),
+            timeout=0.01 if mode == "timeout" else None,
+        )
+    )
+    if mode == "timeout":
+        with pytest.raises(TimeoutError):
+            await joiner
+    else:
+        await asyncio.sleep(0)
+        joiner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joiner
+
+    assert client.process is process
+    assert process.returncode is None
+    process.release_initialize.set()
+    result = await asyncio.wait_for(owner, 1)
+    assert result.status == "completed"
+    await client.close()
+
+
+@pytest.mark.parametrize("mode", ("timeout", "cancel"))
+@run_async
+async def test_simultaneous_start_join_interruption_preserves_owner(
+    tmp_path: Path, mode: str
+) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    original_start = client.start
+    start_call_count = 0
+    both_start_calls_entered = asyncio.Event()
+    release_start_calls = asyncio.Event()
+
+    async def synchronized_start(*args: Any, **kwargs: Any) -> CodexAppClient:
+        nonlocal start_call_count
+        start_call_count += 1
+        if start_call_count == 2:
+            both_start_calls_entered.set()
+        await release_start_calls.wait()
+        return await original_start(*args, **kwargs)
+
+    client.start = synchronized_start  # type: ignore[method-assign]
+    workspaces = [tmp_path / "owner", tmp_path / "simultaneous-joiner"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    owner = asyncio.create_task(
+        client.solve(workspaces[0], "owner", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    joiner = asyncio.create_task(
+        client.solve(
+            workspaces[1],
+            "joiner",
+            tool_registry=ToolRegistry(workspaces[1]),
+        )
+    )
+    await asyncio.wait_for(both_start_calls_entered.wait(), 1)
+    release_start_calls.set()
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    if mode == "timeout":
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(joiner, 0.01)
+    else:
+        joiner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joiner
+
+    assert client.process is process
+    assert process.returncode is None
+    process.release_initialize.set()
+    result = await asyncio.wait_for(owner, 1)
+    assert result.status == "completed"
+    await client.close()
+
+
+@run_async
+async def test_cancellation_waits_for_stale_process_cleanup(tmp_path: Path) -> None:
+    process = DelayedWaitProcess()
+    client = make_client(process, tmp_path)
+    await client.start()
+    client._started = False
+    workspace = tmp_path / "replacement"
+    workspace.mkdir()
+
+    solve = asyncio.create_task(
+        client.solve(workspace, "replacement", tool_registry=ToolRegistry(workspace))
+    )
+    await asyncio.wait_for(process.wait_started.wait(), 1)
+    solve.cancel()
+    await asyncio.sleep(0)
+    cleanup_was_pending = not solve.done()
+    process.release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await solve
+
+    assert cleanup_was_pending
+    assert client.process is None
 
 
 @pytest.mark.parametrize(
