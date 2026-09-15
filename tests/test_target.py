@@ -259,4 +259,5 @@ def test_registry_exposes_sanitized_endpoint_metadata_only(tmp_path: Path) -> No
     assert "private-target.example" not in str(report)
     assert "authority_sha256" in report["endpoints"][0]
     names = {item["name"] for item in registry.dynamic_tools()}
-    assert {"inspect_file", "target_info", "http_request", "tcp_open"} <= names
+    assert {"inspect_artifact", "target_info", "http_request", "tcp_open"} <= names
+    assert "inspect_file" not in names

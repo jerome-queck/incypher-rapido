@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import copy
 import hashlib
 import inspect
 import json
 import os
+import re
 import urllib.parse
 from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import suppress
@@ -106,10 +108,28 @@ MAX_TURN_TOOL_CALLS = 100
 MAX_ACTIVE_SERVER_TASKS = 128
 MAX_PROVENANCE_BYTES = 2 * 1024 * 1024
 INTERRUPT_TIMEOUT_SECONDS = 2.0
+MAX_TAINT_DECODE_DEPTH = 4
+MAX_TAINT_ARGUMENT_STRINGS = 256
+MAX_TAINT_ARGUMENT_BYTES = 256 * 1024
+MAX_TAINT_ARGUMENT_NODES = 1024
+MAX_TAINT_VARIANTS = 512
+MAX_TAINT_DECODED_BYTES = 256 * 1024
+MAX_TAINT_CANDIDATES = 64
+MAX_TAINT_ASSEMBLY_FRAGMENTS = 128
+MAX_TAINT_PATH_SUFFIXES = 16
+MAX_TURN_TAINT_ARGUMENT_STRINGS = 2048
+MAX_TURN_TAINT_ARGUMENT_BYTES = 2 * 1024 * 1024
+MAX_TURN_TAINT_VARIANTS = 4096
+MAX_TURN_TAINT_DECODED_BYTES = 2 * 1024 * 1024
+MAX_TURN_TAINT_CANDIDATES = 512
+MAX_TURN_TAINT_STATE_VALUES = 128
+MAX_TURN_TAINT_STATE_BYTES = 256 * 1024
+MAX_TURN_CANDIDATE_HASHES = 512
 
 _ARTIFACT_TOOLS = {
     "audio_metadata",
     "decompress_gzip",
+    "derive_artifact",
     "dicom_metadata",
     "disassemble_elf",
     "elf_symbols",
@@ -117,6 +137,7 @@ _ARTIFACT_TOOLS = {
     "extract_strings",
     "image_metadata",
     "inspect_binary",
+    "inspect_artifact",
     "inspect_elf",
     "inspect_filesystem",
     "inspect_file",
@@ -129,6 +150,13 @@ _ARTIFACT_TOOLS = {
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
 _TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
+_BASE64_TAINT_TOKEN = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
+_URLSAFE_BASE64_TAINT_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}={0,2}(?![A-Za-z0-9_=-])"
+)
+_HEX_TAINT_TOKEN = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{14,}(?![0-9A-Fa-f])")
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+_REVERSIBLE_TAINT_TOKEN = re.compile(r"[A-Za-z0-9%+/_=-]{8,}")
 _TURN_FAILURE_CLASSES = {
     "contextWindowExceeded": "context_window_exceeded",
     "sessionBudgetExceeded": "session_budget_exceeded",
@@ -300,6 +328,14 @@ class _TurnState:
     provenance_bytes: int = 0
     tainted_candidates: set[str] = field(default_factory=set)
     tainted_target_inputs: set[str] = field(default_factory=set)
+    target_taint_complete: bool = True
+    taint_argument_strings: int = 0
+    taint_argument_bytes: int = 0
+    taint_variants: int = 0
+    taint_decoded_bytes: int = 0
+    taint_candidates: int = 0
+    taint_state_bytes: int = 0
+    candidate_hashes: int = 0
     tool_request_active: bool = False
     last_event: dict[str, Any] = field(default_factory=dict)
 
@@ -307,9 +343,10 @@ class _TurnState:
 def _json_text(value: Any, *, limit: int) -> str:
     try:
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
+        encoded_bytes = encoded.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
         raise ProtocolError("value is not JSON serializable") from exc
-    if len(encoded.encode("utf-8")) > limit:
+    if len(encoded_bytes) > limit:
         raise ProtocolError("JSON value exceeds the protocol limit")
     return encoded
 
@@ -319,6 +356,14 @@ def _bounded_message_text(value: Any, *, limit: int = MAX_AGENT_MESSAGE_BYTES) -
         return ""
     raw = value.encode("utf-8", "replace")
     return raw[:limit].decode("utf-8", "ignore")
+
+
+def _valid_unicode(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
 
 
 def _item_text(item: Mapping[str, Any]) -> str:
@@ -379,36 +424,303 @@ def _source_bound_tool_call(
     )
 
 
+@dataclass
+class _TaintScan:
+    strings: list[str] = field(default_factory=list)
+    fragments: set[str] = field(default_factory=set)
+    candidates: set[str] = field(default_factory=set)
+    argument_strings: int = 0
+    argument_bytes: int = 0
+    nodes: int = 0
+    variants: int = 0
+    decoded_bytes: int = 0
+    complete: bool = True
+    invalid_unicode: bool = False
+
+
+def _argument_scan(value: Any) -> _TaintScan:
+    """Collect strings from one JSON value without unbounded recursive work."""
+    scan = _TaintScan()
+    pending = [value]
+    seen_containers: set[int] = set()
+    while pending:
+        child = pending.pop()
+        scan.nodes += 1
+        if scan.nodes > MAX_TAINT_ARGUMENT_NODES:
+            scan.complete = False
+            break
+        if isinstance(child, str):
+            try:
+                size = len(child.encode("utf-8"))
+            except UnicodeError:
+                scan.invalid_unicode = True
+                scan.complete = False
+                break
+            if (
+                scan.argument_strings >= MAX_TAINT_ARGUMENT_STRINGS
+                or scan.argument_bytes + size > MAX_TAINT_ARGUMENT_BYTES
+            ):
+                scan.complete = False
+                break
+            scan.strings.append(child)
+            scan.argument_strings += 1
+            scan.argument_bytes += size
+            continue
+        if isinstance(child, Mapping):
+            identity = id(child)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            pending.extend(child.keys())
+            pending.extend(child.values())
+        elif isinstance(child, Sequence) and not isinstance(child, (bytes, bytearray)):
+            identity = id(child)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            pending.extend(child)
+    return scan
+
+
 def _argument_strings(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Mapping):
-        return [item for child in value.values() for item in _argument_strings(child)]
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        return [item for child in value for item in _argument_strings(child)]
-    return []
+    return _argument_scan(value).strings
+
+
+def _padded_base64(value: str) -> str | None:
+    remainder = len(value) % 4
+    if remainder == 1:
+        return None
+    return value + "=" * ((4 - remainder) % 4)
+
+
+def _decode_taint_bytes(value: str, *, form_query: bool) -> tuple[list[bytes], bool]:
+    decoded: list[bytes] = []
+    complete = True
+    if _PERCENT_ESCAPE.search(value):
+        with suppress(UnicodeError):
+            decoded.append(urllib.parse.unquote_to_bytes(value))
+        if form_query:
+            with suppress(UnicodeError):
+                decoded.append(urllib.parse.unquote_to_bytes(value.replace("+", " ")))
+    elif form_query and "+" in value:
+        with suppress(UnicodeError):
+            decoded.append(value.replace("+", " ").encode("utf-8"))
+
+    tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for pattern in (_BASE64_TAINT_TOKEN, _URLSAFE_BASE64_TAINT_TOKEN):
+        for match in pattern.finditer(value):
+            token = match.group()
+            if token in seen_tokens:
+                continue
+            if len(tokens) >= MAX_TAINT_VARIANTS:
+                complete = False
+                break
+            tokens.append(token)
+            seen_tokens.add(token)
+        if not complete:
+            break
+    if value not in tokens:
+        tokens.append(value)
+    for encoded in tokens:
+        padded = _padded_base64(encoded)
+        if padded is None:
+            continue
+        for altchars in (None, b"-_"):
+            try:
+                decoded.append(base64.b64decode(padded, altchars=altchars, validate=True))
+            except (binascii.Error, ValueError):
+                pass
+
+    hex_inputs: list[str] = []
+    for match in _HEX_TAINT_TOKEN.finditer(value):
+        if len(hex_inputs) >= MAX_TAINT_VARIANTS:
+            complete = False
+            break
+        hex_inputs.append(match.group())
+    if value not in hex_inputs:
+        hex_inputs.append(value)
+    for encoded in hex_inputs:
+        compact = encoded.translate(str.maketrans("", "", " \t\n\r\v\f"))
+        if len(compact) < 14 or len(compact) % 2:
+            continue
+        try:
+            decoded.append(bytes.fromhex(compact))
+        except ValueError:
+            pass
+    return decoded, complete
+
+
+def _add_taint_variant(
+    scan: _TaintScan,
+    pending: list[tuple[str, int, bool]],
+    seen: set[str],
+    text: str,
+    depth: int,
+    form_query: bool,
+) -> None:
+    if not text or text in seen:
+        return
+    try:
+        text_size = len(text.encode("utf-8"))
+    except UnicodeError:
+        scan.invalid_unicode = True
+        scan.complete = False
+        return
+    if scan.variants >= MAX_TAINT_VARIANTS:
+        scan.complete = False
+        return
+    seen.add(text)
+    scan.variants += 1
+    # Candidate-sized fragments suffice for exact split/recombination tracking;
+    # larger values are still decoded and searched without entering turn state.
+    if text_size <= 1024:
+        scan.fragments.add(text)
+    pending.append((text, depth, form_query))
+
+
+def _expand_target_taint(scan: _TaintScan) -> None:
+    pending: list[tuple[str, int, bool]] = []
+    seen: set[str] = set()
+    for value in scan.strings:
+        _add_taint_variant(scan, pending, seen, value, 0, False)
+    while pending and scan.complete:
+        current, depth, form_query = pending.pop()
+        for match in FLAG_RE.finditer(current):
+            if match.group() in scan.candidates:
+                continue
+            if len(scan.candidates) >= MAX_TAINT_CANDIDATES:
+                scan.complete = False
+                break
+            scan.candidates.add(match.group())
+        if not scan.complete:
+            break
+
+        path, query_separator, query = current.partition("?")
+        for fragment in path.split("/", MAX_TAINT_VARIANTS):
+            _add_taint_variant(scan, pending, seen, fragment, depth, False)
+        # A standard Base64 slash is ambiguous with a URL path separator. Try
+        # only short, bounded suffixes; candidate encodings are at most 700 B.
+        suffixes = 0
+        slash = path.rfind("/")
+        while slash >= 0 and suffixes < MAX_TAINT_PATH_SUFFIXES:
+            suffix = path[slash + 1 :]
+            if len(suffix.encode("utf-8")) > 1024:
+                break
+            _add_taint_variant(scan, pending, seen, suffix, depth, False)
+            suffixes += 1
+            slash = path.rfind("/", 0, slash)
+        if query_separator:
+            for pair in query.split("&", MAX_TAINT_VARIANTS):
+                key, value_separator, value = pair.partition("=")
+                _add_taint_variant(scan, pending, seen, key, depth, True)
+                if value_separator:
+                    _add_taint_variant(scan, pending, seen, value, depth, True)
+
+        decoded_values, decoding_complete = _decode_taint_bytes(current, form_query=form_query)
+        if not decoding_complete:
+            scan.complete = False
+            break
+        for raw in decoded_values:
+            if scan.decoded_bytes + len(raw) > MAX_TAINT_DECODED_BYTES:
+                scan.complete = False
+                break
+            scan.decoded_bytes += len(raw)
+            text = raw.decode("utf-8", "replace")
+            if not text or text in seen:
+                continue
+            if depth >= MAX_TAINT_DECODE_DEPTH:
+                scan.complete = False
+                break
+            _add_taint_variant(scan, pending, seen, text, depth + 1, form_query)
+
+
+def _target_candidate_taint(arguments: Mapping[str, Any]) -> tuple[set[str], bool]:
+    scan = _argument_scan(arguments)
+    if not scan.invalid_unicode:
+        _expand_target_taint(scan)
+    return scan.candidates, scan.complete and not scan.invalid_unicode
+
+
+def _commit_target_taint(state: _TurnState, scan: _TaintScan) -> None:
+    cumulative_limits = (
+        ("taint_argument_strings", scan.argument_strings, MAX_TURN_TAINT_ARGUMENT_STRINGS),
+        ("taint_argument_bytes", scan.argument_bytes, MAX_TURN_TAINT_ARGUMENT_BYTES),
+        ("taint_variants", scan.variants, MAX_TURN_TAINT_VARIANTS),
+        ("taint_decoded_bytes", scan.decoded_bytes, MAX_TURN_TAINT_DECODED_BYTES),
+        ("taint_candidates", len(scan.candidates), MAX_TURN_TAINT_CANDIDATES),
+    )
+    complete = scan.complete and not scan.invalid_unicode
+    for attribute, increment, limit in cumulative_limits:
+        current = getattr(state, attribute)
+        if current + increment > limit:
+            complete = False
+        setattr(state, attribute, min(limit, current + increment))
+
+    new_candidates = scan.candidates - state.tainted_candidates
+    new_fragments = scan.fragments - state.tainted_target_inputs
+    additions = {*new_candidates, *new_fragments}
+    try:
+        addition_bytes = sum(len(value.encode("utf-8")) for value in additions)
+    except UnicodeError:
+        complete = False
+        addition_bytes = 0
+    if (
+        len(state.tainted_candidates | state.tainted_target_inputs | additions)
+        > MAX_TURN_TAINT_STATE_VALUES
+        or state.taint_state_bytes + addition_bytes > MAX_TURN_TAINT_STATE_BYTES
+    ):
+        complete = False
+    if complete and state.target_taint_complete:
+        state.tainted_candidates.update(new_candidates)
+        state.tainted_target_inputs.update(new_fragments)
+        state.taint_state_bytes += addition_bytes
+    state.target_taint_complete &= complete
+
+
+def _candidate_assembled_from_taint(candidate: str, fragments: set[str]) -> bool:
+    if candidate in fragments:
+        return True
+    usable = {fragment for fragment in fragments if fragment and fragment in candidate}
+    if len(usable) > MAX_TAINT_ASSEMBLY_FRAGMENTS:
+        return True
+    reachable = [False] * (len(candidate) + 1)
+    reachable[0] = True
+    for start in range(len(candidate)):
+        if not reachable[start]:
+            continue
+        for fragment in usable:
+            if candidate.startswith(fragment, start):
+                reachable[start + len(fragment)] = True
+        if reachable[-1]:
+            return True
+    return reachable[-1]
+
+
+def _bounded_candidate_hashes(
+    state: _TurnState, values: Sequence[str], *, limit: int
+) -> tuple[list[str], bool]:
+    unique = sorted(set(values))
+    remaining = MAX_TURN_CANDIDATE_HASHES - state.candidate_hashes
+    complete = len(unique) <= limit and len(unique) <= remaining
+    selected = unique[: min(limit, max(0, remaining))]
+    hashes = [hashlib.sha256(value.encode("utf-8")).hexdigest() for value in selected]
+    state.candidate_hashes += len(hashes)
+    return hashes, complete
 
 
 def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[str]:
     """Find candidate-shaped model input, including supported transport encodings."""
     values = _argument_strings(arguments)
-    decoded_values = [urllib.parse.unquote(value) for value in values]
     canonical = ALIASES.get(name, name)
-    data = arguments.get("data")
-    if canonical in {"http_request", "tcp_exchange"} and isinstance(data, str):
-        encoding = arguments.get("encoding", "utf8")
-        try:
-            if encoding == "base64":
-                decoded_values.append(base64.b64decode(data, validate=True).decode("utf-8"))
-            elif encoding == "hex":
-                decoded_values.append(bytes.fromhex(data).decode("utf-8"))
-            elif encoding == "utf8":
-                decoded_values.append(data)
-        except (UnicodeError, ValueError):
-            pass
-    return {
-        match.group() for value in [*values, *decoded_values] for match in FLAG_RE.finditer(value)
-    }
+    if canonical in _TARGET_OBSERVATION_TOOLS:
+        return _target_candidate_taint(arguments)[0]
+    # The handler calls this only after source binding. Reversible transform
+    # inputs found verbatim in earlier host output therefore remain host-rooted.
+    if canonical in _TRANSFORM_TOOLS:
+        return set()
+    decoded_values = [*values, *(urllib.parse.unquote(value) for value in values)]
+    return {match.group() for value in decoded_values for match in FLAG_RE.finditer(value)}
 
 
 def _target_provenance_output(
@@ -420,9 +732,24 @@ def _target_provenance_output(
     canonical = ALIASES.get(name, name)
     if canonical not in _TARGET_OBSERVATION_TOOLS:
         return encoded_result
+    taint_fragments = {*tainted_candidates, *tainted_inputs}
+    assembled_needles = {
+        match.group()
+        for match in _REVERSIBLE_TAINT_TOKEN.finditer(encoded_result)
+        if _candidate_assembled_from_taint(match.group(), taint_fragments)
+    }
+    encoded_result = FLAG_RE.sub(
+        lambda match: (
+            "[model-supplied]"
+            if _candidate_assembled_from_taint(match.group(), taint_fragments)
+            else match.group()
+        ),
+        encoded_result,
+    )
     needles = {
         *tainted_candidates,
-        *tainted_inputs,
+        *(value for value in tainted_inputs if len(value) >= 8),
+        *assembled_needles,
     }
     for needle in sorted(needles, key=len, reverse=True):
         encoded_result = encoded_result.replace(needle, "[model-supplied]")
@@ -738,7 +1065,7 @@ class CodexAppClient:
                 future.set_result(message.get("result"))
             return
 
-        if not isinstance(method, str) or len(method) > 200:
+        if not isinstance(method, str) or len(method) > 200 or not _valid_unicode(method):
             if has_id and isinstance(message_id, int) and not isinstance(message_id, bool):
                 await self._send_response(
                     message_id, error={"code": -32600, "message": "invalid request"}
@@ -806,13 +1133,19 @@ class CodexAppClient:
                 },
             )
             return
+        if not all(_valid_unicode(value) for value in (thread_id, turn_id, call_id)):
+            await self._send_response(
+                message_id,
+                error={"code": -32602, "message": "request identifiers contain invalid Unicode"},
+            )
+            return
         tool = params.get("tool")
         name = tool.get("name") if isinstance(tool, Mapping) else tool
         name = params.get("name", params.get("toolName", name))
         arguments = params.get("arguments", {})
         if isinstance(tool, Mapping) and "arguments" in tool and "arguments" not in params:
             arguments = tool["arguments"]
-        if not isinstance(name, str) or not name or len(name) > 200:
+        if not isinstance(name, str) or not name or len(name) > 200 or not _valid_unicode(name):
             await self._send_response(
                 message_id, error={"code": -32602, "message": "invalid tool name"}
             )
@@ -877,6 +1210,21 @@ class CodexAppClient:
                 },
             )
             return
+        argument_scan = _argument_scan(arguments)
+        if argument_scan.invalid_unicode:
+            await self._send_response(
+                message_id,
+                result={
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": '{"error":{"code":"invalid_arguments","message":"tool arguments contain invalid Unicode"}}',
+                        }
+                    ],
+                },
+            )
+            return
         state.tool_request_active = True
         current_task = asyncio.current_task()
         if current_task is None:
@@ -889,22 +1237,28 @@ class CodexAppClient:
         current_task.add_done_callback(
             lambda _task, turn_state=state: setattr(turn_state, "tool_request_active", False)
         )
-        source_bound = _source_bound_tool_call(state, name, arguments)
-        current_supplied = _supplied_candidate_values(name, arguments) if source_bound else set()
         canonical_name = ALIASES.get(name, name)
-        if canonical_name in _TARGET_OBSERVATION_TOOLS:
-            state.tainted_candidates.update(current_supplied)
-            state.tainted_target_inputs.update(
-                value for value in _argument_strings(arguments) if len(value) >= 8
+        source_bound = _source_bound_tool_call(state, name, arguments)
+        if source_bound and canonical_name in _TARGET_OBSERVATION_TOOLS:
+            _expand_target_taint(argument_scan)
+            _commit_target_taint(state, argument_scan)
+            current_supplied = argument_scan.candidates
+        else:
+            current_supplied = (
+                _supplied_candidate_values(name, arguments) if source_bound else set()
             )
         supplied_candidates = {*state.tainted_candidates, *current_supplied}
+        supplied_hashes, supplied_hashes_complete = _bounded_candidate_hashes(
+            state, sorted(current_supplied), limit=MAX_TAINT_CANDIDATES
+        )
+        if canonical_name in _TARGET_OBSERVATION_TOOLS and not supplied_hashes_complete:
+            state.target_taint_complete = False
+            supplied_hashes = []
         call_record: dict[str, Any] | None = {
             "name": name,
             "success": None,
             "source_bound": source_bound,
-            "supplied_candidate_sha256s": sorted(
-                hashlib.sha256(value.encode()).hexdigest() for value in current_supplied
-            ),
+            "supplied_candidate_sha256s": supplied_hashes,
         }
         state.tool_calls.append(call_record)
         try:
@@ -939,14 +1293,45 @@ class CodexAppClient:
             }
             if call_record is not None:
                 call_record["success"] = True
-                call_record["candidate_sha256s"] = sorted(
-                    {
-                        hashlib.sha256(match.group().encode()).hexdigest()
-                        for match in list(FLAG_RE.finditer(encoded_result))[:20]
-                        if match.group() not in supplied_candidates | state.tainted_candidates
-                    }
+                result_candidates: list[str] = []
+                result_candidates_complete = True
+                for match in FLAG_RE.finditer(encoded_result):
+                    if len(result_candidates) >= MAX_TAINT_CANDIDATES:
+                        result_candidates_complete = False
+                        break
+                    candidate = match.group()
+                    if candidate not in result_candidates:
+                        result_candidates.append(candidate)
+                if canonical_name in _TARGET_OBSERVATION_TOOLS:
+                    if not result_candidates_complete:
+                        state.target_taint_complete = False
+                    fragments = {*state.tainted_candidates, *state.tainted_target_inputs}
+                    result_candidates = [
+                        candidate
+                        for candidate in result_candidates
+                        if candidate not in supplied_candidates
+                        and not _candidate_assembled_from_taint(candidate, fragments)
+                    ]
+                    if not state.target_taint_complete:
+                        result_candidates = []
+                else:
+                    result_candidates = [
+                        candidate
+                        for candidate in result_candidates
+                        if candidate not in supplied_candidates | state.tainted_candidates
+                    ]
+                candidate_hashes, candidate_hashes_complete = _bounded_candidate_hashes(
+                    state, result_candidates, limit=MAX_TAINT_CANDIDATES
                 )
-            if source_bound and state is not None:
+                if canonical_name in _TARGET_OBSERVATION_TOOLS and not candidate_hashes_complete:
+                    state.target_taint_complete = False
+                    candidate_hashes = []
+                call_record["candidate_sha256s"] = candidate_hashes
+            if (
+                source_bound
+                and state is not None
+                and (canonical_name not in _TARGET_OBSERVATION_TOOLS or state.target_taint_complete)
+            ):
                 provenance_result = _target_provenance_output(
                     name,
                     encoded_result,

@@ -16,6 +16,7 @@ import re
 import stat
 import struct
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -163,8 +164,9 @@ def _path_argument(arguments: Mapping[str, Any], allowed: set[str]) -> str:
     return value
 
 
-def _read_prefix(workspace: Workspace, path_arg: str, limit: int) -> tuple[bytes, int]:
-    """Use Workspace validation and descriptor-relative no-follow opens together."""
+@contextmanager
+def _media_source(workspace: Workspace, path_arg: str):
+    """Open one workspace source once through anchored no-follow descriptors."""
     from .tools import MAX_FILE_BYTES
 
     path = workspace.path(path_arg)
@@ -188,8 +190,7 @@ def _read_prefix(workspace: Workspace, path_arg: str, limit: int) -> tuple[bytes
             raise _error("symlink_or_invalid_path", "multiply linked inputs are not allowed")
         if info.st_size > MAX_FILE_BYTES:
             raise _error("input_too_large", "file exceeds the bounded media file limit")
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            return stream.read(limit), info.st_size
+        yield descriptor, info.st_size
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             raise _error(
@@ -199,6 +200,29 @@ def _read_prefix(workspace: Workspace, path_arg: str, limit: int) -> tuple[bytes
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+def _read_prefix_descriptor(descriptor: int, size: int, limit: int) -> bytes:
+    """Read from the caller's bound descriptor and reject in-place source changes."""
+    if type(descriptor) is not int or descriptor < 0 or type(size) is not int or size < 0:
+        raise _error("invalid_argument", "media parsing requires a bounded descriptor and size")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise _error("not_a_file", "media parsing requires a regular file")
+        if before.st_size != size:
+            raise _error("source_changed", "media size differs from the opened source")
+        length = min(size, limit)
+        data = os.pread(descriptor, length, 0)
+        if len(data) != length:
+            raise _error("source_changed", "media changed during bounded reading")
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise _error("read_failed", "media bytes could not be read") from exc
+    facts = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, fact) != getattr(after, fact) for fact in facts):
+        raise _error("source_changed", "media changed during bounded reading")
+    return data
 
 
 def _json_size(value: Any) -> int:
@@ -233,10 +257,20 @@ def _dicom_preview(value: bytes, vr: str, endian: str, encoding: str) -> dict[st
 def dicom_metadata(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Preview bounded top-level Part-10 tags, stopping before any pixel payload."""
     path_arg = _path_argument(arguments, {"path", "max_bytes", "max_tags", "max_value_bytes"})
+    with _media_source(workspace, path_arg) as (descriptor, size):
+        return dicom_metadata_from_descriptor(descriptor, size, arguments)
+
+
+def dicom_metadata_from_descriptor(
+    descriptor: int, size: int, arguments: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Parse DICOM metadata from one already-bound regular-file descriptor."""
+    path_arg = _path_argument(arguments, {"path", "max_bytes", "max_tags", "max_value_bytes"})
     byte_limit = _integer(arguments, "max_bytes", 132, MAX_MEDIA_BYTES, 1024 * 1024)
     tag_limit = _integer(arguments, "max_tags", 1, MAX_DICOM_TAGS, 128)
     value_limit = _integer(arguments, "max_value_bytes", 1, MAX_DICOM_VALUE_BYTES, 128)
-    data, file_size = _read_prefix(workspace, path_arg, byte_limit)
+    data = _read_prefix_descriptor(descriptor, size, byte_limit)
+    file_size = size
     if len(data) < 132 or data[128:132] != b"DICM":
         raise _error("unsupported_format", "DICOM Part-10 preamble and DICM prefix are required")
     result: dict[str, Any] = {
@@ -465,10 +499,20 @@ def _wav_format(data: bytes, offset: int, length: int) -> dict[str, int]:
 def wav_analyze(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Inspect bounded PCM WAV frames and first-bit byte previews without decoding claims."""
     path_arg = _path_argument(arguments, {"path", "max_bytes", "max_frames", "preview_bytes"})
+    with _media_source(workspace, path_arg) as (descriptor, size):
+        return wav_analyze_from_descriptor(descriptor, size, arguments)
+
+
+def wav_analyze_from_descriptor(
+    descriptor: int, size: int, arguments: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Analyze WAV bytes from one already-bound regular-file descriptor."""
+    path_arg = _path_argument(arguments, {"path", "max_bytes", "max_frames", "preview_bytes"})
     byte_limit = _integer(arguments, "max_bytes", 44, MAX_MEDIA_BYTES, 1024 * 1024)
     frame_limit = _integer(arguments, "max_frames", 1, MAX_WAV_FRAMES, 65_536)
     preview_limit = _integer(arguments, "preview_bytes", 1, MAX_WAV_PREVIEW_BYTES, 128)
-    data, file_size = _read_prefix(workspace, path_arg, byte_limit)
+    data = _read_prefix_descriptor(descriptor, size, byte_limit)
+    file_size = size
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise _error("unsupported_format", "only little-endian RIFF/WAVE files are supported")
     container_end = struct.unpack_from("<I", data, 4)[0] + 8

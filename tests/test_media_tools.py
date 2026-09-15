@@ -152,7 +152,8 @@ def test_media_tools_refuse_multiply_linked_inputs(tmp_path, operation):
 def test_media_tools_are_registered_for_native_model_dispatch(tmp_path):
     (tmp_path / "image.dcm").write_bytes(dicom_fixture())
     names = {spec["name"] for spec in ToolRegistry(tmp_path).dynamic_tools()}
-    assert {"dicom_metadata", "wav_analyze"} <= names
+    assert "inspect_artifact" in names
+    assert {"dicom_metadata", "wav_analyze"}.isdisjoint(names)
     assert (
         call_tool(Workspace(tmp_path), "dicom_metadata", {"path": "image.dcm"})["format"] == "dicom"
     )

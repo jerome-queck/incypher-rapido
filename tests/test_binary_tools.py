@@ -327,5 +327,6 @@ def test_binary_tools_are_registered_for_native_model_dispatch(tmp_path):
     (tmp_path / "input.elf").write_bytes(elf_fixture())
     workspace = Workspace(tmp_path)
     names = {spec["name"] for spec in ToolRegistry(workspace).dynamic_tools()}
-    assert {"inspect_elf", "elf_symbols", "disassemble_elf"} <= names
+    assert {"inspect_artifact", "elf_symbols"} <= names
+    assert {"inspect_elf", "disassemble_elf"}.isdisjoint(names)
     assert call_tool(workspace, "inspect_elf", {"path": "input.elf"})["format"] == "elf"

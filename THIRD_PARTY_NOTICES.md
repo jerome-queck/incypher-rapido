@@ -8,6 +8,10 @@ The container image redistributes these principal components:
 - Node.js 22 from the pinned official Node container image. Node.js and its
   bundled dependencies retain their respective licenses in
   `/licenses/NODE_LICENSE` in the image.
+- Pinned Pillow, Capstone, dpkt, pefile, and pypdf Python distributions. Their
+  package metadata and license files remain in `/opt/venv`.
+- Tesseract OCR from Debian. Its package copyright and license records remain
+  under `/usr/share/doc` in the image.
 - Debian and Python base-image packages. Their package-specific copyright and
   license records remain under `/usr/share/doc` in the image.
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from rapido.tools import (
+    AGENT_TOOL_NAMES,
     MAX_ARCHIVE_ENTRIES,
     MAX_ARCHIVE_MEMBER_BYTES,
     MAX_COMMAND_OUTPUT_BYTES,
@@ -71,8 +72,22 @@ class ToolFixture(unittest.TestCase):
 
     def test_dynamic_registry_is_workspace_bound(self) -> None:
         registry = ToolRegistry(self.workspace)
-        names = {spec["name"] for spec in registry.dynamic_tool_specs}
-        self.assertIn("inspect_file", names)
+        specs = {spec["name"]: spec for spec in registry.dynamic_tool_specs}
+        names = set(specs)
+        self.assertEqual(names, set(AGENT_TOOL_NAMES))
+        self.assertIn("inspect_artifact", names)
+        self.assertNotIn("inspect_file", names)
+        self.assertEqual(specs["search_text"]["inputSchema"]["required"], ["path", "query"])
+        self.assertEqual(
+            specs["decompress_gzip"]["inputSchema"]["required"], ["path", "destination"]
+        )
+        self.assertEqual(
+            specs["decode_hex"]["inputSchema"]["oneOf"],
+            [{"required": ["data"]}, {"required": ["path"]}],
+        )
+        filesystem_schema = specs["inspect_filesystem"]["inputSchema"]
+        self.assertEqual(filesystem_schema["required"], ["path"])
+        self.assertEqual(filesystem_schema["oneOf"][1]["required"], ["action", "filesystem_path"])
         self.assertEqual(registry.dispatch("hash", {"path": "note.txt"})["path"], "note.txt")
 
     def test_large_files_use_ranges_streaming_hashes_and_bounded_scans(self) -> None:

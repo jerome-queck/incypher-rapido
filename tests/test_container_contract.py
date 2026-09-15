@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 CONTAINER_DOC = ROOT / "deploy" / "CONTAINER.md"
 DOCKERIGNORE = ROOT / ".dockerignore"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+TOOLING_ACCEPTANCE = ROOT / "scripts" / "tooling_acceptance.py"
 
 
 def test_image_is_target_platform_python_and_pinned_codex() -> None:
@@ -24,7 +26,8 @@ def test_image_is_target_platform_python_and_pinned_codex() -> None:
         '= "0.154.0"'
     )
     assert version_check in text
-    assert "ca-certificates file binutils" in text
+    for package in ("ca-certificates", "file", "binutils", "e2fsprogs", "tesseract-ocr"):
+        assert package in text
 
 
 def test_image_has_no_secret_like_arg_or_env() -> None:
@@ -102,3 +105,44 @@ def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
     assert "stop_signal: SIGTERM" in text
     assert "stop_grace_period: 180s" in text
     assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()
+
+
+def test_amd64_ci_runs_hardened_offline_tooling_acceptance() -> None:
+    text = CI_WORKFLOW.read_text()
+    for value in (
+        "scripts/tooling_acceptance.py",
+        "--network none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--entrypoint /opt/venv/bin/python rapido:ci",
+    ):
+        assert value in text
+    assert re.search(
+        r"- if: matrix\.platform == 'linux/amd64'\n"
+        r"\s+run: >-\n"
+        r"\s+docker run .*--network none .*tooling_acceptance\.py",
+        text,
+        re.DOTALL,
+    )
+    assert not re.search(
+        r"- if: matrix\.platform == 'linux/arm64'[\s\S]{0,500}tooling_acceptance\.py",
+        text,
+    )
+
+
+def test_tooling_acceptance_does_not_claim_model_execution() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert '"model": "gpt-' not in text
+    assert '"reasoning_effort": "xhigh"' not in text
+    assert '"fallback"' not in text
+    assert '"inference": False' in text
+    assert '"model": None' in text
+    assert '"reasoning_effort": None' in text
+    assert "no model inference is performed" in text
+
+
+def test_tooling_acceptance_reports_computed_visible_schema_size() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert '"schema_count": len(visible_specs)' in text
+    assert '"schema_bytes": len(_json_bytes(visible_specs))' in text

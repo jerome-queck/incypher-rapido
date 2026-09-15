@@ -148,7 +148,10 @@ audit framework. A secret-free production-path fixture compared one active chall
 (arm A) with two active challenges/four turns (arm C), over all 15 catalogue entries. Arm C took
 0.1994 seconds versus 0.3597 seconds for A (ratio 0.5544), with identical outcomes, 30 attempts,
 SQLite integrity `ok`, and no residual task or workspace. The pre-registered gate was ratio ≤0.70.
-`scripts/scheduler_acceptance.py` reproduces the measurement.
+`scripts/scheduler_acceptance.py` reproduces the measurement. Its deliberate CLI benchmark retains
+that wall-clock gate. CI passes `max_elapsed_ratio=None` because shared-runner pauses made the
+sub-second ratio nondeterministic; CI instead checks the exact admission topology, all 15 outcomes,
+30 attempts, cleanup, and SQLite integrity.
 
 Selected defaults are two active challenges, two independent lanes, four lane slots, two FIFO
 episodes, and one dynamic instance. Initial episode coverage precedes retries; one challenge never
@@ -167,6 +170,46 @@ claimed by this update.
 Effective routing: architecture/research `gpt-6-astra`/`xhigh`; implementation fixtures and
 measurement `gpt-5.6-luna`/`xhigh`; focused testing and independent review
 `gpt-daybreak-blue-latest`/`xhigh`; no fallback.
+
+## Category-tooling decision
+
+Organizer evidence supports deep preparation for web, pwn, crypto, reversing, forensics, and
+medical/healthcare; the practice catalogue additionally exercises network and misc [B1, B2]. The
+final set is distinct, but no retrieved organizer source establishes mobile, blockchain, cloud,
+OSINT, hardware, or ML as IN-CYPHER categories. Build deep for the evidenced surface. Cover other
+possible CTF categories only through reusable passive primitives; do not install full speculative
+stacks.
+
+The first measured slice therefore adds one source-bound artifact inspector, durable ranged
+base64/hex/URL derivation, and bounded exact arithmetic. Artifact adapters cover paginated
+text/strings/bytes, archives, PDF, PCAP/PCAPNG, ELF/PE, multi-architecture entrypoint disassembly,
+raster/bitplanes/OCR, WAV, and DICOM with explicit complete/partial/unsupported states. Capstone is
+the bounded x86/x64/ARM/Thumb/AArch64 decoder; absence is reported explicitly rather than widening
+confinement through an objdump fallback. The native app-server wire sees 12 workspace tools (9,463
+compact JSON bytes), or 11,296 bytes with five assigned-target tools, rather than every
+compatibility operation. Installed parser distributions occupy about 29.7 MB in the host
+verification environment; an intermediate ARM64 image grew 47,218,090 bytes.
+Storage remains governed by the 500 GB workspace allowance, not a smaller package budget.
+
+The selected pinned additions are Pillow, Capstone, dpkt, pefile, pypdf, and Debian Tesseract.
+Build-time installation is automatic on both supported Linux image architectures and requires no
+host analyzer installation. Admission still requires final-image fixtures and lifecycle review;
+package presence alone is not a capability claim. Higher-value next slices are assigned-origin web
+browsing, TCP reconstruction/payload derivation, deeper pwn/reversing metadata, and bounded nested
+DICOM/forensic filesystem access. Broad speculative category stacks remain deferred absent evidence.
+
+The accepted non-live snapshot passes 492 unit/interface tests (one host-skipped Linux sandbox
+test), Ruff, formatting, and the deterministic scheduler benchmark at a 0.5503 elapsed ratio. An
+independent native ARM64 final-image fixture run passed every declared adapter, fixed Tesseract OCR,
+zero child-process residue, stable file-descriptor count, and temporary-directory removal. Separate
+ABI-4 Landlock/seccomp probes denied worker and descendant sentinel reads and loopback access while
+per-call scratch remained usable and was removed by the parent.
+
+Effective routing for this tooling slice: architecture `gpt-6-astra`/`xhigh`; bounded fixture work
+`gpt-5.6-luna`/`xhigh`; demanding implementation, independent review, and integration after an
+Astra safety-filter failure `gpt-daybreak-blue-latest`/`xhigh`. Every dispatch was exact and no
+provider fallback was accepted. The instruction to switch directly to Daybreak after an Astra
+failure governs subsequent work.
 
 ## Sources
 
@@ -200,3 +243,4 @@ measurement `gpt-5.6-luna`/`xhigh`; focused testing and independent review
 [O9]: https://learn.chatgpt.com/docs/app-server
 [O10]: https://learn.chatgpt.com/docs/auth/ci-cd-auth
 [B1]: https://hackathon.in-cypher.com/how-to-play
+[B2]: https://www.imperial.ac.uk/about/global/singapore/research/in-cypher/in-cypher-hackathon/

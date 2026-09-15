@@ -1,10 +1,10 @@
 """Small, workspace-confined tools exposed through native Codex dynamic tools.
 
-The module intentionally has no third-party dependencies.  Every operation takes a
-workspace root and a workspace-relative path; paths are checked with ``lstat`` before
-use so a symlink cannot be used to leave the workspace.  The limits below are part of
-the interface, rather than merely implementation details: callers can rely on a
-request failing instead of causing an unbounded read, archive expansion, or process.
+Every operation takes a workspace root and workspace-relative paths; optional format
+adapters are pinned by the runtime image. Paths are checked before use and sensitive
+operations use descriptor-confined no-follow access. The limits below are part of the
+interface, rather than merely implementation details: callers can rely on a request
+failing instead of causing an unbounded read, archive expansion, or process.
 """
 
 from __future__ import annotations
@@ -35,7 +35,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .artifact_inspector import artifact_tool_spec, inspect_artifact
 from .binary_tools import binary_tool_specs, disassemble_elf, elf_symbols, inspect_elf
+from .derive_tools import derive_artifact, derive_tool_spec
+from .exact_tools import compute_exact, exact_tool_spec
 from .media_tools import dicom_metadata, media_tool_specs, wav_analyze
 
 try:  # aifc was removed from Python 3.13; WAV remains universally available.
@@ -1472,6 +1475,10 @@ TOOLS: dict[str, tuple[ToolFunction, str]] = {
         "List bounded workspace entries without following symlinks.",
     ),
     "inspect_file": (inspect_file, "Inspect a file and compute bounded cryptographic hashes."),
+    "inspect_artifact": (
+        inspect_artifact,
+        "Inspect a content-detected artifact through one bounded passive interface.",
+    ),
     "read_bytes": (read_bytes, "Read a bounded byte range as base64."),
     "read_text": (read_text, "Read a bounded text range with replacement decoding."),
     "search_text": (search_text, "Search a bounded UTF-8 file for literal text."),
@@ -1479,6 +1486,14 @@ TOOLS: dict[str, tuple[ToolFunction, str]] = {
     "decode_base64": (decode_base64, "Decode bounded base64 data or a workspace file."),
     "decode_hex": (decode_hex, "Decode bounded hexadecimal data or a workspace file."),
     "decode_url": (decode_url, "Decode bounded percent-encoded URL data or a workspace file."),
+    "derive_artifact": (
+        derive_artifact,
+        "Decode one bounded source range into a content-addressed workspace artifact.",
+    ),
+    "compute_exact": (
+        compute_exact,
+        "Compute bounded exact arithmetic and byte operations without file or process access.",
+    ),
     "list_zip": (list_zip, "List ZIP members and flag unsafe or oversized entries."),
     "list_tar": (list_tar, "List TAR members and flag unsafe or oversized entries."),
     "extract_archive": (extract_archive, "Safely extract a ZIP or TAR into the workspace."),
@@ -1525,6 +1540,25 @@ ALIASES = {
     "hash": "inspect_file",
     "binary": "inspect_binary",
 }
+
+# Keep specialized compatibility operations dispatchable, but show the model one
+# compact default surface. The facade covers passive format inspection; only
+# semantically distinct search, transform, materialization, symbol, and filesystem
+# operations remain separate.
+AGENT_TOOL_NAMES = (
+    "list_workspace",
+    "inspect_artifact",
+    "search_text",
+    "derive_artifact",
+    "decode_base64",
+    "decode_hex",
+    "decode_url",
+    "compute_exact",
+    "extract_archive",
+    "decompress_gzip",
+    "elf_symbols",
+    "inspect_filesystem",
+)
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -1591,20 +1625,57 @@ def tool_schemas() -> list[dict[str, Any]]:
             "filesystem_path": {"type": "string"},
         },
     }
-    extension_specs = {spec["name"]: spec for spec in [*binary_tool_specs(), *media_tool_specs()]}
-    return [
-        extension_specs.get(
-            name,
-            {
-                "name": name,
-                "description": description,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": schemas.get(name, {}),
-                    "additionalProperties": False,
+    extension_specs = {
+        spec["name"]: spec
+        for spec in [
+            artifact_tool_spec(),
+            derive_tool_spec(),
+            exact_tool_spec(),
+            *binary_tool_specs(),
+            *media_tool_specs(),
+        ]
+    }
+
+    required_fields = {
+        "inspect_file": ["path"],
+        "read_bytes": ["path"],
+        "read_text": ["path"],
+        "search_text": ["path", "query"],
+        "extract_strings": ["path"],
+        "list_zip": ["path"],
+        "list_tar": ["path"],
+        "extract_archive": ["path"],
+        "decompress_gzip": ["path", "destination"],
+        "image_metadata": ["path"],
+        "audio_metadata": ["path"],
+        "inspect_binary": ["path"],
+        "inspect_filesystem": ["path"],
+    }
+
+    def generic_spec(name: str, description: str) -> dict[str, Any]:
+        input_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": schemas.get(name, {}),
+            "additionalProperties": False,
+        }
+        if name in required_fields:
+            input_schema["required"] = required_fields[name]
+        if name in {"decode_base64", "decode_hex", "decode_url"}:
+            input_schema["oneOf"] = [{"required": ["data"]}, {"required": ["path"]}]
+        if name == "inspect_filesystem":
+            input_schema["oneOf"] = [
+                {
+                    "properties": {"action": {"enum": ["superblock", "deleted"]}},
                 },
-            },
-        )
+                {
+                    "properties": {"action": {"enum": ["list", "stat", "read"]}},
+                    "required": ["action", "filesystem_path"],
+                },
+            ]
+        return {"name": name, "description": description, "inputSchema": input_schema}
+
+    return [
+        extension_specs.get(name, generic_spec(name, description))
         for name, (_, description) in TOOLS.items()
     ]
 
@@ -1672,7 +1743,8 @@ class ToolRegistry:
                 self.workspace = Workspace(workspace.root, max_workspace_bytes=max_workspace_bytes)
         else:
             self.workspace = Workspace(workspace, max_workspace_bytes=max_workspace_bytes)
-        self._tools = tuple(tool_schemas())
+        schemas = {spec["name"]: spec for spec in tool_schemas()}
+        self._tools = tuple(schemas[name] for name in AGENT_TOOL_NAMES)
         self._dispatch_lock = threading.Lock()
 
     def _remove_added_entries(self, before: set[str]) -> None:
@@ -1728,6 +1800,7 @@ class ToolRegistry:
 
 
 __all__ = [
+    "AGENT_TOOL_NAMES",
     "ALIASES",
     "TOOLS",
     "ToolError",
