@@ -72,6 +72,12 @@ active challenges; it is not a host filesystem quota. Per-artifact, aggregate-so
 tool-output, deadline, and PID bounds remain. SQLite/WAL growth, auth-home refresh files, and
 Docker logs are separate stores; provide host capacity and log handling for them.
 
+SQLite also stores content-addressed, immutable host-observation manifests for bounded episode
+carry. That evidence is run-scoped and sanitized, but the database remains private runtime state:
+candidate fingerprints and other operational records are intentionally not a publishable report.
+After preserving approved sanitized repository evidence, remove each live run's exact state and
+workspace while retaining the dedicated auth home.
+
 The 180-second stop grace covers bounded TCP-open drain, the 45-second receipt-bound instance
 cleanup window, native-process termination, and scheduling margin. Rapido starts recovery before
 new work, drains bounded operations before deleting workspaces, and persists ambiguous effects.

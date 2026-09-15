@@ -19,6 +19,14 @@ from typing import Any, Protocol
 
 from .board import BoardClient, BoardError, BoardTransportError, Challenge, Verdict
 from .config import RuntimeConfig
+from .evidence import (
+    EvidenceBatch,
+    EvidenceError,
+    HostObservation,
+    RunEvidence,
+    project_tool_observation,
+    seal_unavailable_attempt_evidence,
+)
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_PRIOR_ATTEMPTS,
@@ -124,8 +132,10 @@ class ToolCallEvidence:
     name: str
     success: bool | None
     source_bound: bool
+    candidate_sensitive: bool
     candidate_sha256s: tuple[str, ...]
     supplied_candidate_sha256s: tuple[str, ...]
+    observation: HostObservation
 
 
 @dataclass(frozen=True)
@@ -195,12 +205,16 @@ def _durable_tool_name(value: object) -> str:
     return value if isinstance(value, str) and value in _DURABLE_TOOL_NAMES else "unknown_tool"
 
 
-def _normalize_tool_calls(raw_calls: object) -> tuple[int, tuple[ToolCallEvidence, ...]]:
+def _normalize_tool_calls(
+    raw_calls: object,
+) -> tuple[int, tuple[ToolCallEvidence, ...], bool]:
     if not isinstance(raw_calls, list):
-        return 0, ()
+        return 0, (), False
     evidence: list[ToolCallEvidence] = []
+    complete = True
     for call in raw_calls:
         if not isinstance(call, dict) or not isinstance(call.get("success"), (bool, type(None))):
+            complete = False
             continue
         raw_hashes = call.get("candidate_sha256s", ())
         hashes = (
@@ -222,16 +236,45 @@ def _normalize_tool_calls(raw_calls: object) -> tuple[int, tuple[ToolCallEvidenc
             if isinstance(raw_supplied_hashes, (list, tuple))
             else ()
         )
-        evidence.append(
-            ToolCallEvidence(
-                name=_durable_tool_name(call.get("name")),
-                success=call.get("success"),
-                source_bound=call.get("source_bound") is True,
+        name = _durable_tool_name(call.get("name"))
+        success = call.get("success")
+        source_bound = call.get("source_bound") is True
+        raw_candidate_sensitive = call.get("candidate_sensitive")
+        candidate_sensitive = (
+            raw_candidate_sensitive is True or bool(hashes) or bool(supplied_hashes)
+        )
+        if raw_candidate_sensitive is not None and type(raw_candidate_sensitive) is not bool:
+            complete = False
+        observation = call.get("host_observation")
+        if not isinstance(observation, HostObservation) or (
+            observation.tool != name
+            or observation.success is not success
+            or observation.source_bound is not source_bound
+            or observation.candidate_sensitive is not candidate_sensitive
+            or observation.candidate_sha256s != hashes
+            or observation.supplied_candidate_sha256s != supplied_hashes
+        ):
+            complete = False
+            observation = project_tool_observation(
+                name,
+                success=success,
+                source_bound=source_bound,
                 candidate_sha256s=hashes,
                 supplied_candidate_sha256s=supplied_hashes,
+                candidate_sensitive=candidate_sensitive,
+            )
+        evidence.append(
+            ToolCallEvidence(
+                name=name,
+                success=success,
+                source_bound=source_bound,
+                candidate_sensitive=candidate_sensitive,
+                candidate_sha256s=hashes,
+                supplied_candidate_sha256s=supplied_hashes,
+                observation=observation,
             )
         )
-    return len(raw_calls), tuple(evidence)
+    return len(raw_calls), tuple(evidence), complete and len(evidence) == len(raw_calls)
 
 
 def _artifact_name(file_ref: str, index: int) -> str:
@@ -305,6 +348,7 @@ class Orchestrator:
         self._slots = asyncio.Semaphore(config.concurrency)
         self._dynamic_slots = asyncio.Semaphore(config.dynamic_concurrency)
         self._submission_lock = asyncio.Lock()
+        self._run_evidence: RunEvidence | None = None
 
     async def _board_call(
         self, deadline: float, function: Any, /, *args: Any, **kwargs: Any
@@ -830,6 +874,9 @@ class Orchestrator:
         target_endpoints: tuple[TargetEndpoint, ...] = (),
     ) -> LaneResult:
         attempt_id = f"{run_id}:{challenge.id}:{episode}:{lane}"
+        run_evidence = self._run_evidence
+        if run_evidence is None or run_evidence.run_id != run_id:
+            run_evidence = RunEvidence.open(self.state, run_id)
         self.state.start_attempt(
             attempt_id,
             run_id,
@@ -842,7 +889,32 @@ class Orchestrator:
         started = time.monotonic()
         tool_call_count = 0
         tool_calls: tuple[ToolCallEvidence, ...] = ()
+        tool_evidence_complete = False
         target_registry = None
+
+        def finish_attempt(
+            status: str,
+            *,
+            evidence_gap: str | None = None,
+            **fields: Any,
+        ) -> None:
+            complete = tool_evidence_complete and evidence_gap is None
+            gap = evidence_gap or (None if complete else "provenance_incomplete")
+            run_evidence.commit(
+                attempt_id,
+                EvidenceBatch(
+                    observations=tuple(call.observation for call in tool_calls),
+                    complete=complete,
+                    gap=gap,
+                ),
+            )
+            try:
+                self.state.finish_attempt(attempt_id, status, **fields)
+            except ValueError as exc:
+                raise EvidenceError(
+                    "sealed attempt could not transition to terminal state"
+                ) from exc
+
         try:
             if target_endpoints:
                 target_registry = TargetToolRegistry(
@@ -874,6 +946,11 @@ class Orchestrator:
                 lane,
                 episode=episode,
                 prior_attempts=tuple(prior_attempts),
+                prior_observations=run_evidence.carry(
+                    challenge.id,
+                    lane,
+                    before_episode=episode,
+                ),
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -904,7 +981,9 @@ class Orchestrator:
                 ),
                 timeout=timeout_seconds + 5,
             )
-            tool_call_count, tool_calls = _normalize_tool_calls(turn.tool_calls)
+            tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
+                turn.tool_calls
+            )
             if turn.status != "completed":
                 raise NativeTurnIncompleteError(
                     turn.status,
@@ -928,8 +1007,7 @@ class Orchestrator:
                         "candidate originated in model-supplied tool input"
                     )
             terminal = "candidate" if finding.status == "candidate" else finding.status
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
                 summary=finding.summary,
                 candidate=finding.candidate,
@@ -944,10 +1022,12 @@ class Orchestrator:
             timeout_calls = getattr(getattr(exc, "result", None), "tool_calls", None)
             tool_count_known = isinstance(timeout_calls, list)
             if tool_count_known:
-                tool_call_count, tool_calls = _normalize_tool_calls(timeout_calls)
-            self.state.finish_attempt(
-                attempt_id,
+                tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
+                    timeout_calls
+                )
+            finish_attempt(
                 terminal,
+                evidence_gap="turn_timeout",
                 summary="native turn exceeded deadline",
                 tool_count=tool_call_count,
                 failure_class="timeout",
@@ -962,10 +1042,15 @@ class Orchestrator:
                     "tool_call_count": tool_call_count if tool_count_known else None,
                 },
             )
-        except asyncio.CancelledError:
-            self.state.finish_attempt(
-                attempt_id,
+        except asyncio.CancelledError as exc:
+            cancelled_calls = getattr(getattr(exc, "result", None), "tool_calls", None)
+            if isinstance(cancelled_calls, list):
+                tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
+                    cancelled_calls
+                )
+            finish_attempt(
                 "cancelled",
+                evidence_gap="turn_cancelled",
                 summary="run shutdown",
                 tool_count=tool_call_count,
                 failure_class="cancelled",
@@ -974,8 +1059,7 @@ class Orchestrator:
         except CandidateProvenanceError:
             finding = None
             terminal = "unsolved"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
                 summary="flag-shaped hypothesis rejected by provenance policy",
                 tool_count=tool_call_count,
@@ -994,8 +1078,7 @@ class Orchestrator:
         except SolverOutputError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
                 summary="native turn failed safely",
                 tool_count=tool_call_count,
@@ -1014,8 +1097,7 @@ class Orchestrator:
         except NativeTurnIncompleteError as exc:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
                 summary="native turn failed safely",
                 tool_count=tool_call_count,
@@ -1033,12 +1115,14 @@ class Orchestrator:
                     "failure_class": exc.failure_class,
                 },
             )
+        except EvidenceError:
+            raise
         except RuntimeError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
+                evidence_gap="turn_failed",
                 summary="native turn failed safely",
                 tool_count=tool_call_count,
                 failure_class="native_runtime",
@@ -1056,9 +1140,9 @@ class Orchestrator:
         except OSError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
+                evidence_gap="turn_failed",
                 summary="native turn failed safely",
                 tool_count=tool_call_count,
                 failure_class="operating_system",
@@ -1076,9 +1160,9 @@ class Orchestrator:
         except ValueError:
             finding = None
             terminal = "failed"
-            self.state.finish_attempt(
-                attempt_id,
+            finish_attempt(
                 terminal,
+                evidence_gap="turn_failed",
                 summary="native turn failed safely",
                 tool_count=tool_call_count,
                 failure_class="invalid_value",
@@ -1285,6 +1369,7 @@ class Orchestrator:
                                 "name": call.name,
                                 "success": call.success,
                                 "source_bound": call.source_bound,
+                                "candidate_sensitive": call.candidate_sensitive,
                                 "candidate_sha256s": list(
                                     call.candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
                                 ),
@@ -1550,6 +1635,7 @@ class Orchestrator:
         )
         try:
             self.state.recover_interrupted()
+            seal_unavailable_attempt_evidence(self.state)
         except BaseException:
             self.state.release_supervisor()
             raise
@@ -1559,6 +1645,7 @@ class Orchestrator:
             self._ensure_private_work_root()
             run_root.mkdir(mode=0o700, exist_ok=False)
             self.state.start_run(run_id, self.config.public_record())
+            self._run_evidence = RunEvidence.open(self.state, run_id)
         except BaseException:
             self.state.release_supervisor()
             raise
@@ -1641,6 +1728,7 @@ class Orchestrator:
             try:
                 await self._drain_runtime_close()
             finally:
+                self._run_evidence = None
                 self.state.release_supervisor()
         counts = {name: 0 for name in ("solved", "candidate", "unsolved", "unsupported", "error")}
         for terminal in outcomes.values():

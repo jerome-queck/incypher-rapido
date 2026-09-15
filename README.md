@@ -97,7 +97,11 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 
 The effective non-secret configuration is printed by `config`. Never publish state/work folders:
 attempt rows can contain candidate values, while submission records retain fingerprints and
-verdicts. `RAPIDO_CONCURRENCY` must cover
+verdicts. Each later episode receives only bounded, immutable, same-run/same-challenge/same-lane
+host observations from earlier attempts, including safe structural facts from a candidate
+disagreement. Raw tool payloads, payload-derived digests from candidate observations, authorities,
+paths, credentials, and candidate fingerprints are not carried into that prompt.
+`RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 
 ## Stop, restart, and cleanup
