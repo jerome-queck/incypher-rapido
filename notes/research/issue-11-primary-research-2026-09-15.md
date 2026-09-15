@@ -271,7 +271,8 @@ validate exact manifest/schema/trigger versions. Final exact-range review then r
 additional fail-closed boundaries: Python 3.11 cancellation metadata loss, sensitivity lost through
 quota omission, and binary/Base64 candidate fingerprinting. All three now have deterministic
 regressions. A reviewer-created Sol/xhigh sublane was stopped immediately and supplied no accepted
-verdict or patch.
+verdict or patch. A fresh no-subdelegation `gpt-daybreak-blue-latest`/`xhigh` review then passed 14
+focused regressions on both Python 3.11 and 3.12 with no remaining finding.
 
 A subsequent immutable Daybreak/xhigh security diff scan of commit `3bceeb2` closed all four runtime
 surfaces. It validated one P3 candidate-fingerprint oracle in non-candidate terminal carry and rejected
