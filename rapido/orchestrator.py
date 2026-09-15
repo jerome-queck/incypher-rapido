@@ -968,8 +968,8 @@ class Orchestrator:
                         "omitted_for_prompt_budget": omitted_for_budget,
                     },
                 )
-            turn = await asyncio.wait_for(
-                self.runtime.solve(
+            async with asyncio.timeout(timeout_seconds + 5):
+                turn = await self.runtime.solve(
                     workspace,
                     turn_prompt,
                     developer_instructions=DEVELOPER_INSTRUCTIONS,
@@ -978,9 +978,7 @@ class Orchestrator:
                     output_schema=SOLVER_OUTPUT_SCHEMA,
                     timeout=timeout_seconds,
                     tool_registry=target_registry,
-                ),
-                timeout=timeout_seconds + 5,
-            )
+                )
             tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
                 turn.tool_calls
             )

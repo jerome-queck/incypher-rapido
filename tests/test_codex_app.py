@@ -1304,6 +1304,52 @@ async def test_independent_encoded_target_result_remains_transform_source_bound(
 
 
 @run_async
+async def test_binary_base64_target_candidate_marks_observation_sensitive(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    candidate = "INCYPHER{binary-candidate-oracle}"
+    encoded = base64.b64encode(b"\x00\x01\x02" + candidate.encode()).decode()
+
+    class BinaryTargetRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "http_request"
+            assert arguments == {"path": "/binary"}
+            return {"status": 200, "data_base64": encoded}
+
+    registry = BinaryTargetRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 144,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "144",
+                "tool": {"name": "http_request"},
+                "arguments": {"path": "/binary"},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    call = state.tool_calls[0]
+    assert call["candidate_sensitive"] is True
+    assert hashlib.sha256(candidate.encode()).hexdigest() in call["candidate_sha256s"]
+    assert isinstance(call["host_observation"], HostObservation)
+    assert call["host_observation"].candidate_sensitive is True
+    await client.close()
+
+
+@run_async
 async def test_unexamined_standard_base64_path_suffix_fails_target_evidence_closed(
     fake_process: FakeProcess, tmp_path: Path
 ) -> None:

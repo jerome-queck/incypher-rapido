@@ -255,7 +255,8 @@ immutable host-recorded provenance but still semantically untrusted, requires re
 decisive facts, and budgets it inside the 128-KiB total prompt cap. It cannot satisfy current-turn
 candidate provenance.
 
-Post-review integration checks pass 582 tests with one platform-conditional skip, Ruff, formatting,
+Post-review integration checks pass 586 tests with one platform-conditional skip on both Python
+3.11 and 3.12, plus Ruff, formatting,
 and whitespace validation. Effective routing: competing architecture designs
 `gpt-6-astra`/`xhigh`; demanding implementation and independent review
 `gpt-daybreak-blue-latest`/`xhigh`; black-box acceptance fixtures `gpt-5.6-luna`/`xhigh`. The Astra
@@ -264,18 +265,23 @@ architecture dispatch succeeded on its first attempt, so no fallback or retry oc
 Independent Daybreak/xhigh review reproduced six initial defects and four fail-closed follow-ups.
 The integrated corrections retain candidate-disagreement structure without a digest oracle, budget
 all carry and Board-valid descriptions inside the total prompt cap, preserve completed observations
-on cancellation, retain safe target status/count/payload fingerprints, reject floats before
-persistence, and validate exact manifest/schema/trigger versions. A final independent reproduction
-pass reported no remaining findings. No dispatch used fallback.
+on cancellation across Python 3.11 and 3.12, retain safe target status/count/payload fingerprints,
+scan decoded binary target payloads before fingerprint carry, reject floats before persistence, and
+validate exact manifest/schema/trigger versions. Final exact-range review then reproduced three
+additional fail-closed boundaries: Python 3.11 cancellation metadata loss, sensitivity lost through
+quota omission, and binary/Base64 candidate fingerprinting. All three now have deterministic
+regressions. A reviewer-created Sol/xhigh sublane was stopped immediately and supplied no accepted
+verdict or patch.
 
 A subsequent immutable Daybreak/xhigh security diff scan of commit `3bceeb2` closed all four runtime
 surfaces. It validated one P3 candidate-fingerprint oracle in non-candidate terminal carry and rejected
 three concurrency/resource candidates with deterministic reproductions and measured bounds. The fix
-persists a private fail-closed candidate-sensitivity marker, including incomplete scans, and derives
-attempt-wide public digest redaction from that marker rather than terminal status. The original oracle
-no longer reproduces across all seven carryable terminal statuses; ordinary structural carry retains
-its digests. One Astra/xhigh threat-model attempt failed to converge and was interrupted; routing then
-switched directly to Daybreak/xhigh with no Astra retry or silent fallback.
+persists a private fail-closed candidate-sensitivity marker before any quota omission, including
+incomplete scans and decoded binary target results, and derives attempt-wide public digest redaction
+from that marker rather than terminal status. The original oracle no longer reproduces across all
+seven carryable terminal statuses or any quota path; ordinary structural carry retains its digests.
+One Astra/xhigh threat-model attempt failed to converge and was interrupted; routing then switched
+directly to Daybreak/xhigh with no Astra retry or silent fallback.
 
 ## Sources
 

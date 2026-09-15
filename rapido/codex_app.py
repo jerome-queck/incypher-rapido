@@ -1426,15 +1426,27 @@ class CodexAppClient:
                     source_taint_complete = False
             if call_record is not None:
                 call_record["success"] = True
-                result_candidates: list[str] = []
-                result_candidates_complete = True
-                for match in FLAG_RE.finditer(encoded_result):
-                    if len(result_candidates) >= MAX_TAINT_CANDIDATES:
-                        result_candidates_complete = False
-                        break
-                    candidate = match.group()
-                    if candidate not in result_candidates:
-                        result_candidates.append(candidate)
+                if (
+                    observation_result is not None
+                    and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                ):
+                    result_scan = _argument_scan(observation_result)
+                    if not result_scan.invalid_unicode:
+                        _expand_target_taint(result_scan)
+                    result_candidates = sorted(result_scan.candidates)
+                    result_candidates_complete = (
+                        result_scan.complete and not result_scan.invalid_unicode
+                    )
+                else:
+                    result_candidates = []
+                    result_candidates_complete = True
+                    for match in FLAG_RE.finditer(encoded_result):
+                        if len(result_candidates) >= MAX_TAINT_CANDIDATES:
+                            result_candidates_complete = False
+                            break
+                        candidate = match.group()
+                        if candidate not in result_candidates:
+                            result_candidates.append(candidate)
                 call_record["candidate_sensitive"] = bool(
                     call_record["candidate_sensitive"]
                     or result_candidates

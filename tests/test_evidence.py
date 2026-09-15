@@ -200,7 +200,7 @@ def test_newer_evidence_schema_fails_closed(tmp_path: Path) -> None:
             )
             """
         )
-        connection.execute("INSERT INTO evidence_schema VALUES (1, 3)")
+        connection.execute("INSERT INTO evidence_schema VALUES (1, 4)")
     with pytest.raises(EvidenceConflictError, match="version conflict"):
         RunEvidence.open(state, "run-a")
     tables = {
@@ -243,7 +243,7 @@ def test_exact_empty_initial_schema_stub_recovers_atomically(tmp_path: Path) -> 
         state._connection.execute(
             "SELECT schema_version FROM evidence_schema WHERE singleton=1"
         ).fetchone()[0]
-        == 2
+        == 3
     )
     state.close()
 
@@ -469,6 +469,43 @@ def test_candidate_sensitive_manifest_redacts_all_digests_but_retains_safe_facts
     state.close()
 
 
+@pytest.mark.parametrize(
+    "limits",
+    (
+        EvidenceLimits(max_observations=1),
+        EvidenceLimits(max_object_bytes=1),
+        EvidenceLimits(max_attempt_bytes=1),
+    ),
+)
+def test_quota_omitted_candidate_sensitive_observation_taints_manifest(
+    tmp_path: Path, limits: EvidenceLimits
+) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    _attempt(state, "mixed-attempt")
+    ordinary = _observation("ordinary", source_sha256="b" * 64)
+    sensitive = HostObservation(
+        "inspect_file",
+        True,
+        True,
+        {"format": "sensitive", "size": 9, "source_sha256": "a" * 64},
+        candidate_sensitive=True,
+    )
+    evidence = RunEvidence.open(state, "run-a", limits)
+    manifest = evidence.commit("mixed-attempt", EvidenceBatch((ordinary, sensitive)))
+    state.finish_attempt("mixed-attempt", "unsolved")
+
+    assert manifest.candidate_sensitive is True
+    assert "candidate_sensitive" not in manifest.as_dict()
+    assert manifest.omitted_count > 0
+    rendered = _render(evidence.carry(7, 0, 1))
+    assert manifest.digest not in rendered
+    assert '"digest"' not in rendered
+    assert "sha256" not in rendered
+    assert "a" * 64 not in rendered
+    assert "b" * 64 not in rendered
+    state.close()
+
+
 def test_projector_preserves_structure_but_not_raw_or_authority() -> None:
     candidate = "INCYPHER{projector-sentinel}"
     artifact = project_tool_observation(
@@ -670,7 +707,7 @@ def test_manifest_rejects_canonical_newer_document_with_valid_domain_digest(
         "SELECT payload_json FROM evidence_manifests WHERE run_id='run-a' AND attempt_id='a0'"
     ).fetchone()
     document = json.loads(bytes(row["payload_json"]))
-    document["schema_version"] = 3
+    document["schema_version"] = 4
     payload = json.dumps(
         document,
         ensure_ascii=False,

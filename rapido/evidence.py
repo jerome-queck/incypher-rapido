@@ -23,7 +23,7 @@ from typing import Any, TypeAlias
 from .board import FLAG_RE
 from .state import StateStore
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _OBJECT_DOMAIN = b"rapido-host-evidence-object-v1\0"
 _MANIFEST_DOMAIN = b"rapido-host-evidence-manifest-v1\0"
 _CONFIG_DOMAIN = b"rapido-host-evidence-config-v1\0"
@@ -32,6 +32,7 @@ _TARGET_PAYLOAD_DOMAIN = _TARGET_PAYLOAD_DOMAIN_LABEL.encode() + b"\0"
 _MANIFEST_DOCUMENT_KEYS = frozenset(
     {
         "attempt_id",
+        "candidate_sensitive",
         "challenge_id",
         "committed_count",
         "complete",
@@ -489,6 +490,7 @@ class EvidenceManifest:
     item_bytes: int
     omissions: tuple[tuple[str, int], ...]
     items: tuple[EvidenceItem, ...]
+    candidate_sensitive: bool = False
     carry_omitted_items: int = 0
     carry_redact_digests: bool = False
 
@@ -1258,6 +1260,7 @@ def seal_unavailable_attempt_evidence(state: StateStore) -> int:
             )
             document = {
                 "attempt_id": attempt["id"],
+                "candidate_sensitive": False,
                 "challenge_id": attempt["challenge_id"],
                 "committed_count": 0,
                 "complete": False,
@@ -1416,6 +1419,9 @@ class RunEvidence:
         attempt = self._attempt(attempt_id)
         objects: list[tuple[int, str, str, bytes]] = []
         omissions = {"attempt_bytes": 0, "object_bytes": 0, "observation_limit": 0}
+        candidate_sensitive = any(
+            observation.candidate_sensitive for observation in batch.observations
+        )
         item_bytes = 0
         for ordinal, observation in enumerate(batch.observations):
             if ordinal >= self.limits.max_observations:
@@ -1434,6 +1440,7 @@ class RunEvidence:
 
         manifest_document = {
             "attempt_id": attempt_id,
+            "candidate_sensitive": candidate_sensitive,
             "challenge_id": attempt["challenge_id"],
             "committed_count": len(objects),
             "complete": batch.complete and not any(omissions.values()),
@@ -1624,6 +1631,7 @@ class RunEvidence:
             or document["schema_version"] != _SCHEMA_VERSION
             or not isinstance(document.get("attempt_id"), str)
             or not isinstance(document.get("run_id"), str)
+            or type(document.get("candidate_sensitive")) is not bool
             or type(document.get("complete")) is not bool
             or any(
                 type(document.get(key)) is not int or document[key] < 0 for key in integer_fields
@@ -1743,6 +1751,7 @@ class RunEvidence:
             item_bytes=row["item_bytes"],
             omissions=tuple(sorted((key, int(value)) for key, value in omissions.items())),
             items=tuple(items),
+            candidate_sensitive=document["candidate_sensitive"],
         )
 
     @staticmethod
@@ -1787,8 +1796,10 @@ class RunEvidence:
         available = []
         for row in rows:
             manifest = self._load_manifest(row["attempt_id"])
-            if row["status"] == "candidate" or any(
-                item._is_candidate_sensitive() for item in manifest.items
+            if (
+                row["status"] == "candidate"
+                or manifest.candidate_sensitive
+                or any(item._is_candidate_sensitive() for item in manifest.items)
             ):
                 manifest = replace(
                     manifest,
