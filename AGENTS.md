@@ -24,10 +24,10 @@
 
 - Run Board work through the final container with supervisor-owned credentials, bounded allowlisted access, and verified cleanup. Live solver runs are authorized to enable autonomous submission for candidates that satisfy the repository's qualification policy. Never manually enter or relay a flag, and never submit a deliberate probe.
 - Use up to 8 CPUs, 24 GiB RAM, and 500 GiB external storage when measurement supports it. Storage has no smaller artificial quota.
-- Start every live solver run with a newly created empty state/workspace, download challenge material afresh, and reuse no prior attempt database, artifact, or evidence. After sanitized evidence is durable, delete that run's containers, volumes, and workspaces while preserving authentication and repository evidence. Analyze all 15 challenges even when the Board reports one solved; use the remote solved mark only to prevent duplicate submission.
+- Start every live solver run with a newly created empty state/workspace, download challenge material afresh, and reuse no prior attempt database, artifact, answer, or evidence. After sanitized evidence is durable, delete that run's containers, volumes, and workspaces while preserving authentication and repository evidence. Score every live run from 0/15: analyze and submit freshly derived qualified candidates for all 15 challenges, including challenges the Board already marks solved. Count only a candidate-validating verdict or independent deterministic verification, never a generic already-solved response.
 - Live-verify Board assumptions when needed. Increase dynamic-instance concurrency cautiously until an observed or documented boundary.
 
 ## Completion
 
-- Pre-register a numeric solve-improvement threshold against the prior 1/15 Board baseline before the final run.
+- Pre-register a numeric run-local solve-improvement threshold against the prior 1/15 autonomous baseline before the final run.
 - Finish only after an unattended Daybreak/xhigh final-image run attempts all 15 challenges from fresh solver state, meets that threshold, and shows no manual answer relay, stuck work, leaked process/instance, or lifecycle regression.
