@@ -16,12 +16,13 @@ services:
         source: /private/path/rapido-codex-home
         target: /auth/codex
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=64m
+      - /tmp:rw,noexec,nosuid,nodev
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    cpus: 2.0
-    mem_limit: 2g
+    cpus: 8.0
+    mem_limit: 24g
     pids_limit: 256
     stop_signal: SIGTERM
+    stop_grace_period: 180s

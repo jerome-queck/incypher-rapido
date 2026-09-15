@@ -9,11 +9,13 @@ tool request shape Rapido exposes.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import inspect
 import json
 import os
+import urllib.parse
 from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -107,18 +109,46 @@ INTERRUPT_TIMEOUT_SECONDS = 2.0
 
 _ARTIFACT_TOOLS = {
     "audio_metadata",
+    "decompress_gzip",
+    "dicom_metadata",
+    "disassemble_elf",
+    "elf_symbols",
     "extract_archive",
     "extract_strings",
     "image_metadata",
     "inspect_binary",
+    "inspect_elf",
+    "inspect_filesystem",
     "inspect_file",
     "list_tar",
     "list_zip",
     "read_bytes",
     "read_text",
     "search_text",
+    "wav_analyze",
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
+_TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
+_TURN_FAILURE_CLASSES = {
+    "contextWindowExceeded": "context_window_exceeded",
+    "sessionBudgetExceeded": "session_budget_exceeded",
+    "usageLimitExceeded": "usage_limit_exceeded",
+    "rateLimitExceeded": "rate_limit_exceeded",
+    "serverOverloaded": "server_overloaded",
+    "cyberPolicy": "cyber_policy",
+    "misalignmentPolicyViolation": "misalignment_policy_violation",
+    "internalServerError": "internal_server_error",
+    "unauthorized": "unauthorized",
+    "badRequest": "bad_request",
+    "threadRollbackFailed": "thread_rollback_failed",
+    "sandboxError": "sandbox_error",
+    "other": "other",
+    "httpConnectionFailed": "http_connection_failed",
+    "responseStreamConnectionFailed": "response_stream_connection_failed",
+    "responseStreamDisconnected": "response_stream_disconnected",
+    "responseTooManyFailedAttempts": "response_too_many_failed_attempts",
+    "activeTurnNotSteerable": "active_turn_not_steerable",
+}
 
 
 class CodexAppError(RuntimeError):
@@ -195,6 +225,7 @@ class TurnResult:
     items: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
     structured_output: Any = None
+    failure_class: str | None = None
     timed_out: bool = False
     interrupt_sent: bool = False
     process_fenced: bool = False
@@ -203,6 +234,25 @@ class TurnResult:
     @property
     def text(self) -> str:
         return self.agent_message
+
+
+def _turn_failure_class(completed: Mapping[str, Any]) -> str | None:
+    status = completed.get("status")
+    if status == "completed":
+        return None
+    if status == "interrupted":
+        return "interrupted"
+    error = completed.get("error")
+    if not isinstance(error, Mapping):
+        return "unknown"
+    info = error.get("codexErrorInfo")
+    if isinstance(info, str):
+        return _TURN_FAILURE_CLASSES.get(info, "unknown")
+    if isinstance(info, Mapping) and len(info) == 1:
+        key = next(iter(info))
+        if isinstance(key, str):
+            return _TURN_FAILURE_CLASSES.get(key, "unknown")
+    return "unknown"
 
 
 class WorkspaceThreadRegistry:
@@ -248,6 +298,9 @@ class _TurnState:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     provenance_outputs: list[str] = field(default_factory=list)
     provenance_bytes: int = 0
+    tainted_candidates: set[str] = field(default_factory=set)
+    tainted_target_inputs: set[str] = field(default_factory=set)
+    tool_request_active: bool = False
     last_event: dict[str, Any] = field(default_factory=dict)
 
 
@@ -299,6 +352,8 @@ def _source_bound_tool_call(
     state: _TurnState | None, name: str, arguments: Mapping[str, Any]
 ) -> bool:
     canonical = ALIASES.get(name, name)
+    if canonical in _TARGET_OBSERVATION_TOOLS:
+        return True
     if canonical in _ARTIFACT_TOOLS and _artifact_relative_path(arguments.get("path")):
         return True
     if canonical not in _TRANSFORM_TOOLS or state is None:
@@ -306,7 +361,72 @@ def _source_bound_tool_call(
     if _artifact_relative_path(arguments.get("path")):
         return True
     data = arguments.get("data")
-    return isinstance(data, str) and any(data in output for output in state.provenance_outputs)
+    if not isinstance(data, str):
+        return False
+    if any(data in output for output in state.provenance_outputs):
+        return True
+    if canonical != "decode_hex":
+        return False
+    # ``bytes.fromhex`` deliberately accepts ASCII whitespace and hexadecimal is
+    # case-insensitive. Bind only a meaningful, otherwise exact compact hex value
+    # to an earlier host result; do not normalize punctuation or concatenate fields.
+    compact = data.translate(str.maketrans("", "", " \t\n\r\v\f"))
+    return (
+        len(compact) >= 16
+        and len(compact) % 2 == 0
+        and all(character in "0123456789abcdefABCDEF" for character in compact)
+        and any(compact.lower() in output.lower() for output in state.provenance_outputs)
+    )
+
+
+def _argument_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [item for child in value.values() for item in _argument_strings(child)]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [item for child in value for item in _argument_strings(child)]
+    return []
+
+
+def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[str]:
+    """Find candidate-shaped model input, including supported transport encodings."""
+    values = _argument_strings(arguments)
+    decoded_values = [urllib.parse.unquote(value) for value in values]
+    canonical = ALIASES.get(name, name)
+    data = arguments.get("data")
+    if canonical in {"http_request", "tcp_exchange"} and isinstance(data, str):
+        encoding = arguments.get("encoding", "utf8")
+        try:
+            if encoding == "base64":
+                decoded_values.append(base64.b64decode(data, validate=True).decode("utf-8"))
+            elif encoding == "hex":
+                decoded_values.append(bytes.fromhex(data).decode("utf-8"))
+            elif encoding == "utf8":
+                decoded_values.append(data)
+        except (UnicodeError, ValueError):
+            pass
+    return {
+        match.group() for value in [*values, *decoded_values] for match in FLAG_RE.finditer(value)
+    }
+
+
+def _target_provenance_output(
+    name: str,
+    encoded_result: str,
+    tainted_inputs: set[str],
+    tainted_candidates: set[str],
+) -> str:
+    canonical = ALIASES.get(name, name)
+    if canonical not in _TARGET_OBSERVATION_TOOLS:
+        return encoded_result
+    needles = {
+        *tainted_candidates,
+        *tainted_inputs,
+    }
+    for needle in sorted(needles, key=len, reverse=True):
+        encoded_result = encoded_result.replace(needle, "[model-supplied]")
+    return encoded_result
 
 
 class CodexAppClient:
@@ -743,11 +863,48 @@ class CodexAppClient:
                 },
             )
             return
+        if state.tool_request_active:
+            await self._send_response(
+                message_id,
+                result={
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": '{"error":{"code":"tool_busy","message":"one tool request is already active for this turn"}}',
+                        }
+                    ],
+                },
+            )
+            return
+        state.tool_request_active = True
+        current_task = asyncio.current_task()
+        if current_task is None:
+            state.tool_request_active = False
+            await self._send_response(
+                message_id,
+                error={"code": -32603, "message": "tool request task unavailable"},
+            )
+            return
+        current_task.add_done_callback(
+            lambda _task, turn_state=state: setattr(turn_state, "tool_request_active", False)
+        )
         source_bound = _source_bound_tool_call(state, name, arguments)
+        current_supplied = _supplied_candidate_values(name, arguments) if source_bound else set()
+        canonical_name = ALIASES.get(name, name)
+        if canonical_name in _TARGET_OBSERVATION_TOOLS:
+            state.tainted_candidates.update(current_supplied)
+            state.tainted_target_inputs.update(
+                value for value in _argument_strings(arguments) if len(value) >= 8
+            )
+        supplied_candidates = {*state.tainted_candidates, *current_supplied}
         call_record: dict[str, Any] | None = {
             "name": name,
             "success": None,
             "source_bound": source_bound,
+            "supplied_candidate_sha256s": sorted(
+                hashlib.sha256(value.encode()).hexdigest() for value in current_supplied
+            ),
         }
         state.tool_calls.append(call_record)
         try:
@@ -763,8 +920,15 @@ class CodexAppClient:
                 except asyncio.CancelledError:
                     # Python worker threads cannot be killed. Drain this bounded tool
                     # before close returns so workspace cleanup cannot race it.
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:  # noqa: BLE001 - preserve caller cancellation
+                            break
                     with suppress(Exception):
-                        await worker
+                        worker.result()
                     raise
             if inspect.isawaitable(result):
                 result = await result
@@ -779,12 +943,19 @@ class CodexAppClient:
                     {
                         hashlib.sha256(match.group().encode()).hexdigest()
                         for match in list(FLAG_RE.finditer(encoded_result))[:20]
+                        if match.group() not in supplied_candidates | state.tainted_candidates
                     }
                 )
             if source_bound and state is not None:
-                encoded_bytes = len(encoded_result.encode("utf-8"))
+                provenance_result = _target_provenance_output(
+                    name,
+                    encoded_result,
+                    state.tainted_target_inputs,
+                    state.tainted_candidates,
+                )
+                encoded_bytes = len(provenance_result.encode("utf-8"))
                 if state.provenance_bytes + encoded_bytes <= MAX_PROVENANCE_BYTES:
-                    state.provenance_outputs.append(encoded_result)
+                    state.provenance_outputs.append(provenance_result)
                     state.provenance_bytes += encoded_bytes
         except ToolError as exc:
             error_payload = {"code": exc.code, "message": exc.message}
@@ -1170,25 +1341,34 @@ class CodexAppClient:
         selected_effort = reasoning_effort or self.reasoning_effort
         if not selected_model or not selected_effort:
             raise ModelValidationError("model and reasoning_effort are required")
+
+        # A concurrent lane can enter after the subprocess is assigned but
+        # before initialization completes.  This caller does not own that
+        # startup, so its cancellation or deadline must not fence the shared
+        # process underneath the owner lane.
+        if self._start_waiter is not None:
+            await asyncio.wait_for(asyncio.shield(self._start_waiter), timeout=remaining())
+
+        # ``start`` already fences an owner-side failure.  Keep every possible
+        # join path outside the thread-setup handler: two first entrants can
+        # both reach this call before either start coroutine claims ownership.
+        reader_stopped = self._reader_task is not None and self._reader_task.done()
+        process_stopped = self.process is not None and self.process.returncode is not None
+        if self.process is not None and (reader_stopped or process_stopped or not self._started):
+            await self._close_before_restart()
+        if self.process is None or not self._started:
+            await asyncio.wait_for(
+                self.start(
+                    model=selected_model,
+                    reasoning_effort=selected_effort,
+                    cwd=workspace,
+                    developer_instructions=developer_instructions,
+                    tool_registry=tool_registry,
+                    workspace_registry=workspace_registry,
+                ),
+                timeout=remaining(),
+            )
         try:
-            reader_stopped = self._reader_task is not None and self._reader_task.done()
-            process_stopped = self.process is not None and self.process.returncode is not None
-            if self.process is not None and (
-                reader_stopped or process_stopped or not self._started
-            ):
-                await self.close()
-            if self.process is None or not self._started:
-                await asyncio.wait_for(
-                    self.start(
-                        model=selected_model,
-                        reasoning_effort=selected_effort,
-                        cwd=workspace,
-                        developer_instructions=developer_instructions,
-                        tool_registry=tool_registry,
-                        workspace_registry=workspace_registry,
-                    ),
-                    timeout=remaining(),
-                )
             thread_id = await asyncio.wait_for(
                 self.start_thread(
                     model=selected_model,
@@ -1201,8 +1381,8 @@ class CodexAppClient:
                 timeout=remaining(),
             )
         except (TimeoutError, asyncio.CancelledError, CodexAppError):
-            # No turn id exists during setup, so interrupt is impossible. Fence the
-            # whole app-server before the caller can delete the lane workspace.
+            # No turn id exists during thread setup, so interrupt is impossible.
+            # Fence the app-server before the caller can delete the lane workspace.
             await self.close()
             raise
         turn_timeout = remaining()
@@ -1284,6 +1464,7 @@ class CodexAppClient:
             items=list(state.items),
             raw=dict(completed),
             structured_output=structured,
+            failure_class=_turn_failure_class(completed),
             timed_out=timed_out,
             interrupt_sent=interrupt_sent,
             process_fenced=process_fenced,
@@ -1334,6 +1515,19 @@ class CodexAppClient:
             task.cancel()
         if targets:
             await asyncio.gather(*targets, return_exceptions=True)
+
+    async def _close_before_restart(self) -> None:
+        """Finish stale-process cleanup before propagating caller cancellation."""
+        close_task = asyncio.create_task(self.close())
+        interrupted = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                interrupted = True
+        close_task.result()
+        if interrupted:
+            raise asyncio.CancelledError
 
     def _fail_pending(self, error: BaseException) -> None:
         for future in tuple(self._pending.values()):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import io
+import os
 import tarfile
 import tempfile
 import unittest
@@ -161,6 +163,120 @@ class ToolFixture(unittest.TestCase):
             "inside.txt",
         )
 
+    def test_gzip_decompression_is_bounded_and_non_overwriting(self) -> None:
+        with gzip.open(self.root / "disk.img.gz", "wb") as archive:
+            archive.write(b"filesystem image")
+        result = call_tool(
+            self.workspace,
+            "decompress_gzip",
+            {"path": "disk.img.gz", "destination": "expanded/disk.img"},
+        )
+        self.assertEqual(result["bytes"], 16)
+        self.assertEqual((self.root / "expanded/disk.img").read_bytes(), b"filesystem image")
+        self.assertEqual((self.root / "expanded/disk.img").stat().st_nlink, 1)
+        self.assertFalse(
+            any(path.name.startswith(".rapido-part-") for path in self.root.rglob("*"))
+        )
+        self.assertToolError(
+            "write_conflict",
+            call_tool,
+            self.workspace,
+            "decompress_gzip",
+            {"path": "disk.img.gz", "destination": "expanded/disk.img"},
+        )
+
+    def test_gzip_failure_cleanup_is_bounded_and_inode_owned(self) -> None:
+        (self.root / "invalid.gz").write_bytes(b"not gzip")
+        self.assertToolError(
+            "invalid_archive",
+            call_tool,
+            self.workspace,
+            "decompress_gzip",
+            {"path": "invalid.gz", "destination": "invalid/out"},
+        )
+        self.assertFalse((self.root / "invalid/out").exists())
+        self.assertFalse((self.root / "invalid").exists())
+
+        with gzip.open(self.root / "bomb.gz", "wb") as archive:
+            archive.write(b"12345678")
+        with mock.patch("rapido.tools.MAX_ARCHIVE_BYTES", 4):
+            self.assertToolError(
+                "archive_too_large",
+                call_tool,
+                self.workspace,
+                "decompress_gzip",
+                {"path": "bomb.gz", "destination": "bomb/out"},
+            )
+        self.assertFalse((self.root / "bomb/out").exists())
+
+        with gzip.open(self.root / "race.gz", "wb") as archive:
+            archive.write(b"payload")
+        destination = self.root / "race/out"
+        original_read = gzip.GzipFile.read
+        replaced = False
+
+        def replace_output(handle, *args, **kwargs):
+            nonlocal replaced
+            if not replaced:
+                destination.write_bytes(b"concurrent replacement")
+                replaced = True
+                raise OSError("synthetic read failure")
+            return original_read(handle, *args, **kwargs)
+
+        with mock.patch.object(gzip.GzipFile, "read", replace_output):
+            self.assertToolError(
+                "invalid_archive",
+                ToolRegistry(self.workspace).dispatch,
+                "decompress_gzip",
+                {"path": "race.gz", "destination": "race/out"},
+            )
+        self.assertEqual(destination.read_bytes(), b"concurrent replacement")
+
+        entries, _ = self.workspace.snapshot()
+        with mock.patch("rapido.tools.MAX_WORKSPACE_ENTRIES", len(entries) + 1):
+            self.assertToolError(
+                "workspace_quota",
+                ToolRegistry(self.workspace).dispatch,
+                "decompress_gzip",
+                {"path": "race.gz", "destination": "entry/quota/out"},
+            )
+        self.assertFalse((self.root / "entry").exists())
+
+    def test_encrypted_zip_requires_and_validates_password_before_writing(self) -> None:
+        fixture = base64.b64decode(
+            "UEsDBAoACQAAAFtTL13uf7cmIQAAABUAAAAJABwAcGxhaW4udHh0VVQJAAPurKhq7qyo"
+            "anV4CwABBPUBAAAEFAAAAIt6rrGjEoxMjOR8cji3ziWW71RDaasSyAcRj6dh033dClBL"
+            "Bwjuf7cmIQAAABUAAABQSwECHgMKAAkAAABbUy9d7n+3JiEAAAAVAAAACQAYAAAAAAAB"
+            "AAAApIEAAAAAcGxhaW4udHh0VVQFAAPurKhqdXgLAAEE9QEAAAQUAAAAUEsFBgAAAAAB"
+            "AAEATwAAAHQAAAAAAA=="
+        )
+        (self.root / "encrypted.zip").write_bytes(fixture)
+        self.assertToolError(
+            "archive_password_required",
+            call_tool,
+            self.workspace,
+            "extract_archive",
+            {"path": "encrypted.zip", "destination": "missing-password"},
+        )
+        self.assertFalse((self.root / "missing-password").exists())
+        self.assertToolError(
+            "archive_password_rejected",
+            call_tool,
+            self.workspace,
+            "extract_archive",
+            {"path": "encrypted.zip", "destination": "wrong-password", "password": "wrong"},
+        )
+        self.assertFalse((self.root / "wrong-password").exists())
+        call_tool(
+            self.workspace,
+            "extract_archive",
+            {"path": "encrypted.zip", "destination": "decrypted", "password": "test-pass"},
+        )
+        self.assertEqual(
+            (self.root / "decrypted" / "plain.txt").read_text(encoding="utf-8"),
+            "inside secret fixture",
+        )
+
     def test_archive_traversal_symlink_and_bomb_do_not_write(self) -> None:
         with zipfile.ZipFile(self.root / "evil.zip", "w") as archive:
             archive.writestr("../outside.txt", "do not write")
@@ -292,6 +408,83 @@ class ToolFixture(unittest.TestCase):
         self.assertEqual(stderr, b"")
         self.assertTrue(truncated)
         self.assertFalse(timed_out)
+
+    def test_filesystem_tool_uses_fixed_read_only_command_and_inherited_fd(self) -> None:
+        (self.root / "disk.img").write_bytes(b"filesystem")
+        with (
+            mock.patch("rapido.tools.shutil.which", return_value="/usr/sbin/debugfs"),
+            mock.patch(
+                "rapido.tools._run_bounded_command",
+                return_value=(0, b"12 100644 file.txt\n", b"", False, False),
+            ) as run,
+        ):
+            result = call_tool(
+                self.workspace,
+                "inspect_filesystem",
+                {"path": "disk.img", "action": "list", "filesystem_path": "/safe"},
+            )
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["/usr/sbin/debugfs", "-R", "ls -l /safe"])
+        self.assertRegex(argv[3], r"^/proc/self/fd/\d+$")
+        self.assertEqual(len(run.call_args.kwargs["pass_fds"]), 1)
+        self.assertIn("file.txt", result["text"])
+        self.assertToolError(
+            "invalid_argument",
+            call_tool,
+            self.workspace,
+            "inspect_filesystem",
+            {"path": "disk.img", "action": "read", "filesystem_path": "/safe\n!sh"},
+        )
+
+    def test_filesystem_input_is_anchored_and_special_files_never_reach_debugfs(self) -> None:
+        os.mkfifo(self.root / "pipe")
+        with (
+            mock.patch("rapido.tools.shutil.which", return_value="/usr/sbin/debugfs"),
+            mock.patch("rapido.tools._run_bounded_command") as run,
+        ):
+            self.assertToolError(
+                "not_a_file",
+                call_tool,
+                self.workspace,
+                "inspect_filesystem",
+                {"path": "pipe", "action": "superblock"},
+            )
+            run.assert_not_called()
+
+        inside = self.root / "inside"
+        inside.mkdir()
+        (inside / "disk.img").write_bytes(b"inside image")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "disk.img").write_bytes(b"outside image")
+        original_open = os.open
+        swapped = False
+
+        def swap_ancestor(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path == "disk.img" and kwargs.get("dir_fd") is not None and not swapped:
+                inside.rename(self.root / "anchored")
+                inside.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        def inspect_descriptor(argv, cwd, *, pass_fds=()):
+            self.assertEqual(os.pread(pass_fds[0], 12, 0), b"inside image")
+            return 0, b"anchored", b"", False, False
+
+        patched_open = mock.Mock(side_effect=swap_ancestor)
+        with (
+            mock.patch("rapido.tools.shutil.which", return_value="/usr/sbin/debugfs"),
+            mock.patch("rapido.tools.os.open", patched_open),
+            mock.patch("rapido.tools.os.supports_dir_fd", {*os.supports_dir_fd, patched_open}),
+            mock.patch("rapido.tools._run_bounded_command", side_effect=inspect_descriptor),
+        ):
+            result = call_tool(
+                self.workspace,
+                "inspect_filesystem",
+                {"path": "inside/disk.img", "action": "superblock"},
+            )
+        self.assertEqual(result["text"], "anchored")
 
 
 if __name__ == "__main__":

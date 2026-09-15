@@ -8,15 +8,16 @@ from rapido.config import ConfigError, RuntimeConfig, validate_codex_home
 def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     config = RuntimeConfig.from_env({})
     assert config.board_url == "https://hackathon.in-cypher.com"
-    assert config.model == "gpt-5.6-luna"
+    assert config.model == "gpt-daybreak-blue-latest"
     assert config.reasoning_effort == "xhigh"
     assert config.concurrency == 2
     assert config.attempts_per_challenge == 2
     assert config.run_seconds == 19_800
     assert config.max_artifact_bytes == 64 * 1024 * 1024
     assert config.max_challenge_bytes == 128 * 1024 * 1024
-    assert config.max_workspace_bytes == 512 * 1024 * 1024
-    assert config.max_lane_workspace_bytes == 192 * 1024 * 1024
+    assert config.max_workspace_bytes == 500 * 1024 * 1024 * 1024
+    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
+    assert config.challenge_ids == ()
 
 
 def test_secrets_are_never_in_public_record() -> None:
@@ -41,6 +42,8 @@ def test_secrets_are_never_in_public_record() -> None:
         ("RAPIDO_STATE_PATH", "state.sqlite3"),
         ("RAPIDO_MAX_CHALLENGE_BYTES", "1024"),
         ("RAPIDO_MAX_WORKSPACE_BYTES", "1024"),
+        ("RAPIDO_CHALLENGE_IDS", "7,7"),
+        ("RAPIDO_CHALLENGE_IDS", "7,nope"),
     ],
 )
 def test_rejects_unsupported_or_unsafe_configuration(name: str, value: str) -> None:
@@ -50,7 +53,19 @@ def test_rejects_unsupported_or_unsafe_configuration(name: str, value: str) -> N
 
 def test_workspace_budget_must_cover_all_lane_copies() -> None:
     with pytest.raises(ConfigError, match="source plus every lane"):
-        RuntimeConfig.from_env({"RAPIDO_ATTEMPTS_PER_CHALLENGE": "4"})
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_ATTEMPTS_PER_CHALLENGE": "4",
+                "RAPIDO_MAX_WORKSPACE_BYTES": str(512 * 1024 * 1024),
+            }
+        )
+
+
+def test_workspace_budget_can_match_large_external_runtime_storage() -> None:
+    configured = 500 * 1024 * 1024 * 1024
+    config = RuntimeConfig.from_env({"RAPIDO_MAX_WORKSPACE_BYTES": str(configured)})
+    assert config.max_workspace_bytes == configured
+    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
 
 
 def test_requires_board_token_only_for_board_work() -> None:
@@ -71,6 +86,12 @@ def test_accepts_explicit_paths() -> None:
     assert config.state_path == Path("/tmp/rapido/test.db")
     assert config.codex_home == Path("/tmp/rapido/codex")
     assert config.submit_candidates is True
+
+
+def test_accepts_bounded_challenge_selection_for_acceptance_runs() -> None:
+    config = RuntimeConfig.from_env({"RAPIDO_CHALLENGE_IDS": "109, 42"})
+    assert config.challenge_ids == (109, 42)
+    assert config.public_record()["challenge_ids"] == [109, 42]
 
 
 def test_native_auth_home_must_be_private_regular_and_writable(tmp_path: Path) -> None:

@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from rapido.board import BoardError, Challenge, Verdict
+from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.orchestrator import Orchestrator
 from rapido.state import StateStore
@@ -19,6 +20,7 @@ class FakeBoard:
         self.challenges = {challenge.id: challenge for challenge in challenges}
         self.submissions: list[tuple[int, str]] = []
         self.instance_calls: list[tuple[str, int]] = []
+        self.active_instances: dict[int, dict[str, object]] = {}
 
     def list_challenges(self):
         return [{"id": challenge_id} for challenge_id in self.challenges]
@@ -42,12 +44,50 @@ class FakeBoard:
 
     def instance(self, method: str, challenge_id: int):
         self.instance_calls.append((method, challenge_id))
-        return {
-            "success": True,
-            "status": 200,
-            "connection_info": "generation-one",
-            "until": 100,
-        }
+        if method == "POST":
+            self.active_instances[challenge_id] = {
+                "connection_info": "http://127.0.0.1:8135/",
+                "until": 100,
+            }
+            return {"success": True, "status": 200, **self.active_instances[challenge_id]}
+        if method == "DELETE":
+            self.active_instances.pop(challenge_id, None)
+            return {"success": True, "status": 200, "connection_info": "", "until": None}
+        if challenge_id not in self.active_instances:
+            return {
+                "success": False,
+                "status": 404,
+                "connection_info": "",
+                "until": None,
+            }
+        return {"success": True, "status": 200, **self.active_instances[challenge_id]}
+
+
+class RejectingCreateBoard(FakeBoard):
+    def instance(self, method: str, challenge_id: int):
+        if method == "POST":
+            self.instance_calls.append((method, challenge_id))
+            return {"success": False, "status": 409, "connection_info": "", "until": None}
+        return super().instance(method, challenge_id)
+
+
+class SlowCreateBoard(FakeBoard):
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.post_started = threading.Event()
+        self.post_release = threading.Event()
+
+    def instance(self, method: str, challenge_id: int):
+        if method == "POST":
+            self.instance_calls.append((method, challenge_id))
+            self.post_started.set()
+            assert self.post_release.wait(timeout=2)
+            self.active_instances[challenge_id] = {
+                "connection_info": "http://127.0.0.1:8135/",
+                "until": 100,
+            }
+            return {"success": True, "status": 200, **self.active_instances[challenge_id]}
+        return super().instance(method, challenge_id)
 
 
 class FakeRuntime:
@@ -57,11 +97,13 @@ class FakeRuntime:
         self.max_active = 0
         self.started = False
         self.closed = False
+        self.solve_kwargs: list[dict[str, object]] = []
 
     async def start(self) -> None:
         self.started = True
 
     async def solve(self, workspace, prompt, **kwargs):
+        self.solve_kwargs.append(kwargs)
         prompt = json.loads(prompt)
         challenge_id = prompt["challenge"]["id"]
         lane = prompt["lane"]
@@ -101,12 +143,42 @@ class FakeRuntime:
         self.closed = True
 
 
+class ReplaceDuringSolveRuntime(FakeRuntime):
+    def __init__(self, board: FakeBoard) -> None:
+        super().__init__({2: {0: None, 1: None}})
+        self.board = board
+
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        self.board.active_instances[2] = {
+            "connection_info": "http://127.0.0.2:8135/",
+            "until": 101,
+        }
+        return turn
+
+
 class FirstChallengeTimeoutRuntime(FakeRuntime):
     async def solve(self, workspace, prompt, **kwargs):
         document = json.loads(prompt)
         if document["challenge"]["id"] == 1:
             raise TimeoutError
         return await super().solve(workspace, prompt, **kwargs)
+
+
+class FailedTurnRuntime(FakeRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        turn.status = "failed"
+        turn.failure_class = "usage_limit_exceeded"
+        turn.tool_calls.append(
+            {
+                "name": "sensitive-model-tool-name-sentinel",
+                "success": False,
+                "source_bound": False,
+                "candidate_sha256s": [],
+            }
+        )
+        return turn
 
 
 class HangingStartRuntime(FakeRuntime):
@@ -123,6 +195,17 @@ class NoProvenanceRuntime(FakeRuntime):
     async def solve(self, workspace, prompt, **kwargs):
         turn = await super().solve(workspace, prompt, **kwargs)
         turn.tool_calls[0]["candidate_sha256s"] = []
+        turn.tool_calls[0]["source_bound"] = False
+        return turn
+
+
+class ReflectedCandidateRuntime(FakeRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        candidate = json.loads(turn.text)["candidate"]
+        fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+        turn.tool_calls[0]["candidate_sha256s"] = [fingerprint]
+        turn.tool_calls[0]["supplied_candidate_sha256s"] = [fingerprint]
         return turn
 
 
@@ -165,6 +248,48 @@ class AmbiguousSubmitBoard(FakeBoard):
 
 class ShortTimeoutBoard(FakeBoard):
     timeout = 0.1
+
+
+class FlakyIdentityBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.identity_calls = 0
+
+    def identity(self):
+        self.identity_calls += 1
+        if self.identity_calls == 1:
+            raise BoardTransportError("Board transport failed")
+        return super().identity()
+
+
+class AlwaysFailingIdentityBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge], error: BoardError) -> None:
+        super().__init__(challenges)
+        self.error = error
+        self.identity_calls = 0
+
+    def identity(self):
+        self.identity_calls += 1
+        raise self.error
+
+
+class FlakyCreateTransportBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.post_calls = 0
+
+    def instance(self, method: str, challenge_id: int):
+        if method == "POST":
+            self.post_calls += 1
+            self.instance_calls.append((method, challenge_id))
+            raise BoardTransportError("Board transport failed")
+        return super().instance(method, challenge_id)
 
 
 class TransportBecomesTooSlowRuntime(FakeRuntime):
@@ -319,22 +444,133 @@ def test_disabled_submissions_and_dynamic_surface_are_truthful(tmp_path: Path) -
     store.close()
 
 
-def test_stale_owned_instance_requires_generation_safe_manual_cleanup(tmp_path: Path) -> None:
+def test_stale_owned_instance_with_matching_receipt_is_deleted_and_verified(
+    tmp_path: Path,
+) -> None:
     cfg = config(tmp_path)
     store = StateStore(tmp_path / "state.sqlite3")
+    store.bind_board_identity(1, 2)
     store.start_run("old-run", cfg.public_record())
     store.upsert_challenge(9, "Dynamic", "web", "dynamic_iac", 100)
-    receipt = hashlib.sha256(b'{"connection_info":"generation-one","until":100}').hexdigest()
+    receipt = hashlib.sha256(
+        b'{"connection_info":"generation-one","since":null,"until":100}'
+    ).hexdigest()
     store.mark_instance("old-run", 9, "owned", receipt_sha256=receipt)
     store.finish_run("old-run", "interrupted")
     board = FakeBoard([challenge(10, challenge_type="dynamic_iac")])
+    board.active_instances[9] = {"connection_info": "generation-one", "until": 100}
     asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
-    assert board.instance_calls == [("GET", 9)]
-    assert store.owned_instances()[0]["status"] == "cleanup_pending"
+    assert board.instance_calls == [("GET", 9), ("DELETE", 9), ("GET", 9)]
+    assert store.owned_instances() == []
     event = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='instance_cleanup'"
     ).fetchone()
-    assert '"status":"manual_reconciliation_required"' in event["data_json"]
+    assert '"status":"removed"' in event["data_json"]
+    store.close()
+
+
+def test_dynamic_challenge_creates_uses_and_removes_board_instance(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path, submit=False), manage_dynamic_instances=True)
+    dynamic = challenge(2, challenge_type="dynamic_iac")
+    board = FakeBoard([dynamic])
+    runtime = FakeRuntime({2: {0: None, 1: None}})
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(cfg, board, store, runtime).run())
+    assert report.unsolved == 1
+    assert board.instance_calls == [
+        ("GET", 2),
+        ("POST", 2),
+        ("GET", 2),
+        ("GET", 2),
+        ("DELETE", 2),
+        ("GET", 2),
+    ]
+    assert store.owned_instances() == []
+    ready = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='instance_ready'"
+    ).fetchone()
+    assert '"protocol":"http"' in ready["data_json"]
+    assert "127.0.0.1" not in ready["data_json"]
+    assert all(kwargs["tool_registry"].endpoints[0].port == 8135 for kwargs in runtime.solve_kwargs)
+    store.close()
+
+
+def test_preexisting_unowned_instance_is_never_deleted(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path, submit=False), manage_dynamic_instances=True)
+    dynamic = challenge(2, challenge_type="dynamic_iac")
+    board = FakeBoard([dynamic])
+    board.active_instances[2] = {
+        "connection_info": "http://127.0.0.1:8135/",
+        "until": 100,
+    }
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    assert report.errors == 1
+    assert board.instance_calls == [("GET", 2)]
+    assert 2 in board.active_instances
+    assert store.owned_instances() == []
+    store.close()
+
+
+def test_rejected_create_cleans_intent_without_delete_when_absent(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path, submit=False), manage_dynamic_instances=True)
+    dynamic = challenge(2, challenge_type="dynamic_iac")
+    board = RejectingCreateBoard([dynamic])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    assert report.errors == 1
+    assert board.instance_calls == [("GET", 2), ("POST", 2), ("GET", 2)]
+    assert store.owned_instances() == []
+    store.close()
+
+
+def test_create_cancellation_waits_for_teardown_and_verifies_absence(tmp_path: Path) -> None:
+    async def exercise() -> tuple[SlowCreateBoard, StateStore]:
+        cfg = replace(config(tmp_path, submit=False), manage_dynamic_instances=True)
+        dynamic = challenge(2, challenge_type="dynamic_iac")
+        board = SlowCreateBoard([dynamic])
+        store = StateStore(tmp_path / "state.sqlite3")
+        store.start_run("run", cfg.public_record())
+        store.upsert_challenge(2, dynamic.name, dynamic.category, dynamic.type, dynamic.value)
+        orchestrator = Orchestrator(cfg, board, store, FakeRuntime({}))
+        task = asyncio.create_task(
+            orchestrator._solve_dynamic_challenge(
+                "run", tmp_path / "work", dynamic, asyncio.get_running_loop().time() + 60
+            )
+        )
+        assert await asyncio.to_thread(board.post_started.wait, 1)
+        task.cancel()
+        board.post_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return board, store
+
+    board, store = asyncio.run(exercise())
+    assert board.instance_calls == [
+        ("GET", 2),
+        ("POST", 2),
+        ("GET", 2),
+        ("DELETE", 2),
+        ("GET", 2),
+    ]
+    assert board.active_instances == {}
+    assert store.owned_instances() == []
+    store.close()
+
+
+def test_completion_never_deletes_replaced_generation(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path, submit=False), manage_dynamic_instances=True)
+    dynamic = challenge(2, challenge_type="dynamic_iac")
+    board = FakeBoard([dynamic])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(cfg, board, store, ReplaceDuringSolveRuntime(board)).run())
+    assert report.errors == 1
+    assert board.instance_calls == [("GET", 2), ("POST", 2), ("GET", 2), ("GET", 2)]
+    assert board.active_instances[2]["connection_info"] == "http://127.0.0.2:8135/"
+    event = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='instance_cleanup'"
+    ).fetchone()
+    assert '"status":"skipped_replaced"' in event["data_json"]
     store.close()
 
 
@@ -427,7 +663,61 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
             NoProvenanceRuntime({1: {0: answer, 1: answer}}),
         ).run()
     )
+    assert report.unsolved == 1
+    assert report.errors == 0
+    assert board.submissions == []
+    failure = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
+    ).fetchone()
+    assert '"reason":"candidate_provenance"' in failure["data_json"]
+    store.close()
+
+
+def test_failed_native_turn_persists_closed_class_and_tool_evidence(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path),
+            board,
+            store,
+            FailedTurnRuntime({1: {0: None, 1: None}}),
+        ).run()
+    )
     assert report.errors == 1
+    failures = [
+        row["data_json"]
+        for row in store._connection.execute(
+            "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence"
+        )
+    ]
+    assert len(failures) == 2
+    assert all('"reason":"native_turn_incomplete"' in event for event in failures)
+    assert all('"status":"failed"' in event for event in failures)
+    assert all('"failure_class":"usage_limit_exceeded"' in event for event in failures)
+    wave = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_wave'"
+    ).fetchone()
+    assert "inspect_file" in wave["data_json"]
+    assert "unknown_tool" in wave["data_json"]
+    assert "sensitive-model-tool-name-sentinel" not in wave["data_json"]
+    store.close()
+
+
+def test_candidate_rejects_model_supplied_value_reflected_by_tool(tmp_path: Path) -> None:
+    answer = "INCYPHER{reflected_input}"
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path),
+            board,
+            store,
+            ReflectedCandidateRuntime({1: {0: answer, 1: answer}}),
+        ).run()
+    )
+    assert report.unsolved == 1
+    assert report.errors == 0
     assert board.submissions == []
     store.close()
 
@@ -480,6 +770,67 @@ def test_empty_board_catalogue_fails_closed(tmp_path: Path) -> None:
     store.close()
 
 
+def test_transient_identity_transport_is_retried_without_operator_restart(tmp_path: Path) -> None:
+    board = FlakyIdentityBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert report.status == "completed"
+    assert board.identity_calls == 4
+    store.close()
+
+
+def test_board_read_transport_retry_is_bounded_to_three_attempts(tmp_path: Path) -> None:
+    board = AlwaysFailingIdentityBoard(
+        [challenge(1)], BoardTransportError("Board transport failed")
+    )
+    store = StateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(BoardTransportError):
+        asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert board.identity_calls == 3
+    store.close()
+
+
+def test_semantic_board_error_is_not_retried(tmp_path: Path) -> None:
+    board = AlwaysFailingIdentityBoard([challenge(1)], BoardError("invalid response"))
+    store = StateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(BoardError, match="invalid response"):
+        asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert board.identity_calls == 1
+    store.close()
+
+
+def test_instance_create_transport_is_never_retried(tmp_path: Path) -> None:
+    board = FlakyCreateTransportBoard([challenge(2, challenge_type="dynamic_iac")])
+    store = StateStore(tmp_path / "state.sqlite3")
+    cfg = replace(config(tmp_path), manage_dynamic_instances=True)
+    report = asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    assert report.errors == 1
+    assert board.post_calls == 1
+    store.close()
+
+
+def test_dynamic_readiness_retry_uses_the_120_second_deadline(tmp_path: Path) -> None:
+    class RecordingOrchestrator(Orchestrator):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.instance_get_deadlines: list[float] = []
+
+        async def _board_read(self, deadline, function, /, *args, **kwargs):
+            if getattr(function, "__name__", "") == "instance" and args[:1] == ("GET",):
+                self.instance_get_deadlines.append(deadline)
+            return await super()._board_read(deadline, function, *args, **kwargs)
+
+    board = FakeBoard([challenge(2, challenge_type="dynamic_iac")])
+    store = StateStore(tmp_path / "state.sqlite3")
+    cfg = replace(config(tmp_path), manage_dynamic_instances=True, run_seconds=300)
+    orchestrator = RecordingOrchestrator(cfg, board, store, FakeRuntime({}))
+    report = asyncio.run(orchestrator.run())
+    assert report.status == "completed"
+    preflight_deadline, readiness_deadline = orchestrator.instance_get_deadlines[:2]
+    assert preflight_deadline - readiness_deadline > 150
+    store.close()
+
+
 def test_board_coherence_ignores_timeout_and_attachment_signature_volatility(
     tmp_path: Path,
 ) -> None:
@@ -510,9 +861,12 @@ def test_stale_instance_generation_mismatch_never_deletes_replacement(
 ) -> None:
     cfg = config(tmp_path)
     store = StateStore(tmp_path / "state.sqlite3")
+    store.bind_board_identity(1, 2)
     store.start_run("old-run", cfg.public_record())
     store.upsert_challenge(9, "Dynamic", "web", "dynamic_iac", 100)
-    old_receipt = hashlib.sha256(b'{"connection_info":"generation-one","until":100}').hexdigest()
+    old_receipt = hashlib.sha256(
+        b'{"connection_info":"generation-one","since":null,"until":100}'
+    ).hexdigest()
     store.mark_instance("old-run", 9, "owned", receipt_sha256=old_receipt)
     store.finish_run("old-run", "interrupted")
     board = ReplacedInstanceBoard([challenge(10, challenge_type="dynamic_iac")])
@@ -526,9 +880,34 @@ def test_stale_instance_generation_mismatch_never_deletes_replacement(
     store.close()
 
 
+def test_receiptless_stale_intent_never_authorizes_delete(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.bind_board_identity(1, 2)
+    store.start_run("old-run", cfg.public_record())
+    store.upsert_challenge(9, "Dynamic", "web", "dynamic_iac", 100)
+    store.mark_instance("old-run", 9, "creating")
+    store.finish_run("old-run", "interrupted")
+    board = FakeBoard([challenge(10, challenge_type="dynamic_iac")])
+    board.active_instances[9] = {
+        "connection_info": "http://127.0.0.1:8135/",
+        "until": 100,
+    }
+    asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    assert board.instance_calls == [("GET", 9)]
+    assert 9 in board.active_instances
+    assert store.owned_instances()[0]["status"] == "cleanup_pending"
+    event = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='instance_cleanup'"
+    ).fetchone()
+    assert '"reason":"no generation receipt proves ownership"' in event["data_json"]
+    store.close()
+
+
 def test_indeterminate_instance_state_retains_cleanup_ownership(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = StateStore(tmp_path / "state.sqlite3")
+    store.bind_board_identity(1, 2)
     store.start_run("old-run", cfg.public_record())
     store.upsert_challenge(9, "Dynamic", "web", "dynamic_iac", 100)
     store.mark_instance("old-run", 9, "owned", receipt_sha256="a" * 64)
@@ -540,7 +919,7 @@ def test_indeterminate_instance_state_retains_cleanup_ownership(tmp_path: Path) 
     event = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='instance_cleanup'"
     ).fetchone()
-    assert '"reason":"Board state was indeterminate"' in event["data_json"]
+    assert '"detail":"Board state was indeterminate"' in event["data_json"]
     store.close()
 
 

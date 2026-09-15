@@ -9,13 +9,15 @@ from __future__ import annotations
 import json
 import re
 import ssl
-import urllib.error
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .target import _connect_target, _parse_http_response, _send_before
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -28,6 +30,10 @@ MAX_CHALLENGE_DESCRIPTION_BYTES = 256 * 1024
 
 class BoardError(RuntimeError):
     """A deliberately sanitized Board failure."""
+
+
+class BoardTransportError(BoardError):
+    """A retryable failure that occurred before a readable Board response."""
 
 
 @dataclass(frozen=True)
@@ -105,38 +111,70 @@ def _https_url(value: str, *, origin_only: bool = False) -> urllib.parse.SplitRe
     return parsed
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 def _default_transport(
     request: urllib.request.Request, timeout: float, byte_limit: int
 ) -> HttpResponse:
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        _NoRedirect(),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-    )
+    parsed = _https_url(request.full_url)
+    deadline = time.monotonic() + timeout
+    raw_sock = None
+    sock = None
     try:
-        try:
-            response = opener.open(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            body = response.read(byte_limit + 1)
-            if len(body) > byte_limit:
-                raise BoardError("Board response exceeded the configured byte limit")
-            return HttpResponse(
-                status=int(response.code),
-                body=body,
-                location=response.headers.get("Location", ""),
-                content_type=response.headers.get("Content-Type", ""),
-            )
+        raw_sock = _connect_target((parsed.hostname or "", parsed.port or 443), timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        raw_sock.settimeout(remaining)
+        sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=parsed.hostname)
+        path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        method = request.get_method()
+        body = request.data or b""
+        headers = dict(request.header_items())
+        headers["Host"] = parsed.hostname or ""
+        headers["Accept-Encoding"] = "identity"
+        headers["Connection"] = "close"
+        if request.data is not None:
+            headers["Content-Length"] = str(len(body))
+        request_bytes = bytearray(f"{method} {path} HTTP/1.1\r\n".encode("ascii"))
+        for name, value in headers.items():
+            if "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+                raise ValueError("HTTP header contains a line break")
+            request_bytes.extend(f"{name}: {value}\r\n".encode("latin-1"))
+        request_bytes.extend(b"\r\n")
+        request_bytes.extend(body)
+        _send_before(sock, bytes(request_bytes), deadline)
+        status, _, response_headers, response_body, truncated = _parse_http_response(
+            sock,
+            deadline,
+            method,
+            response_limit=byte_limit,
+            header_limit=64 * 1024,
+            returned_header_limit=100,
+            header_value_limit=64 * 1024,
+        )
+        if truncated:
+            raise BoardError("Board response exceeded the configured byte limit")
+        by_name = {name.lower(): value for name, value in response_headers}
+        return HttpResponse(
+            status=status,
+            body=response_body,
+            location=by_name.get("location", ""),
+            content_type=by_name.get("content-type", ""),
+        )
     except BoardError:
         raise
-    except (OSError, urllib.error.URLError, ValueError) as exc:
-        raise BoardError("Board transport failed") from exc
+    except (OSError, TimeoutError, UnicodeError, ValueError, ssl.SSLError) as exc:
+        raise BoardTransportError("Board transport failed") from exc
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if raw_sock is not None and raw_sock is not sock:
+            try:
+                raw_sock.close()
+            except OSError:
+                pass
 
 
 class BoardClient:
@@ -355,11 +393,34 @@ class BoardClient:
         if not isinstance(document, dict):
             raise BoardError("instance operation returned an invalid shape")
         data = document.get("data", {})
+        if not isinstance(data, dict):
+            raise BoardError("instance operation returned invalid data")
+        connection_info = data.get("connectionInfo", "")
+        if connection_info is None:
+            connection_info = ""
+        try:
+            connection_info_bytes = (
+                connection_info.encode("utf-8") if isinstance(connection_info, str) else b""
+            )
+        except UnicodeError as exc:
+            raise BoardError("instance connection information is invalid") from exc
+        if not isinstance(connection_info, str) or len(connection_info_bytes) > 32 * 1024:
+            raise BoardError("instance connection information is invalid")
+        until = data.get("until")
+        since = data.get("since")
+        for name, value in (("until", until), ("since", since)):
+            if value is not None and (
+                not isinstance(value, (str, int, float))
+                or isinstance(value, bool)
+                or len(str(value)) > 256
+            ):
+                raise BoardError(f"instance {name} is invalid")
         return {
             "success": document.get("success") is True,
             "status": response.status,
-            "connection_info": data.get("connectionInfo", "") if isinstance(data, dict) else "",
-            "until": data.get("until") if isinstance(data, dict) else None,
+            "connection_info": connection_info,
+            "until": until,
+            "since": since,
             "message": str(document.get("message", ""))[:512],
         }
 

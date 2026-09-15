@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import threading
 from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar
@@ -20,9 +22,11 @@ from rapido.codex_app import (
     CodexAppError,
     ModelValidationError,
     ProtocolError,
+    TurnResult,
     TurnTimeoutError,
     WorkspaceThreadRegistry,
     _source_bound_tool_call,
+    _turn_failure_class,
     _TurnState,
 )
 from rapido.tools import ToolError, ToolRegistry, Workspace
@@ -152,6 +156,40 @@ class FakeProcess:
         return self.returncode
 
 
+class DelayedInitializeProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.initialize_seen = asyncio.Event()
+        self.release_initialize = asyncio.Event()
+
+    def handle(self, message: dict[str, Any]) -> None:
+        if message.get("method") != "initialize":
+            super().handle(message)
+            return
+        request_id = message.get("id")
+        if request_id is None:
+            return
+        self.initialize_seen.set()
+
+        async def respond() -> None:
+            await self.release_initialize.wait()
+            await self.stdout.push({"id": request_id, "result": {}})
+
+        asyncio.create_task(respond())
+
+
+class DelayedWaitProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_started = asyncio.Event()
+        self.release_wait = asyncio.Event()
+
+    async def wait(self) -> int:
+        self.wait_started.set()
+        await self.release_wait.wait()
+        return await super().wait()
+
+
 class ToolStub:
     dynamic_tool_specs: ClassVar[list[dict[str, Any]]] = [
         {"name": "echo", "inputSchema": {"type": "object"}}
@@ -194,9 +232,235 @@ def make_client(process: FakeProcess, tmp_path: Path, **kwargs: Any) -> CodexApp
     )
 
 
-@pytest.mark.parametrize("name", ("image_metadata", "audio_metadata", "inspect_binary", "binary"))
+@run_async
+async def test_concurrent_solve_waits_for_shared_startup(tmp_path: Path) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    workspaces = [tmp_path / "lane-0", tmp_path / "lane-1"]
+    for workspace in workspaces:
+        workspace.mkdir()
+
+    first = asyncio.create_task(
+        client.solve(workspaces[0], "first", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    second = asyncio.create_task(
+        client.solve(workspaces[1], "second", tool_registry=ToolRegistry(workspaces[1]))
+    )
+    await asyncio.sleep(0)
+    process.release_initialize.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True),
+        1,
+    )
+
+    assert [type(result) for result in results] == [TurnResult, TurnResult]
+    assert [result.status for result in results] == ["completed", "completed"]
+    await client.close()
+
+
+@pytest.mark.parametrize("mode", ("timeout", "cancel"))
+@run_async
+async def test_join_interruption_does_not_fence_shared_startup(tmp_path: Path, mode: str) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    workspaces = [tmp_path / "owner", tmp_path / "joiner"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    owner = asyncio.create_task(
+        client.solve(workspaces[0], "owner", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    joiner = asyncio.create_task(
+        client.solve(
+            workspaces[1],
+            "joiner",
+            tool_registry=ToolRegistry(workspaces[1]),
+            timeout=0.01 if mode == "timeout" else None,
+        )
+    )
+    if mode == "timeout":
+        with pytest.raises(TimeoutError):
+            await joiner
+    else:
+        await asyncio.sleep(0)
+        joiner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joiner
+
+    assert client.process is process
+    assert process.returncode is None
+    process.release_initialize.set()
+    result = await asyncio.wait_for(owner, 1)
+    assert result.status == "completed"
+    await client.close()
+
+
+@pytest.mark.parametrize("mode", ("timeout", "cancel"))
+@run_async
+async def test_simultaneous_start_join_interruption_preserves_owner(
+    tmp_path: Path, mode: str
+) -> None:
+    process = DelayedInitializeProcess()
+
+    async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = CodexAppClient(
+        env={"PATH": "/explicit/path"},
+        process_factory=factory,
+        model="model-a",
+        reasoning_effort="high",
+    )
+    original_start = client.start
+    start_call_count = 0
+    both_start_calls_entered = asyncio.Event()
+    release_start_calls = asyncio.Event()
+
+    async def synchronized_start(*args: Any, **kwargs: Any) -> CodexAppClient:
+        nonlocal start_call_count
+        start_call_count += 1
+        if start_call_count == 2:
+            both_start_calls_entered.set()
+        await release_start_calls.wait()
+        return await original_start(*args, **kwargs)
+
+    client.start = synchronized_start  # type: ignore[method-assign]
+    workspaces = [tmp_path / "owner", tmp_path / "simultaneous-joiner"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    owner = asyncio.create_task(
+        client.solve(workspaces[0], "owner", tool_registry=ToolRegistry(workspaces[0]))
+    )
+    joiner = asyncio.create_task(
+        client.solve(
+            workspaces[1],
+            "joiner",
+            tool_registry=ToolRegistry(workspaces[1]),
+        )
+    )
+    await asyncio.wait_for(both_start_calls_entered.wait(), 1)
+    release_start_calls.set()
+    await asyncio.wait_for(process.initialize_seen.wait(), 1)
+    if mode == "timeout":
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(joiner, 0.01)
+    else:
+        joiner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joiner
+
+    assert client.process is process
+    assert process.returncode is None
+    process.release_initialize.set()
+    result = await asyncio.wait_for(owner, 1)
+    assert result.status == "completed"
+    await client.close()
+
+
+@run_async
+async def test_cancellation_waits_for_stale_process_cleanup(tmp_path: Path) -> None:
+    process = DelayedWaitProcess()
+    client = make_client(process, tmp_path)
+    await client.start()
+    client._started = False
+    workspace = tmp_path / "replacement"
+    workspace.mkdir()
+
+    solve = asyncio.create_task(
+        client.solve(workspace, "replacement", tool_registry=ToolRegistry(workspace))
+    )
+    await asyncio.wait_for(process.wait_started.wait(), 1)
+    solve.cancel()
+    await asyncio.sleep(0)
+    cleanup_was_pending = not solve.done()
+    process.release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await solve
+
+    assert cleanup_was_pending
+    assert client.process is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "image_metadata",
+        "audio_metadata",
+        "inspect_binary",
+        "binary",
+        "inspect_elf",
+        "elf_symbols",
+        "disassemble_elf",
+        "dicom_metadata",
+        "wav_analyze",
+    ),
+)
 def test_canonical_metadata_tools_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {"path": "artifacts/input.bin"})
+
+
+@pytest.mark.parametrize("name", ("http_request", "tcp_open", "tcp_exchange"))
+def test_assigned_target_observations_are_source_bound(name: str) -> None:
+    assert _source_bound_tool_call(None, name, {})
+
+
+def test_hex_transform_accepts_only_normalized_prior_host_output() -> None:
+    state = _TurnState(thread_id="thread-1")
+    rooted = "494e4359504845527b726f6f7465647d"
+    state.provenance_outputs.append(json.dumps({"hex": rooted}))
+    spaced_upper = " ".join(rooted[index : index + 2].upper() for index in range(0, len(rooted), 2))
+    assert _source_bound_tool_call(state, "decode_hex", {"data": spaced_upper})
+    assert not _source_bound_tool_call(
+        state, "decode_hex", {"data": "494e4359504845527b756e726f6f7465647d"}
+    )
+    assert not _source_bound_tool_call(state, "decode_hex", {"data": "41"})
+    assert not _source_bound_tool_call(
+        state, "decode_hex", {"data": rooted[:8] + "\N{NO-BREAK SPACE}" + rooted[8:]}
+    )
+    split = _TurnState(thread_id="thread-2")
+    split.provenance_outputs.append(json.dumps({"left": rooted[:16], "right": rooted[16:]}))
+    assert not _source_bound_tool_call(split, "decode_hex", {"data": rooted})
+
+
+@pytest.mark.parametrize(
+    ("error_info", "expected"),
+    (
+        ("usageLimitExceeded", "usage_limit_exceeded"),
+        ({"responseStreamDisconnected": {"httpStatusCode": 503}}, "response_stream_disconnected"),
+        ("futureUntrustedValue", "unknown"),
+        ({"futureUntrustedValue": {}}, "unknown"),
+    ),
+)
+def test_turn_failure_class_uses_closed_non_secret_codes(error_info: object, expected: str) -> None:
+    completed = {
+        "status": "failed",
+        "error": {
+            "message": "sensitive provider text",
+            "additionalDetails": "sensitive detail",
+            "codexErrorInfo": error_info,
+        },
+    }
+    assert _turn_failure_class(completed) == expected
+    assert _turn_failure_class({"status": "completed"}) is None
 
 
 @run_async
@@ -430,6 +694,7 @@ async def test_tool_call_and_structured_tool_error(
             },
         }
     )
+    await asyncio.gather(*client._server_tasks)
     await client._route_message(
         {
             "id": 91,
@@ -448,6 +713,216 @@ async def test_tool_call_and_structured_tool_error(
     assert responses[90]["result"]["success"] is True
     assert responses[91]["result"]["success"] is False
     assert '"bad_tool"' in responses[91]["result"]["contentItems"][0]["text"]
+    await client.close()
+
+
+@run_async
+async def test_delayed_target_response_cannot_turn_prior_input_into_candidate_provenance(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class ReflectionRegistry(ToolStub):
+        delayed = ""
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if arguments.get("data"):
+                self.delayed = base64.b64decode(arguments["data"], validate=True).decode()
+                return {"observed": "accepted"}
+            return {"delayed": self.delayed, "observed": "flag{server_observation}"}
+
+    registry = ReflectionRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    supplied = "flag{model_supplied}"
+    encoded = base64.b64encode(supplied.encode()).decode()
+    await client._route_message(
+        {
+            "id": 93,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": encoded, "encoding": "base64"},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+    await client._route_message(
+        {
+            "id": 94,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-delayed",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert (
+        hashlib.sha256(supplied.encode()).hexdigest()
+        in state.tool_calls[0]["supplied_candidate_sha256s"]
+    )
+    hashes = state.tool_calls[1]["candidate_sha256s"]
+    assert hashlib.sha256(supplied.encode()).hexdigest() not in hashes
+    assert hashlib.sha256(b"flag{server_observation}").hexdigest() in hashes
+    assert all(
+        supplied not in output and encoded not in output for output in state.provenance_outputs
+    )
+    assert not _source_bound_tool_call(state, "decode_base64", {"data": encoded})
+    await client.close()
+
+
+@run_async
+async def test_aliased_pending_turn_tool_request_is_rejected_without_queuing_worker(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class BlockingRegistry(ToolStub):
+        def __init__(self) -> None:
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.calls = 0
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            self.first_started.set()
+            assert self.release_first.wait(timeout=2)
+            return {"observed": "completed"}
+
+    registry = BlockingRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._pending_turns["thread-1"] = state
+    await client._route_message(
+        {
+            "id": 95,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-a",
+                "callId": "first",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    assert await asyncio.to_thread(registry.first_started.wait, 1)
+    await client._route_message(
+        {
+            "id": 96,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-b",
+                "callId": "second",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    for _ in range(20):
+        if any(item["id"] == 96 for item in fake_process.responses):
+            break
+        await asyncio.sleep(0)
+    busy = next(item for item in fake_process.responses if item["id"] == 96)
+    assert busy["result"]["success"] is False
+    assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
+    assert registry.calls == 1
+    assert len(state.tool_calls) == 1
+    registry.release_first.set()
+    await asyncio.gather(*client._server_tasks)
+    assert state.tool_request_active is False
+    await client.close()
+
+
+@run_async
+async def test_repeated_cancellation_retains_tool_admission_until_worker_finishes(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class BlockingRegistry(ToolStub):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            self.finished.set()
+            raise ToolError("injected_failure", "worker failed during cancellation drain")
+
+    registry = BlockingRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._pending_turns["thread-1"] = state
+    await client._route_message(
+        {
+            "id": 97,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-a",
+                "callId": "first",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    assert await asyncio.to_thread(registry.started.wait, 1)
+    handler = next(iter(client._server_tasks))
+    handler.cancel()
+    await asyncio.sleep(0)
+    handler.cancel()
+    await asyncio.sleep(0)
+    assert not handler.done()
+    assert state.tool_request_active is True
+
+    await client._route_message(
+        {
+            "id": 98,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "provisional-b",
+                "callId": "second",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    for _ in range(20):
+        if any(item["id"] == 98 for item in fake_process.responses):
+            break
+        await asyncio.sleep(0)
+    busy = next(item for item in fake_process.responses if item["id"] == 98)
+    assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
+
+    registry.release.set()
+    result = await asyncio.gather(handler, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert registry.finished.is_set()
+    assert state.tool_request_active is False
     await client.close()
 
 
@@ -595,6 +1070,7 @@ async def test_turn_item_and_tool_audits_are_aggregate_bounded(
                 },
             }
         )
+        await asyncio.gather(*client._server_tasks)
     await asyncio.gather(*client._server_tasks)
     assert len(state.items) <= MAX_TURN_ITEMS
     assert state.item_bytes <= MAX_TURN_ITEM_BYTES

@@ -15,7 +15,7 @@ from rapido.board import Challenge
 from rapido.codex_app import CodexAppClient, TurnTimeoutError
 from rapido.config import validate_codex_home
 from rapido.solver import (
-    DEVELOPER_INSTRUCTIONS,
+    OFFLINE_DEVELOPER_INSTRUCTIONS,
     SOLVER_OUTPUT_SCHEMA,
     SolverFinding,
     build_turn_prompt,
@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--codex-home", type=Path, required=True)
     result.add_argument("--work-root", type=Path, required=True)
     result.add_argument("--expected-sha256", required=True)
-    result.add_argument("--model", default="gpt-5.6-luna")
+    result.add_argument("--model", default="gpt-daybreak-blue-latest")
     result.add_argument("--effort", default="xhigh")
     result.add_argument("--timeout", type=float, default=300)
     result.add_argument("--max-workspace-bytes", type=int, default=192 * 1024 * 1024)
@@ -84,7 +84,7 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
         turn = await client.solve(
             workspace,
             build_turn_prompt(challenge, ["artifact.txt"], index),
-            developer_instructions=DEVELOPER_INSTRUCTIONS,
+            developer_instructions=OFFLINE_DEVELOPER_INSTRUCTIONS,
             model=arguments.model,
             reasoning_effort=arguments.effort,
             output_schema=SOLVER_OUTPUT_SCHEMA,
@@ -110,7 +110,7 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
                 await client.solve(
                     workspaces[0],
                     build_turn_prompt(challenge, ["artifact.txt"], 99),
-                    developer_instructions=DEVELOPER_INSTRUCTIONS,
+                    developer_instructions=OFFLINE_DEVELOPER_INSTRUCTIONS,
                     model=arguments.model,
                     reasoning_effort=arguments.effort,
                     output_schema=SOLVER_OUTPUT_SCHEMA,
@@ -126,7 +126,7 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
             recovery = await client.solve(
                 workspaces[0],
                 build_turn_prompt(challenge, ["artifact.txt"], 100),
-                developer_instructions=DEVELOPER_INSTRUCTIONS,
+                developer_instructions=OFFLINE_DEVELOPER_INSTRUCTIONS,
                 model=arguments.model,
                 reasoning_effort=arguments.effort,
                 output_schema=SOLVER_OUTPUT_SCHEMA,

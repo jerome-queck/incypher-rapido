@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
+import gzip
 import hashlib
 import json
 import os
 import re
+import secrets
 import selectors
 import shutil
 import stat
@@ -27,9 +30,13 @@ import urllib.parse
 import warnings
 import wave
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from .binary_tools import binary_tool_specs, disassemble_elf, elf_symbols, inspect_elf
+from .media_tools import dicom_metadata, media_tool_specs, wav_analyze
 
 try:  # aifc was removed from Python 3.13; WAV remains universally available.
     with warnings.catch_warnings():
@@ -173,6 +180,25 @@ class Workspace:
                 limit=self.max_workspace_bytes,
             )
 
+    def ensure_entry_capacity(self, relative: str, *, temporary_entries: int = 0) -> None:
+        """Reserve path components plus bounded transient entries before writing."""
+        if temporary_entries < 0:
+            raise _error("invalid_argument", "temporary entry count cannot be negative")
+        parts = self._parts(relative)
+        if not parts:
+            raise _error("invalid_argument", "destination must name a new file")
+        entries, _ = self.snapshot()
+        prefixes = ["/".join(parts[: index + 1]) for index in range(len(parts))]
+        additional = sum(prefix not in entries for prefix in prefixes) + temporary_entries
+        if len(entries) + additional > MAX_WORKSPACE_ENTRIES:
+            raise _error(
+                "workspace_quota",
+                "operation would exceed the cumulative workspace entry limit",
+                current=len(entries),
+                additional=additional,
+                limit=MAX_WORKSPACE_ENTRIES,
+            )
+
     @staticmethod
     def _parts(relative: str) -> tuple[str, ...]:
         relative = _bounded_text(relative, "path", MAX_INPUT_BYTES)
@@ -249,6 +275,155 @@ class Workspace:
                 except OSError as exc:
                     raise _error("write_failed", "cannot create destination directory") from exc
         return self.path(relative)
+
+
+@contextmanager
+def _workspace_regular_fd(
+    workspace: Workspace, relative: str, *, limit: int = MAX_FILE_BYTES
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Open a regular input through anchored no-follow directory descriptors."""
+    parts = workspace._parts(relative)
+    if not parts:
+        raise _error("not_a_file", "path must name a regular file")
+    if len(parts) > 128:
+        raise _error("limit_exceeded", "path has too many components")
+    required = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, name) for name in required) or os.open not in os.supports_dir_fd:
+        raise _error("unsupported_platform", "descriptor-confined file access is unavailable")
+    descriptors: list[int] = []
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptors.append(os.open(workspace.root, directory_flags))
+        for part in parts[:-1]:
+            descriptors.append(os.open(part, directory_flags, dir_fd=descriptors[-1]))
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=descriptors[-1],
+        )
+        descriptors.append(descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _error("not_a_file", "path must name a regular file")
+        if metadata.st_nlink > 1:
+            raise _error("symlink_or_invalid_path", "multiply linked inputs are not allowed")
+        _check_file_size(metadata, limit=limit)
+        yield descriptor, metadata
+    except ToolError:
+        raise
+    except FileNotFoundError as exc:
+        raise _error("not_found", "file does not exist") from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise _error(
+                "symlink_or_invalid_path", "symlinks and invalid components are not allowed"
+            ) from exc
+        raise _error("read_failed", "file could not be opened safely") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+@contextmanager
+def _workspace_exclusive_output_fd(workspace: Workspace, relative: str) -> Iterator[int]:
+    """Write privately, then atomically publish a complete output without overwriting."""
+    parts = workspace._parts(relative)
+    if not parts:
+        raise _error("invalid_argument", "destination must name a new file")
+    if len(parts) > 128:
+        raise _error("limit_exceeded", "destination has too many components")
+    required = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if (
+        any(not hasattr(os, name) for name in required)
+        or os.open not in os.supports_dir_fd
+        or os.link not in os.supports_dir_fd
+        or os.unlink not in os.supports_dir_fd
+    ):
+        raise _error("unsupported_platform", "descriptor-confined file access is unavailable")
+    descriptors: list[int] = []
+    output_descriptor: int | None = None
+    owned: os.stat_result | None = None
+    temporary_name: str | None = None
+    created_directories: list[tuple[int, str, int, int]] = []
+    published = False
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptors.append(os.open(workspace.root, directory_flags))
+        for part in parts[:-1]:
+            try:
+                descriptor = os.open(part, directory_flags, dir_fd=descriptors[-1])
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptors[-1])
+                    created = os.stat(part, dir_fd=descriptors[-1], follow_symlinks=False)
+                    created_directories.append(
+                        (descriptors[-1], part, created.st_dev, created.st_ino)
+                    )
+                except FileExistsError:
+                    pass
+                descriptor = os.open(part, directory_flags, dir_fd=descriptors[-1])
+            descriptors.append(descriptor)
+        for _ in range(8):
+            candidate = f".rapido-part-{secrets.token_hex(16)}"
+            try:
+                output_descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=descriptors[-1],
+                )
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if output_descriptor is None or temporary_name is None:
+            raise _error("write_conflict", "could not allocate a private output name")
+        owned = os.fstat(output_descriptor)
+        if not stat.S_ISREG(owned.st_mode):
+            raise _error("write_failed", "private output is not a regular file")
+        yield output_descriptor
+        try:
+            os.fsync(output_descriptor)
+            os.link(
+                temporary_name,
+                parts[-1],
+                src_dir_fd=descriptors[-1],
+                dst_dir_fd=descriptors[-1],
+                follow_symlinks=False,
+            )
+            published = True
+        except FileExistsError as exc:
+            raise _error("write_conflict", "destination already exists") from exc
+        except OSError as exc:
+            raise _error("write_failed", "completed output could not be published") from exc
+    except ToolError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise _error(
+                "symlink_or_invalid_path", "destination contains an invalid component"
+            ) from exc
+        raise _error("write_failed", "destination could not be created safely") from exc
+    finally:
+        if temporary_name is not None and owned is not None and descriptors:
+            try:
+                current = os.stat(temporary_name, dir_fd=descriptors[-1], follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+                    os.unlink(temporary_name, dir_fd=descriptors[-1])
+            except OSError:
+                pass
+        if output_descriptor is not None:
+            os.close(output_descriptor)
+        if not published:
+            for parent_descriptor, name, device, inode in reversed(created_directories):
+                try:
+                    current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) == (device, inode):
+                        os.rmdir(name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _ensure_regular(path: Path) -> os.stat_result:
@@ -781,6 +956,14 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
     fmt = arguments.get("format", "auto")
     if fmt not in ("auto", "zip", "tar"):
         raise _error("invalid_argument", "format must be auto, zip, or tar")
+    password_value = arguments.get("password")
+    password = (
+        None
+        if password_value is None
+        else _bounded_text(password_value, "password", 256).encode("utf-8")
+    )
+    if password is not None and fmt == "tar":
+        raise _error("invalid_argument", "password is supported only for ZIP archives")
     archive_path = workspace.path(path_arg)
     _check_file_size(_ensure_regular(archive_path))
     # Validate without creating anything.  A malformed/traversal archive should be
@@ -821,6 +1004,18 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
                             raise _error("archive_too_large", "archive exceeds extraction limits")
                         if (info.external_attr >> 16) & 0o170000 == 0o120000:
                             raise _error("unsafe_archive", "symlink entries cannot be extracted")
+                        if info.flag_bits & 1:
+                            if password is None:
+                                raise _error(
+                                    "archive_password_required", "ZIP member requires a password"
+                                )
+                            try:
+                                with archive.open(info, "r", pwd=password) as probe:
+                                    probe.read(1)
+                            except RuntimeError as exc:
+                                raise _error(
+                                    "archive_password_rejected", "ZIP password was rejected"
+                                ) from exc
                         target = _safe_member_destination(workspace, destination, clean)
                         _preflight_target(target, seen_targets, workspace)
                         preflight.append((info, target))
@@ -828,7 +1023,13 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
                     workspace.ensure_capacity(total)
                     destination = _prepare_destination(workspace, destination_arg)
                     for info, target in preflight:
-                        _write_archive_member(target, archive.open(info, "r"), info.file_size)
+                        try:
+                            source = archive.open(info, "r", pwd=password)
+                        except RuntimeError as exc:
+                            raise _error(
+                                "archive_password_rejected", "ZIP password was rejected"
+                            ) from exc
+                        _write_archive_member(target, source, info.file_size)
                         extracted.append(workspace.relative(target))
                     return _result(
                         {
@@ -888,6 +1089,36 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
     except (OSError, zipfile.BadZipFile, tarfile.TarError) as exc:
         raise _error("invalid_archive", "archive could not be safely extracted") from exc
     raise _error("invalid_archive", "archive could not be identified")
+
+
+def decompress_gzip(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Decompress one bounded gzip stream without using its embedded filename."""
+    source_arg = _bounded_text(arguments.get("path"), "path")
+    destination_arg = _bounded_text(arguments.get("destination"), "destination")
+    workspace.ensure_capacity(MAX_ARCHIVE_BYTES)
+    workspace.ensure_entry_capacity(destination_arg, temporary_entries=1)
+    written = 0
+    with (
+        _workspace_regular_fd(workspace, source_arg) as (source_descriptor, _),
+        _workspace_exclusive_output_fd(workspace, destination_arg) as output_descriptor,
+        os.fdopen(os.dup(source_descriptor), "rb") as source_stream,
+        gzip.GzipFile(fileobj=source_stream, mode="rb") as compressed,
+        os.fdopen(os.dup(output_descriptor), "wb") as output,
+    ):
+        try:
+            while written <= MAX_ARCHIVE_BYTES:
+                block = compressed.read(min(64 * 1024, MAX_ARCHIVE_BYTES - written + 1))
+                if not block:
+                    break
+                written += len(block)
+                if written > MAX_ARCHIVE_BYTES:
+                    raise _error("archive_too_large", "gzip output exceeds its byte limit")
+                output.write(block)
+        except ToolError:
+            raise
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise _error("invalid_archive", "file is not a readable bounded gzip stream") from exc
+    return _result({"path": source_arg, "destination": destination_arg, "bytes": written})
 
 
 def _u16(data: bytes, offset: int, endian: str = ">") -> int:
@@ -1042,7 +1273,9 @@ def _command_output(data: bytes) -> tuple[str, bool]:
     return clipped.decode("utf-8", "replace"), truncated
 
 
-def _run_bounded_command(argv: list[str], cwd: Path) -> tuple[int, bytes, bytes, bool, bool]:
+def _run_bounded_command(
+    argv: list[str], cwd: Path, *, pass_fds: tuple[int, ...] = ()
+) -> tuple[int, bytes, bytes, bool, bool]:
     """Run fixed argv while draining pipes but retaining only a bounded prefix."""
     process = subprocess.Popen(
         argv,
@@ -1053,6 +1286,7 @@ def _run_bounded_command(argv: list[str], cwd: Path) -> tuple[int, bytes, bytes,
         stderr=subprocess.PIPE,
         bufsize=0,
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        pass_fds=pass_fds,
     )
     selector = selectors.DefaultSelector()
     buffers: dict[int, bytearray] = {}
@@ -1168,6 +1402,68 @@ def inspect_binary(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[s
     return _result({"path": path_arg, "kind": kind, "commands": results})
 
 
+_FILESYSTEM_PATH = re.compile(r"/(?:[A-Za-z0-9._+@,:=-]+/?)*")
+
+
+def inspect_filesystem(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Inspect an ext-family image with fixed read-only debugfs commands."""
+    image_arg = _bounded_text(arguments.get("path"), "path")
+    action = _bounded_text(arguments.get("action", "superblock"), "action", 32)
+    commands = {
+        "superblock": "stats",
+        "deleted": "lsdel",
+    }
+    filesystem_path = arguments.get("filesystem_path")
+    if action in {"list", "stat", "read"}:
+        filesystem_path = _bounded_text(filesystem_path, "filesystem_path", 1024)
+        if (
+            not filesystem_path.isascii()
+            or not _FILESYSTEM_PATH.fullmatch(filesystem_path)
+            or ".." in filesystem_path.split("/")
+        ):
+            raise _error(
+                "invalid_argument",
+                "filesystem_path must be a strict absolute path without whitespace or traversal",
+            )
+        commands[action] = {
+            "list": "ls -l",
+            "stat": "stat",
+            "read": "cat",
+        }[action] + f" {filesystem_path}"
+    elif action not in commands:
+        raise _error("invalid_argument", "action must be superblock, deleted, list, stat, or read")
+    executable = shutil.which("debugfs", path="/usr/bin:/bin:/usr/sbin:/sbin")
+    if not executable:
+        raise _error("tool_unavailable", "read-only filesystem analyzer is unavailable")
+    with _workspace_regular_fd(workspace, image_arg) as (descriptor, _):
+        returncode, stdout, stderr, truncated, timed_out = _run_bounded_command(
+            [executable, "-R", commands[action], f"/proc/self/fd/{descriptor}"],
+            workspace.root,
+            pass_fds=(descriptor,),
+        )
+    if timed_out:
+        raise _error("tool_timeout", "filesystem analysis exceeded its time bound")
+    record: dict[str, Any] = {
+        "path": image_arg,
+        "action": action,
+        "returncode": returncode,
+        "truncated": truncated,
+    }
+    if action == "read":
+        record.update(
+            {
+                "bytes": len(stdout),
+                "data_base64": base64.b64encode(stdout).decode(),
+                "text_preview": stdout[:MAX_STRING_LENGTH].decode("utf-8", "replace"),
+            }
+        )
+    else:
+        record["text"] = stdout.decode("utf-8", "replace")
+    if stderr:
+        record["diagnostic"] = stderr[:MAX_STRING_LENGTH].decode("utf-8", "replace")
+    return _result(record)
+
+
 ToolFunction = Callable[[Workspace, Mapping[str, Any]], dict[str, Any]]
 
 TOOLS: dict[str, tuple[ToolFunction, str]] = {
@@ -1186,9 +1482,37 @@ TOOLS: dict[str, tuple[ToolFunction, str]] = {
     "list_zip": (list_zip, "List ZIP members and flag unsafe or oversized entries."),
     "list_tar": (list_tar, "List TAR members and flag unsafe or oversized entries."),
     "extract_archive": (extract_archive, "Safely extract a ZIP or TAR into the workspace."),
+    "decompress_gzip": (
+        decompress_gzip,
+        "Safely decompress one bounded gzip stream to a new workspace file.",
+    ),
     "image_metadata": (image_metadata, "Read dimensions from common image headers."),
     "audio_metadata": (audio_metadata, "Read WAV or AIFF audio metadata."),
+    "dicom_metadata": (
+        dicom_metadata,
+        "Read bounded top-level DICOM Part-10 metadata without pixel payloads.",
+    ),
+    "wav_analyze": (
+        wav_analyze,
+        "Analyze bounded integer-PCM WAV statistics and LSB/text previews.",
+    ),
     "inspect_binary": (inspect_binary, "Inspect a binary with fixed-argv installed tools."),
+    "inspect_elf": (
+        inspect_elf,
+        "Read bounded ELF headers and a page of section metadata from a workspace file.",
+    ),
+    "elf_symbols": (
+        elf_symbols,
+        "Read a bounded static or dynamic ELF symbol-table prefix using installed readelf.",
+    ),
+    "disassemble_elf": (
+        disassemble_elf,
+        "Read a bounded ELF instruction window using installed objdump; never execute input.",
+    ),
+    "inspect_filesystem": (
+        inspect_filesystem,
+        "Inspect ext-family images with fixed read-only superblock, directory, deleted-file, stat, or read operations.",
+    ),
 }
 
 # Friendly short aliases are useful for tiny clients, while canonical names remain
@@ -1252,21 +1576,35 @@ def tool_schemas() -> list[dict[str, Any]]:
             "path": common_path,
             "destination": {"type": "string"},
             "format": {"type": "string", "enum": ["auto", "zip", "tar"]},
+            "password": {"type": "string", "maxLength": 256},
         },
+        "decompress_gzip": {"path": common_path, "destination": common_path},
         "image_metadata": {"path": common_path},
         "audio_metadata": {"path": common_path},
         "inspect_binary": {"path": common_path},
-    }
-    return [
-        {
-            "name": name,
-            "description": description,
-            "inputSchema": {
-                "type": "object",
-                "properties": schemas.get(name, {}),
-                "additionalProperties": False,
+        "inspect_filesystem": {
+            "path": common_path,
+            "action": {
+                "type": "string",
+                "enum": ["superblock", "deleted", "list", "stat", "read"],
             },
-        }
+            "filesystem_path": {"type": "string"},
+        },
+    }
+    extension_specs = {spec["name"]: spec for spec in [*binary_tool_specs(), *media_tool_specs()]}
+    return [
+        extension_specs.get(
+            name,
+            {
+                "name": name,
+                "description": description,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": schemas.get(name, {}),
+                    "additionalProperties": False,
+                },
+            },
+        )
         for name, (_, description) in TOOLS.items()
     ]
 

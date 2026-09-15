@@ -131,6 +131,12 @@ class StateStore:
                 receipt_sha256 TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS board_identity (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                user_id INTEGER NOT NULL,
+                team_id INTEGER NOT NULL,
+                bound_at TEXT NOT NULL
+            );
             """
         )
         instance_columns = {
@@ -205,6 +211,34 @@ class StateStore:
                 "INSERT INTO runs(id, started_at, status, config_json) VALUES (?, ?, 'running', ?)",
                 (run_id, self._now(), json.dumps(config, sort_keys=True, separators=(",", ":"))),
             )
+
+    def bind_board_identity(self, user_id: int, team_id: int) -> None:
+        """Bind durable ownership and submission accounting to one Board identity."""
+        if type(user_id) is not int or user_id <= 0 or type(team_id) is not int or team_id <= 0:
+            raise ValueError("Board identity must contain positive user and team ids")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT user_id, team_id FROM board_identity WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                legacy_effects = connection.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM submission_intents) +
+                      (SELECT COUNT(*) FROM instances
+                       WHERE status IN ('creating', 'owned', 'cleanup_pending')) AS count
+                    """
+                ).fetchone()["count"]
+                if legacy_effects:
+                    raise RuntimeError(
+                        "legacy state has unbound external effects; use its original identity or a new state"
+                    )
+                connection.execute(
+                    "INSERT INTO board_identity(singleton, user_id, team_id, bound_at) VALUES (1, ?, ?, ?)",
+                    (user_id, team_id, self._now()),
+                )
+            elif (row["user_id"], row["team_id"]) != (user_id, team_id):
+                raise RuntimeError("state is bound to a different qualified Board identity")
 
     def finish_run(self, run_id: str, status: str) -> None:
         if status not in {"completed", "deadline", "failed", "interrupted"}:
@@ -520,7 +554,7 @@ class StateStore:
         *,
         receipt_sha256: str | None = None,
     ) -> None:
-        if status not in {"owned", "cleanup_pending", "removed"}:
+        if status not in {"creating", "owned", "cleanup_pending", "removed"}:
             raise ValueError("invalid instance status")
         if status == "owned" and (
             receipt_sha256 is None
@@ -535,7 +569,10 @@ class StateStore:
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(challenge_id) DO UPDATE SET
                   run_id=excluded.run_id, status=excluded.status,
-                  receipt_sha256=COALESCE(excluded.receipt_sha256, instances.receipt_sha256),
+                  receipt_sha256=CASE
+                    WHEN excluded.status='creating' THEN NULL
+                    ELSE COALESCE(excluded.receipt_sha256, instances.receipt_sha256)
+                  END,
                   updated_at=excluded.updated_at
                 """,
                 (challenge_id, run_id, status, receipt_sha256, self._now()),
@@ -546,7 +583,7 @@ class StateStore:
             rows = self._connection.execute(
                 """
                 SELECT challenge_id, run_id, status, receipt_sha256, updated_at
-                FROM instances WHERE status IN ('owned', 'cleanup_pending')
+                FROM instances WHERE status IN ('creating', 'owned', 'cleanup_pending')
                 ORDER BY challenge_id
                 """
             ).fetchall()

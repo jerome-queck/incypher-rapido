@@ -1,10 +1,17 @@
 import json
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from rapido.board import BoardClient, BoardError, HttpResponse
+from rapido.board import (
+    BoardClient,
+    BoardError,
+    BoardTransportError,
+    HttpResponse,
+    _default_transport,
+)
 
 
 class FakeTransport:
@@ -15,6 +22,80 @@ class FakeTransport:
     def __call__(self, request: urllib.request.Request, timeout: float, limit: int) -> HttpResponse:
         self.requests.append(request)
         return self.replies.pop(0)
+
+
+class FakeBoardSocket:
+    def __init__(self, response: bytes) -> None:
+        self.response = response
+        self.sent = bytearray()
+        self.timeout = 0.0
+        self.closed = False
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def send(self, data) -> int:
+        self.sent.extend(data)
+        return len(data)
+
+    def recv(self, limit: int) -> bytes:
+        result = self.response[:limit]
+        self.response = self.response[limit:]
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_default_board_transport_is_raw_bounded_and_does_not_follow_redirects() -> None:
+    body = b'{"success":true,"data":[]}'
+    sock = FakeBoardSocket(
+        b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\n\r\n"
+        + body
+    )
+    context = mock.Mock()
+    context.wrap_socket.return_value = sock
+    request = urllib.request.Request(
+        "https://hackathon.in-cypher.com/api/v1/challenges",
+        headers={"Authorization": "Token secret"},
+    )
+    with (
+        mock.patch("rapido.board._connect_target", return_value=sock),
+        mock.patch("rapido.board.ssl.create_default_context", return_value=context),
+    ):
+        response = _default_transport(request, 1.0, 1024)
+    assert response == HttpResponse(302, body, "/login", "")
+    assert b"Authorization: Token secret\r\n" in sock.sent
+    assert b"Host: hackathon.in-cypher.com\r\n" in sock.sent
+    assert sock.closed
+
+
+def test_default_board_transport_preserves_bounded_long_location() -> None:
+    location = "/" + "a" * 3000
+    response_bytes = (
+        b"HTTP/1.1 302 Found\r\nLocation: " + location.encode() + b"\r\nContent-Length: 0\r\n\r\n"
+    )
+    sock = FakeBoardSocket(response_bytes)
+    context = mock.Mock()
+    context.wrap_socket.return_value = sock
+    request = urllib.request.Request("https://hackathon.in-cypher.com/files/a")
+    with (
+        mock.patch("rapido.board._connect_target", return_value=sock),
+        mock.patch("rapido.board.ssl.create_default_context", return_value=context),
+    ):
+        response = _default_transport(request, 1.0, 1024)
+    assert response.location == location
+
+
+def test_default_board_transport_classifies_retryable_connection_failure() -> None:
+    request = urllib.request.Request("https://hackathon.in-cypher.com/api/v1/challenges")
+    with (
+        mock.patch("rapido.board._connect_target", side_effect=OSError("reset")),
+        pytest.raises(BoardTransportError, match="Board transport failed"),
+    ):
+        _default_transport(request, 1.0, 1024)
 
 
 def envelope(data: object, status: int = 200) -> HttpResponse:
@@ -172,3 +253,37 @@ def test_rejects_non_boolean_solved_field() -> None:
     board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
     with pytest.raises(BoardError, match="solved value"):
         board.challenge(7)
+
+
+def test_instance_lifecycle_shape_is_bounded_and_preserves_readiness_fields() -> None:
+    fake = FakeTransport(
+        [
+            envelope(
+                {
+                    "connectionInfo": '<a href="http://target.example:8135/">open</a>',
+                    "since": "2026-09-15T01:00:00Z",
+                    "until": "2026-09-15T02:00:00Z",
+                }
+            )
+        ]
+    )
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    result = board.instance("GET", 42)
+    assert result["success"] is True
+    assert result["since"] == "2026-09-15T01:00:00Z"
+    assert "target.example" in result["connection_info"]
+    assert fake.requests[0].full_url.endswith("instance?challengeId=42")
+
+
+def test_instance_rejects_unbounded_or_structured_connection_information() -> None:
+    fake = FakeTransport([envelope({"connectionInfo": {"host": "not accepted"}})])
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    with pytest.raises(BoardError, match="connection information"):
+        board.instance("GET", 42)
+
+
+def test_instance_rejects_non_utf8_connection_information_safely() -> None:
+    fake = FakeTransport([envelope({"connectionInfo": "\ud800"})])
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    with pytest.raises(BoardError, match="connection information"):
+        board.instance("GET", 42)

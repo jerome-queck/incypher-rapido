@@ -79,11 +79,12 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
     for flag in (
         "--env-file=/path/to/rapido.env",
         "--init",
-        "--cpus=2",
-        "--memory=2g",
+        "--stop-timeout=180",
+        "--cpus=8",
+        "--memory=24g",
         "--pids-limit=256",
         "--read-only",
-        "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m",
+        "--tmpfs /tmp:rw,noexec,nosuid,nodev",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges:true",
         "--mount type=bind,src=/private/path/rapido-state,dst=/state",
@@ -92,3 +93,11 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
         assert flag in text
     assert "single app-server central auth owner" in text
     assert "empty auth volume intentionally fails preflight" in text
+    assert "RAPIDO_MAX_WORKSPACE_BYTES=536870912000" in text
+
+
+def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
+    text = (ROOT / "deploy" / "docker-compose.example.yml").read_text()
+    assert "stop_signal: SIGTERM" in text
+    assert "stop_grace_period: 180s" in text
+    assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()
