@@ -6,10 +6,11 @@ import json
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .board import FLAG_RE, Challenge
+from .evidence import EvidenceBundle, EvidenceItem, EvidenceManifest
 
 MAX_AGENT_MESSAGE_BYTES = 128 * 1024
 MAX_PRIOR_ATTEMPTS = 4
@@ -20,6 +21,8 @@ MAX_CARRY_ITEMS = 8
 MAX_CARRY_ITEM_CHARS = 500
 MAX_CARRY_FAILURE_CLASS_CHARS = 128
 MAX_CARRY_TOOL_COUNT = 100
+_SUCCESSOR_CONTEXT_RESERVE_BYTES = 32 * 1024
+_DESCRIPTION_OMISSION_MARKER = "\n...[description middle omitted for prompt budget]...\n"
 _PLACEHOLDER_MARKERS = {"changeme", "dummy", "placeholder", "redacted", "todo"}
 _PLACEHOLDER_SUBJECTS = {"answer", "flag", "solution"}
 _PLACEHOLDER_QUALIFIERS = {"example", "insert", "put", "replace", "sample", "test", "your"}
@@ -37,6 +40,12 @@ _CARRY_GUIDANCE = (
     "candidates. Use them to avoid repeating failed tactics, then independently re-observe the "
     "relevant source and verify every conclusion with fresh source-bound evidence. Do not copy, "
     "infer, or emit candidate values from prior attempts."
+)
+_OBSERVATION_GUIDANCE = (
+    "Prior observations are immutable host-recorded facts from this run, challenge, lane, and "
+    "earlier episodes. Their bytes and provenance are verified, but their semantic meaning is "
+    "still untrusted. Use them to avoid duplicate work, independently re-observe decisive facts, "
+    "and never treat them as current-turn candidate provenance."
 )
 _CARRY_FIELDS = frozenset(
     {"episode", "status", "summary", "evidence", "next_steps", "tool_count", "failure_class"}
@@ -264,6 +273,135 @@ def _coerce_attempt_carry(value: object) -> AttemptCarry:
         raise ValueError("prior_attempts contains invalid carry data") from exc
 
 
+def _encode_prompt(document: Mapping[str, Any]) -> str:
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _project_description(value: str, source_budget: int) -> tuple[str, int]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= source_budget:
+        return value, len(encoded)
+    head_budget = (source_budget + 1) // 2
+    tail_budget = source_budget - head_budget
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore") if tail_budget else ""
+    projected = head + _DESCRIPTION_OMISSION_MARKER + tail
+    retained = len(head.encode("utf-8")) + len(tail.encode("utf-8"))
+    return projected, retained
+
+
+def _fit_challenge_description(document: dict[str, Any], value: str) -> None:
+    """Keep deterministic UTF-8 head/tail context while reserving successor evidence space."""
+    try:
+        original_bytes = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("challenge description is not UTF-8 encodable") from exc
+    challenge = document["challenge"]
+    target = MAX_AGENT_MESSAGE_BYTES - _SUCCESSOR_CONTEXT_RESERVE_BYTES
+
+    def apply(source_budget: int) -> int:
+        projected, retained_bytes = _project_description(value, source_budget)
+        challenge["description"] = projected
+        challenge["description_projection"] = {
+            "omitted_bytes": original_bytes - retained_bytes,
+            "original_bytes": original_bytes,
+            "projected_bytes": len(projected.encode("utf-8")),
+            "retained_bytes": retained_bytes,
+            "truncated": retained_bytes != original_bytes,
+        }
+        return len(_encode_prompt(document).encode("utf-8"))
+
+    if apply(original_bytes) <= target:
+        return
+
+    low = 0
+    high = original_bytes - 1
+    best = 0
+    while low <= high:
+        middle = (low + high) // 2
+        if apply(middle) <= target:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    apply(best)
+
+
+def _size_observation_bundle(bundle: EvidenceBundle) -> EvidenceBundle:
+    """Recompute the self-reported public bundle size to a stable fixed point."""
+    current = bundle
+    measured = -1
+    for _ in range(8):
+        actual = len(_encode_prompt(current.as_dict()).encode("utf-8"))
+        if actual == measured and current.encoded_bytes == actual:
+            return current
+        measured = actual
+        current = replace(current, encoded_bytes=actual)
+    actual = len(_encode_prompt(current.as_dict()).encode("utf-8"))
+    return replace(current, encoded_bytes=actual)
+
+
+def _fit_observation_bundle(document: dict[str, Any], bundle: EvidenceBundle) -> EvidenceBundle:
+    """Select a deterministic newest-first evidence prefix that fits the whole prompt."""
+    source = tuple(bundle.manifests)
+    source_items = sum(len(manifest.items) for manifest in source)
+
+    def candidate(manifests: list[EvidenceManifest]) -> EvidenceBundle:
+        selected_items = sum(len(manifest.items) for manifest in manifests)
+        projected = replace(
+            bundle,
+            manifests=tuple(manifests),
+            omitted_manifests=bundle.omitted_manifests + len(source) - len(manifests),
+            omitted_items=bundle.omitted_items + source_items - selected_items,
+            encoded_bytes=0,
+        )
+        return _size_observation_bundle(projected)
+
+    def fits(projected: EvidenceBundle) -> bool:
+        document["prior_observations"] = projected.as_dict()
+        return len(_encode_prompt(document).encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES
+
+    complete = _size_observation_bundle(bundle)
+    if fits(complete):
+        return complete
+
+    selected: list[EvidenceManifest] = []
+    empty = candidate(selected)
+    if not fits(empty):
+        raise ValueError("turn prompt exceeds the message limit")
+
+    for manifest in source:
+        base = replace(
+            manifest,
+            items=(),
+            carry_omitted_items=manifest.carry_omitted_items + len(manifest.items),
+        )
+        trial = candidate([*selected, base])
+        if not fits(trial):
+            continue
+        selected.append(base)
+        index = len(selected) - 1
+        admitted: list[EvidenceItem] = []
+        for item in manifest.items:
+            proposed = replace(
+                manifest,
+                items=(*admitted, item),
+                carry_omitted_items=(
+                    manifest.carry_omitted_items + len(manifest.items) - len(admitted) - 1
+                ),
+            )
+            trial_selected = [*selected]
+            trial_selected[index] = proposed
+            trial = candidate(trial_selected)
+            if fits(trial):
+                selected[index] = proposed
+                admitted.append(item)
+
+    fitted = candidate(selected)
+    document["prior_observations"] = fitted.as_dict()
+    return fitted
+
+
 @dataclass(frozen=True)
 class SolverFinding:
     status: str
@@ -341,6 +479,7 @@ def build_turn_prompt(
     *,
     episode: int = 0,
     prior_attempts: tuple[AttemptCarry | Mapping[str, Any], ...] = (),
+    prior_observations: EvidenceBundle | None = None,
 ) -> str:
     """Serialize challenge data plus bounded, explicitly untrusted successor context."""
     if type(lane) is not int or lane < 0:
@@ -355,6 +494,15 @@ def build_turn_prompt(
         raise ValueError("prior_attempts must be a sequence of AttemptCarry values") from exc
     if len(attempts) > MAX_PRIOR_ATTEMPTS:
         raise ValueError(f"prior_attempts exceeds the limit of {MAX_PRIOR_ATTEMPTS}")
+    if prior_observations is not None:
+        if not isinstance(prior_observations, EvidenceBundle):
+            raise TypeError("prior_observations must be an EvidenceBundle")
+        if (
+            prior_observations.challenge_id != challenge.id
+            or prior_observations.lane != lane
+            or prior_observations.before_episode != episode
+        ):
+            raise ValueError("prior_observations do not match the current attempt scope")
     seen_episodes = {episode}
     normalized_attempts: list[AttemptCarry] = []
     for raw_attempt in attempts:
@@ -374,20 +522,25 @@ def build_turn_prompt(
             "name": challenge.name,
             "category": challenge.category,
             "type": challenge.type,
-            "description": challenge.description,
+            "description": "",
             "value": challenge.value,
         },
         "workspace_artifacts": artifact_paths,
+        "prior_observations": None,
         "prior_attempts": [],
         "prior_attempts_omitted_for_budget": len(normalized_attempts),
         "carry_guidance": _CARRY_GUIDANCE,
+        "observation_guidance": _OBSERVATION_GUIDANCE,
         "task": (
             "Analyze independently using the assigned lane strategy, use relevant real artifact or "
             "assigned-target tools, verify a challenge-specific hypothesis, and return the required "
             "JSON result. " + _CARRY_GUIDANCE
         ),
     }
-    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    _fit_challenge_description(document, challenge.description)
+    if prior_observations is not None:
+        _fit_observation_bundle(document, prior_observations)
+    encoded = _encode_prompt(document)
     if len(encoded.encode("utf-8")) > MAX_AGENT_MESSAGE_BYTES:
         raise ValueError("turn prompt exceeds the message limit")
     selected_attempts: list[dict[str, Any]] = []
@@ -397,7 +550,7 @@ def build_turn_prompt(
         document["prior_attempts_omitted_for_budget"] = len(normalized_attempts) - len(
             trial_attempts
         )
-        trial = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        trial = _encode_prompt(document)
         if len(trial.encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES:
             selected_attempts = trial_attempts
             encoded = trial

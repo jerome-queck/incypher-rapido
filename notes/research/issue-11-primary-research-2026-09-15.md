@@ -231,6 +231,42 @@ Astra safety-filter failure `gpt-daybreak-blue-latest`/`xhigh`. Every dispatch w
 provider fallback was accepted. The instruction to switch directly to Daybreak after an Astra
 failure governs subsequent work.
 
+## Immutable episode-evidence decision
+
+Measured synthetic pressure used 15 challenges, two episodes, and two lanes: 60 attempts and 91
+host events occupied 106,496 SQLite bytes. A carry envelope measured 1,194 bytes empty and 42,565
+bytes with four maximal ASCII manifests. Existing wave records retained mutable model summaries
+and truncated call metadata, so they could not independently preserve detailed host observations.
+
+The selected design is a SQLite-only `RunEvidence` deep module with three public operations:
+`open`, `commit`, and `carry`. Each running attempt commits a canonical, domain-separated SHA-256
+manifest before its terminal transition. SQLite triggers bind the immutable manifest to
+run/challenge/lane/episode identity. Reopening verifies canonical bytes, hashes, schema, limits,
+relationships, and byte accounting; legacy or crash-interrupted terminal attempts receive an
+explicit empty unavailable manifest rather than invented observations.
+
+The host projects tool results through a closed typed policy. It retains bounded structural facts
+and digests while excluding raw payloads, authorities, paths, credentials, and candidate material.
+Carry is deterministic, capped at 64 KiB, same-run/same-challenge/same-lane, and earlier-episode
+only. It may preserve structural observations from a candidate-status attempt so a disagreement can
+inform the next episode, but removes all candidate hashes and values. The solver prompt labels it
+immutable host-recorded provenance but still semantically untrusted, requires re-observation of
+decisive facts, and budgets it inside the 128-KiB total prompt cap. It cannot satisfy current-turn
+candidate provenance.
+
+Post-review integration checks pass 574 tests with one platform-conditional skip, Ruff, formatting,
+and whitespace validation. Effective routing: competing architecture designs
+`gpt-6-astra`/`xhigh`; demanding implementation and independent review
+`gpt-daybreak-blue-latest`/`xhigh`; black-box acceptance fixtures `gpt-5.6-luna`/`xhigh`. The Astra
+architecture dispatch succeeded on its first attempt, so no fallback or retry occurred.
+
+Independent Daybreak/xhigh review reproduced six initial defects and four fail-closed follow-ups.
+The integrated corrections retain candidate-disagreement structure without a digest oracle, budget
+all carry and Board-valid descriptions inside the total prompt cap, preserve completed observations
+on cancellation, retain safe target status/count/payload fingerprints, reject floats before
+persistence, and validate exact manifest/schema/trigger versions. A final independent reproduction
+pass reported no remaining findings. No dispatch used fallback.
+
 ## Sources
 
 [I11]: https://github.com/jerome-queck/incypher-rapido/issues/11

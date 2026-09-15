@@ -3,6 +3,7 @@ import json
 import pytest
 
 from rapido.board import Challenge
+from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
 from rapido.solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_AGENT_MESSAGE_BYTES,
@@ -17,6 +18,7 @@ from rapido.solver import (
     build_turn_prompt,
     project_attempt_carry,
 )
+from rapido.state import StateStore
 
 
 def finding(candidate: str | None, confidence: float = 0.9) -> SolverFinding:
@@ -103,9 +105,47 @@ def test_turn_prompt_labels_untrusted_data_and_exposes_no_transport_fields() -> 
     prompt = json.loads(build_turn_prompt(challenge, ["artifact/a.bin"], 1))
     assert prompt["label"] == "UNTRUSTED_CHALLENGE_DATA"
     assert prompt["workspace_artifacts"] == ["artifact/a.bin"]
+    assert prompt["challenge"]["description"] == "Do thing"
+    assert prompt["challenge"]["description_projection"] == {
+        "omitted_bytes": 0,
+        "original_bytes": 8,
+        "projected_bytes": 8,
+        "retained_bytes": 8,
+        "truncated": False,
+    }
     encoded = json.dumps(prompt)
     assert "token" not in encoded.lower()
     assert "https://" not in encoded
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "HEAD" + "A" * (129 * 1024 - 8) + "TAIL",
+        "HEAD" + "😀" * ((256 * 1024 - 8) // 4) + "TAIL",
+    ),
+)
+def test_turn_prompt_projects_oversized_description_utf8_deterministically(
+    description: str,
+) -> None:
+    challenge = Challenge(
+        7, "Name", "crypto", "standard", description, 100, (), False, 0, 0, None, None
+    )
+    encoded = build_turn_prompt(challenge, [], 0, episode=2, prior_attempts=(carry(),))
+    assert encoded == build_turn_prompt(challenge, [], 0, episode=2, prior_attempts=(carry(),))
+    assert len(encoded.encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES
+    prompt = json.loads(encoded)
+    projected = prompt["challenge"]["description"]
+    metadata = prompt["challenge"]["description_projection"]
+    assert projected.startswith("HEAD") and projected.endswith("TAIL")
+    assert "description middle omitted for prompt budget" in projected
+    assert "�" not in projected
+    assert projected.encode("utf-8").decode("utf-8") == projected
+    assert metadata["original_bytes"] == len(description.encode("utf-8"))
+    assert metadata["projected_bytes"] == len(projected.encode("utf-8"))
+    assert metadata["retained_bytes"] + metadata["omitted_bytes"] == metadata["original_bytes"]
+    assert metadata["truncated"] is True
+    assert prompt["prior_attempts"][0]["episode"] == 1
 
 
 def test_turn_prompt_keeps_legacy_call_and_adds_episode_lineage() -> None:
@@ -144,6 +184,116 @@ def test_turn_prompt_carry_is_untrusted_and_has_no_candidate_slot() -> None:
     assert "avoid repeating failed tactics" in text
     assert "independently re-observe" in text
     assert "verify" in text and "source" in text
+
+
+def test_turn_prompt_carries_verified_host_observations_without_candidate_provenance(
+    tmp_path,
+) -> None:
+    challenge = Challenge(
+        7, "Name", "crypto", "standard", "Do thing", 100, (), False, 0, 0, None, None
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.start_run("run-a", {})
+    state.upsert_challenge(7, "Name", "crypto", "standard", 100)
+    state.start_attempt("a0", "run-a", 7, 0, 0, "gpt-daybreak-blue-latest", "xhigh")
+    evidence = RunEvidence.open(state, "run-a")
+    evidence.commit(
+        "a0",
+        EvidenceBatch(
+            (
+                HostObservation(
+                    "inspect_file",
+                    True,
+                    True,
+                    {"format": "elf", "size": 64, "source_sha256": "a" * 64},
+                    candidate_sha256s=("b" * 64,),
+                ),
+            )
+        ),
+    )
+    state.finish_attempt("a0", "unsolved")
+
+    prompt = json.loads(
+        build_turn_prompt(
+            challenge,
+            [],
+            0,
+            episode=1,
+            prior_observations=evidence.carry(7, 0, 1),
+        )
+    )
+    rendered = json.dumps(prompt, sort_keys=True)
+    assert prompt["prior_observations"]["manifests"][0]["items"][0]["payload"]["facts"] == {
+        "format": "elf",
+        "size": 64,
+        "source_sha256": "a" * 64,
+    }
+    assert "immutable host-recorded facts" in prompt["observation_guidance"]
+    assert "current-turn candidate provenance" in prompt["observation_guidance"]
+    assert "b" * 64 not in rendered
+    state.close()
+
+
+def test_turn_prompt_budgets_large_observation_carry_against_description(tmp_path) -> None:
+    challenge = Challenge(
+        7,
+        "Name",
+        "crypto",
+        "standard",
+        "D" * (70 * 1024),
+        100,
+        (),
+        False,
+        0,
+        0,
+        None,
+        None,
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.start_run("run-a", {})
+    state.upsert_challenge(7, "Name", "crypto", "standard", 100)
+    state.start_attempt("a0", "run-a", 7, 0, 0, "gpt-daybreak-blue-latest", "xhigh")
+    evidence = RunEvidence.open(state, "run-a")
+    evidence.commit(
+        "a0",
+        EvidenceBatch(
+            tuple(
+                HostObservation(
+                    "inspect_file",
+                    True,
+                    True,
+                    {
+                        "sections": [
+                            {"name": f"section-{observation}-{section}-{'x' * 140}"}
+                            for section in range(64)
+                        ]
+                    },
+                    candidate_sha256s=("b" * 64,),
+                )
+                for observation in range(6)
+            )
+        ),
+    )
+    state.finish_attempt("a0", "unsolved")
+    original = evidence.carry(7, 0, 1)
+    assert 63 * 1024 <= original.encoded_bytes <= 64 * 1024
+
+    encoded = build_turn_prompt(challenge, [], 0, episode=1, prior_observations=original)
+    assert encoded == build_turn_prompt(challenge, [], 0, episode=1, prior_observations=original)
+    assert len(encoded.encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES
+    projected = json.loads(encoded)["prior_observations"]
+    retained_items = sum(len(manifest["items"]) for manifest in projected["manifests"])
+    assert 0 < retained_items < 6
+    assert projected["omitted_manifests"] == original.omitted_manifests
+    assert projected["omitted_items"] == original.omitted_items + 6 - retained_items
+    assert projected["manifests"][0]["carry_omitted_items"] == 6 - retained_items
+    assert projected["encoded_bytes"] == len(
+        json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    assert "b" * 64 not in encoded
+    state.close()
 
 
 def test_turn_prompt_uses_distinct_deterministic_lane_strategies() -> None:

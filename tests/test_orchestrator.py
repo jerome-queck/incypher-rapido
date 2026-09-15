@@ -11,6 +11,7 @@ import pytest
 
 from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
+from rapido.evidence import HostObservation
 from rapido.orchestrator import Orchestrator
 from rapido.state import StateStore
 
@@ -214,6 +215,42 @@ class HangingStartRuntime(FakeRuntime):
 class CancelledStartRuntime(FakeRuntime):
     async def start(self) -> None:
         raise asyncio.CancelledError
+
+
+class CancelledSolveRuntime(FakeRuntime):
+    def __init__(self, *, with_observation: bool) -> None:
+        super().__init__({})
+        self.with_observation = with_observation
+        self.solve_started = asyncio.Event()
+
+    async def solve(self, workspace, prompt, **kwargs):
+        del workspace, prompt, kwargs
+        self.solve_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            observation = HostObservation(
+                tool="inspect_file",
+                success=True,
+                source_bound=True,
+                facts={"format": "ELF"},
+            )
+            calls = (
+                [
+                    {
+                        "name": observation.tool,
+                        "success": observation.success,
+                        "source_bound": observation.source_bound,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ]
+                if self.with_observation
+                else []
+            )
+            exc.result = type("CancelledEvidence", (), {"tool_calls": calls})()
+            raise
 
 
 class BlockingCloseRuntime(FakeRuntime):
@@ -485,6 +522,15 @@ def test_finding_carry_and_uncensored_tool_count_are_durable_with_capped_wave_de
     assert all(item["retained_tool_call_count"] == 10 for item in wave["tool_calls"])
     assert all(item["tool_calls_truncated"] is True for item in wave["tool_calls"])
     assert all(len(item["calls"]) == 10 for item in wave["tool_calls"])
+    manifests = store._connection.execute(
+        """
+        SELECT complete, gap, observation_count, committed_count
+        FROM evidence_manifests ORDER BY attempt_id
+        """
+    ).fetchall()
+    assert len(manifests) == 2
+    assert all(row["complete"] == 0 and row["gap"] == "provenance_incomplete" for row in manifests)
+    assert all(row["observation_count"] == 12 and row["committed_count"] == 12 for row in manifests)
     store.close()
 
 
@@ -708,6 +754,72 @@ def test_cancellation_persists_interrupted_run(tmp_path: Path) -> None:
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("with_observation", "expected_count"),
+    ((True, 1), (False, 0)),
+)
+def test_lane_cancellation_commits_completed_tool_evidence_with_explicit_gap(
+    tmp_path: Path, with_observation: bool, expected_count: int
+) -> None:
+    async def exercise() -> tuple[StateStore, str]:
+        cfg = config(tmp_path)
+        store = StateStore(cfg.state_path)
+        store.start_run("run", cfg.public_record())
+        store.upsert_challenge(1, "A", "crypto", "standard", 100)
+        workspace = tmp_path / "lane"
+        workspace.mkdir()
+        runtime = CancelledSolveRuntime(with_observation=with_observation)
+        lane = asyncio.create_task(
+            Orchestrator(cfg, FakeBoard([challenge(1)]), store, runtime)._lane(
+                "run", challenge(1), 0, 0, workspace, [], 10
+            )
+        )
+        await asyncio.wait_for(runtime.solve_started.wait(), 1)
+        lane.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await lane
+        return store, "run:1:0:0"
+
+    store, attempt_id = asyncio.run(exercise())
+    attempt = store._connection.execute(
+        "SELECT status, tool_count, failure_class FROM attempts WHERE id=?",
+        (attempt_id,),
+    ).fetchone()
+    manifest = store._connection.execute(
+        "SELECT complete, gap, observation_count FROM evidence_manifests WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    assert dict(attempt) == {
+        "status": "cancelled",
+        "tool_count": expected_count,
+        "failure_class": "cancelled",
+    }
+    assert dict(manifest) == {
+        "complete": 0,
+        "gap": "turn_cancelled",
+        "observation_count": expected_count,
+    }
+    if with_observation:
+        payload = (
+            store._connection.execute(
+                """
+            SELECT o.payload_json
+            FROM evidence_items AS i
+            JOIN evidence_manifests AS m
+              ON m.run_id=i.run_id AND m.digest=i.manifest_digest
+            JOIN evidence_objects AS o
+              ON o.run_id=i.run_id AND o.digest=i.object_digest
+            WHERE m.attempt_id=?
+            """,
+                (attempt_id,),
+            )
+            .fetchone()["payload_json"]
+            .decode()
+        )
+        assert '"format":"ELF"' in payload
+    store.close()
+
+
 def test_repeated_shutdown_cancellation_drains_runtime_before_releasing_leases(
     tmp_path: Path,
 ) -> None:
@@ -798,6 +910,27 @@ def test_malformed_model_text_terminalizes_every_attempt(tmp_path: Path) -> None
     attempts = store.attempts_for_challenge(report.run_id, 1)
     assert all(row["status"] == "failed" for row in attempts)
     assert all(row["failure_class"] == "solver_output" for row in attempts)
+    store.close()
+
+
+def test_restart_seals_interrupted_attempt_as_explicit_unavailable_evidence(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    store.start_run("old-run", cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.start_attempt("old-attempt", "old-run", 1, 0, 0, cfg.model, cfg.reasoning_effort)
+
+    report = asyncio.run(Orchestrator(cfg, FakeBoard([challenge(2)]), store, FakeRuntime({})).run())
+    manifest = store._connection.execute(
+        "SELECT complete, gap, observation_count FROM evidence_manifests WHERE attempt_id=?",
+        ("old-attempt",),
+    ).fetchone()
+    assert report.status == "completed"
+    assert dict(manifest) == {
+        "complete": 0,
+        "gap": "process_interrupted",
+        "observation_count": 0,
+    }
     store.close()
 
 

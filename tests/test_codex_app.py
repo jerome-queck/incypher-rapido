@@ -47,6 +47,7 @@ from rapido.codex_app import (
     _turn_failure_class,
     _TurnState,
 )
+from rapido.evidence import HostObservation
 from rapido.tools import ToolError, ToolRegistry, Workspace
 
 
@@ -1009,6 +1010,10 @@ async def test_tool_call_and_structured_tool_error(
     assert responses[90]["result"]["success"] is True
     assert responses[91]["result"]["success"] is False
     assert '"bad_tool"' in responses[91]["result"]["contentItems"][0]["text"]
+    assert len(state.tool_calls) == 2
+    assert all(isinstance(call["host_observation"], HostObservation) for call in state.tool_calls)
+    assert state.tool_calls[0]["host_observation"].success is True
+    assert state.tool_calls[1]["host_observation"].success is False
     await client.close()
 
 
@@ -2102,6 +2107,83 @@ async def test_exact_model_validation_and_timeout_interrupt(
     assert caught.value.result.interrupt_sent
     assert not caught.value.result.process_fenced
     assert any(item.get("method") == "turn/interrupt" for item in fake_process.stdin.writes)
+    await client.close()
+
+
+@run_async
+async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+    client.thread_id = "thread-1"
+    client._thread_registries["thread-1"] = ToolRegistry(tmp_path)
+
+    async def controlled_turn(message: dict[str, Any]) -> None:
+        if message.get("method") == "turn/start":
+            await fake_process.stdout.push(
+                {"id": message["id"], "result": {"turn": {"id": "cancelled-turn"}}}
+            )
+            for _ in range(100):
+                if "cancelled-turn" in client._turns:
+                    break
+                await asyncio.sleep(0)
+            await fake_process.stdout.push(
+                {
+                    "id": 991,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "cancelled-turn",
+                        "callId": "completed-before-cancel",
+                        "tool": {"name": "decode_hex"},
+                        "arguments": {"data": "73656e7369746976652d7261772d7061796c6f6164"},
+                    },
+                }
+            )
+        elif message.get("method") == "turn/interrupt":
+            await fake_process.stdout.push({"id": message["id"], "result": {}})
+            await fake_process.stdout.push(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "cancelled-turn", "status": "interrupted"},
+                    },
+                }
+            )
+
+    fake_process.handle = lambda message: asyncio.create_task(controlled_turn(message))  # type: ignore[method-assign]
+    running = asyncio.create_task(client.run_turn("wait"))
+    for _ in range(100):
+        if any(response.get("id") == 991 for response in fake_process.responses):
+            break
+        await asyncio.sleep(0)
+    tool_response = next(
+        response for response in fake_process.responses if response.get("id") == 991
+    )
+    assert "result" in tool_response, tool_response
+    assert tool_response["result"]["success"] is True
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await running
+
+    retained = caught.value.result
+    assert len(retained.tool_calls) == 1
+    call = retained.tool_calls[0]
+    assert set(call) == {
+        "candidate_sha256s",
+        "host_observation",
+        "name",
+        "source_bound",
+        "success",
+        "supplied_candidate_sha256s",
+    }
+    assert isinstance(call["host_observation"], HostObservation)
+    assert call["host_observation"].tool == "decode_hex"
+    assert "sensitive-raw-payload" not in repr(retained)
+    assert not hasattr(retained, "raw")
     await client.close()
 
 

@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Any, Protocol, Self
 
 from .board import FLAG_RE
+from .evidence import HostObservation, project_tool_observation
 from .tools import ALIASES, ToolError, ToolRegistry, Workspace
 
 APP_SERVER_ARGS: tuple[str, ...] = (
@@ -262,6 +263,32 @@ class TurnResult:
     @property
     def text(self) -> str:
         return self.agent_message
+
+
+@dataclass(frozen=True)
+class _CancelledTurnEvidence:
+    """Sanitized completed-tool evidence retained across task cancellation."""
+
+    tool_calls: list[dict[str, Any]]
+
+
+def _cancelled_turn_evidence(state: _TurnState) -> _CancelledTurnEvidence:
+    tool_calls: list[dict[str, Any]] = []
+    for call in state.tool_calls:
+        observation = call.get("host_observation")
+        if not isinstance(observation, HostObservation):
+            continue
+        tool_calls.append(
+            {
+                "name": observation.tool,
+                "success": observation.success,
+                "source_bound": observation.source_bound,
+                "candidate_sha256s": list(observation.candidate_sha256s),
+                "supplied_candidate_sha256s": list(observation.supplied_candidate_sha256s),
+                "host_observation": observation,
+            }
+        )
+    return _CancelledTurnEvidence(tool_calls=tool_calls)
 
 
 def _turn_failure_class(completed: Mapping[str, Any]) -> str | None:
@@ -1340,6 +1367,7 @@ class CodexAppClient:
             "supplied_candidate_sha256s": supplied_hashes,
         }
         state.tool_calls.append(call_record)
+        observation_result: Mapping[str, Any] | None = None
         try:
             dispatch = getattr(registry, "dispatch", None) or getattr(registry, "call", None)
             if dispatch is None:
@@ -1365,6 +1393,8 @@ class CodexAppClient:
                     raise
             if inspect.isawaitable(result):
                 result = await result
+            if isinstance(result, Mapping):
+                observation_result = result
             encoded_result = _json_text(result, limit=MAX_TOOL_RESULT_BYTES)
             payload = {
                 "success": True,
@@ -1491,6 +1521,20 @@ class CodexAppClient:
             }
             if call_record is not None:
                 call_record["success"] = False
+        if call_record is not None:
+            try:
+                call_record["host_observation"] = project_tool_observation(
+                    canonical_name,
+                    success=call_record["success"],
+                    source_bound=source_bound,
+                    result=observation_result,
+                    candidate_sha256s=tuple(call_record.get("candidate_sha256s", ()))[:20],
+                    supplied_candidate_sha256s=tuple(
+                        call_record.get("supplied_candidate_sha256s", ())
+                    )[:20],
+                )
+            except (TypeError, ValueError):
+                call_record["host_observation"] = None
         await self._send_response(message_id, result=payload)
 
     async def _handle_notification(self, method: str, params: Any) -> None:
@@ -1785,8 +1829,9 @@ class CodexAppClient:
             if raise_on_timeout:
                 raise TurnTimeoutError(result)
             return result
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             await self._terminate_turn(state)
+            exc.result = _cancelled_turn_evidence(state)
             raise
         except ModelValidationError:
             await self._terminate_turn(state)
