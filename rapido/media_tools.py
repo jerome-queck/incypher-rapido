@@ -30,6 +30,8 @@ MAX_WAV_SAMPLES = 262_144
 MAX_WAV_CHANNELS = 8
 MAX_WAV_CHUNKS = 512
 MAX_WAV_PREVIEW_BYTES = 256
+MAX_WAV_CANDIDATE_SIGNALS = 16
+_FLAG_SIGNAL_RE = re.compile(r"(?:INCYPHER|flag)\{[^{}\r\n]{1,512}\}")
 
 _SHORT_VRS = frozenset(
     [
@@ -377,23 +379,57 @@ def _text_signals(data: bytes) -> list[dict[str, Any]]:
     return matches
 
 
-def _lsb_preview(bits: list[int]) -> dict[str, Any]:
+def _pack_bits(bits: bytes | bytearray, offset: int, order: str) -> bytes:
+    count = max(0, len(bits) - offset) // 8
+    return bytes(
+        sum(
+            bits[offset + index * 8 + bit] << (7 - bit if order == "msb_first" else bit)
+            for bit in range(8)
+        )
+        for index in range(count)
+    )
+
+
+def _lsb_preview(bits: bytes | bytearray) -> dict[str, Any]:
     count = len(bits) // 8
     result: dict[str, Any] = {"complete_bytes": count, "discarded_tail_bits": len(bits) % 8}
     for order in ("msb_first", "lsb_first"):
-        value = bytes(
-            sum(
-                bits[index * 8 + bit] << (7 - bit if order == "msb_first" else bit)
-                for bit in range(8)
-            )
-            for index in range(count)
-        )
+        value = _pack_bits(bits, 0, order)
         result[order] = {
             "hex": value.hex(),
             "text": _printable(value),
             "text_signals": _text_signals(value),
         }
     return result
+
+
+def _lsb_candidate_signals(
+    streams: list[tuple[str, bytearray]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return bounded flag-shaped strings from every byte alignment and bit order."""
+    signals: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for stream, bits in streams:
+        for bit_offset in range(min(8, len(bits))):
+            for order in ("msb_first", "lsb_first"):
+                decoded = _pack_bits(bits, bit_offset, order).decode("latin1")
+                for match in _FLAG_SIGNAL_RE.finditer(decoded):
+                    value = match.group()
+                    if value in seen:
+                        continue
+                    seen.add(value)
+                    signals.append(
+                        {
+                            "stream": stream,
+                            "bit_offset": bit_offset,
+                            "bit_order": order,
+                            "byte_offset": match.start(),
+                            "text": value,
+                        }
+                    )
+                    if len(signals) >= MAX_WAV_CANDIDATE_SIGNALS:
+                        return signals, True
+    return signals, False
 
 
 def _wav_format(data: bytes, offset: int, length: int) -> dict[str, int]:
@@ -473,8 +509,8 @@ def wav_analyze(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str,
     payload = memoryview(data)[audio_start : audio_start + analyzed_frames * frame_bytes]
     peak = 1 << (width * 8 - 1)
     stats: list[dict[str, Any]] = []
-    bit_streams: list[list[int]] = [[] for _ in range(channels)]
-    interleaved: list[int] = []
+    bit_streams = [bytearray() for _ in range(channels)]
+    interleaved = bytearray()
     for channel in range(channels):
         stats.append(
             {
@@ -510,10 +546,8 @@ def wav_analyze(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str,
             row["last_sign"] = sign
         if len(row["sample_preview"]) < 16:
             row["sample_preview"].append(sample)
-        if len(bit_streams[channel]) < preview_limit * 8:
-            bit_streams[channel].append(bit)
-        if len(interleaved) < preview_limit * 8:
-            interleaved.append(bit)
+        bit_streams[channel].append(bit)
+        interleaved.append(bit)
     for channel, row in enumerate(stats):
         total, squares = row.pop("sum"), row.pop("sum_squares")
         row.pop("last_sign")
@@ -524,8 +558,14 @@ def wav_analyze(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str,
         row["lsb_one_fraction"] = (
             round(row.pop("lsb_ones") / analyzed_frames, 6) if analyzed_frames else 0.0
         )
-        row["lsb_preview"] = _lsb_preview(bit_streams[channel])
+        row["lsb_preview"] = _lsb_preview(bit_streams[channel][: preview_limit * 8])
         row["lsb_preview_truncated"] = analyzed_frames > preview_limit * 8
+    candidate_signals, candidate_signals_truncated = _lsb_candidate_signals(
+        [
+            ("interleaved", interleaved),
+            *((f"channel_{index}", bits) for index, bits in enumerate(bit_streams)),
+        ]
+    )
     signals_scan_bytes = min(len(payload), 64 * 1024)
     result = {
         "path": path_arg,
@@ -541,8 +581,10 @@ def wav_analyze(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str,
         "analyzed_seconds": round(analyzed_frames / parameters["sample_rate"], 6),
         "truncated": analyzed_frames < total_frames,
         "channel_stats": stats,
-        "interleaved_lsb_preview": _lsb_preview(interleaved),
+        "interleaved_lsb_preview": _lsb_preview(interleaved[: preview_limit * 8]),
         "interleaved_lsb_preview_truncated": analyzed_frames * channels > preview_limit * 8,
+        "lsb_candidate_signals": candidate_signals,
+        "lsb_candidate_signals_truncated": candidate_signals_truncated,
         "pcm_text_signals": _text_signals(bytes(payload[:signals_scan_bytes])),
         "pcm_text_scanned_bytes": signals_scan_bytes,
         "pcm_text_truncated": signals_scan_bytes < len(payload),

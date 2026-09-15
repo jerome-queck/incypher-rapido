@@ -7,7 +7,13 @@ import wave
 
 import pytest
 
-from rapido.media_tools import dicom_metadata, media_tool_specs, wav_analyze
+from rapido.media_tools import (
+    MAX_WAV_CANDIDATE_SIGNALS,
+    _lsb_candidate_signals,
+    dicom_metadata,
+    media_tool_specs,
+    wav_analyze,
+)
 from rapido.tools import ToolError, ToolRegistry, Workspace, call_tool
 
 
@@ -36,6 +42,20 @@ def wav_fixture(path) -> None:
         output.setsampwidth(2)
         output.setframerate(8000)
         output.writeframes(frames)
+
+
+def wav_shifted_flag_fixture(path) -> str:
+    candidate = "INCYPHER{shifted_lsb_scan}"
+    bits = [1, 0, 1] + [
+        (byte >> shift) & 1 for byte in candidate.encode() for shift in range(7, -1, -1)
+    ]
+    frames = b"".join(struct.pack("<h", 100 + bit) for bit in bits)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(8000)
+        output.writeframes(frames)
+    return candidate
 
 
 def test_dicom_metadata_stops_before_pixel_payload(tmp_path):
@@ -81,6 +101,30 @@ def test_wav_frame_limit_and_malformed_inputs(tmp_path):
     with pytest.raises(ToolError) as error:
         wav_analyze(Workspace(tmp_path), {"path": "bad.wav"})
     assert error.value.code == "unsupported_format"
+
+
+def test_wav_finds_candidate_across_lsb_alignment(tmp_path):
+    candidate = wav_shifted_flag_fixture(tmp_path / "shifted.wav")
+    result = wav_analyze(Workspace(tmp_path), {"path": "shifted.wav"})
+    assert result["lsb_candidate_signals"] == [
+        {
+            "stream": "interleaved",
+            "bit_offset": 3,
+            "bit_order": "msb_first",
+            "byte_offset": 0,
+            "text": candidate,
+        }
+    ]
+    assert result["lsb_candidate_signals_truncated"] is False
+
+
+def test_wav_candidate_signal_limit_is_truthful():
+    candidates = [f"INCYPHER{{candidate_{index:02d}}}" for index in range(17)]
+    payload = " ".join(candidates).encode()
+    bits = bytearray((byte >> shift) & 1 for byte in payload for shift in range(7, -1, -1))
+    signals, truncated = _lsb_candidate_signals([("interleaved", bits)])
+    assert len(signals) == MAX_WAV_CANDIDATE_SIGNALS
+    assert truncated is True
 
 
 @pytest.mark.parametrize("operation", [dicom_metadata, wav_analyze])
