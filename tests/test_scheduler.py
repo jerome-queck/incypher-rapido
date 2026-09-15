@@ -204,6 +204,7 @@ class CoverageBarrierRuntime:
         self.episode_one_admitted = asyncio.Event()
         self.admissions: list[tuple[int, int, int]] = []
         self.invalid_carry: list[tuple[int, int, list[dict[str, object]]]] = []
+        self.invalid_observations: list[tuple[int, int, dict[str, object]]] = []
         self.overlapping_episode_violations: list[tuple[int, int, int]] = []
         self._wave_arrivals: Counter[tuple[int, int]] = Counter()
         self._wave_ready: dict[tuple[int, int], asyncio.Event] = {}
@@ -238,6 +239,19 @@ class CoverageBarrierRuntime:
             ]
             if document["prior_attempts"] != expected:
                 self.invalid_carry.append((challenge_id, lane, document["prior_attempts"]))
+            observations = document["prior_observations"]
+            manifests = observations.get("manifests", [])
+            if not (
+                observations.get("challenge_id") == challenge_id
+                and observations.get("lane") == lane
+                and observations.get("before_episode") == episode
+                and len(manifests) == 1
+                and manifests[0].get("episode") == 0
+                and manifests[0].get("gap") == "provenance_incomplete"
+                and len(manifests[0].get("items", [])) == 1
+                and manifests[0]["items"][0].get("tool") == "inspect_file"
+            ):
+                self.invalid_observations.append((challenge_id, lane, observations))
 
         active_episode = self._active_episode.get(challenge_id)
         if active_episode is not None and active_episode != episode:
@@ -418,6 +432,7 @@ def test_fifo_coverage_precedes_successors_and_carry_is_lane_local(tmp_path: Pat
         assert last_episode_zero < first_episode_one
         assert runtime.overlapping_episode_violations == []
         assert runtime.invalid_carry == []
+        assert runtime.invalid_observations == []
         assert Counter(runtime.admissions) == Counter(
             (challenge_id, episode, lane)
             for challenge_id in (1, 2, 3)
