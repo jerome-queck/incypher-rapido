@@ -23,6 +23,7 @@ RUN set -eux; \
 FROM ${PYTHON_IMAGE} AS python-build
 WORKDIR /src
 COPY pyproject.toml /src/pyproject.toml
+COPY LICENSE /src/LICENSE
 COPY rapido /src/rapido
 RUN python -m venv --copies /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check .
@@ -40,6 +41,8 @@ COPY --from=codex /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=codex /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=python-build /opt/venv /opt/venv
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
+COPY --from=codex /usr/local/LICENSE /licenses/NODE_LICENSE
 
 # Older Docker COPY implementations can drop npm's nested optional-dependency
 # symlink. Recreate the package-local link explicitly in the final image.

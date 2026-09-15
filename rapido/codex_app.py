@@ -9,11 +9,13 @@ tool request shape Rapido exposes.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import inspect
 import json
 import os
+import urllib.parse
 from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -119,6 +121,7 @@ _ARTIFACT_TOOLS = {
     "search_text",
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
+_TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
 
 
 class CodexAppError(RuntimeError):
@@ -248,6 +251,8 @@ class _TurnState:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     provenance_outputs: list[str] = field(default_factory=list)
     provenance_bytes: int = 0
+    tainted_candidates: set[str] = field(default_factory=set)
+    tainted_target_inputs: set[str] = field(default_factory=set)
     last_event: dict[str, Any] = field(default_factory=dict)
 
 
@@ -299,6 +304,8 @@ def _source_bound_tool_call(
     state: _TurnState | None, name: str, arguments: Mapping[str, Any]
 ) -> bool:
     canonical = ALIASES.get(name, name)
+    if canonical in _TARGET_OBSERVATION_TOOLS:
+        return True
     if canonical in _ARTIFACT_TOOLS and _artifact_relative_path(arguments.get("path")):
         return True
     if canonical not in _TRANSFORM_TOOLS or state is None:
@@ -307,6 +314,56 @@ def _source_bound_tool_call(
         return True
     data = arguments.get("data")
     return isinstance(data, str) and any(data in output for output in state.provenance_outputs)
+
+
+def _argument_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [item for child in value.values() for item in _argument_strings(child)]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [item for child in value for item in _argument_strings(child)]
+    return []
+
+
+def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[str]:
+    """Find candidate-shaped model input, including supported transport encodings."""
+    values = _argument_strings(arguments)
+    decoded_values = [urllib.parse.unquote(value) for value in values]
+    canonical = ALIASES.get(name, name)
+    data = arguments.get("data")
+    if canonical in {"http_request", "tcp_exchange"} and isinstance(data, str):
+        encoding = arguments.get("encoding", "utf8")
+        try:
+            if encoding == "base64":
+                decoded_values.append(base64.b64decode(data, validate=True).decode("utf-8"))
+            elif encoding == "hex":
+                decoded_values.append(bytes.fromhex(data).decode("utf-8"))
+            elif encoding == "utf8":
+                decoded_values.append(data)
+        except (UnicodeError, ValueError):
+            pass
+    return {
+        match.group() for value in [*values, *decoded_values] for match in FLAG_RE.finditer(value)
+    }
+
+
+def _target_provenance_output(
+    name: str,
+    encoded_result: str,
+    tainted_inputs: set[str],
+    tainted_candidates: set[str],
+) -> str:
+    canonical = ALIASES.get(name, name)
+    if canonical not in _TARGET_OBSERVATION_TOOLS:
+        return encoded_result
+    needles = {
+        *tainted_candidates,
+        *tainted_inputs,
+    }
+    for needle in sorted(needles, key=len, reverse=True):
+        encoded_result = encoded_result.replace(needle, "[model-supplied]")
+    return encoded_result
 
 
 class CodexAppClient:
@@ -744,6 +801,14 @@ class CodexAppClient:
             )
             return
         source_bound = _source_bound_tool_call(state, name, arguments)
+        current_supplied = _supplied_candidate_values(name, arguments) if source_bound else set()
+        canonical_name = ALIASES.get(name, name)
+        if canonical_name in _TARGET_OBSERVATION_TOOLS:
+            state.tainted_candidates.update(current_supplied)
+            state.tainted_target_inputs.update(
+                value for value in _argument_strings(arguments) if len(value) >= 8
+            )
+        supplied_candidates = {*state.tainted_candidates, *current_supplied}
         call_record: dict[str, Any] | None = {
             "name": name,
             "success": None,
@@ -779,12 +844,19 @@ class CodexAppClient:
                     {
                         hashlib.sha256(match.group().encode()).hexdigest()
                         for match in list(FLAG_RE.finditer(encoded_result))[:20]
+                        if match.group() not in supplied_candidates
                     }
                 )
             if source_bound and state is not None:
-                encoded_bytes = len(encoded_result.encode("utf-8"))
+                provenance_result = _target_provenance_output(
+                    name,
+                    encoded_result,
+                    state.tainted_target_inputs,
+                    state.tainted_candidates,
+                )
+                encoded_bytes = len(provenance_result.encode("utf-8"))
                 if state.provenance_bytes + encoded_bytes <= MAX_PROVENANCE_BYTES:
-                    state.provenance_outputs.append(encoded_result)
+                    state.provenance_outputs.append(provenance_result)
                     state.provenance_bytes += encoded_bytes
         except ToolError as exc:
             error_payload = {"code": exc.code, "message": exc.message}

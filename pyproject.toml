@@ -7,6 +7,7 @@ name = "incypher-rapido"
 version = "0.1.0"
 description = "Autonomous native-Codex agent for bounded IN-CYPHER challenge solving"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
 dependencies = []
 
 [project.scripts]

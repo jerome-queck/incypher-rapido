@@ -28,6 +28,7 @@ from .solver import (
     build_turn_prompt,
 )
 from .state import StateStore
+from .target import TargetEndpoint, TargetToolRegistry, parse_connection_info
 
 
 class NativeTurn(Protocol):
@@ -49,6 +50,7 @@ class NativeRuntime(Protocol):
         reasoning_effort: str,
         output_schema: dict[str, Any],
         timeout: float,
+        tool_registry: Any | None = None,
     ) -> NativeTurn: ...
 
     async def close(self) -> None: ...
@@ -100,6 +102,11 @@ _CATEGORY_ORDER = {
 }
 
 
+def _category_rank(value: str) -> int:
+    normalized = re.sub(r"^\(practice\)\s*", "", value.strip(), flags=re.IGNORECASE).lower()
+    return _CATEGORY_ORDER.get(normalized, len(_CATEGORY_ORDER))
+
+
 def _artifact_name(file_ref: str, index: int) -> str:
     raw = Path(urllib.parse.unquote(urllib.parse.urlsplit(file_ref).path)).name
     safe = _SAFE_NAME.sub("_", raw).strip("._")[:100] or "artifact.bin"
@@ -120,7 +127,11 @@ def _max_parallel(results: list[LaneResult]) -> int:
 
 def _instance_receipt(result: dict[str, Any]) -> str:
     encoded = json.dumps(
-        {"connection_info": result.get("connection_info"), "until": result.get("until")},
+        {
+            "connection_info": result.get("connection_info"),
+            "since": result.get("since"),
+            "until": result.get("until"),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -183,82 +194,257 @@ class Orchestrator:
 
     async def _cleanup_owned_instances(self, deadline: float) -> None:
         for record in self.state.owned_instances():
-            run_id = str(record["run_id"])
-            challenge_id = int(record["challenge_id"])
-            expected_receipt = record.get("receipt_sha256")
-            if not isinstance(expected_receipt, str):
-                self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
-                self.state.event(
-                    run_id,
-                    "instance_cleanup",
-                    {
-                        "challenge_id": challenge_id,
-                        "status": "manual_reconciliation_required",
-                        "reason": "ownership receipt missing",
-                    },
-                )
-                continue
-            try:
-                current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
-            except BoardError:
-                self.state.event(
-                    run_id, "instance_cleanup", {"challenge_id": challenge_id, "status": "failed"}
-                )
-                continue
-            if current["status"] == 404:
-                self.state.mark_instance(run_id, challenge_id, "removed")
-                self.state.event(
-                    run_id, "instance_cleanup", {"challenge_id": challenge_id, "status": "absent"}
-                )
-                continue
-            if current["success"] is not True:
-                self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
-                self.state.event(
-                    run_id,
-                    "instance_cleanup",
-                    {
-                        "challenge_id": challenge_id,
-                        "status": "manual_reconciliation_required",
-                        "reason": "Board state was indeterminate",
-                    },
-                )
-                continue
-            if _instance_receipt(current) != expected_receipt:
-                self.state.mark_instance(run_id, challenge_id, "removed")
-                self.state.event(
-                    run_id,
-                    "instance_cleanup",
-                    {"challenge_id": challenge_id, "status": "skipped_replaced"},
-                )
-                continue
+            await self._cleanup_instance_record(record, deadline)
+
+    async def _cleanup_instance_record(self, record: dict[str, Any], deadline: float) -> bool:
+        run_id = str(record["run_id"])
+        challenge_id = int(record["challenge_id"])
+        expected_receipt = record.get("receipt_sha256")
+        if isinstance(expected_receipt, str):
+            return await self._delete_instance(
+                run_id,
+                challenge_id,
+                deadline,
+                expected_receipt=expected_receipt,
+                reason="restart_recovery",
+            )
+        try:
+            current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+        except (BoardError, RunDeadlineReached):
             self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
+            self.state.event(
+                run_id, "instance_cleanup", {"challenge_id": challenge_id, "status": "failed"}
+            )
+            return False
+        if current.get("status") == 404:
+            self.state.mark_instance(run_id, challenge_id, "removed")
+            self.state.event(
+                run_id, "instance_cleanup", {"challenge_id": challenge_id, "status": "absent"}
+            )
+            return True
+        self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
+        self.state.event(
+            run_id,
+            "instance_cleanup",
+            {
+                "challenge_id": challenge_id,
+                "status": "manual_reconciliation_required",
+                "reason": "no generation receipt proves ownership",
+            },
+        )
+        return False
+
+    async def _delete_instance(
+        self,
+        run_id: str,
+        challenge_id: int,
+        deadline: float,
+        *,
+        expected_receipt: str,
+        reason: str,
+    ) -> bool:
+        """Request deletion and verify remote absence without abandoning ownership."""
+        self.state.mark_instance(run_id, challenge_id, "cleanup_pending")
+        try:
+            current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+        except (BoardError, RunDeadlineReached):
+            self.state.event(
+                run_id,
+                "instance_cleanup",
+                {"challenge_id": challenge_id, "status": "predelete_failed", "reason": reason},
+            )
+            return False
+        if current.get("status") == 404:
+            self.state.mark_instance(run_id, challenge_id, "removed")
+            self.state.event(
+                run_id,
+                "instance_cleanup",
+                {"challenge_id": challenge_id, "status": "absent", "reason": reason},
+            )
+            return True
+        if current.get("success") is not True:
             self.state.event(
                 run_id,
                 "instance_cleanup",
                 {
                     "challenge_id": challenge_id,
                     "status": "manual_reconciliation_required",
-                    "reason": "Board DELETE has no generation precondition",
+                    "reason": reason,
+                    "detail": "Board state was indeterminate",
                 },
             )
+            return False
+        if _instance_receipt(current) != expected_receipt:
+            self.state.mark_instance(run_id, challenge_id, "removed")
+            self.state.event(
+                run_id,
+                "instance_cleanup",
+                {"challenge_id": challenge_id, "status": "skipped_replaced", "reason": reason},
+            )
+            return False
+        try:
+            result = await self._board_call(deadline, self.board.instance, "DELETE", challenge_id)
+        except (BoardError, RunDeadlineReached):
+            self.state.event(
+                run_id,
+                "instance_cleanup",
+                {"challenge_id": challenge_id, "status": "delete_failed", "reason": reason},
+            )
+            return False
+        if result.get("success") is not True:
+            if result.get("status") == 404:
+                self.state.mark_instance(run_id, challenge_id, "removed")
+                self.state.event(
+                    run_id,
+                    "instance_cleanup",
+                    {"challenge_id": challenge_id, "status": "absent", "reason": reason},
+                )
+                return True
+            self.state.event(
+                run_id,
+                "instance_cleanup",
+                {
+                    "challenge_id": challenge_id,
+                    "status": "delete_rejected",
+                    "http_status": result.get("status"),
+                    "reason": reason,
+                },
+            )
+            return False
+        while deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
+            try:
+                current = await self._board_call(deadline, self.board.instance, "GET", challenge_id)
+            except (BoardError, RunDeadlineReached):
+                break
+            if current.get("status") == 404:
+                self.state.mark_instance(run_id, challenge_id, "removed")
+                self.state.event(
+                    run_id,
+                    "instance_cleanup",
+                    {"challenge_id": challenge_id, "status": "removed", "reason": reason},
+                )
+                return True
+            if current.get("success") is not True:
+                break
+            await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        self.state.event(
+            run_id,
+            "instance_cleanup",
+            {"challenge_id": challenge_id, "status": "absence_unverified", "reason": reason},
+        )
+        return False
 
-    async def _challenge_catalogue(self, deadline: float) -> list[Challenge]:
+    async def _start_instance(
+        self, run_id: str, challenge: Challenge, deadline: float
+    ) -> tuple[tuple[TargetEndpoint, ...], str]:
+        """Persist intent, create once, poll boundedly, and parse Board-issued endpoints."""
+        existing = await self._board_call(deadline, self.board.instance, "GET", challenge.id)
+        if existing.get("success") is True:
+            raise BoardError("dynamic instance is already active without runtime ownership")
+        if existing.get("status") != 404:
+            raise BoardError("dynamic instance preflight was indeterminate")
+        self.state.mark_instance(run_id, challenge.id, "creating")
+        self.state.event(
+            run_id, "instance_create_intent", {"challenge_id": challenge.id, "writes": 0}
+        )
+        transport_timeout = float(getattr(self.board, "timeout", 15.0))
+        if deadline - time.monotonic() <= transport_timeout:
+            raise RunDeadlineReached
+        create_task = asyncio.create_task(
+            asyncio.to_thread(self.board.instance, "POST", challenge.id)
+        )
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            result = await asyncio.shield(create_task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            try:
+                result = await create_task
+            except (BoardError, RunDeadlineReached):
+                self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+                raise cancelled
+        except (BoardError, RunDeadlineReached):
+            self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+            raise
+        self.state.event(
+            run_id,
+            "instance_create",
+            {
+                "challenge_id": challenge.id,
+                "success": result.get("success") is True,
+                "http_status": result.get("status"),
+            },
+        )
+        if result.get("success") is not True:
+            self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+            if cancelled is not None:
+                raise cancelled
+            raise BoardError("dynamic instance creation was rejected")
+        provisional_receipt: str | None = None
+        if isinstance(result.get("connection_info"), str) and result["connection_info"]:
+            provisional_receipt = _instance_receipt(result)
+            self.state.mark_instance(
+                run_id, challenge.id, "owned", receipt_sha256=provisional_receipt
+            )
+        if cancelled is not None:
+            if provisional_receipt is None:
+                self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+            raise cancelled
+        ready_deadline = min(deadline, time.monotonic() + 120.0)
+        while ready_deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
+            current = await self._board_call(deadline, self.board.instance, "GET", challenge.id)
+            info = current.get("connection_info")
+            if current.get("success") is True and isinstance(info, str) and info:
+                try:
+                    endpoints = parse_connection_info(info)
+                except ValueError as exc:
+                    raise BoardError(
+                        "dynamic instance returned invalid connection information"
+                    ) from exc
+                receipt = _instance_receipt(current)
+                if provisional_receipt is not None and receipt != provisional_receipt:
+                    raise BoardError("dynamic instance generation changed during creation")
+                self.state.mark_instance(run_id, challenge.id, "owned", receipt_sha256=receipt)
+                self.state.event(
+                    run_id,
+                    "instance_ready",
+                    {
+                        "challenge_id": challenge.id,
+                        "receipt_sha256": receipt,
+                        "endpoints": [
+                            endpoint.public_record(index)
+                            for index, endpoint in enumerate(endpoints)
+                        ],
+                    },
+                )
+                return endpoints, receipt
+            if current.get("status") in {403, 429}:
+                raise BoardError("dynamic instance readiness was rejected")
+            await asyncio.sleep(min(2.0, max(0.0, ready_deadline - time.monotonic())))
+        raise BoardError("dynamic instance did not become ready before the bounded deadline")
+
+    async def _qualified_identity(self, deadline: float) -> tuple[int, int]:
         anonymous_rejected = await self._board_call(
             deadline, self.board.anonymous_identity_is_rejected
         )
         if anonymous_rejected is not True:
             raise BoardError("anonymous Board identity negative control failed")
         identity = await self._board_call(deadline, self.board.identity)
-        identity_confirmation = await self._board_call(deadline, self.board.identity)
-        if type(identity.get("id")) is not int or identity["id"] <= 0:
+        confirmation = await self._board_call(deadline, self.board.identity)
+        user_id = identity.get("id")
+        team_id = identity.get("team_id")
+        if type(user_id) is not int or user_id <= 0:
             raise BoardError("Board identity is not qualified")
-        if type(identity.get("team_id")) is not int or identity["team_id"] <= 0:
+        if type(team_id) is not int or team_id <= 0:
             raise BoardError("Board identity has no qualified team")
-        if (
-            identity_confirmation.get("id") != identity["id"]
-            or identity_confirmation.get("team_id") != identity["team_id"]
-        ):
+        if confirmation.get("id") != user_id or confirmation.get("team_id") != team_id:
             raise BoardError("consecutive Board identities were incoherent")
+        self.state.bind_board_identity(user_id, team_id)
+        return user_id, team_id
+
+    async def _challenge_catalogue(
+        self, deadline: float, identity: tuple[int, int]
+    ) -> list[Challenge]:
         reads = [
             await self._board_call(deadline, self.board.list_challenges),
             await self._board_call(deadline, self.board.list_challenges),
@@ -296,19 +482,23 @@ class Orchestrator:
         ):
             raise BoardError("challenge list changed during qualification")
         final_identity = await self._board_call(deadline, self.board.identity)
-        if (
-            final_identity.get("id") != identity["id"]
-            or final_identity.get("team_id") != identity["team_id"]
-        ):
+        if final_identity.get("id") != identity[0] or final_identity.get("team_id") != identity[1]:
             raise BoardError("Board identity changed during qualification")
         details.sort(
             key=lambda challenge: (
-                challenge.type != "standard",
-                _CATEGORY_ORDER.get(challenge.category.lower(), len(_CATEGORY_ORDER)),
+                challenge.type != "dynamic_iac",
+                _category_rank(challenge.category),
                 challenge.value,
                 challenge.id,
             )
         )
+        if self.config.challenge_ids:
+            available = {challenge.id for challenge in details}
+            missing = sorted(set(self.config.challenge_ids) - available)
+            if missing:
+                raise BoardError("configured challenge ids are absent from the qualified catalogue")
+            selected = set(self.config.challenge_ids)
+            details = [challenge for challenge in details if challenge.id in selected]
         return details
 
     async def _prepare_workspaces(
@@ -430,6 +620,7 @@ class Orchestrator:
         workspace: Path,
         artifact_paths: list[str],
         timeout_seconds: float,
+        target_endpoints: tuple[TargetEndpoint, ...] = (),
     ) -> LaneResult:
         attempt_id = f"{run_id}:{challenge.id}:{lane}"
         self.state.start_attempt(
@@ -442,6 +633,16 @@ class Orchestrator:
         )
         started = time.monotonic()
         tool_calls: tuple[ToolCallEvidence, ...] = ()
+        target_registry = (
+            TargetToolRegistry(
+                workspace,
+                target_endpoints,
+                team_key=self.config.team_key,
+                max_workspace_bytes=self.config.max_lane_workspace_bytes,
+            )
+            if target_endpoints
+            else None
+        )
         try:
             turn = await asyncio.wait_for(
                 self.runtime.solve(
@@ -452,6 +653,7 @@ class Orchestrator:
                     reasoning_effort=self.config.reasoning_effort,
                     output_schema=SOLVER_OUTPUT_SCHEMA,
                     timeout=timeout_seconds,
+                    tool_registry=target_registry,
                 ),
                 timeout=timeout_seconds + 5,
             )
@@ -515,10 +717,18 @@ class Orchestrator:
             finding = None
             terminal = "failed"
             self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+        finally:
+            if target_registry is not None:
+                target_registry.close()
         return LaneResult(lane, started, time.monotonic(), finding, terminal, tool_calls)
 
     async def _solve_challenge(
-        self, run_id: str, run_root: Path, challenge: Challenge, deadline: float
+        self,
+        run_id: str,
+        run_root: Path,
+        challenge: Challenge,
+        deadline: float,
+        target_endpoints: tuple[TargetEndpoint, ...] = (),
     ) -> str:
         self.state.set_challenge_status(challenge.id, "running")
         try:
@@ -537,7 +747,15 @@ class Orchestrator:
 
         async def scheduled_lane(lane: int, workspace: Path, artifacts: list[str]) -> LaneResult:
             async with self._slots:
-                return await self._lane(run_id, challenge, lane, workspace, artifacts, timeout)
+                return await self._lane(
+                    run_id,
+                    challenge,
+                    lane,
+                    workspace,
+                    artifacts,
+                    timeout,
+                    target_endpoints,
+                )
 
         pending = {
             asyncio.create_task(scheduled_lane(lane, workspace, artifacts))
@@ -706,6 +924,52 @@ class Orchestrator:
         self.state.set_challenge_status(challenge.id, status)
         return status
 
+    async def _solve_dynamic_challenge(
+        self, run_id: str, run_root: Path, challenge: Challenge, deadline: float
+    ) -> str:
+        """Own the complete create/use/delete lifecycle for one dynamic challenge."""
+        try:
+            endpoints, receipt = await self._start_instance(run_id, challenge, deadline)
+        except BaseException as exc:
+            owned_record = next(
+                (
+                    record
+                    for record in self.state.owned_instances()
+                    if record["run_id"] == run_id and record["challenge_id"] == challenge.id
+                ),
+                None,
+            )
+            if owned_record is not None:
+                cleanup = asyncio.create_task(
+                    self._cleanup_instance_record(owned_record, time.monotonic() + 45.0)
+                )
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    with suppress(Exception):
+                        await cleanup
+            if isinstance(exc, (BoardError, RunDeadlineReached)):
+                self.state.set_challenge_status(challenge.id, "error")
+                return "error"
+            raise
+        terminal = "error"
+        cleanup_ok = False
+        try:
+            terminal = await self._solve_challenge(run_id, run_root, challenge, deadline, endpoints)
+        finally:
+            cleanup_deadline = time.monotonic() + 45.0
+            cleanup_ok = await self._delete_instance(
+                run_id,
+                challenge.id,
+                cleanup_deadline,
+                expected_receipt=receipt,
+                reason="challenge_complete",
+            )
+        if not cleanup_ok:
+            self.state.set_challenge_status(challenge.id, "error")
+            return "error"
+        return terminal
+
     async def run(self) -> RunReport:
         deadline = time.monotonic() + self.config.run_seconds
         self._ensure_private_work_root()
@@ -735,6 +999,7 @@ class Orchestrator:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
+            identity = await self._qualified_identity(deadline)
             await self._cleanup_owned_instances(deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -746,7 +1011,7 @@ class Orchestrator:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
-            challenges = await self._challenge_catalogue(deadline)
+            challenges = await self._challenge_catalogue(deadline, identity)
             challenge_count = len(challenges)
             for challenge in challenges:
                 self.state.upsert_challenge(
@@ -763,14 +1028,20 @@ class Orchestrator:
                 if time.monotonic() >= deadline:
                     status = "deadline"
                     break
-                if challenge.type != "standard":
+                if challenge.type != "standard" and (
+                    challenge.type != "dynamic_iac" or not self.config.manage_dynamic_instances
+                ):
                     self.state.set_challenge_status(challenge.id, "unsupported")
                     self.state.event(
                         run_id,
                         "challenge_unsupported",
                         {
                             "challenge_id": challenge.id,
-                            "reason": "live_target_outside_runtime_scope",
+                            "reason": (
+                                "dynamic_management_disabled"
+                                if challenge.type == "dynamic_iac"
+                                else "organizer_challenge_type_unavailable"
+                            ),
                         },
                     )
                     counts["unsupported"] += 1
@@ -780,8 +1051,13 @@ class Orchestrator:
                     raise RunDeadlineReached
                 try:
                     try:
+                        operation = (
+                            self._solve_dynamic_challenge(run_id, run_root, challenge, deadline)
+                            if challenge.type == "dynamic_iac"
+                            else self._solve_challenge(run_id, run_root, challenge, deadline)
+                        )
                         terminal = await asyncio.wait_for(
-                            self._solve_challenge(run_id, run_root, challenge, deadline),
+                            operation,
                             timeout=remaining,
                         )
                     except TimeoutError as exc:

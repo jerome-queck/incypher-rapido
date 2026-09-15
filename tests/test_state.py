@@ -196,3 +196,46 @@ def test_owned_instance_lifecycle_is_restartable(tmp_path: Path) -> None:
     store.mark_instance("run-1", 1, "removed")
     assert store.owned_instances() == []
     store.close()
+
+
+def test_state_is_bound_to_one_qualified_board_identity(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.bind_board_identity(10, 20)
+    store.bind_board_identity(10, 20)
+    with pytest.raises(RuntimeError, match="different qualified Board identity"):
+        store.bind_board_identity(11, 20)
+    store.close()
+
+
+def test_create_intent_is_durable_before_instance_receipt_exists(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "web", "dynamic_iac", 100)
+    store.mark_instance("run-1", 1, "creating")
+    row = store.owned_instances()[0]
+    assert row["status"] == "creating"
+    assert row["receipt_sha256"] is None
+    store.close()
+
+
+def test_new_create_intent_clears_previous_generation_receipt(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.start_run("run-2", {})
+    store.upsert_challenge(1, "A", "web", "dynamic_iac", 100)
+    store.mark_instance("run-1", 1, "owned", receipt_sha256="a" * 64)
+    store.mark_instance("run-2", 1, "creating")
+    row = store.owned_instances()[0]
+    assert row["run_id"] == "run-2"
+    assert row["receipt_sha256"] is None
+    store.close()
+
+
+def test_legacy_external_effects_cannot_be_adopted_by_first_new_identity(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "web", "dynamic_iac", 100)
+    store.mark_instance("run-1", 1, "creating")
+    with pytest.raises(RuntimeError, match="legacy state has unbound external effects"):
+        store.bind_board_identity(10, 20)
+    store.close()

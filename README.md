@@ -5,17 +5,20 @@ ChatGPT subscription. No OpenAI API key or direct model API is supported.
 
 Rapido keeps Board credentials in the supervisor only. One native app-server owns subscription
 authentication, while at least two independent threads analyze separate workspace copies through a
-small allowlist of offline tools. Unified execution, shell, browser, network, app, computer-use, and
-nested multi-agent tools are disabled. The retained native V8 broker can invoke only Rapido's bounded
-dynamic-tool allowlist. A candidate is submitted only when two lanes derive the same
+small allowlist of workspace tools and Board-endpoint-bound HTTP/TCP clients. Unified execution,
+shell, browser, general network, app, computer-use, and nested multi-agent tools are disabled. The
+retained native V8 broker can invoke only Rapido's bounded dynamic-tool allowlist. A candidate is
+submitted only when two lanes derive the same
 non-placeholder value observed in a successful source-bound tool result.
 
 ## Current boundary
 
-The runtime analyzes supplied descriptions and artifacts. Live-target scanning or exploitation is
-outside scope; dynamic target challenges and raw-TCP `TEAM_KEY` use are unsupported and recorded as
-`unsupported`. The default also withholds all submissions (`RAPIDO_SUBMIT_CANDIDATES=false`). Enable
-submission only for an authorized run.
+The runtime analyzes supplied descriptions, artifacts, and assigned dynamic targets. With instance
+management enabled, Rapido preflights absence, creates one Board instance, polls readiness, binds
+HTTP/TCP tools to only the issued authorities, completes the observed team-key PoW when requested,
+and verifies receipt-matched teardown. General scanning and arbitrary destinations remain outside
+scope. The defaults withhold submissions and instance writes; enable either only for an authorized
+run.
 
 ## Local setup
 
@@ -37,6 +40,7 @@ Keep Board values in an external mode-0600 env file:
 ```text
 CTFD_URL=https://hackathon.in-cypher.com
 CTFD_API_TOKEN=...
+TEAM_KEY=...
 RAPIDO_CODEX_HOME=/private/path/codex-home
 RAPIDO_STATE_PATH=/private/path/state/rapido.sqlite3
 RAPIDO_WORK_ROOT=/private/path/state/work
@@ -67,9 +71,10 @@ Important settings:
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | Maximum one downloaded artifact |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source bytes before lane copies |
 | `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912` | Source, lane copies, and cumulative workspace-file cap |
+| `RAPIDO_CHALLENGE_IDS` | empty | Optional unique comma-separated qualified challenge IDs; empty means full catalogue |
 | `RAPIDO_SUBMIT_CANDIDATES` | `false` | Serial exact-agreement submissions when true |
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Global ceiling for wrong or indeterminate effects |
-| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `false` | Reserved; dynamic analysis remains unsupported |
+| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `false` | Create, access, and receipt-check/delete `dynamic_iac` instances |
 
 ## Verification
 
@@ -81,8 +86,8 @@ docker build -t rapido:local .
 
 The run clock starts before restart cleanup and native startup. No new Board call starts unless its
 full transport timeout fits. Cancellation drains an in-flight Board call (at most its 15-second
-transport timeout) and any bounded offline tool before deleting workspaces; wall-clock shutdown can
-therefore extend beyond the work-admission deadline by that bounded teardown.
+transport timeout) and any bounded tool before deleting workspaces; wall-clock shutdown can extend
+beyond the work-admission deadline by bounded teardown.
 
 Container mounts, resource limits, and auth ownership are documented in
 [`deploy/CONTAINER.md`](deploy/CONTAINER.md). Research decisions are under [`notes/research`](notes/research).
@@ -93,8 +98,10 @@ reservations/fingerprints/verdicts without Board credentials. Use `rapido pendin
 `rapido reconcile --challenge-id ... --candidate-sha256 ... --outcome correct|incorrect|not-delivered`
 after independently
 checking an ambiguous submission; Rapido never guesses whether a timed-out POST landed. Instance
-reconciliation verifies generation receipts but refuses automatic DELETE because the Board contract
-has no conditional-generation delete. State-path, shared Codex-home, and shared work-root leases
+reconciliation quarantines receipt-less ambiguous creates. Receipt-bound cleanup re-reads and matches
+the generation immediately before DELETE; the Board contract still lacks an atomic conditional
+generation delete, so a narrow read/delete race remains documented. State-path, shared Codex-home,
+and shared work-root leases
 enforce one supervisor/app-server/workspace owner. Challenge workspaces and recognized stale run roots
 are removed without
 following symlinks. Never publish state/work directories: attempt state can contain candidate values.

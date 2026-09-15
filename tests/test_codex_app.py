@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from functools import wraps
@@ -197,6 +198,11 @@ def make_client(process: FakeProcess, tmp_path: Path, **kwargs: Any) -> CodexApp
 @pytest.mark.parametrize("name", ("image_metadata", "audio_metadata", "inspect_binary", "binary"))
 def test_canonical_metadata_tools_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {"path": "artifacts/input.bin"})
+
+
+@pytest.mark.parametrize("name", ("http_request", "tcp_open", "tcp_exchange"))
+def test_assigned_target_observations_are_source_bound(name: str) -> None:
+    assert _source_bound_tool_call(None, name, {})
 
 
 @run_async
@@ -448,6 +454,70 @@ async def test_tool_call_and_structured_tool_error(
     assert responses[90]["result"]["success"] is True
     assert responses[91]["result"]["success"] is False
     assert '"bad_tool"' in responses[91]["result"]["contentItems"][0]["text"]
+    await client.close()
+
+
+@run_async
+async def test_delayed_target_response_cannot_turn_prior_input_into_candidate_provenance(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class ReflectionRegistry(ToolStub):
+        delayed = ""
+
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if arguments.get("data"):
+                self.delayed = base64.b64decode(arguments["data"], validate=True).decode()
+                return {"observed": "accepted"}
+            return {"delayed": self.delayed, "observed": "flag{server_observation}"}
+
+    registry = ReflectionRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    supplied = "flag{model_supplied}"
+    encoded = base64.b64encode(supplied.encode()).decode()
+    await client._route_message(
+        {
+            "id": 93,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": encoded, "encoding": "base64"},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+    await client._route_message(
+        {
+            "id": 94,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-delayed",
+                "tool": {"name": "tcp_exchange"},
+                "arguments": {"data": ""},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    hashes = state.tool_calls[1]["candidate_sha256s"]
+    assert hashlib.sha256(supplied.encode()).hexdigest() not in hashes
+    assert hashlib.sha256(b"flag{server_observation}").hexdigest() in hashes
+    assert all(
+        supplied not in output and encoded not in output for output in state.provenance_outputs
+    )
+    assert not _source_bound_tool_call(state, "decode_base64", {"data": encoded})
     await client.close()
 
 

@@ -3,8 +3,12 @@
 The image is a Linux multi-stage build. Codex is installed from npm as
 `@openai/codex@0.154.0` in a target-platform Node stage, so buildx can produce
 matching `linux/amd64` and `linux/arm64` images. The final stage is Python
-3.12 and includes only the fixed offline analyzers `file` and `binutils`, plus
-CA certificates. Both base image references are digest-pinned.
+3.12 and includes the fixed analyzers `file` and `binutils`, CA certificates,
+and the base system's `getent` resolver used by the assigned-target connector.
+Both base image references are digest-pinned.
+Project/Codex Apache-2.0 terms, third-party notices, and the Node distribution
+license are retained under `/licenses`; Debian package records remain under
+`/usr/share/doc`.
 
 The image installs the project into `/opt/venv`, runs as UID/GID `10001`, and
 starts with the exec-form command `rapido run`. `/state` is application state.
@@ -46,7 +50,8 @@ when competing containers use different state paths. The dedicated home must
 not contain Codex/MCP capability configuration; app-server unified execution,
 shell, browser, network, plugin, hook, skill, app, image, automation, and
 nested-agent features are disabled. Native `code_mode_host` is retained solely as the V8 broker for
-Rapido's bounded dynamic-tool allowlist; unified execution and TTY execution remain disabled.
+Rapido's bounded workspace and assigned-target dynamic-tool allowlist; unified execution and TTY
+execution remain disabled.
 
 Named volumes are also supported, but the auth volume must first be seeded with
 the dedicated `auth.json` and retain the same ownership and private modes. An
@@ -64,8 +69,9 @@ recognized stale run roots are deleted without following symlinks. Put an
 independent host/storage quota on the state bind mount for defense in depth.
 
 `RAPIDO_RUN_SECONDS` is the work-admission budget beginning before recovery and
-native startup. An in-flight Board call can add at most its 15-second transport
-timeout during cancellation; a bounded offline tool is drained before workspace
-deletion. Generation-matched stale dynamic instances require manual cleanup:
-the current Board DELETE contract has no generation precondition, so Rapido will
-not risk deleting a replacement instance.
+native startup. An in-flight Board call or target operation can add at most its
+bounded transport timeout during cancellation; a bounded tool is drained before
+workspace deletion. Receipt-less ambiguous creates require manual reconciliation.
+Receipt-bound cleanup re-reads the current generation immediately before DELETE
+and refuses a mismatch. The Board DELETE contract has no atomic generation
+precondition, leaving a narrow server-side replacement race explicitly unresolved.

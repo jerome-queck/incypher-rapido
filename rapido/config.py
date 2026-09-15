@@ -86,6 +86,22 @@ def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false")
 
 
+def _challenge_ids(env: Mapping[str, str]) -> tuple[int, ...]:
+    raw = env.get("RAPIDO_CHALLENGE_IDS", "").strip()
+    if not raw:
+        return ()
+    parts = raw.split(",")
+    if len(parts) > 1000:
+        raise ConfigError("RAPIDO_CHALLENGE_IDS exceeds the challenge limit")
+    try:
+        values = tuple(int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise ConfigError("RAPIDO_CHALLENGE_IDS must be comma-separated integers") from exc
+    if any(value <= 0 for value in values) or len(values) != len(set(values)):
+        raise ConfigError("RAPIDO_CHALLENGE_IDS must contain unique positive integers")
+    return values
+
+
 def _origin(env: Mapping[str, str]) -> str:
     value = _text(env, "CTFD_URL", "https://hackathon.in-cypher.com").rstrip("/")
     parsed = urlsplit(value)
@@ -126,6 +142,7 @@ class RuntimeConfig:
     codex_home: Path
     codex_binary: str
     profile: str
+    challenge_ids: tuple[int, ...]
     wrong_submission_ceiling: int
     submit_candidates: bool
     manage_dynamic_instances: bool
@@ -208,6 +225,7 @@ class RuntimeConfig:
             codex_home=_path(values, "RAPIDO_CODEX_HOME", "/auth/codex"),
             codex_binary=_text(values, "RAPIDO_CODEX_BINARY", "codex"),
             profile=profile,
+            challenge_ids=_challenge_ids(values),
             wrong_submission_ceiling=_integer(
                 values, "RAPIDO_WRONG_SUBMISSION_CEILING", 2, minimum=0, maximum=10
             ),
@@ -233,6 +251,7 @@ class RuntimeConfig:
             "work_root": str(self.work_root),
             "codex_home": str(self.codex_home),
             "profile": self.profile,
+            "challenge_ids": list(self.challenge_ids),
             "wrong_submission_ceiling": self.wrong_submission_ceiling,
             "submit_candidates": self.submit_candidates,
             "manage_dynamic_instances": self.manage_dynamic_instances,
