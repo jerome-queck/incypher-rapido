@@ -87,7 +87,9 @@ longest admitted TCP-open drain. Keep a single app-server central auth owner.
 
 Optional artifact parsers run in a killable descriptor-only worker. Linux Landlock restricts its
 filesystem to runtime libraries, the already-open source, and one private per-call scratch
-directory; seccomp denies networking for the worker and descendants. Scratch is deleted by the
+directory. Seccomp denies networking and process-group detachment for the worker and descendants;
+amd64 rejects the x32 syscall ABI before its native syscall allow path. Model-visible TAR inventory
+uses the same isolated worker; archive materialization is ZIP-only. Scratch is deleted by the
 supervisor on every success or failure path. A kernel without the required confinement returns
 `tool_unavailable` instead of running the parser with wider authority.
 

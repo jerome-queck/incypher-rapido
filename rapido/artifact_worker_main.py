@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import os
@@ -32,6 +33,7 @@ _ADAPTER_FORMATS = {
     "pcap": {"pcap"},
     "pdf": {"pdf"},
     "pe": {"pe"},
+    "tar": {"tar"},
 }
 _BASE_FIELDS = {"path", "source_bytes", "source_sha256", "format", "view", "selection"}
 _SAFE_NATIVE_ENV = {
@@ -342,6 +344,48 @@ def _dispatch(
             child_result = json.loads(child.stdout)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise _fail("tool_failed", "sandbox descendant probe failed") from exc
+        detachment_probe = (
+            "import json,os,time;"
+            "r={'pid':os.getpid(),'pgid':os.getpgrp()};"
+            "\nfor n,f in [('setsid',os.setsid),('setpgid',lambda:os.setpgid(0,0))]:"
+            "\n try: f(); r[n]=None"
+            "\n except OSError as e: r[n]=e.errno"
+            "\nprint(json.dumps(r),flush=True)"
+            "\nif r['setsid'] is not None and r['setpgid'] is not None: time.sleep(30)"
+        )
+        detached = subprocess.Popen(
+            [os.path.realpath(sys.executable), "-I", "-B", "-c", detachment_probe],
+            cwd=".",
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_SAFE_NATIVE_ENV,
+        )
+        assert detached.stdout is not None
+        try:
+            detached_result = json.loads(detached.stdout.readline())
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise _fail("tool_failed", "sandbox detachment probe failed") from exc
+        finally:
+            detached.stdout.close()
+        x32_socket_errno = x32_connect_errno = None
+        if os.uname().machine.lower() == "x86_64":
+            libc = ctypes.CDLL(None, use_errno=True)
+
+            def x32_probe(number: int, *arguments: int) -> int | None:
+                ctypes.set_errno(0)
+                result = libc.syscall(
+                    ctypes.c_long(0x40000000 | number),
+                    *(ctypes.c_long(argument) for argument in arguments),
+                )
+                if result >= 0:
+                    os.close(result)
+                    return None
+                return ctypes.get_errno()
+
+            x32_socket_errno = x32_probe(41, socket.AF_INET, socket.SOCK_STREAM, 0)
+            x32_connect_errno = x32_probe(42, -1, 0, 0)
         return {
             "file_read_blocked": file_errno in {errno.EACCES, errno.EPERM},
             "file_errno": file_errno,
@@ -351,6 +395,14 @@ def _dispatch(
             "descendant_scratch_write": child_result.get("scratch") is True,
             "descendant_file_read_blocked": child_result.get("file") in {errno.EACCES, errno.EPERM},
             "descendant_network_blocked": child_result.get("net") in {errno.EACCES, errno.EPERM},
+            "detachment_probe_pid": detached_result.get("pid"),
+            "detachment_probe_pgid": detached_result.get("pgid"),
+            "worker_pid": os.getpid(),
+            "worker_pgid": os.getpgrp(),
+            "setsid_errno": detached_result.get("setsid"),
+            "setpgid_errno": detached_result.get("setpgid"),
+            "x32_socket_errno": x32_socket_errno,
+            "x32_connect_errno": x32_connect_errno,
         }
     assert adapter is not None
     inspector, ToolError = adapter
@@ -362,6 +414,7 @@ def _dispatch(
             "pcap": inspector._pcap_view,
             "pdf": inspector._pdf_view,
             "pe": inspector._pe_view,
+            "tar": inspector._tar_view,
         }[operation]
         return function(descriptor, size, cursor, dict(base))
     except ToolError as exc:

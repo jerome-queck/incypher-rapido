@@ -10,6 +10,7 @@ import struct
 import tarfile
 import wave
 import zipfile
+from types import SimpleNamespace
 
 import dpkt
 import pefile
@@ -90,6 +91,35 @@ def _pe_fixture() -> bytes:
     return bytes(dos) + coff + optional + section + b"\xc3"
 
 
+def _fake_pefile(*, imports=(), exports=()):
+    class PE:
+        def __init__(self, **_kwargs):
+            self.DIRECTORY_ENTRY_IMPORT = list(imports)
+            self.DIRECTORY_ENTRY_EXPORT = SimpleNamespace(symbols=list(exports))
+
+        def parse_data_directories(self, **_kwargs):
+            return None
+
+    return SimpleNamespace(
+        PE=PE,
+        DIRECTORY_ENTRY={
+            "IMAGE_DIRECTORY_ENTRY_IMPORT": 1,
+            "IMAGE_DIRECTORY_ENTRY_EXPORT": 2,
+        },
+    )
+
+
+def _pe_imports(count: int):
+    return [SimpleNamespace(name=b"symbol", ordinal=index) for index in range(count)]
+
+
+def _pe_exports(count: int):
+    return [
+        SimpleNamespace(name=b"export", ordinal=index, address=0x1000 + index)
+        for index in range(count)
+    ]
+
+
 def _dicom_element(group: int, element: int, vr: str, value: bytes) -> bytes:
     if len(value) % 2:
         value += b"\x00" if vr == "UI" else b" "
@@ -113,10 +143,10 @@ def _pcap_fixture(packets: list[bytes]) -> bytes:
     return bytes(result)
 
 
-def _pcapng_block(kind: int, body: bytes) -> bytes:
+def _pcapng_block(kind: int, body: bytes, endian: str = "<") -> bytes:
     length = 12 + len(body)
     assert length % 4 == 0
-    return struct.pack("<II", kind, length) + body + struct.pack("<I", length)
+    return struct.pack(endian + "II", kind, length) + body + struct.pack(endian + "I", length)
 
 
 def _pcapng_fixture() -> bytes:
@@ -155,6 +185,57 @@ def test_public_inspector_routes_optional_parsers_through_bound_worker(tmp_path,
     assert result["stop_reason"] == "fixture"
     assert calls[0][0:4] == (40, "image", 40, None)
     assert calls[0][4]["source_sha256"] == result["source_sha256"]
+
+
+def test_public_inspector_routes_tar_inventory_through_bound_worker(tmp_path, monkeypatch):
+    with tarfile.open(tmp_path / "one.tar", "w") as archive:
+        member = tarfile.TarInfo("safe.txt")
+        member.size = 1
+        archive.addfile(member, io.BytesIO(b"x"))
+    calls = []
+
+    def worker(descriptor, operation, *, size, cursor, base):
+        calls.append((os.fstat(descriptor).st_size, operation, size, cursor, base))
+        return {**base, "coverage": "complete", "stop_reason": "fixture", "data": {}}
+
+    monkeypatch.setattr(artifact_inspector, "run_artifact_worker", worker)
+    monkeypatch.setattr(
+        artifact_inspector,
+        "_tar_view",
+        lambda *_args, **_kwargs: pytest.fail("supervisor parsed TAR inventory"),
+    )
+    result = isolated_inspect_artifact(
+        Workspace(tmp_path), {"path": "one.tar", "view": "structure"}
+    )
+    assert result["stop_reason"] == "fixture"
+    size = (tmp_path / "one.tar").stat().st_size
+    assert calls[0][0:4] == (size, "tar", size, None)
+    assert calls[0][4]["format"] == "tar"
+
+
+def test_public_inspector_rejects_same_inode_change_after_worker_result(tmp_path, monkeypatch):
+    source = tmp_path / "one.tar"
+    with tarfile.open(source, "w") as archive:
+        member = tarfile.TarInfo("safe.txt")
+        member.size = 1
+        archive.addfile(member, io.BytesIO(b"x"))
+    original = source.stat()
+
+    def worker(descriptor, operation, *, size, cursor, base):
+        del descriptor, operation, size, cursor
+        with source.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            stream.write(b"x")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000_000))
+        assert source.stat().st_ino == original.st_ino
+        return {**base, "coverage": "complete", "stop_reason": "fixture", "data": {}}
+
+    monkeypatch.setattr(artifact_inspector, "run_artifact_worker", worker)
+    with pytest.raises(ToolError) as error:
+        isolated_inspect_artifact(Workspace(tmp_path), {"path": "one.tar", "view": "structure"})
+    assert error.value.code == "source_changed"
 
 
 @pytest.mark.parametrize(
@@ -341,6 +422,30 @@ def test_pcapng_pages_never_exceed_scan_budget(tmp_path, monkeypatch):
     assert sum(len(page["data"]["records"]) for page in pages) == 3
 
 
+def test_pcapng_pagination_preserves_mixed_section_byte_order(tmp_path):
+    def section(endian: str) -> bytes:
+        byte_order_magic = b"\x4d\x3c\x2b\x1a" if endian == "<" else b"\x1a\x2b\x3c\x4d"
+        body = byte_order_magic + struct.pack(endian + "HHq", 1, 0, -1)
+        return _pcapng_block(0x0A0D0D0A, body, endian)
+
+    def interface(endian: str) -> bytes:
+        return _pcapng_block(1, struct.pack(endian + "HHI", 1, 0, 65_535), endian)
+
+    path = tmp_path / "mixed-sections.pcapng"
+    path.write_bytes(section("<") + interface("<") * 98 + section(">") + interface(">"))
+    workspace = Workspace(tmp_path)
+    first = isolated_inspect_artifact(workspace, {"path": path.name, "view": "structure"})
+    second = isolated_inspect_artifact(
+        workspace,
+        {"path": path.name, "view": "structure", "cursor": first["next_cursor"]},
+    )
+    assert first["coverage"] == "partial" and len(first["data"]["records"]) == 100
+    assert second["coverage"] == "complete"
+    assert second["data"]["records"] == [
+        {"offset": 2016, "block_type": "0x00000001", "block_length": 20}
+    ]
+
+
 def test_pcap_still_has_truthful_inventory_when_dpkt_is_unavailable(tmp_path, monkeypatch):
     (tmp_path / "capture").write_bytes(_pcap_fixture([b"packet"]))
     monkeypatch.setattr(artifact_inspector, "_dpkt", None)
@@ -398,6 +503,87 @@ def test_pefile_deep_view_is_explicitly_unsupported_when_unavailable(tmp_path, m
     assert result["stop_reason"] == "dependency_unavailable"
 
 
+def test_pe_import_library_limit_reports_partial(tmp_path, monkeypatch):
+    (tmp_path / "inert.exe").write_bytes(_pe_fixture())
+    libraries = [
+        SimpleNamespace(dll=f"lib{index}".encode(), imports=[])
+        for index in range(artifact_inspector.MAX_RECORDS + 1)
+    ]
+    monkeypatch.setattr(artifact_inspector, "_pefile", _fake_pefile(imports=libraries))
+    result = inspect_artifact(
+        Workspace(tmp_path),
+        {"path": "inert.exe", "view": "structure", "selection": "imports"},
+    )
+    assert len(result["data"]["imports"]) == artifact_inspector.MAX_RECORDS
+    assert result["coverage"] == "partial"
+    assert result["stop_reason"] == "record_limit"
+
+
+def test_pe_per_library_import_limit_reports_partial(tmp_path, monkeypatch):
+    (tmp_path / "inert.exe").write_bytes(_pe_fixture())
+    libraries = [
+        SimpleNamespace(dll=b"limited.dll", imports=_pe_imports(artifact_inspector.MAX_RECORDS + 1))
+    ]
+    monkeypatch.setattr(artifact_inspector, "_pefile", _fake_pefile(imports=libraries))
+    result = inspect_artifact(
+        Workspace(tmp_path),
+        {"path": "inert.exe", "view": "structure", "selection": "imports"},
+    )
+    assert len(result["data"]["imports"][0]["symbols"]) == artifact_inspector.MAX_RECORDS
+    assert result["coverage"] == "partial"
+    assert result["stop_reason"] == "record_limit"
+
+
+def test_pe_per_library_exact_record_limit_is_complete(tmp_path, monkeypatch):
+    (tmp_path / "inert.exe").write_bytes(_pe_fixture())
+    libraries = [
+        SimpleNamespace(dll=b"complete.dll", imports=_pe_imports(artifact_inspector.MAX_RECORDS))
+    ]
+    monkeypatch.setattr(artifact_inspector, "_pefile", _fake_pefile(imports=libraries))
+    result = inspect_artifact(
+        Workspace(tmp_path),
+        {"path": "inert.exe", "view": "structure", "selection": "imports"},
+    )
+    assert result["coverage"] == "complete"
+    assert result["stop_reason"] == "directory_complete"
+
+
+def test_pe_export_limit_reports_partial(tmp_path, monkeypatch):
+    (tmp_path / "inert.exe").write_bytes(_pe_fixture())
+    monkeypatch.setattr(
+        artifact_inspector,
+        "_pefile",
+        _fake_pefile(exports=_pe_exports(artifact_inspector.MAX_RECORDS + 1)),
+    )
+    result = inspect_artifact(
+        Workspace(tmp_path),
+        {"path": "inert.exe", "view": "structure", "selection": "exports"},
+    )
+    assert len(result["data"]["exports"]) == artifact_inspector.MAX_RECORDS
+    assert result["coverage"] == "partial"
+    assert result["stop_reason"] == "record_limit"
+
+
+@pytest.mark.parametrize("selection", ["imports", "exports"])
+def test_pe_exact_record_limit_is_complete(tmp_path, monkeypatch, selection):
+    (tmp_path / "inert.exe").write_bytes(_pe_fixture())
+    if selection == "imports":
+        libraries = [
+            SimpleNamespace(dll=f"lib{index}".encode(), imports=[])
+            for index in range(artifact_inspector.MAX_RECORDS)
+        ]
+        fake = _fake_pefile(imports=libraries)
+    else:
+        fake = _fake_pefile(exports=_pe_exports(artifact_inspector.MAX_RECORDS))
+    monkeypatch.setattr(artifact_inspector, "_pefile", fake)
+    result = inspect_artifact(
+        Workspace(tmp_path),
+        {"path": "inert.exe", "view": "structure", "selection": selection},
+    )
+    assert result["coverage"] == "complete"
+    assert result["stop_reason"] == "directory_complete"
+
+
 def test_disassembly_is_fixed_and_unavailable_is_not_success(tmp_path, monkeypatch):
     (tmp_path / "inert.elf").write_bytes(_elf_fixture())
     monkeypatch.setattr(
@@ -437,7 +623,7 @@ def test_disassembly_prefers_bounded_multiarchitecture_capstone(tmp_path, monkey
 def test_disassembly_accepts_address_windows_and_cursor_pages(tmp_path):
     (tmp_path / "paged.elf").write_bytes(_elf_fixture(b"\x90" * 600))
     workspace = Workspace(tmp_path)
-    selected = isolated_inspect_artifact(
+    selected = inspect_artifact(
         workspace,
         {
             "path": "paged.elf",
@@ -448,7 +634,7 @@ def test_disassembly_accepts_address_windows_and_cursor_pages(tmp_path):
     assert selected["data"]["start_address"] == "0x1010"
     assert selected["data"]["window"] == "address"
     assert selected["data"]["instruction_count"] == 256
-    continued = isolated_inspect_artifact(
+    continued = inspect_artifact(
         workspace,
         {
             "path": "paged.elf",
@@ -459,7 +645,7 @@ def test_disassembly_accepts_address_windows_and_cursor_pages(tmp_path):
     )
     assert continued["data"]["start_address"] == "0x1110"
     with pytest.raises(ToolError) as stale:
-        isolated_inspect_artifact(
+        inspect_artifact(
             workspace,
             {
                 "path": "paged.elf",
@@ -668,6 +854,31 @@ def test_binary_string_crossing_scan_boundary_is_returned_whole_once(tmp_path, m
             "span_complete": True,
         }
     ]
+
+
+def test_binary_string_record_pagination_keeps_earliest_overlapping_omission(tmp_path):
+    prefix = (b"\xff\x00\x00\xff" * 100) + b"ABCDE\xff"
+    overlapping = b"\x00A\x00B\x00C\x00D\x00\xff\xff"
+    path = tmp_path / "overlapping-strings.bin"
+    path.write_bytes(prefix + overlapping * 50)
+    workspace = Workspace(tmp_path)
+    first = isolated_inspect_artifact(workspace, {"path": path.name, "view": "text"})
+    second = isolated_inspect_artifact(
+        workspace,
+        {"path": path.name, "view": "text", "cursor": first["next_cursor"]},
+    )
+    rows = first["data"]["strings"] + second["data"]["strings"]
+    final_little_endian_offset = len(prefix) + 49 * len(overlapping) + 1
+    assert first["coverage"] == "partial" and len(first["data"]["strings"]) == 100
+    assert second["coverage"] == "complete"
+    assert len(rows) == 101
+    assert {
+        "offset": final_little_endian_offset,
+        "encoding": "utf-16-le",
+        "text": "ABCD",
+        "truncated": False,
+        "span_complete": True,
+    } in rows
 
 
 def test_symlink_hardlink_special_file_and_traversal_are_refused(tmp_path):

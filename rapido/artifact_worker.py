@@ -1,9 +1,9 @@
 """Killable, descriptor-only isolation for optional artifact parsers.
 
-The public entry point accepts an already-confined regular-file descriptor.  It
+The public entry point accepts an already-confined regular-file descriptor. It
 never accepts an executable or source path: both the Python worker and its JSON
-protocol are fixed here.  The child starts a new process group so a deadline or
-output violation kills the worker and every native descendant together.
+protocol are fixed here. The child starts a new process group; Linux confinement
+prevents it or descendants from changing groups, so cleanup kills the full tree.
 """
 
 from __future__ import annotations
@@ -34,13 +34,21 @@ _SCRATCH_PREFIX = "rapido-artifact-"
 _WORKER_SCRIPT = str(Path(__file__).with_name("artifact_worker_main.py").resolve())
 _PYTHON_EXECUTABLE = os.path.abspath(sys.executable)
 _SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
-_OPERATIONS = frozenset({"disassembly", "image", "pcap", "pdf", "pe"})
+_OPERATIONS = frozenset({"disassembly", "image", "pcap", "pdf", "pe", "tar"})
 _REMOTE_ERROR_CODES = frozenset(
     """dependency_unavailable input_too_large internal_error invalid_argument invalid_artifact
     invalid_cursor invalid_encoding limit_exceeded not_a_file output_too_large read_failed
     resource_limit source_changed stale_cursor tool_cleanup_failed tool_failed tool_unavailable
     unsupported_format unsupported_platform""".split()  # noqa: SIM905
 )
+
+
+def _require_linux_sandbox() -> None:
+    if sys.platform != "linux":
+        raise _error(
+            "tool_unavailable",
+            "artifact worker requires Linux Landlock and seccomp confinement",
+        )
 
 
 def _error(code: str, message: str) -> Exception:
@@ -226,8 +234,8 @@ def _run_worker(
             raise _error("tool_failed", "artifact worker exited without a valid result")
         return _read_protocol_response(bytes(output))
     finally:
-        # A successful worker may still have a descendant holding no pipe.  Killing
-        # its original process group after response collection closes that escape.
+        # A successful worker may still have a same-group descendant holding no
+        # pipe. Linux confinement prevents descendants from escaping this group.
         _kill_process_group(process)
         selector.close()
         for stream in (process.stdout, process.stderr):
@@ -251,6 +259,7 @@ def run_artifact_worker(
     base: Mapping[str, Any],
 ) -> Any:
     """Run one allowlisted parser against an already-confined regular descriptor."""
+    _require_linux_sandbox()
     if type(descriptor) is not int or descriptor < 0:
         raise _error("invalid_argument", "artifact worker requires an open file descriptor")
     try:

@@ -140,7 +140,10 @@ evidence first, then remove only the run's containers, volumes, and workspaces a
 - `exec format error` or unsupported architecture: build and run the same explicit Linux platform;
   only amd64 and arm64 are supported.
 - Artifact-parser `tool_unavailable` errors: update the Docker Engine/Desktop Linux VM to a kernel
-  that supports Landlock and seccomp. Optional untrusted-file parsing fails closed without both.
+  that supports Landlock and seccomp. Optional untrusted-file parsing fails closed without both;
+  isolated workers also deny networking, process-group detachment, and the amd64 x32 syscall ABI.
+- TAR inventory is available through `inspect_artifact`; model-visible archive materialization is
+  ZIP-only until TAR extraction can remain inside the same confinement boundary.
 - Supervisor/auth lease errors: stop the competing container; never share one auth home between
   app-server owners.
 - `preflight` errors: check the official HTTPS origin, token, authenticated identity, and stable

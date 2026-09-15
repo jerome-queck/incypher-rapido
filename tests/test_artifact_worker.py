@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import signal
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -11,13 +13,42 @@ import pytest
 from PIL import Image
 from pypdf import PdfWriter
 
-from rapido import artifact_worker, artifact_worker_main
+from rapido import artifact_inspector, artifact_worker, artifact_worker_main
 from rapido.artifact_worker import run_artifact_worker
 from rapido.tools import ToolError
+
+_PRODUCTION_PLATFORM_GUARD = artifact_worker._require_linux_sandbox
+
+
+@pytest.fixture(autouse=True)
+def _exercise_worker_protocol_off_linux(monkeypatch):
+    """Protocol/parser tests bypass only the public production-platform guard."""
+    if sys.platform != "linux":
+        monkeypatch.setattr(artifact_worker, "_require_linux_sandbox", lambda: None)
 
 
 def _open(path: Path) -> int:
     return os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+
+
+def test_public_worker_fails_closed_without_linux_confinement(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"bound")
+    descriptor = _open(source)
+    monkeypatch.setattr(artifact_worker, "_require_linux_sandbox", _PRODUCTION_PLATFORM_GUARD)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    try:
+        with pytest.raises(ToolError) as error:
+            run_artifact_worker(
+                descriptor,
+                "tar",
+                size=source.stat().st_size,
+                cursor=None,
+                base=_base("source", source.stat().st_size, "tar", "structure", "entries"),
+            )
+    finally:
+        os.close(descriptor)
+    assert error.value.code == "tool_unavailable"
 
 
 def _fixture_worker(tmp_path: Path, source: str) -> str:
@@ -39,6 +70,14 @@ def _base(path: str, size: int, format_name: str, view: str, selection: str | No
         "view": view,
         "selection": selection,
     }
+
+
+def _tar_fixture(path: Path, count: int) -> None:
+    with tarfile.open(path, "w") as archive:
+        for index in range(count):
+            member = tarfile.TarInfo(f"entry-{index:04}.txt")
+            member.size = 1
+            archive.addfile(member, io.BytesIO(b"x"))
 
 
 def _wait_group_gone(process_group: int, popen: object) -> None:
@@ -95,6 +134,90 @@ def test_pdf_parser_is_bounded_behind_structured_protocol(tmp_path):
     assert result["data"]["pages"] == [
         {"height_points": 144.0, "index": 0, "rotation": 0, "width_points": 72.0}
     ]
+
+
+def test_tar_inventory_worker_preserves_pagination_and_display_path(tmp_path):
+    source = tmp_path / "many.tar"
+    _tar_fixture(source, 101)
+    descriptor = _open(source)
+    size = os.fstat(descriptor).st_size
+    base = _base("many.tar", size, "tar", "structure", "entries")
+    try:
+        first = run_artifact_worker(descriptor, "tar", size=size, cursor=None, base=base)
+        second = run_artifact_worker(
+            descriptor,
+            "tar",
+            size=size,
+            cursor=first["next_cursor"],
+            base=base,
+        )
+    finally:
+        os.close(descriptor)
+    assert len(first["data"]["entries"]) == 100
+    assert first["coverage"] == "partial"
+    assert first["stop_reason"] == "record_limit"
+    assert len(second["data"]["entries"]) == 1
+    assert second["coverage"] == "complete"
+    assert second["stop_reason"] == "end_of_inventory"
+    assert second["path"] == "many.tar"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [(b"not a tar archive", "invalid_artifact"), (None, "limit_exceeded")],
+)
+def test_tar_worker_fails_safely_on_malformed_or_resource_limited_inventory(
+    tmp_path, monkeypatch, payload, expected_code
+):
+    source = tmp_path / "bounded.tar"
+    if payload is None:
+        _tar_fixture(source, artifact_inspector.MAX_ARCHIVE_ENTRIES + 1)
+    else:
+        source.write_bytes(payload)
+    created = []
+    real_mkdtemp = artifact_worker.tempfile.mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(artifact_worker.tempfile, "mkdtemp", tracked_mkdtemp)
+    descriptor = _open(source)
+    size = os.fstat(descriptor).st_size
+    try:
+        with pytest.raises(ToolError) as error:
+            run_artifact_worker(
+                descriptor,
+                "tar",
+                size=size,
+                cursor=None,
+                base=_base("bounded.tar", size, "tar", "structure", "entries"),
+            )
+    finally:
+        os.close(descriptor)
+    assert error.value.code == expected_code
+    assert created and all(not path.exists() for path in created)
+
+
+def test_tar_worker_protocol_binds_operation_to_tar_format(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"not relevant")
+    descriptor = _open(source)
+    size = os.fstat(descriptor).st_size
+    try:
+        with pytest.raises(ToolError) as error:
+            run_artifact_worker(
+                descriptor,
+                "tar",
+                size=size,
+                cursor=None,
+                base=_base("source", size, "zip", "structure", "entries"),
+            )
+    finally:
+        os.close(descriptor)
+    assert error.value.code == "invalid_argument"
+    assert error.value.message == "artifact-worker view binding is invalid"
 
 
 def test_malformed_third_party_input_maps_to_stable_tool_error(tmp_path):
@@ -354,7 +477,7 @@ time.sleep(30)
     _wait_group_gone(process_groups[0], real_popen)
 
 
-def test_success_response_also_kills_detached_descendant_group(tmp_path, monkeypatch):
+def test_success_response_also_kills_same_group_descendant(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.write_bytes(b"x")
     script = _fixture_worker(

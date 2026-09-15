@@ -185,8 +185,8 @@ base64/hex/URL derivation, and bounded exact arithmetic. Artifact adapters cover
 text/strings/bytes, archives, PDF, PCAP/PCAPNG, ELF/PE, multi-architecture entrypoint disassembly,
 raster/bitplanes/OCR, WAV, and DICOM with explicit complete/partial/unsupported states. Capstone is
 the bounded x86/x64/ARM/Thumb/AArch64 decoder; absence is reported explicitly rather than widening
-confinement through an objdump fallback. The native app-server wire sees 12 workspace tools (9,463
-compact JSON bytes), or 11,296 bytes with five assigned-target tools, rather than every
+confinement through an objdump fallback. The native app-server wire sees 12 workspace tools (9,450
+compact JSON bytes), or 11,282 bytes with five assigned-target tools, rather than every
 compatibility operation. Installed parser distributions occupy about 29.7 MB in the host
 verification environment; an intermediate ARM64 image grew 47,218,090 bytes.
 Storage remains governed by the 500 GB workspace allowance, not a smaller package budget.
@@ -198,12 +198,32 @@ package presence alone is not a capability claim. Higher-value next slices are a
 browsing, TCP reconstruction/payload derivation, deeper pwn/reversing metadata, and bounded nested
 DICOM/forensic filesystem access. Broad speculative category stacks remain deferred absent evidence.
 
-The accepted non-live snapshot passes 492 unit/interface tests (one host-skipped Linux sandbox
-test), Ruff, formatting, and the deterministic scheduler benchmark at a 0.5503 elapsed ratio. An
-independent native ARM64 final-image fixture run passed every declared adapter, fixed Tesseract OCR,
-zero child-process residue, stable file-descriptor count, and temporary-directory removal. Separate
-ABI-4 Landlock/seccomp probes denied worker and descendant sentinel reads and loopback access while
-per-call scratch remained usable and was removed by the parent.
+The accepted non-live snapshot passes 533 unit/interface tests (one host-skipped Linux sandbox
+test), Ruff, formatting, and the deterministic scheduler benchmark at a 0.5627 elapsed ratio. The
+fresh ARM64 image `sha256:e34adf8ca84e43e501e7e5cae97a96495c30e559725a80af2394c58989468510`
+passed all 12 visible tools and the explicit 31-operation acceptance inventory: PCAP/PCAPNG, PE
+disassembly/imports/exports, isolated TAR inventory, bounded gzip and ZIP materialization,
+text/string/byte views, PDF, raster/bitplane/OCR, WAV, DICOM, x86/ARM/AArch64 Capstone, fixed ELF
+helpers, and ext2 inspection. It left zero child processes, held file descriptors at 4 to 4, and
+removed its temporary directory. Its integrated native ARM64 probe confirmed ABI-4 Landlock,
+blocked worker and descendant sentinel reads and loopback access, allowed private scratch, denied
+`setsid`/`setpgid` with `EACCES`, and verified both reported PIDs disappeared. Native amd64 x32
+runtime verification is enforced by the same harness in CI; emulation is not counted as evidence.
+
+An immutable security scan of `cc2301d24e53c173fd58e99bc80608555869fc39` found three low-severity
+parser-boundary defects: supervisor-side TAR/PAX metadata parsing, amd64 x32-tagged syscalls passing
+the native-number filter, and parser descendants able to detach from the cleanup process group.
+The follow-up source routes TAR inventory through the existing bounded worker, rejects the x32 ABI
+before allow, and denies `setsid`/`setpgid`; focused tests, native ARM64 probes, and independent
+Daybreak/xhigh review pass. Native amd64 CI remains authoritative for the x32 runtime guard.
+
+The independent final review then found encoded-reflection and over-limit path-suffix provenance
+bypasses, a post-worker source-fingerprint race, mixed-endian PCAPNG and overlapping-string
+pagination defects, unenforced non-Linux public worker use, supervisor-side TAR materialization, and
+incomplete descendant acceptance. The integrated fixes fail target evidence closed, recheck source
+facts, carry bounded continuation state, reject non-Linux production workers, restrict visible
+materialization to ZIP, and verify exact sandbox PIDs. The 533-test and final-image results above are
+post-fix evidence.
 
 Effective routing for this tooling slice: architecture `gpt-6-astra`/`xhigh`; bounded fixture work
 `gpt-5.6-luna`/`xhigh`; demanding implementation, independent review, and integration after an

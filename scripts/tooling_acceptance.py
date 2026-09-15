@@ -11,6 +11,8 @@ temporary directory which is removed before the process exits.
 from __future__ import annotations
 
 import base64
+import errno
+import gzip
 import hashlib
 import importlib
 import importlib.metadata
@@ -18,8 +20,12 @@ import io
 import json
 import os
 import platform
+import socket
 import struct
+import subprocess
+import tarfile
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -47,6 +53,8 @@ EXPECTED_TOOLS = (
 )
 OUTPUT_LIMIT = 128 * 1024
 NATIVE_PATHS = {
+    "debugfs": ("/usr/bin/debugfs", "/usr/sbin/debugfs"),
+    "mke2fs": ("/usr/bin/mke2fs", "/usr/sbin/mke2fs"),
     "objdump": ("/usr/bin/objdump", "/usr/bin/llvm-objdump"),
     "readelf": ("/usr/bin/readelf", "/usr/bin/llvm-readelf"),
     "tesseract": ("/usr/bin/tesseract", "/usr/local/bin/tesseract"),
@@ -218,13 +226,34 @@ def _pcap_fixture() -> bytes:
     )
 
 
+def _pcapng_block(kind: int, body: bytes) -> bytes:
+    length = 12 + len(body)
+    if length % 4:
+        raise ValueError("PCAPNG fixture block must be four-byte aligned")
+    return struct.pack("<II", kind, length) + body + struct.pack("<I", length)
+
+
+def _pcapng_fixture() -> bytes:
+    """One deterministic PCAPNG section with an enhanced packet block."""
+    section = _pcapng_block(
+        0x0A0D0D0A,
+        b"\x4d\x3c\x2b\x1a" + struct.pack("<HHq", 1, 0, -1),
+    )
+    interface = _pcapng_block(1, struct.pack("<HHI", 1, 0, 65535))
+    packet = b"abcd"
+    enhanced = _pcapng_block(6, struct.pack("<IIIII", 0, 0, 1, 4, 4) + packet)
+    return section + interface + enhanced
+
+
 def _pe_fixture() -> bytes:
-    """A minimal PE32+ with a two-byte x86-64 executable entrypoint."""
+    """A minimal PE32+ with inert code plus import/export directory entries."""
     pe_offset = 0x80
-    optional_size = 112
+    optional_size = 240
     section_offset = pe_offset + 24 + optional_size
-    raw_offset = 0x200
-    output = bytearray(raw_offset + 2)
+    raw_text = 0x200
+    raw_rdata = 0x400
+    rdata_size = 0x800
+    output = bytearray(raw_rdata + rdata_size)
     output[:2] = b"MZ"
     struct.pack_into("<I", output, 0x3C, pe_offset)
     output[pe_offset : pe_offset + 4] = b"PE\0\0"
@@ -233,7 +262,7 @@ def _pe_fixture() -> bytes:
         output,
         pe_offset + 4,
         0x8664,
-        1,
+        2,
         0,
         0,
         0,
@@ -241,13 +270,87 @@ def _pe_fixture() -> bytes:
         0x2022,
     )
     optional = pe_offset + 24
-    struct.pack_into("<H", output, optional, 0x20B)
-    struct.pack_into("<I", output, optional + 16, 0x1000)
+    struct.pack_into("<HBBIII", output, optional, 0x20B, 14, 0, 2, rdata_size, 0)
+    struct.pack_into("<II", output, optional + 16, 0x1000, 0x1000)
     struct.pack_into("<Q", output, optional + 24, 0x140000000)
+    struct.pack_into("<II", output, optional + 32, 0x1000, 0x200)
+    struct.pack_into("<HHHH", output, optional + 40, 6, 0, 0, 0)
+    struct.pack_into("<HH", output, optional + 48, 6, 0)
+    struct.pack_into("<III", output, optional + 52, 0, 0x3000, 0x200)
+    struct.pack_into("<I", output, optional + 64, 0)
+    struct.pack_into("<HH", output, optional + 68, 3, 0x8140)
+    struct.pack_into("<QQQQ", output, optional + 72, 0x100000, 0x1000, 0x100000, 0x1000)
+    struct.pack_into("<II", output, optional + 104, 0, 16)
+    directories = optional + 112
+    struct.pack_into("<II", output, directories, 0x2000, 40)
+    struct.pack_into("<II", output, directories + 8, 0x2100, 40)
+
     output[section_offset : section_offset + 8] = b".text\0\0\0"
-    struct.pack_into("<IIII", output, section_offset + 8, 2, 0x1000, 2, raw_offset)
-    struct.pack_into("<I", output, section_offset + 36, 0x60000020)
-    output[raw_offset:] = b"\x90\xc3"
+    struct.pack_into(
+        "<IIIIIIHHI",
+        output,
+        section_offset + 8,
+        2,
+        0x1000,
+        2,
+        raw_text,
+        0,
+        0,
+        0,
+        0,
+        0x60000020,
+    )
+    rdata_section = section_offset + 40
+    output[rdata_section : rdata_section + 8] = b".rdata\0\0"
+    struct.pack_into(
+        "<IIIIIIHHI",
+        output,
+        rdata_section + 8,
+        rdata_size,
+        0x2000,
+        rdata_size,
+        raw_rdata,
+        0,
+        0,
+        0,
+        0,
+        0x40000040,
+    )
+    output[raw_text : raw_text + 2] = b"\x90\xc3"
+
+    def raw_offset(rva: int) -> int:
+        return raw_rdata + rva - 0x2000
+
+    # IMAGE_EXPORT_DIRECTORY, with one named function at the inert entrypoint.
+    struct.pack_into(
+        "<IIHHIIIIIII",
+        output,
+        raw_offset(0x2000),
+        0,
+        0,
+        0,
+        0,
+        0x2500,
+        1,
+        1,
+        1,
+        0x2600,
+        0x2604,
+        0x2608,
+    )
+    output[raw_offset(0x2500) : raw_offset(0x2500) + 12] = b"fixture.dll\0"
+    struct.pack_into("<I", output, raw_offset(0x2600), 0x1000)
+    struct.pack_into("<I", output, raw_offset(0x2604), 0x2510)
+    struct.pack_into("<H", output, raw_offset(0x2608), 0)
+    output[raw_offset(0x2510) : raw_offset(0x2510) + 6] = b"entry\0"
+
+    # One KERNEL32 import, with matching lookup and address tables.
+    struct.pack_into("<IIIII", output, raw_offset(0x2100), 0x2200, 0, 0, 0x2300, 0x2210)
+    struct.pack_into("<II", output, raw_offset(0x2200), 0x2400, 0)
+    struct.pack_into("<II", output, raw_offset(0x2210), 0x2400, 0)
+    output[raw_offset(0x2300) : raw_offset(0x2300) + 13] = b"KERNEL32.dll\0"
+    struct.pack_into("<H", output, raw_offset(0x2400), 0)
+    output[raw_offset(0x2402) : raw_offset(0x2402) + 12] = b"ExitProcess\0"
     return bytes(output)
 
 
@@ -257,6 +360,24 @@ def _wav_fixture() -> bytes:
     body = b"fmt " + struct.pack("<I", len(fmt)) + fmt
     body += b"data" + struct.pack("<I", len(samples)) + samples
     return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WAVE" + body
+
+
+def _tar_bytes(members: dict[str, bytes]) -> bytes:
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:") as archive:
+        for name, value in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(value)
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(value))
+    return stream.getvalue()
+
+
+def _gzip_bytes(value: bytes) -> bytes:
+    stream = io.BytesIO()
+    with gzip.GzipFile(fileobj=stream, mode="wb", mtime=0) as compressed:
+        compressed.write(value)
+    return stream.getvalue()
 
 
 def _dicom_element(group: int, element: int, vr: bytes, value: bytes) -> bytes:
@@ -282,11 +403,14 @@ def _dicom_fixture() -> bytes:
 
 def _fixture_files(root: Path) -> None:
     (root / "notes.txt").write_bytes(b"offline tooling acceptance fixture\n")
+    (root / "opaque.bin").write_bytes(b"\x00VISIBLE_STRING\x00\x01")
     payload = b"benign derived payload\n"
     (root / "payload.b64").write_text(base64.b64encode(payload).decode("ascii"), encoding="ascii")
     (root / "payload.hex").write_text(payload.hex(), encoding="ascii")
     (root / "payload.url").write_text("benign%20derived%20payload%0A", encoding="ascii")
     (root / "archive.zip").write_bytes(_zip_bytes({"member.txt": b"inert archive member\n"}))
+    (root / "archive.tar").write_bytes(_tar_bytes({"member.txt": b"inert tar member\n"}))
+    (root / "payload.gz").write_bytes(_gzip_bytes(b"inert gzip member\n"))
     (root / "x86_64.elf").write_bytes(_elf_fixture(b"\x90\xc3", bits=64, machine=62))
     (root / "arm.elf").write_bytes(
         _elf_fixture(bytes.fromhex("0100a0e31eff2fe1"), bits=32, machine=40)
@@ -298,9 +422,45 @@ def _fixture_files(root: Path) -> None:
     (root / "bitplane.png").write_bytes(_bitplane_png_fixture())
     (root / "fixture.pdf").write_bytes(_pdf_fixture())
     (root / "fixture.pcap").write_bytes(_pcap_fixture())
+    (root / "fixture.pcapng").write_bytes(_pcapng_fixture())
     (root / "fixture.exe").write_bytes(_pe_fixture())
     (root / "fixture.wav").write_bytes(_wav_fixture())
     (root / "fixture.dcm").write_bytes(_dicom_fixture())
+
+
+def _filesystem_fixture(root: Path) -> None:
+    """Create a tiny deterministic ext2 image for the fixed debugfs adapter."""
+    executable = next(
+        (candidate for candidate in NATIVE_PATHS["mke2fs"] if os.path.isfile(candidate)), None
+    )
+    if executable is None or not os.access(executable, os.X_OK):
+        raise AssertionError("mke2fs: no fixed executable for filesystem fixture")
+    image = root / "fixture.ext2"
+    image.write_bytes(b"\x00" * (4 * 1024 * 1024))
+    try:
+        subprocess.run(
+            [
+                executable,
+                "-q",
+                "-t",
+                "ext2",
+                "-F",
+                "-m",
+                "0",
+                "-U",
+                "00000000-0000-0000-0000-000000000011",
+                "-L",
+                "rapido",
+                str(image),
+            ],
+            cwd=root,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AssertionError("mke2fs: filesystem fixture creation failed") from exc
 
 
 def _zip_bytes(members: dict[str, bytes]) -> bytes:
@@ -373,14 +533,85 @@ def _registry_check(workspace: Any) -> tuple[Any, dict[str, Any]]:
 
 def _operations(registry: Any, root: Path) -> dict[str, Any]:
     checks: dict[str, Any] = {}
+    listed = registry.dispatch(
+        "list_workspace", {"path": ".", "recursive": True, "max_depth": 1, "max_entries": 200}
+    )
+    checks["list_workspace"] = _assert_result(listed, "list_workspace")
+    if listed.get("path") != "." or not any(
+        entry.get("path") == "notes.txt" for entry in listed.get("entries", [])
+    ):
+        raise AssertionError("workspace listing did not expose the inert fixture")
+
+    searched = registry.dispatch(
+        "search_text", {"path": "notes.txt", "query": "TOOLING", "case_sensitive": False}
+    )
+    checks["search_text"] = _assert_result(searched, "search_text")
+    if searched.get("matches", [{}])[0].get("line") != 1:
+        raise AssertionError("text search did not find the inert fixture")
+
+    decoded_base64 = registry.dispatch("decode_base64", {"path": "payload.b64"})
+    checks["decode_base64"] = _assert_result(decoded_base64, "decode_base64")
+    decoded_hex = registry.dispatch("decode_hex", {"path": "payload.hex"})
+    checks["decode_hex"] = _assert_result(decoded_hex, "decode_hex")
+    decoded_url = registry.dispatch("decode_url", {"path": "payload.url"})
+    checks["decode_url"] = _assert_result(decoded_url, "decode_url")
+    expected_payload = b"benign derived payload\n"
+    expected_encoded = base64.b64encode(expected_payload).decode("ascii")
+    for result, encoding in (
+        (decoded_base64, "base64"),
+        (decoded_hex, "hex"),
+        (decoded_url, "url"),
+    ):
+        if (
+            result.get("encoding") != encoding
+            or result.get("data_base64") != expected_encoded
+            or result.get("text") != expected_payload.decode()
+        ):
+            raise AssertionError(f"{encoding} decoder did not recover the inert payload")
+
     inspect = registry.dispatch("inspect_artifact", {"path": "notes.txt", "view": "text"})
     checks["artifact_text"] = _assert_result(inspect, "artifact_text", coverage=True)
     if inspect["format"] != "text" or "offline tooling" not in inspect["data"].get("text", ""):
         raise AssertionError("artifact text view did not read the inert fixture")
+    strings = registry.dispatch("inspect_artifact", {"path": "opaque.bin", "view": "text"})
+    checks["artifact_strings"] = _assert_result(strings, "artifact_strings", coverage=True)
+    if (
+        strings["format"] != "binary"
+        or strings.get("data", {}).get("strings", [{}])[0].get("text") != "VISIBLE_STRING"
+    ):
+        raise AssertionError("artifact string view did not expose the inert string")
+    byte_view = registry.dispatch("inspect_artifact", {"path": "opaque.bin", "view": "bytes"})
+    checks["artifact_bytes"] = _assert_result(byte_view, "artifact_bytes", coverage=True)
+    if byte_view["format"] != "binary" or byte_view.get("data", {}).get("hex_preview") != (
+        b"\x00VISIBLE_STRING\x00\x01".hex()
+    ):
+        raise AssertionError("artifact byte view did not expose the inert bytes")
     archive = registry.dispatch("inspect_artifact", {"path": "archive.zip", "view": "structure"})
     checks["artifact_archive"] = _assert_result(archive, "artifact_archive", coverage=True)
     if archive["format"] != "zip" or archive["data"].get("entry_count") != 1:
         raise AssertionError("artifact archive view did not inventory the inert fixture")
+
+    tar = registry.dispatch(
+        "inspect_artifact", {"path": "archive.tar", "view": "structure", "selection": "entries"}
+    )
+    checks["artifact_tar"] = _assert_result(tar, "artifact_tar", coverage=True)
+    if (
+        tar["format"] != "tar"
+        or tar["coverage"] != "complete"
+        or tar.get("data", {}).get("entry_count") != 1
+    ):
+        raise AssertionError("TAR worker did not inventory the inert fixture")
+
+    gzip_artifact = registry.dispatch(
+        "inspect_artifact", {"path": "payload.gz", "view": "structure", "selection": "entries"}
+    )
+    checks["artifact_gzip"] = _assert_result(gzip_artifact, "artifact_gzip", coverage=True)
+    if (
+        gzip_artifact["format"] != "gzip"
+        or gzip_artifact["coverage"] != "partial"
+        or gzip_artifact.get("stop_reason") != "inventory_only_no_decompression"
+    ):
+        raise AssertionError("gzip worker did not report bounded inventory-only metadata")
 
     pdf = registry.dispatch("inspect_artifact", {"path": "fixture.pdf", "view": "text"})
     checks["artifact_pdf"] = _assert_result(pdf, "artifact_pdf", coverage=True)
@@ -407,6 +638,19 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     ):
         raise AssertionError("PCAP worker did not decode the expected TCP packet")
 
+    pcapng = registry.dispatch(
+        "inspect_artifact", {"path": "fixture.pcapng", "view": "text", "selection": "packets"}
+    )
+    checks["artifact_pcapng"] = _assert_result(pcapng, "artifact_pcapng", coverage=True)
+    packet_blocks = pcapng.get("data", {}).get("packet_blocks", [])
+    if (
+        pcapng["format"] != "pcapng"
+        or pcapng["coverage"] != "complete"
+        or len(packet_blocks) != 1
+        or packet_blocks[0].get("captured_length") != 4
+    ):
+        raise AssertionError("PCAPNG worker did not decode the inert enhanced packet")
+
     pe = registry.dispatch(
         "inspect_artifact", {"path": "fixture.exe", "view": "text", "selection": "disassembly"}
     )
@@ -419,6 +663,36 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
         or pe_data.get("instruction_count", 0) < 2
     ):
         raise AssertionError("PE worker did not decode the expected x86 entrypoint")
+
+    pe_imports = registry.dispatch(
+        "inspect_artifact", {"path": "fixture.exe", "view": "structure", "selection": "imports"}
+    )
+    checks["artifact_pe_imports"] = _assert_result(pe_imports, "artifact_pe_imports", coverage=True)
+    imports = pe_imports.get("data", {}).get("imports", [])
+    if (
+        pe_imports["format"] != "pe"
+        or pe_imports["coverage"] != "complete"
+        or pe_imports.get("data", {}).get("dependency") != "pefile"
+        or len(imports) != 1
+        or imports[0].get("library") != "KERNEL32.dll"
+        or imports[0].get("symbols") != ["ExitProcess"]
+    ):
+        raise AssertionError("PE worker did not expose the inert import directory")
+
+    pe_exports = registry.dispatch(
+        "inspect_artifact", {"path": "fixture.exe", "view": "structure", "selection": "exports"}
+    )
+    checks["artifact_pe_exports"] = _assert_result(pe_exports, "artifact_pe_exports", coverage=True)
+    exports = pe_exports.get("data", {}).get("exports", [])
+    if (
+        pe_exports["format"] != "pe"
+        or pe_exports["coverage"] != "complete"
+        or pe_exports.get("data", {}).get("dependency") != "pefile"
+        or len(exports) != 1
+        or exports[0].get("name") != "entry"
+        or exports[0].get("ordinal") != 1
+    ):
+        raise AssertionError("PE worker did not expose the inert export directory")
 
     bitplane = registry.dispatch(
         "inspect_artifact",
@@ -466,6 +740,23 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
         or dicom.get("stop_reason") != "pixel_data"
     ):
         raise AssertionError("DICOM production path did not stop before pixel data")
+
+    zip_extract = registry.dispatch(
+        "extract_archive",
+        {"path": "archive.zip", "destination": "zip-out", "format": "zip"},
+    )
+    checks["extract_archive_zip"] = _assert_result(zip_extract, "extract_archive_zip")
+    if zip_extract.get("format") != "zip" or zip_extract.get("files") != ["zip-out/member.txt"]:
+        raise AssertionError("ZIP extraction did not publish the inert member")
+    gzip_output = registry.dispatch(
+        "decompress_gzip", {"path": "payload.gz", "destination": "gzip-out/member.txt"}
+    )
+    checks["decompress_gzip"] = _assert_result(gzip_output, "decompress_gzip")
+    if (
+        gzip_output.get("bytes") != len(b"inert gzip member\n")
+        or not (root / "gzip-out/member.txt").read_bytes() == b"inert gzip member\n"
+    ):
+        raise AssertionError("gzip decompression did not publish the inert member")
 
     derived = registry.dispatch("derive_artifact", {"path": "payload.b64", "encoding": "base64"})
     checks["derive"] = _assert_result(derived, "derive")
@@ -520,6 +811,13 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     }:
         raise AssertionError("fixed objdump smoke test failed")
 
+    filesystem = registry.dispatch(
+        "inspect_filesystem", {"path": "fixture.ext2", "action": "superblock"}
+    )
+    checks["inspect_filesystem"] = _assert_result(filesystem, "inspect_filesystem")
+    if filesystem.get("action") != "superblock" or filesystem.get("returncode") != 0:
+        raise AssertionError("fixed debugfs filesystem smoke test failed")
+
     ocr = registry.dispatch(
         "inspect_artifact", {"path": "tiny.png", "view": "text", "selection": "ocr"}
     )
@@ -531,9 +829,14 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
 
 def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, Any]:
     entries, total_bytes = workspace.snapshot()
+    digest = hashlib.sha256(b"benign derived payload\n").hexdigest()
     expected_new = {
         "derived",
-        "derived/" + hashlib.sha256(b"benign derived payload\n").hexdigest() + ".bin",
+        f"derived/{digest}.bin",
+        "zip-out",
+        "zip-out/member.txt",
+        "gzip-out",
+        "gzip-out/member.txt",
     }
     if entries - before != expected_new:
         raise AssertionError(f"unexpected workspace entries: {sorted(entries - before)!r}")
@@ -558,6 +861,85 @@ def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, 
     return {"entries": len(entries), "bytes": total_bytes, "child_processes": len(children)}
 
 
+def _wait_process_gone(process_id: int) -> None:
+    deadline = time.monotonic() + 2.0
+    process_path = Path(f"/proc/{process_id}")
+    while process_path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"sandbox process remained: {process_id}")
+        time.sleep(0.01)
+
+
+def _sandbox_check(root: Path) -> dict[str, Any]:
+    if platform.system() != "Linux":
+        raise AssertionError("final-image artifact sandbox acceptance requires native Linux")
+    from rapido import artifact_worker
+
+    sentinel = root / "sandbox-sentinel"
+    source = root / "sandbox-source"
+    sentinel.write_bytes(b"must-not-be-visible")
+    source.write_bytes(b"bound")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        request = artifact_worker._request_bytes(
+            "_test_sandbox",
+            {"sentinel_path": str(sentinel), "loopback_port": listener.getsockname()[1]},
+        )
+        result = artifact_worker._run_worker(descriptor, request)
+    finally:
+        os.close(descriptor)
+        listener.close()
+    sandbox = result.get("sandbox", {})
+    if not (
+        sandbox.get("enforced") is True
+        and sandbox.get("process_group_locked") is True
+        and result.get("scratch_write") is True
+        and result.get("descendant_scratch_write") is True
+        and result.get("file_read_blocked") is True
+        and result.get("network_blocked") is True
+        and result.get("descendant_file_read_blocked") is True
+        and result.get("descendant_network_blocked") is True
+        and result.get("setsid_errno") == errno.EACCES
+        and result.get("setpgid_errno") == errno.EACCES
+    ):
+        raise AssertionError("artifact sandbox confinement probe failed")
+    machine = platform.machine().lower()
+    if machine == "x86_64":
+        if not (
+            result.get("x32_socket_errno") == errno.EACCES
+            and result.get("x32_connect_errno") == errno.EACCES
+        ):
+            raise AssertionError("amd64 x32 syscall guard failed")
+    elif machine == "aarch64":
+        if (
+            result.get("x32_socket_errno") is not None
+            or result.get("x32_connect_errno") is not None
+        ):
+            raise AssertionError("arm64 sandbox unexpectedly reported x32 probes")
+    else:
+        raise AssertionError(f"unsupported sandbox acceptance architecture: {machine}")
+    worker_pid = result.get("worker_pid")
+    descendant_pid = result.get("detachment_probe_pid")
+    if type(worker_pid) is not int or type(descendant_pid) is not int:
+        raise AssertionError("sandbox probe did not report process identities")
+    _wait_process_gone(worker_pid)
+    _wait_process_gone(descendant_pid)
+    sentinel.unlink()
+    source.unlink()
+    return {
+        "arch": sandbox.get("arch"),
+        "landlock_abi": sandbox.get("landlock_abi"),
+        "process_group_locked": True,
+        "worker_gone": True,
+        "descendant_gone": True,
+        "network_blocked": True,
+        "x32_checked": machine == "x86_64",
+    }
+
+
 def _fd_count() -> int | None:
     for candidate in (Path("/proc/self/fd"), Path("/dev/fd")):
         if candidate.is_dir():
@@ -574,6 +956,7 @@ def run() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rapido-tooling-") as temporary:
         root = Path(temporary)
         _fixture_files(root)
+        _filesystem_fixture(root)
         from rapido.tools import Workspace
 
         workspace = Workspace(root)
@@ -581,6 +964,7 @@ def run() -> dict[str, Any]:
         fds_before = _fd_count()
         registry, registry_facts = _registry_check(workspace)
         operation_facts = _operations(registry, root)
+        sandbox_facts = _sandbox_check(root)
         workspace_facts = _workspace_check(root, workspace, before)
         fds_after = _fd_count()
         if fds_before is not None and fds_after != fds_before:
@@ -591,7 +975,7 @@ def run() -> dict[str, Any]:
     return {
         "ok": True,
         "offline": True,
-        "network": "not_used",
+        "network": "external_not_used",
         "auth": "not_used",
         "board": "not_used",
         "live_solver": "not_used",
@@ -605,6 +989,7 @@ def run() -> dict[str, Any]:
         "fixed_executables": native,
         "registry": registry_facts,
         "operations": operation_facts,
+        "sandbox": sandbox_facts,
         "cleanup": workspace_facts | {"temporary_directory_removed": True},
     }
 

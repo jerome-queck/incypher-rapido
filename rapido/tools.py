@@ -957,16 +957,17 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
     path_arg = _bounded_text(arguments.get("path"), "path")
     destination_arg = _bounded_text(arguments.get("destination", "extracted"), "destination")
     fmt = arguments.get("format", "auto")
-    if fmt not in ("auto", "zip", "tar"):
-        raise _error("invalid_argument", "format must be auto, zip, or tar")
+    if fmt not in ("auto", "zip"):
+        raise _error(
+            "unsupported_archive",
+            "TAR extraction is unavailable; inspect TAR inventory through inspect_artifact",
+        )
     password_value = arguments.get("password")
     password = (
         None
         if password_value is None
         else _bounded_text(password_value, "password", 256).encode("utf-8")
     )
-    if password is not None and fmt == "tar":
-        raise _error("invalid_argument", "password is supported only for ZIP archives")
     archive_path = workspace.path(path_arg)
     _check_file_size(_ensure_regular(archive_path))
     # Validate without creating anything.  A malformed/traversal archive should be
@@ -1043,50 +1044,6 @@ def extract_archive(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[
                             "bytes": total,
                         }
                     )
-        if fmt in ("auto", "tar"):
-            try:
-                # Entered immediately below after preserving the friendly format error.
-                archive = tarfile.open(archive_path, mode="r:*")  # noqa: SIM115
-            except tarfile.TarError:
-                raise _error("invalid_archive", "file is not a supported archive")
-            with archive:
-                preflight_tar: list[tuple[tarfile.TarInfo, Path]] = []
-                seen_targets = set()
-                for count, member in enumerate(archive, 1):
-                    _archive_limit_count(count)
-                    clean = _archive_name(member.name)
-                    if member.isdir():
-                        continue
-                    if member.issym() or member.islnk() or member.isdev():
-                        raise _error(
-                            "unsafe_archive", "links and device entries cannot be extracted"
-                        )
-                    if (
-                        member.size > MAX_ARCHIVE_MEMBER_BYTES
-                        or total + member.size > MAX_ARCHIVE_BYTES
-                    ):
-                        raise _error("archive_too_large", "archive exceeds extraction limits")
-                    target = _safe_member_destination(workspace, destination, clean)
-                    _preflight_target(target, seen_targets, workspace)
-                    preflight_tar.append((member, target))
-                    total += member.size
-                workspace.ensure_capacity(total)
-                destination = _prepare_destination(workspace, destination_arg)
-                for member, target in preflight_tar:
-                    source = archive.extractfile(member)
-                    if source is None:
-                        raise _error("invalid_archive", "archive member has no readable data")
-                    _write_archive_member(target, source, member.size)
-                    extracted.append(workspace.relative(target))
-                return _result(
-                    {
-                        "path": path_arg,
-                        "destination": destination_arg,
-                        "format": "tar",
-                        "files": extracted,
-                        "bytes": total,
-                    }
-                )
     except ToolError:
         raise
     except (OSError, zipfile.BadZipFile, tarfile.TarError) as exc:
@@ -1496,7 +1453,7 @@ TOOLS: dict[str, tuple[ToolFunction, str]] = {
     ),
     "list_zip": (list_zip, "List ZIP members and flag unsafe or oversized entries."),
     "list_tar": (list_tar, "List TAR members and flag unsafe or oversized entries."),
-    "extract_archive": (extract_archive, "Safely extract a ZIP or TAR into the workspace."),
+    "extract_archive": (extract_archive, "Safely extract a ZIP into the workspace."),
     "decompress_gzip": (
         decompress_gzip,
         "Safely decompress one bounded gzip stream to a new workspace file.",
@@ -1609,7 +1566,7 @@ def tool_schemas() -> list[dict[str, Any]]:
         "extract_archive": {
             "path": common_path,
             "destination": {"type": "string"},
-            "format": {"type": "string", "enum": ["auto", "zip", "tar"]},
+            "format": {"type": "string", "enum": ["auto", "zip"]},
             "password": {"type": "string", "maxLength": 256},
         },
         "decompress_gzip": {"path": common_path, "destination": common_path},

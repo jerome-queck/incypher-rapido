@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -146,3 +147,92 @@ def test_tooling_acceptance_reports_computed_visible_schema_size() -> None:
     text = TOOLING_ACCEPTANCE.read_text()
     assert '"schema_count": len(visible_specs)' in text
     assert '"schema_bytes": len(_json_bytes(visible_specs))' in text
+
+
+def test_tooling_acceptance_dispatches_every_visible_tool() -> None:
+    tree = ast.parse(TOOLING_ACCEPTANCE.read_text())
+    expected_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "EXPECTED_TOOLS"
+            for target in node.targets
+        )
+    )
+    expected = set(ast.literal_eval(expected_node.value))
+    operations = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_operations"
+    )
+    dispatched = {
+        call.args[0].value
+        for call in ast.walk(operations)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "dispatch"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+    }
+    assert expected <= dispatched, (
+        f"advertised tools missing from acceptance: {expected - dispatched}"
+    )
+
+
+def test_tooling_acceptance_covers_declared_artifact_adapters_and_views() -> None:
+    tree = ast.parse(TOOLING_ACCEPTANCE.read_text())
+    operations = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_operations"
+    )
+    requests: set[tuple[str, str, str | None]] = set()
+    for call in ast.walk(operations):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "dispatch"
+            and len(call.args) >= 2
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "inspect_artifact"
+            and isinstance(call.args[1], ast.Dict)
+        ):
+            continue
+        fields = {
+            key.value: value.value
+            for key, value in zip(call.args[1].keys, call.args[1].values)
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and isinstance(value, ast.Constant)
+        }
+        path, view = fields.get("path"), fields.get("view")
+        if isinstance(path, str) and isinstance(view, str):
+            requests.add((path, view, fields.get("selection")))
+
+    required = {
+        ("fixture.pcapng", "text", "packets"),
+        ("fixture.exe", "structure", "imports"),
+        ("fixture.exe", "structure", "exports"),
+        ("archive.tar", "structure", "entries"),
+        ("payload.gz", "structure", "entries"),
+        ("opaque.bin", "text", None),
+        ("opaque.bin", "bytes", None),
+    }
+    assert required <= requests, f"artifact coverage missing: {required - requests}"
+
+
+def test_agent_archive_extraction_schema_excludes_unisolated_tar_materialization() -> None:
+    from rapido.tools import tool_schemas
+
+    extract = next(spec for spec in tool_schemas() if spec["name"] == "extract_archive")
+    assert extract["inputSchema"]["properties"]["format"]["enum"] == ["auto", "zip"]
+
+
+def test_tooling_acceptance_tracks_sandbox_descendant_and_native_x32_gate() -> None:
+    text = TOOLING_ACCEPTANCE.read_text()
+    assert 'result.get("detachment_probe_pid")' in text
+    assert "_wait_process_gone(descendant_pid)" in text
+    assert 'result.get("x32_socket_errno") == errno.EACCES' in text
+    assert 'result.get("x32_connect_errno") == errno.EACCES' in text

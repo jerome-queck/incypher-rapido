@@ -45,8 +45,15 @@ _BPF_W = 0x00
 _BPF_ABS = 0x20
 _BPF_JMP = 0x05
 _BPF_JEQ = 0x10
+_BPF_JGE = 0x30
 _BPF_K = 0x00
 _BPF_RET = 0x06
+_X32_SYSCALL_BIT = 0x40000000
+
+_PROCESS_GROUP_SYSCALLS = {
+    "x86_64": frozenset({109, 112}),
+    "aarch64": frozenset({154, 157}),
+}
 
 _ARCHITECTURES = {
     "x86_64": (
@@ -73,7 +80,8 @@ _ARCHITECTURES = {
             425,
             426,
             427,
-        },
+        }
+        | _PROCESS_GROUP_SYSCALLS["x86_64"],
     ),
     "aarch64": (
         0xC00000B7,
@@ -99,7 +107,8 @@ _ARCHITECTURES = {
             425,
             426,
             427,
-        },
+        }
+        | _PROCESS_GROUP_SYSCALLS["aarch64"],
     ),
 }
 
@@ -262,8 +271,7 @@ def _install_landlock(scratch_fd: int) -> int:
     return abi
 
 
-def _install_network_filter() -> str:
-    machine = platform.machine().lower()
+def _seccomp_instructions(machine: str) -> list[_SockFilter]:
     if machine not in _ARCHITECTURES:
         raise SandboxUnavailable(f"unsupported seccomp architecture: {machine}")
     audit_arch, denied = _ARCHITECTURES[machine]
@@ -273,6 +281,15 @@ def _install_network_filter() -> str:
         _SockFilter(_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
         _SockFilter(_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 0),
     ]
+    if machine == "x86_64":
+        # x32 shares AUDIT_ARCH_X86_64 but tags syscall numbers. Reject the
+        # entire ABI before native-number checks and the terminal allow.
+        instructions.extend(
+            (
+                _SockFilter(_BPF_JMP | _BPF_JGE | _BPF_K, 0, 1, _X32_SYSCALL_BIT),
+                _SockFilter(_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ERRNO | errno.EACCES),
+            )
+        )
     for number in sorted(denied):
         instructions.extend(
             (
@@ -281,6 +298,12 @@ def _install_network_filter() -> str:
             )
         )
     instructions.append(_SockFilter(_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ALLOW))
+    return instructions
+
+
+def _install_seccomp_filter() -> str:
+    machine = platform.machine().lower()
+    instructions = _seccomp_instructions(machine)
     program_type = _SockFilter * len(instructions)
     program_data = program_type(*instructions)
     program = _SockFprog(len(instructions), program_data)
@@ -294,7 +317,7 @@ def _install_network_filter() -> str:
 
 
 def apply_artifact_sandbox(source_fd: int, scratch_fd: int) -> dict[str, object]:
-    """Constrain Linux worker/descendants to fixed runtime files and no networking."""
+    """Constrain Linux worker/descendants to fixed files, group, and no networking."""
     if sys.platform != "linux":
         return {"platform": sys.platform, "enforced": False}
     try:
@@ -310,8 +333,14 @@ def apply_artifact_sandbox(source_fd: int, scratch_fd: int) -> dict[str, object]
     if not stat.S_ISDIR(scratch.st_mode):
         raise SandboxUnavailable("scratch descriptor is not a directory")
     abi = _install_landlock(scratch_fd)
-    machine = _install_network_filter()
-    return {"platform": "linux", "enforced": True, "landlock_abi": abi, "arch": machine}
+    machine = _install_seccomp_filter()
+    return {
+        "platform": "linux",
+        "enforced": True,
+        "landlock_abi": abi,
+        "arch": machine,
+        "process_group_locked": True,
+    }
 
 
 __all__ = ["SandboxUnavailable", "apply_artifact_sandbox"]

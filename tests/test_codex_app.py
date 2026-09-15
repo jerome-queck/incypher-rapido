@@ -21,6 +21,7 @@ from rapido.codex_app import (
     MAX_TAINT_CANDIDATES,
     MAX_TAINT_DECODE_DEPTH,
     MAX_TAINT_DECODED_BYTES,
+    MAX_TAINT_PATH_SUFFIXES,
     MAX_TURN_CANDIDATE_HASHES,
     MAX_TURN_ITEM_BYTES,
     MAX_TURN_ITEMS,
@@ -41,6 +42,8 @@ from rapido.codex_app import (
     WorkspaceThreadRegistry,
     _source_bound_tool_call,
     _supplied_candidate_values,
+    _target_candidate_taint,
+    _target_provenance_output,
     _turn_failure_class,
     _TurnState,
 )
@@ -554,6 +557,186 @@ async def test_source_rooted_artifact_and_transform_results_remain_candidate_evi
     await client.close()
 
 
+@run_async
+@pytest.mark.parametrize("encoding", ("base64", "hex", "percent"))
+async def test_source_bound_artifact_argument_echo_cannot_root_transform(
+    fake_process: FakeProcess,
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    candidate = f"INCYPHER{{artifact_{encoding}_echo}}"
+    if encoding == "base64":
+        encoded = base64.b64encode(candidate.encode()).decode()
+        transform = "decode_base64"
+    elif encoding == "hex":
+        encoded = candidate.encode().hex()
+        transform = "decode_hex"
+    else:
+        encoded = urllib.parse.quote(candidate, safe="")
+        transform = "decode_url"
+
+    class ArtifactEchoRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if name == "search_text":
+                return {"echoed_query": arguments["query"]}
+            assert name == transform
+            return {"text": candidate}
+
+    registry = ArtifactEchoRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    for message_id, name, arguments in (
+        (145, "search_text", {"path": "artifacts/source.txt", "query": encoded}),
+        (146, transform, {"data": encoded}),
+    ):
+        await client._route_message(
+            {
+                "id": message_id,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": str(message_id),
+                    "tool": {"name": name},
+                    "arguments": arguments,
+                },
+            }
+        )
+        await asyncio.gather(*client._server_tasks)
+
+    candidate_hash = hashlib.sha256(candidate.encode()).hexdigest()
+    assert state.tool_calls[0]["source_bound"]
+    assert candidate_hash in state.tool_calls[0]["supplied_candidate_sha256s"]
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert not state.tool_calls[1]["source_bound"]
+    assert not any(
+        call["source_bound"] and candidate_hash in call["candidate_sha256s"]
+        for call in state.tool_calls
+    )
+    assert all(encoded not in output for output in state.provenance_outputs)
+    await client.close()
+
+
+@run_async
+async def test_independent_encoded_artifact_result_remains_transform_source_bound(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    candidate = "INCYPHER{independent_encoded_artifact}"
+    encoded = base64.b64encode(candidate.encode()).decode()
+
+    class IndependentArtifactRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del arguments
+            return {"artifact_value": encoded} if name == "search_text" else {"text": candidate}
+
+    registry = IndependentArtifactRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    for message_id, name, arguments in (
+        (
+            147,
+            "search_text",
+            {"path": "artifacts/source.txt", "query": "independent needle"},
+        ),
+        (148, "decode_base64", {"data": encoded}),
+    ):
+        await client._route_message(
+            {
+                "id": message_id,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": str(message_id),
+                    "tool": {"name": name},
+                    "arguments": arguments,
+                },
+            }
+        )
+        await asyncio.gather(*client._server_tasks)
+
+    assert state.tool_calls[1]["source_bound"]
+    assert (
+        hashlib.sha256(candidate.encode()).hexdigest() in state.tool_calls[1]["candidate_sha256s"]
+    )
+    await client.close()
+
+
+@run_async
+@pytest.mark.parametrize("exhaustion", ("arguments", "output"))
+async def test_artifact_provenance_sanitization_budget_exhaustion_fails_closed(
+    fake_process: FakeProcess,
+    tmp_path: Path,
+    exhaustion: str,
+) -> None:
+    candidate = "INCYPHER{blocked_by_artifact_sanitizer_budget}"
+
+    class ExhaustedArtifactRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del name, arguments
+            if exhaustion == "output":
+                return {
+                    "candidate": candidate,
+                    "values": [
+                        f"reversibletoken{index:08d}"
+                        for index in range(MAX_TAINT_ARGUMENT_STRINGS + 1)
+                    ],
+                }
+            return {"artifact_value": candidate}
+
+    arguments: dict[str, Any] = {
+        "path": "artifacts/source.txt",
+        "query": "ordinary",
+    }
+    if exhaustion == "arguments":
+        arguments["values"] = [str(index) for index in range(MAX_TAINT_ARGUMENT_STRINGS + 1)]
+    registry = ExhaustedArtifactRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 149,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": exhaustion,
+                "tool": {"name": "search_text"},
+                "arguments": arguments,
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    response = next(item for item in fake_process.responses if item["id"] == 149)
+    assert response["result"]["success"] is True
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.provenance_outputs == []
+    assert not state.target_taint_complete
+    await client.close()
+
+
 @pytest.mark.parametrize(
     ("error_info", "expected"),
     (
@@ -948,6 +1131,213 @@ def test_target_taint_covers_transport_and_nested_forms(
     candidate: str, arguments: dict[str, Any]
 ) -> None:
     assert candidate in _supplied_candidate_values("http_request", arguments)
+
+
+def test_target_path_suffix_scan_is_complete_only_through_its_exact_limit() -> None:
+    at_limit = "/".join(["***"] * (MAX_TAINT_PATH_SUFFIXES + 1))
+    over_limit = "/".join(["***"] * (MAX_TAINT_PATH_SUFFIXES + 2))
+
+    assert _target_candidate_taint({"path": at_limit}) == (set(), True)
+    assert _target_candidate_taint({"path": over_limit}) == (set(), False)
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ("base64", "urlsafe_base64", "hex", "percent", "binary_base64"),
+)
+def test_target_provenance_redacts_reversibly_encoded_candidate(encoding: str) -> None:
+    candidate = "INCYPHER{!!?}" if encoding == "urlsafe_base64" else f"INCYPHER{{{encoding}}}"
+    if encoding == "urlsafe_base64":
+        encoded = base64.urlsafe_b64encode(candidate.encode()).decode()
+    elif encoding in {"base64", "binary_base64"}:
+        encoded = base64.b64encode(candidate.encode()).decode()
+    elif encoding == "hex":
+        encoded = candidate.encode().hex()
+    else:
+        encoded = urllib.parse.quote(candidate, safe="")
+    target_result = (
+        {"encoding": "base64", "data_base64": encoded}
+        if encoding == "binary_base64"
+        else {"observed": encoded}
+    )
+
+    provenance = _target_provenance_output(
+        "http_request", json.dumps(target_result), {candidate}, {candidate}
+    )
+
+    assert provenance is not None
+    assert encoded not in provenance
+
+
+@run_async
+@pytest.mark.parametrize(
+    "encoding",
+    ("base64", "urlsafe_base64", "hex", "percent", "binary_base64"),
+)
+async def test_encoded_target_reflection_cannot_root_later_transform(
+    fake_process: FakeProcess,
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    candidate = (
+        "INCYPHER{!!?}" if encoding == "urlsafe_base64" else f"INCYPHER{{{encoding}_reflected}}"
+    )
+    if encoding == "urlsafe_base64":
+        encoded = base64.urlsafe_b64encode(candidate.encode()).decode()
+        transform = "decode_base64"
+    elif encoding in {"base64", "binary_base64"}:
+        encoded = base64.b64encode(candidate.encode()).decode()
+        transform = "decode_base64"
+    elif encoding == "hex":
+        encoded = candidate.encode().hex()
+        transform = "decode_hex"
+    else:
+        encoded = urllib.parse.quote(candidate, safe="")
+        transform = "decode_url"
+    target_result = (
+        {"encoding": "base64", "data_base64": encoded}
+        if encoding == "binary_base64"
+        else {"observed": encoded}
+    )
+
+    class EncodedReflectionRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if name == "http_request":
+                return target_result
+            assert name == transform
+            assert arguments == {"data": encoded}
+            return {"text": candidate}
+
+    registry = EncodedReflectionRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    calls = (
+        (140, "http_request", {"path": "/reflect", "candidate": candidate}),
+        (141, transform, {"data": encoded}),
+    )
+    for message_id, name, arguments in calls:
+        await client._route_message(
+            {
+                "id": message_id,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": str(message_id),
+                    "tool": {"name": name},
+                    "arguments": arguments,
+                },
+            }
+        )
+        await asyncio.gather(*client._server_tasks)
+
+    candidate_hash = hashlib.sha256(candidate.encode()).hexdigest()
+    assert candidate_hash in state.tool_calls[0]["supplied_candidate_sha256s"]
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert not state.tool_calls[1]["source_bound"]
+    assert state.tool_calls[1]["candidate_sha256s"] == []
+    assert all(encoded not in output for output in state.provenance_outputs)
+    await client.close()
+
+
+@run_async
+async def test_independent_encoded_target_result_remains_transform_source_bound(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    candidate = "INCYPHER{independent_encoded_target}"
+    encoded = base64.b64encode(candidate.encode()).decode()
+
+    class IndependentEncodedRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del arguments
+            return {"observed": encoded} if name == "http_request" else {"text": candidate}
+
+    registry = IndependentEncodedRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    for message_id, name, arguments in (
+        (142, "http_request", {"path": "/independent"}),
+        (143, "decode_base64", {"data": encoded}),
+    ):
+        await client._route_message(
+            {
+                "id": message_id,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": str(message_id),
+                    "tool": {"name": name},
+                    "arguments": arguments,
+                },
+            }
+        )
+        await asyncio.gather(*client._server_tasks)
+
+    assert state.tool_calls[1]["source_bound"]
+    assert (
+        hashlib.sha256(candidate.encode()).hexdigest() in state.tool_calls[1]["candidate_sha256s"]
+    )
+    await client.close()
+
+
+@run_async
+async def test_unexamined_standard_base64_path_suffix_fails_target_evidence_closed(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    candidate = "INCYPHER{" + "?" * 72 + "}"
+    independent = "INCYPHER{blocked_after_incomplete_suffix_scan}"
+    encoded = base64.b64encode(candidate.encode()).decode()
+    assert encoded.count("/") > MAX_TAINT_PATH_SUFFIXES
+
+    class AmbiguousPathRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del name, arguments
+            return {"reflected": candidate, "independent": independent}
+
+    registry = AmbiguousPathRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 144,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "ambiguous-path",
+                "tool": {"name": "http_request"},
+                "arguments": {"path": "/reflect/" + encoded},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    assert not state.target_taint_complete
+    assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.provenance_outputs == []
+    await client.close()
 
 
 @run_async

@@ -689,35 +689,36 @@ def _tar_view(
     total_declared = 0
     more = False
     try:
-        with (
-            os.fdopen(os.dup(descriptor), "rb") as source,
-            tarfile.open(fileobj=source, mode="r:") as archive,
-        ):
-            for member in archive:
-                count += 1
-                if count > MAX_ARCHIVE_ENTRIES:
-                    raise _error("limit_exceeded", "TAR entry count exceeds the inventory limit")
-                total_declared += max(0, member.size)
-                if count <= start:
-                    continue
-                page_limit = 10 if base["view"] == "summary" else MAX_RECORDS
-                if len(selected) >= page_limit:
-                    more = True
-                    continue
-                name, unsafe_name = _safe_archive_name(member.name)
-                linked = member.issym() or member.islnk()
-                selected.append(
-                    {
-                        "name": name,
-                        "size": member.size,
-                        "directory": member.isdir(),
-                        "linked": linked,
-                        "unsafe": unsafe_name or linked or member.isdev(),
-                        "type": member.type.decode("ascii", "replace")
-                        if isinstance(member.type, bytes)
-                        else str(member.type),
-                    }
-                )
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            source.seek(0)
+            with tarfile.open(fileobj=source, mode="r:") as archive:
+                for member in archive:
+                    count += 1
+                    if count > MAX_ARCHIVE_ENTRIES:
+                        raise _error(
+                            "limit_exceeded", "TAR entry count exceeds the inventory limit"
+                        )
+                    total_declared += max(0, member.size)
+                    if count <= start:
+                        continue
+                    page_limit = 10 if base["view"] == "summary" else MAX_RECORDS
+                    if len(selected) >= page_limit:
+                        more = True
+                        continue
+                    name, unsafe_name = _safe_archive_name(member.name)
+                    linked = member.issym() or member.islnk()
+                    selected.append(
+                        {
+                            "name": name,
+                            "size": member.size,
+                            "directory": member.isdir(),
+                            "linked": linked,
+                            "unsafe": unsafe_name or linked or member.isdev(),
+                            "type": member.type.decode("ascii", "replace")
+                            if isinstance(member.type, bytes)
+                            else str(member.type),
+                        }
+                    )
     except (OSError, tarfile.TarError) as exc:
         raise _error("invalid_artifact", "TAR metadata is malformed") from exc
     data: Any
@@ -1083,6 +1084,96 @@ def _pcap_view(
     )
 
 
+def _pcapng_section_endian(header: bytes) -> str:
+    if header[8:12] == b"\x4d\x3c\x2b\x1a":
+        return "<"
+    if header[8:12] == b"\x1a\x2b\x3c\x4d":
+        return ">"
+    raise _error("invalid_artifact", "PCAPNG section byte order is invalid")
+
+
+def _encode_pcapng_cursor(
+    offset: int,
+    section_offset: int,
+    endian: str,
+    base: Mapping[str, Any],
+) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "o": offset,
+            "h": base["source_sha256"],
+            "f": "pcapng",
+            "w": base["view"],
+            "s": base["selection"],
+            "e": endian,
+            "q": section_offset,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+
+
+def _pcapng_cursor_position(
+    descriptor: int,
+    size: int,
+    cursor: str | None,
+    base: Mapping[str, Any],
+    initial_endian: str,
+) -> tuple[int, str, int]:
+    if cursor is None:
+        return 0, initial_endian, 0
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError) as exc:
+        raise _error("invalid_cursor", "cursor is not a valid artifact continuation") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "v",
+        "o",
+        "h",
+        "f",
+        "w",
+        "s",
+        "e",
+        "q",
+    }:
+        raise _error("invalid_cursor", "PCAPNG cursor shape is invalid")
+    if (
+        payload["v"] != 1
+        or payload["h"] != base["source_sha256"]
+        or payload["f"] != "pcapng"
+        or payload["w"] != base["view"]
+        or payload["s"] != base["selection"]
+    ):
+        raise _error("stale_cursor", "cursor does not match this artifact and view")
+    position, section_offset, endian = payload["o"], payload["q"], payload["e"]
+    if (
+        type(position) is not int
+        or type(section_offset) is not int
+        or type(endian) is not str
+        or endian not in {"<", ">"}
+        or not 0 <= section_offset < position < size
+    ):
+        raise _error("invalid_cursor", "PCAPNG cursor position is invalid")
+    section = _pread(descriptor, 12, section_offset, size)
+    if section[:4] != b"\x0a\x0d\x0d\x0a" or _pcapng_section_endian(section) != endian:
+        raise _error("invalid_cursor", "PCAPNG cursor section binding is invalid")
+    section_length = struct.unpack_from(endian + "I", section, 4)[0]
+    if (
+        section_length < 28
+        or section_length % 4
+        or section_offset + section_length > position
+        or section_offset + section_length > size
+    ):
+        raise _error("invalid_cursor", "PCAPNG cursor section is invalid")
+    trailer = _pread(descriptor, 4, section_offset + section_length - 4, size)
+    if struct.unpack(endian + "I", trailer)[0] != section_length:
+        raise _error("invalid_cursor", "PCAPNG cursor section trailer is invalid")
+    return position, endian, section_offset
+
+
 def _pcapng_view(
     descriptor: int,
     size: int,
@@ -1091,12 +1182,7 @@ def _pcapng_view(
 ) -> dict[str, Any]:
     _check_selection(base["selection"], {"packets", "blocks"})
     first = _pread(descriptor, 12, 0, size)
-    if first[8:12] == b"\x4d\x3c\x2b\x1a":
-        endian = "<"
-    elif first[8:12] == b"\x1a\x2b\x3c\x4d":
-        endian = ">"
-    else:
-        raise _error("invalid_artifact", "PCAPNG byte-order magic is invalid")
+    endian = _pcapng_section_endian(first)
     if base["view"] == "summary":
         block_length = struct.unpack_from(endian + "I", first, 4)[0]
         if block_length < 28 or block_length > size:
@@ -1111,33 +1197,33 @@ def _pcapng_view(
             "partial",
             "block_inventory_not_scanned",
         )
-    position = _cursor_offset(
-        cursor,
-        base["source_sha256"],
-        "pcapng",
-        base["view"],
-        base["selection"],
+    position, endian, section_offset = _pcapng_cursor_position(
+        descriptor,
         size,
+        cursor,
+        base,
+        endian,
     )
     records = []
     scanned = 0
     while position < size and len(records) < MAX_RECORDS and scanned < MAX_SCAN_BYTES:
         header = _pread(descriptor, 12, position, size)
-        block_type = struct.unpack_from(endian + "I", header, 0)[0]
-        if block_type == 0x0A0D0D0A:
-            if header[8:12] == b"\x4d\x3c\x2b\x1a":
-                endian = "<"
-            elif header[8:12] == b"\x1a\x2b\x3c\x4d":
-                endian = ">"
-            else:
-                raise _error("invalid_artifact", "PCAPNG section byte order is invalid")
-        block_length = struct.unpack_from(endian + "I", header, 4)[0]
-        if block_length < 12 or block_length % 4 or block_length > MAX_SCAN_BYTES:
+        section_header = header[:4] == b"\x0a\x0d\x0d\x0a"
+        block_endian = _pcapng_section_endian(header) if section_header else endian
+        block_type = struct.unpack_from(block_endian + "I", header, 0)[0]
+        block_length = struct.unpack_from(block_endian + "I", header, 4)[0]
+        minimum_length = 28 if section_header else 12
+        if (
+            block_length < minimum_length
+            or block_length % 4
+            or block_length > MAX_SCAN_BYTES
+            or position + block_length > size
+        ):
             raise _error("invalid_artifact", "PCAPNG block length is invalid")
         if scanned + block_length > MAX_SCAN_BYTES:
             break
         trailer = _pread(descriptor, 4, position + block_length - 4, size)
-        if struct.unpack(endian + "I", trailer)[0] != block_length:
+        if struct.unpack(block_endian + "I", trailer)[0] != block_length:
             raise _error("invalid_artifact", "PCAPNG block length trailer is inconsistent")
         retained = _pread(descriptor, min(block_length - 4, 28 + 64), position, size)
         row: dict[str, Any] = {
@@ -1147,7 +1233,7 @@ def _pcapng_view(
         }
         if block_type == 6 and block_length >= 32:
             interface, high, low, captured, original = struct.unpack_from(
-                endian + "IIIII", retained, 8
+                block_endian + "IIIII", retained, 8
             )
             if (
                 captured > MAX_PACKET_BYTES
@@ -1163,6 +1249,9 @@ def _pcapng_view(
                 data_hex_preview=retained[28 : 28 + min(captured, 64)].hex(),
             )
         records.append(row)
+        if section_header:
+            endian = block_endian
+            section_offset = position
         position += block_length
         scanned += block_length
     complete = position >= size
@@ -1174,13 +1263,16 @@ def _pcapng_view(
         if complete
         else ("record_limit" if len(records) >= MAX_RECORDS else "scan_limit")
     )
-    return _finish(
+    result = _finish(
         base,
         data,
         "complete" if complete else "partial",
         reason,
-        next_offset=position if not complete else None,
     )
+    if not complete:
+        result["next_cursor"] = _encode_pcapng_cursor(position, section_offset, endian, base)
+        return _bounded_result(result)
+    return result
 
 
 def _elf_metadata(descriptor: int, size: int, start: int, limit: int) -> dict[str, Any]:
@@ -1348,9 +1440,9 @@ def _pe_headers(descriptor: int, size: int) -> tuple[dict[str, Any], list[dict[s
     )
 
 
-def _pe_symbols(descriptor: int, size: int, selection: str) -> tuple[list[Any], bool]:
+def _pe_symbols(descriptor: int, size: int, selection: str) -> tuple[list[Any], bool, bool]:
     if _pefile is None:
-        return [], False
+        return [], False, False
     if size > 64 * 1024 * 1024:
         raise _error("limit_exceeded", "PE deep parsing exceeds its source byte limit")
     data = _pread(descriptor, size, 0, size)
@@ -1360,8 +1452,12 @@ def _pe_symbols(descriptor: int, size: int, selection: str) -> tuple[list[Any], 
             pe.parse_data_directories(
                 directories=[_pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
             )
+            libraries = getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+            limited = len(libraries) > MAX_RECORDS
             rows = []
-            for library in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])[:MAX_RECORDS]:
+            for library in libraries[:MAX_RECORDS]:
+                imports = library.imports
+                limited = limited or len(imports) > MAX_RECORDS
                 rows.append(
                     {
                         "library": bytes(library.dll).decode("ascii", "replace")[:256],
@@ -1369,15 +1465,16 @@ def _pe_symbols(descriptor: int, size: int, selection: str) -> tuple[list[Any], 
                             (bytes(item.name).decode("ascii", "replace")[:256])
                             if item.name
                             else f"ordinal:{item.ordinal}"
-                            for item in library.imports[:MAX_RECORDS]
+                            for item in imports[:MAX_RECORDS]
                         ],
                     }
                 )
-            return rows, True
+            return rows, True, limited
         pe.parse_data_directories(
             directories=[_pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]]
         )
         exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+        symbols = exports.symbols if exports else []
         return (
             [
                 {
@@ -1387,9 +1484,10 @@ def _pe_symbols(descriptor: int, size: int, selection: str) -> tuple[list[Any], 
                     "ordinal": item.ordinal,
                     "address": hex(item.address),
                 }
-                for item in (exports.symbols[:MAX_RECORDS] if exports else [])
+                for item in symbols[:MAX_RECORDS]
             ],
             True,
+            len(symbols) > MAX_RECORDS,
         )
     except Exception as exc:
         raise _error("invalid_artifact", "PE directory metadata is malformed") from exc
@@ -1410,12 +1508,16 @@ def _pe_view(
     if base["selection"] in {"imports", "exports"}:
         if cursor is not None or base["view"] == "summary":
             raise _error("invalid_argument", "PE directory selection is one structure/text request")
-        rows, available = _pe_symbols(descriptor, size, base["selection"])
+        rows, available, limited = _pe_symbols(descriptor, size, base["selection"])
         return _finish(
             base,
             {base["selection"]: rows, "dependency": "pefile" if available else "unavailable"},
-            "complete" if available else "unsupported",
-            "directory_complete" if available else "dependency_unavailable",
+            "partial" if limited else "complete" if available else "unsupported",
+            "record_limit"
+            if limited
+            else "directory_complete"
+            if available
+            else "dependency_unavailable",
         )
     if base["selection"] is not None:
         raise _error("invalid_argument", "PE selection must be imports, exports, or disassembly")
@@ -1474,7 +1576,7 @@ def _binary_strings(
     found.sort(key=lambda row: (row["offset"], row["encoding"]))
     limited = found[:MAX_RECORDS]
     if len(found) > MAX_RECORDS:
-        next_position = max(position + 1, limited[-1]["end_offset"])
+        next_position = max(position + 1, found[MAX_RECORDS]["offset"])
         reason = "record_limit"
     elif deferred_start is not None:
         next_position = deferred_start
@@ -1992,7 +2094,9 @@ def _inspect_artifact(
             if view == "bytes":
                 return _bytes_view(descriptor, size, cursor, base)
             operation = None
-            if format_name == "pdf":
+            if format_name == "tar":
+                operation = "tar"
+            elif format_name == "pdf":
                 operation = "pdf"
             elif format_name == "pcap":
                 operation = "pcap"
@@ -2006,13 +2110,16 @@ def _inspect_artifact(
             ):
                 operation = "disassembly"
             if isolate_optional and operation is not None:
-                return run_artifact_worker(
+                result = run_artifact_worker(
                     descriptor,
                     operation,
                     size=size,
                     cursor=cursor,
                     base=base,
                 )
+                if _source_facts(descriptor) != original_facts:
+                    raise _error("source_changed", "artifact changed during isolated inspection")
+                return result
             if format_name == "text":
                 return _text_view(
                     descriptor,

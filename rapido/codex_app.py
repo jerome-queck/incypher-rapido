@@ -603,13 +603,21 @@ def _expand_target_taint(scan: _TaintScan) -> None:
         # only short, bounded suffixes; candidate encodings are at most 700 B.
         suffixes = 0
         slash = path.rfind("/")
-        while slash >= 0 and suffixes < MAX_TAINT_PATH_SUFFIXES:
+        while slash >= 0:
+            if suffixes >= MAX_TAINT_PATH_SUFFIXES:
+                scan.complete = False
+                break
             suffix = path[slash + 1 :]
             if len(suffix.encode("utf-8")) > 1024:
+                scan.complete = False
                 break
             _add_taint_variant(scan, pending, seen, suffix, depth, False)
+            if not scan.complete:
+                break
             suffixes += 1
             slash = path.rfind("/", 0, slash)
+        if not scan.complete:
+            break
         if query_separator:
             for pair in query.split("&", MAX_TAINT_VARIANTS):
                 key, value_separator, value = pair.partition("=")
@@ -713,7 +721,7 @@ def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[s
     """Find candidate-shaped model input, including supported transport encodings."""
     values = _argument_strings(arguments)
     canonical = ALIASES.get(name, name)
-    if canonical in _TARGET_OBSERVATION_TOOLS:
+    if canonical in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS:
         return _target_candidate_taint(arguments)[0]
     # The handler calls this only after source binding. Reversible transform
     # inputs found verbatim in earlier host output therefore remain host-rooted.
@@ -723,21 +731,72 @@ def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[s
     return {match.group() for value in decoded_values for match in FLAG_RE.finditer(value)}
 
 
+def _reversibly_encoded_taint_needles(
+    encoded_result: str, taint_fragments: set[str]
+) -> tuple[set[str], bool]:
+    """Find bounded output tokens that decode to model-supplied candidates."""
+    if not taint_fragments:
+        return set(), True
+    needles: set[str] = set()
+    seen: set[str] = set()
+    argument_bytes = 0
+    variants = 0
+    decoded_bytes = 0
+    candidates = 0
+    for match in _REVERSIBLE_TAINT_TOKEN.finditer(encoded_result):
+        token = match.group()
+        if token in seen:
+            continue
+        token_bytes = len(token.encode("utf-8"))
+        if (
+            len(seen) >= MAX_TAINT_ARGUMENT_STRINGS
+            or argument_bytes + token_bytes > MAX_TAINT_ARGUMENT_BYTES
+        ):
+            return set(), False
+        seen.add(token)
+        argument_bytes += token_bytes
+        scan = _TaintScan(strings=[token], argument_strings=1, argument_bytes=token_bytes)
+        _expand_target_taint(scan)
+        variants += scan.variants
+        decoded_bytes += scan.decoded_bytes
+        candidates += len(scan.candidates)
+        if (
+            not scan.complete
+            or scan.invalid_unicode
+            or variants > MAX_TAINT_VARIANTS
+            or decoded_bytes > MAX_TAINT_DECODED_BYTES
+            or candidates > MAX_TAINT_CANDIDATES
+        ):
+            return set(), False
+        if any(
+            _candidate_assembled_from_taint(candidate, taint_fragments)
+            for candidate in scan.candidates
+        ):
+            needles.add(token)
+    return needles, True
+
+
 def _target_provenance_output(
     name: str,
     encoded_result: str,
     tainted_inputs: set[str],
     tainted_candidates: set[str],
-) -> str:
+) -> str | None:
     canonical = ALIASES.get(name, name)
-    if canonical not in _TARGET_OBSERVATION_TOOLS:
+    if canonical not in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS:
         return encoded_result
     taint_fragments = {*tainted_candidates, *tainted_inputs}
+    encoded_needles, encoded_scan_complete = _reversibly_encoded_taint_needles(
+        encoded_result, taint_fragments
+    )
+    if not encoded_scan_complete:
+        return None
     assembled_needles = {
         match.group()
         for match in _REVERSIBLE_TAINT_TOKEN.finditer(encoded_result)
         if _candidate_assembled_from_taint(match.group(), taint_fragments)
     }
+    assembled_needles.update(encoded_needles)
     encoded_result = FLAG_RE.sub(
         lambda match: (
             "[model-supplied]"
@@ -1239,10 +1298,25 @@ class CodexAppClient:
         )
         canonical_name = ALIASES.get(name, name)
         source_bound = _source_bound_tool_call(state, name, arguments)
+        call_tainted_inputs: set[str] = set()
+        call_tainted_candidates: set[str] = set()
+        source_taint_complete = state.target_taint_complete
         if source_bound and canonical_name in _TARGET_OBSERVATION_TOOLS:
             _expand_target_taint(argument_scan)
             _commit_target_taint(state, argument_scan)
             current_supplied = argument_scan.candidates
+            call_tainted_inputs = state.tainted_target_inputs
+            call_tainted_candidates = state.tainted_candidates
+            source_taint_complete = state.target_taint_complete
+        elif source_bound and canonical_name in _ARTIFACT_TOOLS:
+            # A trusted workspace path does not make the call's other
+            # model-supplied arguments trusted provenance.
+            _expand_target_taint(argument_scan)
+            current_supplied = argument_scan.candidates
+            call_tainted_inputs = argument_scan.fragments
+            call_tainted_candidates = argument_scan.candidates
+            source_taint_complete &= argument_scan.complete and not argument_scan.invalid_unicode
+            state.target_taint_complete &= source_taint_complete
         else:
             current_supplied = (
                 _supplied_candidate_values(name, arguments) if source_bound else set()
@@ -1251,8 +1325,13 @@ class CodexAppClient:
         supplied_hashes, supplied_hashes_complete = _bounded_candidate_hashes(
             state, sorted(current_supplied), limit=MAX_TAINT_CANDIDATES
         )
-        if canonical_name in _TARGET_OBSERVATION_TOOLS and not supplied_hashes_complete:
+        if (
+            source_bound
+            and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+            and not supplied_hashes_complete
+        ):
             state.target_taint_complete = False
+            source_taint_complete = False
             supplied_hashes = []
         call_record: dict[str, Any] | None = {
             "name": name,
@@ -1291,6 +1370,23 @@ class CodexAppClient:
                 "success": True,
                 "contentItems": [{"type": "inputText", "text": encoded_result}],
             }
+            provenance_result: str | None = None
+            if source_bound and (
+                canonical_name in _TRANSFORM_TOOLS
+                or (
+                    canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                    and source_taint_complete
+                )
+            ):
+                provenance_result = _target_provenance_output(
+                    name,
+                    encoded_result,
+                    call_tainted_inputs,
+                    call_tainted_candidates,
+                )
+                if provenance_result is None:
+                    state.target_taint_complete = False
+                    source_taint_complete = False
             if call_record is not None:
                 call_record["success"] = True
                 result_candidates: list[str] = []
@@ -1314,6 +1410,17 @@ class CodexAppClient:
                     ]
                     if not state.target_taint_complete:
                         result_candidates = []
+                elif canonical_name in _ARTIFACT_TOOLS:
+                    result_candidates = [
+                        candidate
+                        for candidate in result_candidates
+                        if candidate not in supplied_candidates
+                        and not _candidate_assembled_from_taint(
+                            candidate, call_tainted_inputs | call_tainted_candidates
+                        )
+                    ]
+                    if not source_taint_complete:
+                        result_candidates = []
                 else:
                     result_candidates = [
                         candidate
@@ -1323,21 +1430,18 @@ class CodexAppClient:
                 candidate_hashes, candidate_hashes_complete = _bounded_candidate_hashes(
                     state, result_candidates, limit=MAX_TAINT_CANDIDATES
                 )
-                if canonical_name in _TARGET_OBSERVATION_TOOLS and not candidate_hashes_complete:
+                if (
+                    source_bound
+                    and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                    and not candidate_hashes_complete
+                ):
                     state.target_taint_complete = False
+                    source_taint_complete = False
                     candidate_hashes = []
                 call_record["candidate_sha256s"] = candidate_hashes
-            if (
-                source_bound
-                and state is not None
-                and (canonical_name not in _TARGET_OBSERVATION_TOOLS or state.target_taint_complete)
+            if provenance_result is not None and (
+                canonical_name in _TRANSFORM_TOOLS or source_taint_complete
             ):
-                provenance_result = _target_provenance_output(
-                    name,
-                    encoded_result,
-                    state.tainted_target_inputs,
-                    state.tainted_candidates,
-                )
                 encoded_bytes = len(provenance_result.encode("utf-8"))
                 if state.provenance_bytes + encoded_bytes <= MAX_PROVENANCE_BYTES:
                     state.provenance_outputs.append(provenance_result)
