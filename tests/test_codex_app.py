@@ -219,6 +219,24 @@ def test_assigned_target_observations_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {})
 
 
+def test_hex_transform_accepts_only_normalized_prior_host_output() -> None:
+    state = _TurnState(thread_id="thread-1")
+    rooted = "494e4359504845527b726f6f7465647d"
+    state.provenance_outputs.append(json.dumps({"hex": rooted}))
+    spaced_upper = " ".join(rooted[index : index + 2].upper() for index in range(0, len(rooted), 2))
+    assert _source_bound_tool_call(state, "decode_hex", {"data": spaced_upper})
+    assert not _source_bound_tool_call(
+        state, "decode_hex", {"data": "494e4359504845527b756e726f6f7465647d"}
+    )
+    assert not _source_bound_tool_call(state, "decode_hex", {"data": "41"})
+    assert not _source_bound_tool_call(
+        state, "decode_hex", {"data": rooted[:8] + "\N{NO-BREAK SPACE}" + rooted[8:]}
+    )
+    split = _TurnState(thread_id="thread-2")
+    split.provenance_outputs.append(json.dumps({"left": rooted[:16], "right": rooted[16:]}))
+    assert not _source_bound_tool_call(split, "decode_hex", {"data": rooted})
+
+
 @run_async
 async def test_handshake_args_env_and_concurrent_requests(
     fake_process: FakeProcess, tmp_path: Path

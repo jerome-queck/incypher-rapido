@@ -320,7 +320,22 @@ def _source_bound_tool_call(
     if _artifact_relative_path(arguments.get("path")):
         return True
     data = arguments.get("data")
-    return isinstance(data, str) and any(data in output for output in state.provenance_outputs)
+    if not isinstance(data, str):
+        return False
+    if any(data in output for output in state.provenance_outputs):
+        return True
+    if canonical != "decode_hex":
+        return False
+    # ``bytes.fromhex`` deliberately accepts ASCII whitespace and hexadecimal is
+    # case-insensitive. Bind only a meaningful, otherwise exact compact hex value
+    # to an earlier host result; do not normalize punctuation or concatenate fields.
+    compact = data.translate(str.maketrans("", "", " \t\n\r\v\f"))
+    return (
+        len(compact) >= 16
+        and len(compact) % 2 == 0
+        and all(character in "0123456789abcdefABCDEF" for character in compact)
+        and any(compact.lower() in output.lower() for output in state.provenance_outputs)
+    )
 
 
 def _argument_strings(value: Any) -> list[str]:
