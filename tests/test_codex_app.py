@@ -616,6 +616,7 @@ async def test_source_bound_artifact_argument_echo_cannot_root_transform(
     assert state.tool_calls[0]["source_bound"]
     assert candidate_hash in state.tool_calls[0]["supplied_candidate_sha256s"]
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.tool_calls[0]["candidate_sensitive"] is True
     assert not state.tool_calls[1]["source_bound"]
     assert not any(
         call["source_bound"] and candidate_hash in call["candidate_sha256s"]
@@ -733,6 +734,7 @@ async def test_artifact_provenance_sanitization_budget_exhaustion_fails_closed(
     response = next(item for item in fake_process.responses if item["id"] == 149)
     assert response["result"]["success"] is True
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.tool_calls[0]["candidate_sensitive"] is True
     assert state.provenance_outputs == []
     assert not state.target_taint_complete
     await client.close()
@@ -1248,6 +1250,7 @@ async def test_encoded_target_reflection_cannot_root_later_transform(
     assert state.tool_calls[0]["candidate_sha256s"] == []
     assert not state.tool_calls[1]["source_bound"]
     assert state.tool_calls[1]["candidate_sha256s"] == []
+    assert state.tool_calls[1]["candidate_sensitive"] is True
     assert all(encoded not in output for output in state.provenance_outputs)
     await client.close()
 
@@ -1341,6 +1344,7 @@ async def test_unexamined_standard_base64_path_suffix_fails_target_evidence_clos
 
     assert not state.target_taint_complete
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.tool_calls[0]["candidate_sensitive"] is True
     assert state.provenance_outputs == []
     await client.close()
 
@@ -1652,6 +1656,7 @@ async def test_taint_decode_depth_exhaustion_conservatively_disables_target_evid
         await asyncio.gather(*client._server_tasks)
     assert not state.target_taint_complete
     assert state.tool_calls[1]["candidate_sha256s"] == []
+    assert state.tool_calls[1]["candidate_sensitive"] is True
     assert state.provenance_outputs == []
     await client.close()
 
@@ -1725,6 +1730,7 @@ async def test_per_call_taint_budget_exhaustion_returns_response_and_fails_close
     assert registry.calls == 1
     assert not state.target_taint_complete
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.tool_calls[0]["candidate_sensitive"] is True
     assert state.provenance_outputs == []
     assert state.taint_argument_strings <= MAX_TURN_TAINT_ARGUMENT_STRINGS
     assert state.taint_argument_bytes <= MAX_TURN_TAINT_ARGUMENT_BYTES
@@ -1810,6 +1816,7 @@ async def test_cumulative_taint_budget_exhaustion_fails_closed(
     assert response["result"]["success"] is True
     assert not state.target_taint_complete
     assert state.tool_calls[0]["candidate_sha256s"] == []
+    assert state.tool_calls[0]["candidate_sensitive"] is True
     assert state.provenance_outputs == []
     assert getattr(state, attribute) <= limit
     await client.close()
@@ -2174,6 +2181,7 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
     call = retained.tool_calls[0]
     assert set(call) == {
         "candidate_sha256s",
+        "candidate_sensitive",
         "host_observation",
         "name",
         "source_bound",

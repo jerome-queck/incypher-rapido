@@ -107,8 +107,11 @@ def test_canonical_objects_dedupe_and_survive_workspace_deletion(tmp_path: Path)
 
     reopened_state = StateStore(database)
     carried = RunEvidence.open(reopened_state, "run-a").carry(7, 0, 2)
-    assert source_digest in _render(carried)
-    assert str(workspace) not in _render(carried)
+    rendered = _render(carried)
+    assert source_digest in rendered
+    assert first.items[0].digest in rendered
+    assert first.digest in rendered
+    assert str(workspace) not in rendered
     reopened_state.close()
 
 
@@ -197,7 +200,7 @@ def test_newer_evidence_schema_fails_closed(tmp_path: Path) -> None:
             )
             """
         )
-        connection.execute("INSERT INTO evidence_schema VALUES (1, 2)")
+        connection.execute("INSERT INTO evidence_schema VALUES (1, 3)")
     with pytest.raises(EvidenceConflictError, match="version conflict"):
         RunEvidence.open(state, "run-a")
     tables = {
@@ -240,7 +243,7 @@ def test_exact_empty_initial_schema_stub_recovers_atomically(tmp_path: Path) -> 
         state._connection.execute(
             "SELECT schema_version FROM evidence_schema WHERE singleton=1"
         ).fetchone()[0]
-        == 1
+        == 2
     )
     state.close()
 
@@ -372,7 +375,13 @@ def test_carry_isolated_and_includes_candidate_attempts_without_candidate_hashes
     state.close()
 
 
-def test_candidate_carry_removes_private_raw_and_target_payload_digests(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "status",
+    ("candidate", "unsolved", "timeout", "cancelled", "interrupted", "failed", "unsupported"),
+)
+def test_candidate_sensitive_carry_removes_private_digests_for_every_terminal_status(
+    tmp_path: Path, status: str
+) -> None:
     database = tmp_path / "state.sqlite3"
     state = _state(database, "run-a")
     _attempt(state, "candidate-attempt")
@@ -398,7 +407,7 @@ def test_candidate_carry_removes_private_raw_and_target_payload_digests(tmp_path
     manifest = evidence.commit(
         "candidate-attempt", EvidenceBatch((read_observation, target_observation))
     )
-    state.finish_attempt("candidate-attempt", "candidate")
+    state.finish_attempt("candidate-attempt", status)
 
     canonical_text = json.dumps(
         candidate, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -426,6 +435,37 @@ def test_candidate_carry_removes_private_raw_and_target_payload_digests(tmp_path
         assert digest.encode() in _storage(database)
     assert candidate not in rendered
     assert candidate.encode() not in _storage(database)
+    state.close()
+
+
+def test_candidate_sensitive_manifest_redacts_all_digests_but_retains_safe_facts(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    _attempt(state, "mixed-attempt")
+    sensitive = HostObservation(
+        "inspect_file",
+        True,
+        True,
+        {"format": "binary", "size": 7, "source_sha256": "a" * 64},
+        candidate_sensitive=True,
+    )
+    ordinary = HostObservation(
+        "inspect_file",
+        True,
+        True,
+        {"format": "elf", "size": 9, "source_sha256": "b" * 64},
+    )
+    evidence = RunEvidence.open(state, "run-a")
+    evidence.commit("mixed-attempt", EvidenceBatch((sensitive, ordinary)))
+    state.finish_attempt("mixed-attempt", "unsolved")
+
+    rendered = _render(evidence.carry(7, 0, 1))
+    assert '"format":"binary"' in rendered
+    assert '"format":"elf"' in rendered
+    assert '"size":7' in rendered and '"size":9' in rendered
+    assert '"digest"' not in rendered
+    assert "sha256" not in rendered
     state.close()
 
 
@@ -550,6 +590,25 @@ def test_floats_are_rejected_before_canonical_commit() -> None:
         )
 
 
+def test_candidate_hashes_derive_private_candidate_sensitivity() -> None:
+    observation = HostObservation(
+        tool="inspect_file",
+        success=True,
+        source_bound=True,
+        facts={"format": "binary"},
+        candidate_sha256s=("a" * 64,),
+    )
+    assert observation.candidate_sensitive is True
+    with pytest.raises(ValueError, match="candidate sensitivity"):
+        HostObservation(
+            tool="inspect_file",
+            success=True,
+            source_bound=True,
+            facts={},
+            candidate_sensitive=1,  # type: ignore[arg-type]
+        )
+
+
 def test_commit_revalidates_sentinels_and_candidate_hashes_stay_private(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     state = _state(database, "run-a")
@@ -575,6 +634,8 @@ def test_commit_revalidates_sentinels_and_candidate_hashes_stay_private(tmp_path
     evidence.commit("a0", EvidenceBatch((observation,)))
     state.finish_attempt("a0", "unsolved")
     public = _render(evidence.carry(7, 0, 1))
+    assert '"digest"' not in public
+    assert "sha256" not in public
     for sentinel in (
         raw_candidate,
         candidate_digest,
@@ -609,7 +670,7 @@ def test_manifest_rejects_canonical_newer_document_with_valid_domain_digest(
         "SELECT payload_json FROM evidence_manifests WHERE run_id='run-a' AND attempt_id='a0'"
     ).fetchone()
     document = json.loads(bytes(row["payload_json"]))
-    document["schema_version"] = 2
+    document["schema_version"] = 3
     payload = json.dumps(
         document,
         ensure_ascii=False,

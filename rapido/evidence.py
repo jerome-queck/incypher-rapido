@@ -23,7 +23,7 @@ from typing import Any, TypeAlias
 from .board import FLAG_RE
 from .state import StateStore
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _OBJECT_DOMAIN = b"rapido-host-evidence-object-v1\0"
 _MANIFEST_DOMAIN = b"rapido-host-evidence-manifest-v1\0"
 _CONFIG_DOMAIN = b"rapido-host-evidence-config-v1\0"
@@ -365,6 +365,7 @@ class HostObservation:
     facts: Mapping[str, CanonicalValue] = field(default_factory=lambda: MappingProxyType({}))
     candidate_sha256s: tuple[str, ...] = ()
     supplied_candidate_sha256s: tuple[str, ...] = ()
+    candidate_sensitive: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool, str) or _TOOL.fullmatch(self.tool) is None:
@@ -373,6 +374,8 @@ class HostObservation:
             raise ValueError("host observation success must be boolean or null")
         if type(self.source_bound) is not bool:
             raise ValueError("host observation source_bound must be boolean")
+        if type(self.candidate_sensitive) is not bool:
+            raise ValueError("host observation candidate sensitivity must be boolean")
         if not isinstance(self.facts, Mapping):
             raise TypeError("host observation facts must be a mapping")
         frozen = _freeze_json(self.facts)
@@ -392,6 +395,13 @@ class HostObservation:
             ):
                 raise ValueError(f"{name} must contain at most 20 lowercase SHA-256 digests")
             object.__setattr__(self, name, tuple(hashes))
+        object.__setattr__(
+            self,
+            "candidate_sensitive",
+            self.candidate_sensitive
+            or bool(self.candidate_sha256s)
+            or bool(self.supplied_candidate_sha256s),
+        )
         object.__setattr__(self, "facts", frozen)
 
 
@@ -442,10 +452,14 @@ class EvidenceItem:
     payload_json: str
     carry_redact_digests: bool = False
 
+    def _is_candidate_sensitive(self) -> bool:
+        return json.loads(self.payload_json).get("candidate_sensitive") is True
+
     def as_dict(self) -> dict[str, Any]:
         payload = json.loads(self.payload_json)
         payload.pop("candidate_sha256s", None)
         payload.pop("supplied_candidate_sha256s", None)
+        payload.pop("candidate_sensitive", None)
         if self.carry_redact_digests:
             payload = _strip_payload_digests(payload)
         public = {
@@ -887,6 +901,7 @@ def project_tool_observation(
     result: Mapping[str, Any] | None = None,
     candidate_sha256s: tuple[str, ...] = (),
     supplied_candidate_sha256s: tuple[str, ...] = (),
+    candidate_sensitive: bool = False,
 ) -> HostObservation:
     """Project one dispatcher result into the closed durable HostObservation seam."""
     if not isinstance(name, str) or _TOOL.fullmatch(name) is None:
@@ -918,6 +933,7 @@ def project_tool_observation(
         facts=facts,
         candidate_sha256s=candidate_sha256s,
         supplied_candidate_sha256s=supplied_candidate_sha256s,
+        candidate_sensitive=candidate_sensitive,
     )
 
 
@@ -925,6 +941,7 @@ def _project_observation(observation: HostObservation) -> tuple[str, bytes]:
     canonical_tool = observation.tool if observation.tool in _KNOWN_TOOLS else "unknown_tool"
     payload: dict[str, Any] = {
         "candidate_sha256s": list(observation.candidate_sha256s),
+        "candidate_sensitive": observation.candidate_sensitive,
         "facts": {},
         "schema_version": _SCHEMA_VERSION,
         "source_bound": observation.source_bound,
@@ -1559,6 +1576,7 @@ class RunEvidence:
             set(decoded)
             != {
                 "candidate_sha256s",
+                "candidate_sensitive",
                 "facts",
                 "schema_version",
                 "source_bound",
@@ -1570,6 +1588,9 @@ class RunEvidence:
             or decoded.get("schema_version") != _SCHEMA_VERSION
             or decoded.get("success") not in {True, False, None}
             or type(decoded.get("source_bound")) is not bool
+            or type(decoded.get("candidate_sensitive")) is not bool
+            or bool(decoded.get("candidate_sha256s") or decoded.get("supplied_candidate_sha256s"))
+            and decoded.get("candidate_sensitive") is not True
             or not hashes_valid
             or not isinstance(facts, dict)
             or validated_facts != facts
@@ -1766,7 +1787,9 @@ class RunEvidence:
         available = []
         for row in rows:
             manifest = self._load_manifest(row["attempt_id"])
-            if row["status"] == "candidate":
+            if row["status"] == "candidate" or any(
+                item._is_candidate_sensitive() for item in manifest.items
+            ):
                 manifest = replace(
                     manifest,
                     items=tuple(

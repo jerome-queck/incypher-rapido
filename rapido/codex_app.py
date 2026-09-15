@@ -283,6 +283,7 @@ def _cancelled_turn_evidence(state: _TurnState) -> _CancelledTurnEvidence:
                 "name": observation.tool,
                 "success": observation.success,
                 "source_bound": observation.source_bound,
+                "candidate_sensitive": observation.candidate_sensitive,
                 "candidate_sha256s": list(observation.candidate_sha256s),
                 "supplied_candidate_sha256s": list(observation.supplied_candidate_sha256s),
                 "host_observation": observation,
@@ -1364,6 +1365,12 @@ class CodexAppClient:
             "name": name,
             "success": None,
             "source_bound": source_bound,
+            "candidate_sensitive": bool(current_supplied)
+            or (
+                source_bound
+                and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                and not source_taint_complete
+            ),
             "supplied_candidate_sha256s": supplied_hashes,
         }
         state.tool_calls.append(call_record)
@@ -1428,6 +1435,11 @@ class CodexAppClient:
                     candidate = match.group()
                     if candidate not in result_candidates:
                         result_candidates.append(candidate)
+                call_record["candidate_sensitive"] = bool(
+                    call_record["candidate_sensitive"]
+                    or result_candidates
+                    or not result_candidates_complete
+                )
                 if canonical_name in _TARGET_OBSERVATION_TOOLS:
                     if not result_candidates_complete:
                         state.target_taint_complete = False
@@ -1522,6 +1534,12 @@ class CodexAppClient:
             if call_record is not None:
                 call_record["success"] = False
         if call_record is not None:
+            if (
+                source_bound
+                and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                and not source_taint_complete
+            ):
+                call_record["candidate_sensitive"] = True
             try:
                 call_record["host_observation"] = project_tool_observation(
                     canonical_name,
@@ -1532,6 +1550,7 @@ class CodexAppClient:
                     supplied_candidate_sha256s=tuple(
                         call_record.get("supplied_candidate_sha256s", ())
                     )[:20],
+                    candidate_sensitive=call_record.get("candidate_sensitive") is True,
                 )
             except (TypeError, ValueError):
                 call_record["host_observation"] = None

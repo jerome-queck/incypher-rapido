@@ -206,7 +206,6 @@ def test_turn_prompt_carries_verified_host_observations_without_candidate_proven
                     True,
                     True,
                     {"format": "elf", "size": 64, "source_sha256": "a" * 64},
-                    candidate_sha256s=("b" * 64,),
                 ),
             )
         ),
@@ -268,7 +267,6 @@ def test_turn_prompt_budgets_large_observation_carry_against_description(tmp_pat
                             for section in range(64)
                         ]
                     },
-                    candidate_sha256s=("b" * 64,),
                 )
                 for observation in range(6)
             )

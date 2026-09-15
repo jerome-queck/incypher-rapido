@@ -132,6 +132,7 @@ class ToolCallEvidence:
     name: str
     success: bool | None
     source_bound: bool
+    candidate_sensitive: bool
     candidate_sha256s: tuple[str, ...]
     supplied_candidate_sha256s: tuple[str, ...]
     observation: HostObservation
@@ -238,11 +239,18 @@ def _normalize_tool_calls(
         name = _durable_tool_name(call.get("name"))
         success = call.get("success")
         source_bound = call.get("source_bound") is True
+        raw_candidate_sensitive = call.get("candidate_sensitive")
+        candidate_sensitive = (
+            raw_candidate_sensitive is True or bool(hashes) or bool(supplied_hashes)
+        )
+        if raw_candidate_sensitive is not None and type(raw_candidate_sensitive) is not bool:
+            complete = False
         observation = call.get("host_observation")
         if not isinstance(observation, HostObservation) or (
             observation.tool != name
             or observation.success is not success
             or observation.source_bound is not source_bound
+            or observation.candidate_sensitive is not candidate_sensitive
             or observation.candidate_sha256s != hashes
             or observation.supplied_candidate_sha256s != supplied_hashes
         ):
@@ -253,12 +261,14 @@ def _normalize_tool_calls(
                 source_bound=source_bound,
                 candidate_sha256s=hashes,
                 supplied_candidate_sha256s=supplied_hashes,
+                candidate_sensitive=candidate_sensitive,
             )
         evidence.append(
             ToolCallEvidence(
                 name=name,
                 success=success,
                 source_bound=source_bound,
+                candidate_sensitive=candidate_sensitive,
                 candidate_sha256s=hashes,
                 supplied_candidate_sha256s=supplied_hashes,
                 observation=observation,
@@ -1359,6 +1369,7 @@ class Orchestrator:
                                 "name": call.name,
                                 "success": call.success,
                                 "source_bound": call.source_bound,
+                                "candidate_sensitive": call.candidate_sensitive,
                                 "candidate_sha256s": list(
                                     call.candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
                                 ),

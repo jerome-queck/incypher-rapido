@@ -242,19 +242,20 @@ The selected design is a SQLite-only `RunEvidence` deep module with three public
 `open`, `commit`, and `carry`. Each running attempt commits a canonical, domain-separated SHA-256
 manifest before its terminal transition. SQLite triggers bind the immutable manifest to
 run/challenge/lane/episode identity. Reopening verifies canonical bytes, hashes, schema, limits,
-relationships, and byte accounting; legacy or crash-interrupted terminal attempts receive an
-explicit empty unavailable manifest rather than invented observations.
+relationships, candidate-sensitivity markers, and byte accounting. Legacy or crash-interrupted
+terminal attempts receive an explicit empty unavailable manifest rather than invented observations.
 
 The host projects tool results through a closed typed policy. It retains bounded structural facts
 and digests while excluding raw payloads, authorities, paths, credentials, and candidate material.
 Carry is deterministic, capped at 64 KiB, same-run/same-challenge/same-lane, and earlier-episode
-only. It may preserve structural observations from a candidate-status attempt so a disagreement can
-inform the next episode, but removes all candidate hashes and values. The solver prompt labels it
+only. It may preserve structural observations from a candidate-sensitive attempt so a disagreement
+can inform the next episode, but removes candidate values, hashes, payload/object/manifest digests,
+and fail-closed incomplete-scan fingerprints regardless of terminal status. The solver prompt labels it
 immutable host-recorded provenance but still semantically untrusted, requires re-observation of
 decisive facts, and budgets it inside the 128-KiB total prompt cap. It cannot satisfy current-turn
 candidate provenance.
 
-Post-review integration checks pass 574 tests with one platform-conditional skip, Ruff, formatting,
+Post-review integration checks pass 582 tests with one platform-conditional skip, Ruff, formatting,
 and whitespace validation. Effective routing: competing architecture designs
 `gpt-6-astra`/`xhigh`; demanding implementation and independent review
 `gpt-daybreak-blue-latest`/`xhigh`; black-box acceptance fixtures `gpt-5.6-luna`/`xhigh`. The Astra
@@ -266,6 +267,15 @@ all carry and Board-valid descriptions inside the total prompt cap, preserve com
 on cancellation, retain safe target status/count/payload fingerprints, reject floats before
 persistence, and validate exact manifest/schema/trigger versions. A final independent reproduction
 pass reported no remaining findings. No dispatch used fallback.
+
+A subsequent immutable Daybreak/xhigh security diff scan of commit `3bceeb2` closed all four runtime
+surfaces. It validated one P3 candidate-fingerprint oracle in non-candidate terminal carry and rejected
+three concurrency/resource candidates with deterministic reproductions and measured bounds. The fix
+persists a private fail-closed candidate-sensitivity marker, including incomplete scans, and derives
+attempt-wide public digest redaction from that marker rather than terminal status. The original oracle
+no longer reproduces across all seven carryable terminal statuses; ordinary structural carry retains
+its digests. One Astra/xhigh threat-model attempt failed to converge and was interrupted; routing then
+switched directly to Daybreak/xhigh with no Astra retry or silent fallback.
 
 ## Sources
 
