@@ -1389,15 +1389,18 @@ class CodexAppClient:
         if turn_timeout is not None and turn_timeout <= 0:
             await self.close()
             raise TimeoutError("native setup consumed the turn deadline")
-        return await self.run_turn(
-            prompt,
-            thread_id=thread_id,
-            timeout=turn_timeout,
-            output_schema=output_schema,
-            model=selected_model,
-            reasoning_effort=selected_effort,
-            raise_on_timeout=raise_on_timeout,
-        )
+        try:
+            return await self.run_turn(
+                prompt,
+                thread_id=thread_id,
+                timeout=turn_timeout,
+                output_schema=output_schema,
+                model=selected_model,
+                reasoning_effort=selected_effort,
+                raise_on_timeout=raise_on_timeout,
+            )
+        finally:
+            self._retire_thread(str(workspace), thread_id)
 
     async def _terminate_turn(self, state: _TurnState) -> tuple[bool, bool]:
         """Confirm a terminal turn notification or fence the shared process."""
@@ -1501,6 +1504,21 @@ class CodexAppClient:
         elif isinstance(registry, MutableMapping):
             registry[cwd] = thread_id
 
+    def _retire_thread(self, workspace: str, thread_id: str) -> None:
+        """Drop terminal per-thread authority without disturbing a replacement."""
+        self._thread_registries.pop(thread_id, None)
+        if self.workspace_threads.get(workspace) == thread_id:
+            self.workspace_threads.pop(workspace, None)
+            registry = self.workspace_registry
+            unregister = getattr(registry, "unregister", None)
+            if callable(unregister):
+                unregister(workspace)
+            elif isinstance(registry, MutableMapping) and registry.get(workspace) == thread_id:
+                registry.pop(workspace, None)
+        if self.thread_id == thread_id:
+            self.thread_id = None
+            self.thread_workspace = None
+
     def _discard_server_task(self, task: asyncio.Task[None]) -> None:
         self._server_tasks.discard(task)
         self._server_task_turns.pop(task, None)
@@ -1557,12 +1575,7 @@ class CodexAppClient:
         self.models = ()
         self._started = False
 
-    async def close(self) -> None:
-        if self._close_waiter is not None:
-            await asyncio.shield(self._close_waiter)
-            return
-        close_waiter = asyncio.get_running_loop().create_future()
-        self._close_waiter = close_waiter
+    async def _close_impl(self, close_waiter: asyncio.Future[None]) -> None:
         self._closing = True
         self._closed = True
         try:
@@ -1608,10 +1621,37 @@ class CodexAppClient:
             self._server_tasks.clear()
             self._server_task_turns.clear()
             self._clear_session_state()
-        finally:
+        except BaseException as exc:
+            if not close_waiter.done():
+                close_waiter.set_exception(exc)
+                close_waiter.exception()
+            raise
+        else:
             if not close_waiter.done():
                 close_waiter.set_result(None)
+        finally:
             self._close_waiter = None
+
+    async def close(self) -> None:
+        close_waiter = self._close_waiter
+        if close_waiter is None:
+            close_waiter = asyncio.get_running_loop().create_future()
+            self._close_waiter = close_waiter
+            close_task: asyncio.Future[None] = asyncio.create_task(
+                self._close_impl(close_waiter), name="rapido-codex-close"
+            )
+        else:
+            close_task = close_waiter
+
+        cancelled: asyncio.CancelledError | None = None
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        close_task.result()
+        if cancelled is not None:
+            raise cancelled
 
 
 CodexAppServer = CodexAppClient

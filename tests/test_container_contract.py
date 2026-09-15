@@ -92,7 +92,8 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
     ):
         assert flag in text
     assert "single app-server central auth owner" in text
-    assert "empty auth volume intentionally fails preflight" in text
+    assert "empty auth volume intentionally fails `run`" in text
+    assert "Board-only `preflight` does not start or validate" in text
     assert "RAPIDO_MAX_WORKSPACE_BYTES=536870912000" in text
 
 

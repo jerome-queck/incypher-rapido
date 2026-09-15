@@ -192,6 +192,45 @@ def _durable_tool_name(value: object) -> str:
     return value if isinstance(value, str) and value in _DURABLE_TOOL_NAMES else "unknown_tool"
 
 
+def _normalize_tool_calls(raw_calls: object) -> tuple[int, tuple[ToolCallEvidence, ...]]:
+    if not isinstance(raw_calls, list):
+        return 0, ()
+    evidence: list[ToolCallEvidence] = []
+    for call in raw_calls:
+        if not isinstance(call, dict) or not isinstance(call.get("success"), (bool, type(None))):
+            continue
+        raw_hashes = call.get("candidate_sha256s", ())
+        hashes = (
+            tuple(
+                value
+                for value in raw_hashes[:20]
+                if isinstance(value, str) and _SHA256.fullmatch(value)
+            )
+            if isinstance(raw_hashes, (list, tuple))
+            else ()
+        )
+        raw_supplied_hashes = call.get("supplied_candidate_sha256s", ())
+        supplied_hashes = (
+            tuple(
+                value
+                for value in raw_supplied_hashes[:20]
+                if isinstance(value, str) and _SHA256.fullmatch(value)
+            )
+            if isinstance(raw_supplied_hashes, (list, tuple))
+            else ()
+        )
+        evidence.append(
+            ToolCallEvidence(
+                name=_durable_tool_name(call.get("name")),
+                success=call.get("success"),
+                source_bound=call.get("source_bound") is True,
+                candidate_sha256s=hashes,
+                supplied_candidate_sha256s=supplied_hashes,
+            )
+        )
+    return len(raw_calls), tuple(evidence)
+
+
 def _artifact_name(file_ref: str, index: int) -> str:
     raw = Path(urllib.parse.unquote(urllib.parse.urlsplit(file_ref).path)).name
     safe = _SAFE_NAME.sub("_", raw).strip("._")[:100] or "artifact.bin"
@@ -261,6 +300,8 @@ class Orchestrator:
         self.state = state
         self.runtime = runtime
         self._slots = asyncio.Semaphore(config.concurrency)
+        self._dynamic_slots = asyncio.Semaphore(config.dynamic_concurrency)
+        self._submission_lock = asyncio.Lock()
 
     async def _board_call(
         self, deadline: float, function: Any, /, *args: Any, **kwargs: Any
@@ -436,6 +477,28 @@ class Orchestrator:
         )
         return False
 
+    async def _recover_created_instance_receipt(
+        self, run_id: str, challenge_id: int, deadline: float
+    ) -> str:
+        """Boundedly recover ownership evidence after a cancelled successful create."""
+        transport_timeout = float(getattr(self.board, "timeout", 15.0))
+        while deadline - time.monotonic() > transport_timeout:
+            current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
+            info = current.get("connection_info")
+            if current.get("success") is True and isinstance(info, str) and info:
+                receipt = _instance_receipt(current)
+                self.state.mark_instance(run_id, challenge_id, "owned", receipt_sha256=receipt)
+                self.state.event(
+                    run_id,
+                    "instance_receipt_recovered",
+                    {"challenge_id": challenge_id, "receipt_sha256": receipt},
+                )
+                return receipt
+            if current.get("status") in {403, 429}:
+                break
+            await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        raise BoardError("dynamic instance ownership receipt could not be recovered")
+
     async def _start_instance(
         self, run_id: str, challenge: Challenge, deadline: float
     ) -> tuple[tuple[TargetEndpoint, ...], str]:
@@ -490,7 +553,27 @@ class Orchestrator:
             )
         if cancelled is not None:
             if provisional_receipt is None:
-                self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+                recovery = asyncio.create_task(
+                    self._recover_created_instance_receipt(
+                        run_id,
+                        challenge.id,
+                        min(deadline, time.monotonic() + 45.0),
+                    )
+                )
+                while not recovery.done():
+                    try:
+                        provisional_receipt = await asyncio.shield(recovery)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                        continue
+                    except (BoardError, RunDeadlineReached):
+                        self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
+                        break
+                if provisional_receipt is None:
+                    try:
+                        provisional_receipt = recovery.result()
+                    except (BoardError, RunDeadlineReached):
+                        self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
             raise cancelled
         ready_deadline = min(deadline, time.monotonic() + 120.0)
         while ready_deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
@@ -606,9 +689,9 @@ class Orchestrator:
         return details
 
     async def _prepare_workspaces(
-        self, run_root: Path, challenge: Challenge, deadline: float
+        self, run_root: Path, challenge: Challenge, episode: int, deadline: float
     ) -> list[tuple[Path, list[str]]]:
-        challenge_root = run_root / f"challenge-{challenge.id}"
+        challenge_root = run_root / f"challenge-{challenge.id}" / f"episode-{episode}"
         source_root = challenge_root / "source"
         source_root.mkdir(parents=True, exist_ok=False)
         source_paths: list[Path] = []
@@ -636,7 +719,10 @@ class Orchestrator:
                 raise BoardError("challenge artifacts exceed the aggregate byte limit")
             source_paths.append(destination)
 
-        if total_bytes * (self.config.attempts_per_challenge + 1) > self.config.max_workspace_bytes:
+        if (
+            total_bytes * (self.config.attempts_per_challenge + 1)
+            > self.config.max_challenge_workspace_bytes
+        ):
             raise BoardError("challenge artifact copies exceed the workspace byte limit")
 
         workspaces: list[tuple[Path, list[str]]] = []
@@ -690,6 +776,19 @@ class Orchestrator:
             with suppress(Exception):
                 await task
             raise
+
+    async def _drain_runtime_close(self) -> None:
+        """Finish native teardown before propagating repeated cancellation."""
+        close_task = asyncio.create_task(self.runtime.close())
+        cancelled: asyncio.CancelledError | None = None
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        close_task.result()
+        if cancelled is not None:
+            raise cancelled
 
     async def _cleanup_stale_workspaces(self, deadline: float, current: Path) -> int:
         root = self.config.work_root
@@ -802,43 +901,7 @@ class Orchestrator:
                 ),
                 timeout=timeout_seconds + 5,
             )
-            tool_call_count = len(turn.tool_calls)
-            call_evidence: list[ToolCallEvidence] = []
-            for call in turn.tool_calls:
-                if not isinstance(call, dict) or not isinstance(
-                    call.get("success"), (bool, type(None))
-                ):
-                    continue
-                raw_hashes = call.get("candidate_sha256s", ())
-                hashes = (
-                    tuple(
-                        value
-                        for value in raw_hashes[:20]
-                        if isinstance(value, str) and _SHA256.fullmatch(value)
-                    )
-                    if isinstance(raw_hashes, (list, tuple))
-                    else ()
-                )
-                raw_supplied_hashes = call.get("supplied_candidate_sha256s", ())
-                supplied_hashes = (
-                    tuple(
-                        value
-                        for value in raw_supplied_hashes[:20]
-                        if isinstance(value, str) and _SHA256.fullmatch(value)
-                    )
-                    if isinstance(raw_supplied_hashes, (list, tuple))
-                    else ()
-                )
-                call_evidence.append(
-                    ToolCallEvidence(
-                        name=_durable_tool_name(call.get("name")),
-                        success=call.get("success"),
-                        source_bound=call.get("source_bound") is True,
-                        candidate_sha256s=hashes,
-                        supplied_candidate_sha256s=supplied_hashes,
-                    )
-                )
-            tool_calls = tuple(call_evidence)
+            tool_call_count, tool_calls = _normalize_tool_calls(turn.tool_calls)
             if turn.status != "completed":
                 raise NativeTurnIncompleteError(
                     turn.status,
@@ -849,7 +912,7 @@ class Orchestrator:
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
                 candidate_observed = False
                 candidate_supplied = False
-                for call in call_evidence:
+                for call in tool_calls:
                     candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
                     if call.success is True and call.source_bound:
                         candidate_observed |= candidate_fingerprint in call.candidate_sha256s
@@ -872,15 +935,29 @@ class Orchestrator:
                 next_steps=finding.next_steps,
                 tool_count=tool_call_count,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             finding = None
             terminal = "timeout"
+            timeout_calls = getattr(getattr(exc, "result", None), "tool_calls", None)
+            tool_count_known = isinstance(timeout_calls, list)
+            if tool_count_known:
+                tool_call_count, tool_calls = _normalize_tool_calls(timeout_calls)
             self.state.finish_attempt(
                 attempt_id,
                 terminal,
                 summary="native turn exceeded deadline",
                 tool_count=tool_call_count,
                 failure_class="timeout",
+            )
+            self.state.event(
+                run_id,
+                "attempt_timeout_telemetry",
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "lane": lane,
+                    "tool_call_count": tool_call_count if tool_count_known else None,
+                },
             )
         except asyncio.CancelledError:
             self.state.finish_attempt(
@@ -1027,6 +1104,93 @@ class Orchestrator:
             tool_calls,
         )
 
+    def _withhold_candidate(
+        self,
+        run_id: str,
+        challenge_id: int,
+        candidate_sha256: str,
+        reason: str,
+    ) -> str:
+        self.state.event(
+            run_id,
+            "candidate_withheld",
+            {
+                "challenge_id": challenge_id,
+                "candidate_sha256": candidate_sha256,
+                "reason": reason,
+            },
+        )
+        self.state.set_challenge_status(challenge_id, "candidate")
+        return "candidate"
+
+    async def _submit_candidate(
+        self,
+        run_id: str,
+        challenge: Challenge,
+        candidate: str,
+        deadline: float,
+    ) -> str:
+        """Serialize eligibility, reservation, Board effect, and finalization."""
+        fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+        async with self._submission_lock:
+            transport_timeout = float(getattr(self.board, "timeout", 15.0))
+            if deadline - time.monotonic() <= transport_timeout:
+                return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
+            try:
+                current = await self._board_read(deadline, self.board.challenge, challenge.id)
+            except (BoardError, RunDeadlineReached):
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "eligibility_refresh_failed"
+                )
+            if self.state.submission_risk_count() >= self.config.wrong_submission_ceiling:
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "submission_risk_ceiling"
+                )
+            if (
+                not current.solved
+                and current.max_attempts not in (None, 0)
+                and current.attempts >= current.max_attempts
+            ):
+                return self._withhold_candidate(run_id, challenge.id, fingerprint, "board_limit")
+            if deadline - time.monotonic() <= transport_timeout:
+                return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
+            if not self.state.reserve_submission(run_id, challenge.id, candidate):
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "submission_already_reserved"
+                )
+            try:
+                verdict: Verdict = await self._board_call(
+                    deadline, self.board.submit, challenge.id, candidate
+                )
+            except (BoardError, RunDeadlineReached):
+                return self._withhold_candidate(
+                    run_id,
+                    challenge.id,
+                    fingerprint,
+                    "submission_pending_reconciliation",
+                )
+            self.state.finalize_submission(
+                run_id, challenge.id, candidate, verdict.outcome, verdict.http_status
+            )
+            self.state.event(
+                run_id,
+                "submission",
+                {
+                    "challenge_id": challenge.id,
+                    "outcome": verdict.outcome,
+                    "http_status": verdict.http_status,
+                    "run_local_verified": verdict.outcome == "correct",
+                },
+            )
+            if verdict.outcome == "correct":
+                status = "solved"
+            elif verdict.outcome in {"already_solved", "paused", "ratelimited", "unread"}:
+                status = "candidate"
+            else:
+                status = "unsolved"
+            self.state.set_challenge_status(challenge.id, status)
+            return status
+
     async def _solve_challenge(
         self,
         run_id: str,
@@ -1034,10 +1198,12 @@ class Orchestrator:
         challenge: Challenge,
         deadline: float,
         target_endpoints: tuple[TargetEndpoint, ...] = (),
+        *,
+        episode: int = 0,
     ) -> str:
         self.state.set_challenge_status(challenge.id, "running")
         try:
-            workspaces = await self._prepare_workspaces(run_root, challenge, deadline)
+            workspaces = await self._prepare_workspaces(run_root, challenge, episode, deadline)
         except RunDeadlineReached:
             self.state.set_challenge_status(challenge.id, "unsolved")
             raise
@@ -1049,8 +1215,6 @@ class Orchestrator:
         if timeout <= 0:
             self.state.set_challenge_status(challenge.id, "unsolved")
             return "unsolved"
-
-        episode = 0
 
         async def scheduled_lane(lane: int, workspace: Path, artifacts: list[str]) -> LaneResult:
             async with self._slots:
@@ -1147,104 +1311,19 @@ class Orchestrator:
 
         fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
         if not self.config.submit_candidates:
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "submissions_disabled",
-                },
+            return self._withhold_candidate(
+                run_id, challenge.id, fingerprint, "submissions_disabled"
             )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-        if self.state.submission_risk_count() >= self.config.wrong_submission_ceiling:
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "submission_risk_ceiling",
-                },
-            )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-        if challenge.max_attempts not in (None, 0) and challenge.attempts >= challenge.max_attempts:
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "board_limit",
-                },
-            )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-
-        remaining = deadline - time.monotonic()
-        transport_timeout = float(getattr(self.board, "timeout", 15.0))
-        if remaining <= transport_timeout:
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "run_deadline",
-                },
-            )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-        if not self.state.reserve_submission(run_id, challenge.id, candidate):
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "submission_already_reserved",
-                },
-            )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-        try:
-            verdict: Verdict = await self._board_call(
-                deadline, self.board.submit, challenge.id, candidate
-            )
-        except (BoardError, RunDeadlineReached):
-            self.state.event(
-                run_id,
-                "candidate_withheld",
-                {
-                    "challenge_id": challenge.id,
-                    "candidate_sha256": fingerprint,
-                    "reason": "submission_pending_reconciliation",
-                },
-            )
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
-        self.state.finalize_submission(
-            run_id, challenge.id, candidate, verdict.outcome, verdict.http_status
-        )
-        self.state.event(
-            run_id,
-            "submission",
-            {
-                "challenge_id": challenge.id,
-                "outcome": verdict.outcome,
-                "http_status": verdict.http_status,
-            },
-        )
-        status = "solved" if verdict.outcome in {"correct", "already_solved"} else "unsolved"
-        if verdict.outcome in {"paused", "ratelimited", "unread"}:
-            status = "candidate"
-        self.state.set_challenge_status(challenge.id, status)
-        return status
+        return await self._submit_candidate(run_id, challenge, candidate, deadline)
 
     async def _solve_dynamic_challenge(
-        self, run_id: str, run_root: Path, challenge: Challenge, deadline: float
+        self,
+        run_id: str,
+        run_root: Path,
+        challenge: Challenge,
+        deadline: float,
+        *,
+        episode: int = 0,
     ) -> str:
         """Own the complete create/use/delete lifecycle for one dynamic challenge."""
         try:
@@ -1274,20 +1353,190 @@ class Orchestrator:
         terminal = "error"
         cleanup_ok = False
         try:
-            terminal = await self._solve_challenge(run_id, run_root, challenge, deadline, endpoints)
+            terminal = await self._solve_challenge(
+                run_id,
+                run_root,
+                challenge,
+                deadline,
+                endpoints,
+                episode=episode,
+            )
         finally:
             cleanup_deadline = time.monotonic() + 45.0
-            cleanup_ok = await self._delete_instance(
-                run_id,
-                challenge.id,
-                cleanup_deadline,
-                expected_receipt=receipt,
-                reason="challenge_complete",
+            cleanup = asyncio.create_task(
+                self._delete_instance(
+                    run_id,
+                    challenge.id,
+                    cleanup_deadline,
+                    expected_receipt=receipt,
+                    reason="challenge_complete",
+                )
             )
+            cancelled: asyncio.CancelledError | None = None
+            while not cleanup.done():
+                try:
+                    cleanup_ok = await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+            if cleanup.done():
+                cleanup_ok = cleanup.result()
+            if cancelled is not None:
+                raise cancelled
         if not cleanup_ok:
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
         return terminal
+
+    async def _run_challenge_queue(
+        self,
+        run_id: str,
+        run_root: Path,
+        challenges: list[Challenge],
+        deadline: float,
+        outcomes: dict[int, str],
+    ) -> dict[int, str]:
+        """Run a fair episode queue while keeping policy and ownership internal."""
+        queue: asyncio.Queue[tuple[Challenge, int, float] | None] = asyncio.Queue()
+        active: set[int] = set()
+        peak_active = 0
+        admitted_episodes = 0
+
+        def enqueue(challenge: Challenge, episode: int, reason: str) -> None:
+            queued_at = time.monotonic()
+            queue.put_nowait((challenge, episode, queued_at))
+            self.state.event(
+                run_id,
+                "challenge_episode_queued",
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "reason": reason,
+                },
+            )
+
+        for challenge in challenges:
+            enqueue(challenge, 0, "initial_coverage")
+            if challenge.solved:
+                self.state.event(
+                    run_id,
+                    "prior_board_solved_ignored",
+                    {"challenge_id": challenge.id, "run_local_verified": False},
+                )
+
+        async def execute_episode(challenge: Challenge, episode: int, queued_at: float) -> str:
+            nonlocal admitted_episodes, peak_active
+            if time.monotonic() >= deadline:
+                raise RunDeadlineReached
+            if challenge.id in active:
+                raise RuntimeError("challenge episode overlap violated")
+            active.add(challenge.id)
+            peak_active = max(peak_active, len(active))
+            admitted_episodes += 1
+            self.state.event(
+                run_id,
+                "challenge_episode_admitted",
+                {
+                    "challenge_id": challenge.id,
+                    "episode": episode,
+                    "queue_wait_seconds": round(time.monotonic() - queued_at, 3),
+                    "active_challenges": len(active),
+                },
+            )
+            try:
+                if challenge.type == "dynamic_iac":
+                    async with self._dynamic_slots:
+                        if self.state.owned_instances():
+                            self.state.event(
+                                run_id,
+                                "dynamic_admission_blocked",
+                                {
+                                    "challenge_id": challenge.id,
+                                    "episode": episode,
+                                    "reason": "cleanup_pending",
+                                },
+                            )
+                            self.state.set_challenge_status(challenge.id, "error")
+                            return "error"
+                        return await self._solve_dynamic_challenge(
+                            run_id,
+                            run_root,
+                            challenge,
+                            deadline,
+                            episode=episode,
+                        )
+                return await self._solve_challenge(
+                    run_id,
+                    run_root,
+                    challenge,
+                    deadline,
+                    episode=episode,
+                )
+            finally:
+                challenge_root = run_root / f"challenge-{challenge.id}"
+                try:
+                    await self._drain_rmtree(challenge_root / f"episode-{episode}")
+                    with suppress(FileNotFoundError, OSError):
+                        challenge_root.rmdir()
+                finally:
+                    active.remove(challenge.id)
+
+        async def worker() -> None:
+            while True:
+                item = await queue.get()
+                try:
+                    if item is None:
+                        return
+                    challenge, episode, queued_at = item
+                    terminal = await execute_episode(challenge, episode, queued_at)
+                    cleanup_pending = bool(self.state.owned_instances())
+                    should_retry = (
+                        terminal in {"unsolved", "error"}
+                        and episode + 1 < self.config.episodes_per_challenge
+                        and time.monotonic() < deadline
+                        and not (challenge.type == "dynamic_iac" and cleanup_pending)
+                    )
+                    if should_retry:
+                        enqueue(challenge, episode + 1, terminal)
+                    else:
+                        outcomes[challenge.id] = terminal
+                finally:
+                    queue.task_done()
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(self.config.active_challenges, max(1, len(challenges))))
+        ]
+        join = asyncio.create_task(queue.join())
+        timer = asyncio.create_task(asyncio.sleep(max(0.0, deadline - time.monotonic())))
+        try:
+            watched: set[asyncio.Task[Any]] = {join, timer, *workers}
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+            if join in done:
+                await join
+            elif timer in done:
+                raise RunDeadlineReached
+            else:
+                failed_worker = next(task for task in done if task in workers)
+                await failed_worker
+                raise RuntimeError("challenge queue worker exited before drain")
+            for _ in workers:
+                queue.put_nowait(None)
+            await asyncio.gather(*workers)
+        finally:
+            for task in (join, timer, *workers):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(join, timer, *workers, return_exceptions=True)
+        self.state.event(
+            run_id,
+            "challenge_queue_summary",
+            {
+                "admitted_episodes": admitted_episodes,
+                "completed_challenges": len(outcomes),
+                "peak_active_challenges": peak_active,
+            },
+        )
+        return outcomes
 
     async def run(self) -> RunReport:
         deadline = time.monotonic() + self.config.run_seconds
@@ -1310,7 +1559,7 @@ class Orchestrator:
         except BaseException:
             self.state.release_supervisor()
             raise
-        counts = {name: 0 for name in ("solved", "candidate", "unsolved", "unsupported", "error")}
+        outcomes: dict[int, str] = {}
         challenge_count = 0
         status = "failed"
         try:
@@ -1332,6 +1581,7 @@ class Orchestrator:
                 raise RunDeadlineReached
             challenges = await self._challenge_catalogue(deadline, identity)
             challenge_count = len(challenges)
+            eligible: list[Challenge] = []
             for challenge in challenges:
                 self.state.upsert_challenge(
                     challenge.id,
@@ -1340,13 +1590,6 @@ class Orchestrator:
                     challenge.type,
                     challenge.value,
                 )
-                if challenge.solved:
-                    self.state.set_challenge_status(challenge.id, "solved")
-                    counts["solved"] += 1
-                    continue
-                if time.monotonic() >= deadline:
-                    status = "deadline"
-                    break
                 if challenge.type != "standard" and (
                     challenge.type != "dynamic_iac" or not self.config.manage_dynamic_instances
                 ):
@@ -1363,30 +1606,18 @@ class Orchestrator:
                             ),
                         },
                     )
-                    counts["unsupported"] += 1
+                    outcomes[challenge.id] = "unsupported"
                     continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RunDeadlineReached
-                try:
-                    try:
-                        operation = (
-                            self._solve_dynamic_challenge(run_id, run_root, challenge, deadline)
-                            if challenge.type == "dynamic_iac"
-                            else self._solve_challenge(run_id, run_root, challenge, deadline)
-                        )
-                        terminal = await asyncio.wait_for(
-                            operation,
-                            timeout=remaining,
-                        )
-                    except TimeoutError as exc:
-                        raise RunDeadlineReached from exc
-                finally:
-                    await self._drain_rmtree(run_root / f"challenge-{challenge.id}")
-                if terminal in counts:
-                    counts[terminal] += 1
-            else:
-                status = "completed"
+                eligible.append(challenge)
+            if eligible:
+                await self._run_challenge_queue(
+                    run_id,
+                    run_root,
+                    eligible,
+                    deadline,
+                    outcomes,
+                )
+            status = "completed"
             self.state.finish_run(run_id, status)
         except RunDeadlineReached:
             status = "deadline"
@@ -1405,9 +1636,13 @@ class Orchestrator:
             raise
         finally:
             try:
-                await self.runtime.close()
+                await self._drain_runtime_close()
             finally:
                 self.state.release_supervisor()
+        counts = {name: 0 for name in ("solved", "candidate", "unsolved", "unsupported", "error")}
+        for terminal in outcomes.values():
+            if terminal in counts:
+                counts[terminal] += 1
         return RunReport(
             run_id=run_id,
             status=status,

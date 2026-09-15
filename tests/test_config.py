@@ -10,14 +10,26 @@ def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     assert config.board_url == "https://hackathon.in-cypher.com"
     assert config.model == "gpt-daybreak-blue-latest"
     assert config.reasoning_effort == "xhigh"
-    assert config.concurrency == 2
+    assert config.concurrency == 4
+    assert config.active_challenges == 2
+    assert config.episodes_per_challenge == 2
+    assert config.dynamic_concurrency == 1
     assert config.attempts_per_challenge == 2
     assert config.run_seconds == 19_800
     assert config.max_artifact_bytes == 64 * 1024 * 1024
     assert config.max_challenge_bytes == 128 * 1024 * 1024
     assert config.max_workspace_bytes == 500 * 1024 * 1024 * 1024
-    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
+    assert config.max_challenge_workspace_bytes == 250 * 1024 * 1024 * 1024
+    assert config.max_lane_workspace_bytes > 100 * 1024 * 1024 * 1024
     assert config.challenge_ids == ()
+    assert config.submit_candidates is True
+    assert config.manage_dynamic_instances is True
+    public = config.public_record()
+    assert public["active_challenges"] == 2
+    assert public["episodes_per_challenge"] == 2
+    assert public["dynamic_concurrency"] == 1
+    assert public["max_challenge_workspace_bytes"] == config.max_challenge_workspace_bytes
+    assert public["max_lane_workspace_bytes"] == config.max_lane_workspace_bytes
 
 
 def test_secrets_are_never_in_public_record() -> None:
@@ -37,6 +49,12 @@ def test_secrets_are_never_in_public_record() -> None:
         ("CTFD_URL", "https://attacker.example"),
         ("CTFD_URL", "https://hackathon.in-cypher.com:99999"),
         ("RAPIDO_CONCURRENCY", "1"),
+        ("RAPIDO_ACTIVE_CHALLENGES", "0"),
+        ("RAPIDO_ACTIVE_CHALLENGES", "5"),
+        ("RAPIDO_EPISODES_PER_CHALLENGE", "0"),
+        ("RAPIDO_EPISODES_PER_CHALLENGE", "5"),
+        ("RAPIDO_DYNAMIC_CONCURRENCY", "0"),
+        ("RAPIDO_DYNAMIC_CONCURRENCY", "2"),
         ("RAPIDO_REASONING_EFFORT", "extreme"),
         ("RAPIDO_SUBMIT_CANDIDATES", "yes"),
         ("RAPIDO_STATE_PATH", "state.sqlite3"),
@@ -56,6 +74,7 @@ def test_workspace_budget_must_cover_all_lane_copies() -> None:
         RuntimeConfig.from_env(
             {
                 "RAPIDO_ATTEMPTS_PER_CHALLENGE": "4",
+                "RAPIDO_CONCURRENCY": "8",
                 "RAPIDO_MAX_WORKSPACE_BYTES": str(512 * 1024 * 1024),
             }
         )
@@ -65,7 +84,47 @@ def test_workspace_budget_can_match_large_external_runtime_storage() -> None:
     configured = 500 * 1024 * 1024 * 1024
     config = RuntimeConfig.from_env({"RAPIDO_MAX_WORKSPACE_BYTES": str(configured)})
     assert config.max_workspace_bytes == configured
-    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
+    assert config.max_challenge_workspace_bytes == configured // 2
+    assert config.max_lane_workspace_bytes > 100 * 1024 * 1024 * 1024
+
+
+def test_workspace_partition_never_exceeds_run_wide_ceiling() -> None:
+    config = RuntimeConfig.from_env(
+        {
+            "RAPIDO_ACTIVE_CHALLENGES": "3",
+            "RAPIDO_CONCURRENCY": "6",
+            "RAPIDO_MAX_CHALLENGE_BYTES": str(128 * 1024 * 1024),
+            "RAPIDO_MAX_WORKSPACE_BYTES": str(2 * 1024 * 1024 * 1024 + 1),
+        }
+    )
+
+    aggregate = config.active_challenges * (
+        config.max_challenge_bytes + config.attempts_per_challenge * config.max_lane_workspace_bytes
+    )
+    assert aggregate <= config.max_workspace_bytes
+    assert config.max_challenge_workspace_bytes == config.max_workspace_bytes // 3
+
+
+def test_scheduler_capacity_must_admit_whole_lane_waves() -> None:
+    with pytest.raises(ConfigError, match="every lane.*4 required"):
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_ACTIVE_CHALLENGES": "2",
+                "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
+                "RAPIDO_CONCURRENCY": "3",
+            }
+        )
+
+
+def test_workspace_budget_rejects_single_challenge_sized_ceiling_for_active_set() -> None:
+    with pytest.raises(ConfigError, match="all active challenges"):
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_ACTIVE_CHALLENGES": "4",
+                "RAPIDO_CONCURRENCY": "8",
+                "RAPIDO_MAX_WORKSPACE_BYTES": str(128 * 1024 * 1024 * (2 + 1)),
+            }
+        )
 
 
 def test_requires_board_token_only_for_board_work() -> None:
@@ -80,12 +139,14 @@ def test_accepts_explicit_paths() -> None:
             "RAPIDO_STATE_PATH": "/tmp/rapido/test.db",
             "RAPIDO_WORK_ROOT": "/tmp/rapido/work",
             "RAPIDO_CODEX_HOME": "/tmp/rapido/codex",
-            "RAPIDO_SUBMIT_CANDIDATES": "true",
+            "RAPIDO_SUBMIT_CANDIDATES": "false",
+            "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
         }
     )
     assert config.state_path == Path("/tmp/rapido/test.db")
     assert config.codex_home == Path("/tmp/rapido/codex")
-    assert config.submit_candidates is True
+    assert config.submit_candidates is False
+    assert config.manage_dynamic_instances is False
 
 
 def test_accepts_bounded_challenge_selection_for_acceptance_runs() -> None:

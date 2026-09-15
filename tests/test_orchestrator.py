@@ -216,6 +216,18 @@ class CancelledStartRuntime(FakeRuntime):
         raise asyncio.CancelledError
 
 
+class BlockingCloseRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        self.closed = True
+
+
 class NoProvenanceRuntime(FakeRuntime):
     async def solve(self, workspace, prompt, **kwargs):
         turn = await super().solve(workspace, prompt, **kwargs)
@@ -411,9 +423,10 @@ def config(tmp_path: Path, *, submit: bool = True) -> RuntimeConfig:
             "RAPIDO_WORK_ROOT": str(tmp_path / "work"),
             "RAPIDO_CODEX_HOME": str(tmp_path / "auth"),
             "RAPIDO_SUBMIT_CANDIDATES": "true" if submit else "false",
+            "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
         }
     )
-    return replace(base, run_seconds=60, attempt_seconds=15)
+    return replace(base, run_seconds=60, attempt_seconds=15, episodes_per_challenge=1)
 
 
 def test_two_lanes_overlap_agree_submit_once_and_persist_without_plain_candidate(
@@ -693,6 +706,33 @@ def test_cancellation_persists_interrupted_run(tmp_path: Path) -> None:
     assert row["status"] == "interrupted"
     assert runtime.closed
     store.close()
+
+
+def test_repeated_shutdown_cancellation_drains_runtime_before_releasing_leases(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        runtime = BlockingCloseRuntime()
+        store = StateStore(tmp_path / "state.sqlite3")
+        run = asyncio.create_task(
+            Orchestrator(config(tmp_path), FakeBoard([]), store, runtime).run()
+        )
+        await asyncio.wait_for(runtime.close_started.wait(), 1)
+        run.cancel()
+        await asyncio.sleep(0)
+        run.cancel()
+        await asyncio.sleep(0)
+        retained_while_closing = bool(store._lease_files)
+        still_draining = not run.done()
+        runtime.release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert runtime.closed
+        assert not store._lease_files
+        store.close()
+        return retained_while_closing, still_draining
+
+    assert asyncio.run(scenario()) == (True, True)
 
 
 def test_candidate_is_withheld_when_transport_cannot_finish_before_deadline(
