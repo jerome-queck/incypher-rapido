@@ -165,6 +165,22 @@ class FirstChallengeTimeoutRuntime(FakeRuntime):
         return await super().solve(workspace, prompt, **kwargs)
 
 
+class FailedTurnRuntime(FakeRuntime):
+    async def solve(self, workspace, prompt, **kwargs):
+        turn = await super().solve(workspace, prompt, **kwargs)
+        turn.status = "failed"
+        turn.failure_class = "usage_limit_exceeded"
+        turn.tool_calls.append(
+            {
+                "name": "sensitive-model-tool-name-sentinel",
+                "success": False,
+                "source_bound": False,
+                "candidate_sha256s": [],
+            }
+        )
+        return turn
+
+
 class HangingStartRuntime(FakeRuntime):
     async def start(self) -> None:
         await asyncio.sleep(60)
@@ -612,6 +628,37 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
         "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
     ).fetchone()
     assert '"reason":"candidate_provenance"' in failure["data_json"]
+    store.close()
+
+
+def test_failed_native_turn_persists_closed_class_and_tool_evidence(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path),
+            board,
+            store,
+            FailedTurnRuntime({1: {0: None, 1: None}}),
+        ).run()
+    )
+    assert report.errors == 1
+    failures = [
+        row["data_json"]
+        for row in store._connection.execute(
+            "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence"
+        )
+    ]
+    assert len(failures) == 2
+    assert all('"reason":"native_turn_incomplete"' in event for event in failures)
+    assert all('"status":"failed"' in event for event in failures)
+    assert all('"failure_class":"usage_limit_exceeded"' in event for event in failures)
+    wave = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_wave'"
+    ).fetchone()
+    assert "inspect_file" in wave["data_json"]
+    assert "unknown_tool" in wave["data_json"]
+    assert "sensitive-model-tool-name-sentinel" not in wave["data_json"]
     store.close()
 
 

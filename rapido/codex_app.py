@@ -129,6 +129,26 @@ _ARTIFACT_TOOLS = {
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
 _TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
+_TURN_FAILURE_CLASSES = {
+    "contextWindowExceeded": "context_window_exceeded",
+    "sessionBudgetExceeded": "session_budget_exceeded",
+    "usageLimitExceeded": "usage_limit_exceeded",
+    "rateLimitExceeded": "rate_limit_exceeded",
+    "serverOverloaded": "server_overloaded",
+    "cyberPolicy": "cyber_policy",
+    "misalignmentPolicyViolation": "misalignment_policy_violation",
+    "internalServerError": "internal_server_error",
+    "unauthorized": "unauthorized",
+    "badRequest": "bad_request",
+    "threadRollbackFailed": "thread_rollback_failed",
+    "sandboxError": "sandbox_error",
+    "other": "other",
+    "httpConnectionFailed": "http_connection_failed",
+    "responseStreamConnectionFailed": "response_stream_connection_failed",
+    "responseStreamDisconnected": "response_stream_disconnected",
+    "responseTooManyFailedAttempts": "response_too_many_failed_attempts",
+    "activeTurnNotSteerable": "active_turn_not_steerable",
+}
 
 
 class CodexAppError(RuntimeError):
@@ -205,6 +225,7 @@ class TurnResult:
     items: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
     structured_output: Any = None
+    failure_class: str | None = None
     timed_out: bool = False
     interrupt_sent: bool = False
     process_fenced: bool = False
@@ -213,6 +234,25 @@ class TurnResult:
     @property
     def text(self) -> str:
         return self.agent_message
+
+
+def _turn_failure_class(completed: Mapping[str, Any]) -> str | None:
+    status = completed.get("status")
+    if status == "completed":
+        return None
+    if status == "interrupted":
+        return "interrupted"
+    error = completed.get("error")
+    if not isinstance(error, Mapping):
+        return "unknown"
+    info = error.get("codexErrorInfo")
+    if isinstance(info, str):
+        return _TURN_FAILURE_CLASSES.get(info, "unknown")
+    if isinstance(info, Mapping) and len(info) == 1:
+        key = next(iter(info))
+        if isinstance(key, str):
+            return _TURN_FAILURE_CLASSES.get(key, "unknown")
+    return "unknown"
 
 
 class WorkspaceThreadRegistry:
@@ -1390,6 +1430,7 @@ class CodexAppClient:
             items=list(state.items),
             raw=dict(completed),
             structured_output=structured,
+            failure_class=_turn_failure_class(completed),
             timed_out=timed_out,
             interrupt_sent=interrupt_sent,
             process_fenced=process_fenced,

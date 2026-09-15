@@ -35,6 +35,7 @@ from .target import TargetEndpoint, TargetToolRegistry, parse_connection_info
 class NativeTurn(Protocol):
     text: str
     status: str
+    failure_class: str | None
     tool_calls: list[dict[str, Any]]
 
 
@@ -59,6 +60,49 @@ class NativeRuntime(Protocol):
 
 class RunDeadlineReached(TimeoutError):
     """The whole-run work deadline elapsed."""
+
+
+_NATIVE_FAILURE_CLASSES = frozenset(
+    {
+        "active_turn_not_steerable",
+        "bad_request",
+        "context_window_exceeded",
+        "cyber_policy",
+        "http_connection_failed",
+        "internal_server_error",
+        "interrupted",
+        "misalignment_policy_violation",
+        "other",
+        "rate_limit_exceeded",
+        "response_stream_connection_failed",
+        "response_stream_disconnected",
+        "response_too_many_failed_attempts",
+        "sandbox_error",
+        "server_overloaded",
+        "session_budget_exceeded",
+        "thread_rollback_failed",
+        "unauthorized",
+        "unknown",
+        "usage_limit_exceeded",
+    }
+)
+
+
+class NativeTurnIncompleteError(RuntimeError):
+    """A terminal native turn failed with a closed, non-secret classification."""
+
+    def __init__(self, status: object, failure_class: object) -> None:
+        self.status = (
+            status
+            if isinstance(status, str) and status in {"failed", "interrupted", "inProgress"}
+            else "unknown"
+        )
+        self.failure_class = (
+            failure_class
+            if isinstance(failure_class, str) and failure_class in _NATIVE_FAILURE_CLASSES
+            else "unknown"
+        )
+        super().__init__(f"native turn {self.status}: {self.failure_class}")
 
 
 @dataclass(frozen=True)
@@ -98,6 +142,37 @@ _RUN_ROOT_NAME = re.compile(r"run-[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DURABLE_TOOL_CALLS = 10
 _MAX_DURABLE_TOOL_HASHES = 2
+_DURABLE_TOOL_NAMES = frozenset(
+    {
+        "audio_metadata",
+        "decode_base64",
+        "decode_hex",
+        "decode_url",
+        "decompress_gzip",
+        "dicom_metadata",
+        "disassemble_elf",
+        "elf_symbols",
+        "extract_archive",
+        "extract_strings",
+        "http_request",
+        "image_metadata",
+        "inspect_binary",
+        "inspect_elf",
+        "inspect_file",
+        "inspect_filesystem",
+        "list_tar",
+        "list_workspace",
+        "list_zip",
+        "read_bytes",
+        "read_text",
+        "search_text",
+        "target_info",
+        "tcp_close",
+        "tcp_exchange",
+        "tcp_open",
+        "wav_analyze",
+    }
+)
 _CATEGORY_ORDER = {
     name: index
     for index, name in enumerate(("misc", "crypto", "forensics", "rev", "pwn", "network", "web"))
@@ -107,6 +182,10 @@ _CATEGORY_ORDER = {
 def _category_rank(value: str) -> int:
     normalized = re.sub(r"^\(practice\)\s*", "", value.strip(), flags=re.IGNORECASE).lower()
     return _CATEGORY_ORDER.get(normalized, len(_CATEGORY_ORDER))
+
+
+def _durable_tool_name(value: object) -> str:
+    return value if isinstance(value, str) and value in _DURABLE_TOOL_NAMES else "unknown_tool"
 
 
 def _artifact_name(file_ref: str, index: int) -> str:
@@ -659,8 +738,6 @@ class Orchestrator:
                 ),
                 timeout=timeout_seconds + 5,
             )
-            if turn.status != "completed":
-                raise RuntimeError("native turn did not complete")
             call_evidence: list[ToolCallEvidence] = []
             for call in turn.tool_calls[:100]:
                 if not isinstance(call, dict) or not isinstance(
@@ -689,7 +766,7 @@ class Orchestrator:
                 )
                 call_evidence.append(
                     ToolCallEvidence(
-                        name=str(call.get("name", ""))[:200],
+                        name=_durable_tool_name(call.get("name")),
                         success=call.get("success"),
                         source_bound=call.get("source_bound") is True,
                         candidate_sha256s=hashes,
@@ -697,6 +774,11 @@ class Orchestrator:
                     )
                 )
             tool_calls = tuple(call_evidence)
+            if turn.status != "completed":
+                raise NativeTurnIncompleteError(
+                    turn.status,
+                    getattr(turn, "failure_class", None),
+                )
             finding = SolverFinding.from_message(turn.text)
             if finding.candidate is not None:
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
@@ -750,6 +832,21 @@ class Orchestrator:
                 run_id,
                 "attempt_failure",
                 {"challenge_id": challenge.id, "lane": lane, "reason": "solver_output"},
+            )
+        except NativeTurnIncompleteError as exc:
+            finding = None
+            terminal = "failed"
+            self.state.finish_attempt(attempt_id, terminal, summary="native turn failed safely")
+            self.state.event(
+                run_id,
+                "attempt_failure",
+                {
+                    "challenge_id": challenge.id,
+                    "lane": lane,
+                    "reason": "native_turn_incomplete",
+                    "status": exc.status,
+                    "failure_class": exc.failure_class,
+                },
             )
         except RuntimeError:
             finding = None

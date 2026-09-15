@@ -26,6 +26,7 @@ from rapido.codex_app import (
     TurnTimeoutError,
     WorkspaceThreadRegistry,
     _source_bound_tool_call,
+    _turn_failure_class,
     _TurnState,
 )
 from rapido.tools import ToolError, ToolRegistry, Workspace
@@ -269,9 +270,7 @@ async def test_concurrent_solve_waits_for_shared_startup(tmp_path: Path) -> None
 
 @pytest.mark.parametrize("mode", ("timeout", "cancel"))
 @run_async
-async def test_join_interruption_does_not_fence_shared_startup(
-    tmp_path: Path, mode: str
-) -> None:
+async def test_join_interruption_does_not_fence_shared_startup(tmp_path: Path, mode: str) -> None:
     process = DelayedInitializeProcess()
 
     async def factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
@@ -440,6 +439,28 @@ def test_hex_transform_accepts_only_normalized_prior_host_output() -> None:
     split = _TurnState(thread_id="thread-2")
     split.provenance_outputs.append(json.dumps({"left": rooted[:16], "right": rooted[16:]}))
     assert not _source_bound_tool_call(split, "decode_hex", {"data": rooted})
+
+
+@pytest.mark.parametrize(
+    ("error_info", "expected"),
+    (
+        ("usageLimitExceeded", "usage_limit_exceeded"),
+        ({"responseStreamDisconnected": {"httpStatusCode": 503}}, "response_stream_disconnected"),
+        ("futureUntrustedValue", "unknown"),
+        ({"futureUntrustedValue": {}}, "unknown"),
+    ),
+)
+def test_turn_failure_class_uses_closed_non_secret_codes(error_info: object, expected: str) -> None:
+    completed = {
+        "status": "failed",
+        "error": {
+            "message": "sensitive provider text",
+            "additionalDetails": "sensitive detail",
+            "codexErrorInfo": error_info,
+        },
+    }
+    assert _turn_failure_class(completed) == expected
+    assert _turn_failure_class({"status": "completed"}) is None
 
 
 @run_async
