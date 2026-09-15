@@ -84,7 +84,10 @@ async def cycle(root: Path, index: int, workers: int, jobs: int) -> dict[str, in
                     if kind == "cancelled":
                         await asyncio.sleep(0)
                         operation.cancel()
-                    await asyncio.wait_for(operation, timeout=0.005)
+                    if kind == "timeout":
+                        await asyncio.wait_for(operation, timeout=0.005)
+                    else:
+                        await operation
                     outcome = "unsolved"
                 except TimeoutError:
                     outcome = "timeout"
