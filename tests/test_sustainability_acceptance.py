@@ -51,6 +51,20 @@ def test_synthetic_reopen_faults_and_queue_finish(tmp_path):
     asyncio.run(exercise())
 
 
+def test_unsolved_outcome_is_not_scheduler_timing_dependent(tmp_path, monkeypatch):
+    original = HARNESS._operation
+
+    async def delayed_operation(kind):
+        if kind == "unsolved":
+            await asyncio.sleep(0.01)
+        await original(kind)
+
+    monkeypatch.setattr(HARNESS, "_operation", delayed_operation)
+    result = asyncio.run(cycle(tmp_path, 0, 2, 8))
+    assert result["unsolved"] == 2
+    assert result["timeout"] == 2
+
+
 def test_projection_uses_twice_rate_plus_growth_slack():
     report = assess(samples(), 100)
     assert report["status"] == "passed"

@@ -16,6 +16,40 @@ from pathlib import Path
 from typing import Any
 
 MAX_EVENT_BYTES = 128 * 1024
+MAX_ATTEMPT_EVIDENCE_ITEMS = 20
+MAX_ATTEMPT_EVIDENCE_ITEM_CHARS = 1000
+
+_FAILURE_CLASSES = frozenset(
+    {
+        "active_turn_not_steerable",
+        "bad_request",
+        "candidate_provenance",
+        "cancelled",
+        "context_window_exceeded",
+        "cyber_policy",
+        "http_connection_failed",
+        "internal_server_error",
+        "interrupted",
+        "invalid_value",
+        "misalignment_policy_violation",
+        "native_runtime",
+        "operating_system",
+        "other",
+        "rate_limit_exceeded",
+        "response_stream_connection_failed",
+        "response_stream_disconnected",
+        "response_too_many_failed_attempts",
+        "sandbox_error",
+        "server_overloaded",
+        "session_budget_exceeded",
+        "solver_output",
+        "thread_rollback_failed",
+        "timeout",
+        "unauthorized",
+        "unknown",
+        "usage_limit_exceeded",
+    }
+)
 
 
 class StateStore:
@@ -88,6 +122,7 @@ class StateStore:
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES runs(id),
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL DEFAULT 0,
                 lane INTEGER NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
@@ -97,7 +132,11 @@ class StateStore:
                 summary TEXT NOT NULL DEFAULT '',
                 candidate TEXT,
                 confidence REAL,
-                UNIQUE(run_id, challenge_id, lane)
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                next_steps_json TEXT NOT NULL DEFAULT '[]',
+                tool_count INTEGER NOT NULL DEFAULT 0,
+                failure_class TEXT,
+                UNIQUE(run_id, challenge_id, episode, lane)
             );
             CREATE TABLE IF NOT EXISTS events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,12 +178,123 @@ class StateStore:
             );
             """
         )
+        self._migrate_attempts()
         instance_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(instances)").fetchall()
         }
         if "receipt_sha256" not in instance_columns:
             self._connection.execute("ALTER TABLE instances ADD COLUMN receipt_sha256 TEXT")
+
+    def _migrate_attempts(self) -> None:
+        """Atomically upgrade the pre-episode attempts table, retaining every row."""
+        required = {
+            "episode",
+            "evidence_json",
+            "next_steps_json",
+            "tool_count",
+            "failure_class",
+        }
+
+        def inspect_schema() -> tuple[set[str], list[tuple[str, ...]]]:
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(attempts)").fetchall()
+            }
+            unique_columns: list[tuple[str, ...]] = []
+            for index in self._connection.execute("PRAGMA index_list(attempts)").fetchall():
+                if not index["unique"]:
+                    continue
+                name = index["name"]
+                if not isinstance(name, str):
+                    continue
+                quoted_name = '"' + name.replace('"', '""') + '"'
+                unique_columns.append(
+                    tuple(
+                        str(item["name"])
+                        for item in self._connection.execute(
+                            f"PRAGMA index_info({quoted_name})"
+                        ).fetchall()
+                        if item["name"] is not None
+                    )
+                )
+            return columns, unique_columns
+
+        expected_unique = ("run_id", "challenge_id", "episode", "lane")
+        legacy_unique = ("run_id", "challenge_id", "lane")
+
+        def is_current(columns: set[str], unique_columns: list[tuple[str, ...]]) -> bool:
+            return (
+                required <= columns
+                and expected_unique in unique_columns
+                and legacy_unique not in unique_columns
+            )
+
+        columns, unique_columns = inspect_schema()
+        if is_current(columns, unique_columns):
+            return
+
+        # The table is created by the schema script above, so a missing legacy
+        # column only matters for a database created by an older Rapido build.
+        migration_table = f"attempts__rapido_migration_{id(self)}"
+        existing = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (migration_table,)
+        ).fetchone()
+        if existing is not None:
+            raise RuntimeError("stale attempts migration table is present")
+
+        def source(column: str, fallback: str) -> str:
+            return column if column in columns else fallback
+
+        with self.transaction() as connection:
+            # Re-read under the write lock so a concurrent opener cannot
+            # migrate a newer schema back to legacy defaults.
+            columns, unique_columns = inspect_schema()
+            if is_current(columns, unique_columns):
+                return
+
+            connection.execute(
+                f"""
+                CREATE TABLE {migration_table} (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id),
+                    challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                    episode INTEGER NOT NULL DEFAULT 0,
+                    lane INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    effort TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    candidate TEXT,
+                    confidence REAL,
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    next_steps_json TEXT NOT NULL DEFAULT '[]',
+                    tool_count INTEGER NOT NULL DEFAULT 0,
+                    failure_class TEXT,
+                    UNIQUE(run_id, challenge_id, episode, lane)
+                )
+                """
+            )
+            connection.execute(
+                f"""
+                INSERT INTO {migration_table}(
+                    id, run_id, challenge_id, episode, lane, started_at, finished_at,
+                    status, model, effort, summary, candidate, confidence,
+                    evidence_json, next_steps_json, tool_count, failure_class
+                )
+                SELECT
+                    id, run_id, challenge_id, {source("episode", "0")}, lane, started_at,
+                    finished_at, status, model, effort, {source("summary", "''")}, candidate,
+                    {source("confidence", "NULL")}, {source("evidence_json", "'[]'")},
+                    {source("next_steps_json", "'[]'")}, {source("tool_count", "0")},
+                    {source("failure_class", "NULL")}
+                FROM attempts
+                """
+            )
+            connection.execute("DROP TABLE attempts")
+            connection.execute(f"ALTER TABLE {migration_table} RENAME TO attempts")
 
     def acquire_supervisor(
         self,
@@ -292,18 +442,70 @@ class StateStore:
         attempt_id: str,
         run_id: str,
         challenge_id: int,
-        lane: int,
-        model: str,
-        effort: str,
+        episode: int = 0,
+        lane: int | str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> None:
+        # Accept the pre-episode positional form while callers migrate to the
+        # canonical (episode, lane, model, effort) form.
+        if effort is None:
+            if lane is None or model is None:
+                raise TypeError("start_attempt requires lane, model, and effort")
+            lane, model, effort, episode = episode, lane, model, 0
+        if type(episode) is not int or episode < 0:
+            raise ValueError("episode must be a nonnegative integer")
+        if type(lane) is not int or model is None or not isinstance(effort, str):
+            raise ValueError("invalid attempt identity")
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO attempts(id, run_id, challenge_id, lane, started_at, status, model, effort)
-                VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+                INSERT INTO attempts(
+                    id, run_id, challenge_id, episode, lane, started_at, status, model, effort
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
                 """,
-                (attempt_id, run_id, challenge_id, lane, self._now(), model, effort),
+                (attempt_id, run_id, challenge_id, episode, lane, self._now(), model, effort),
             )
+
+    @staticmethod
+    def _encode_attempt_evidence(name: str, value: list[str] | tuple[str, ...]) -> str:
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) > MAX_ATTEMPT_EVIDENCE_ITEMS
+            or any(
+                not isinstance(item, str) or len(item) > MAX_ATTEMPT_EVIDENCE_ITEM_CHARS
+                for item in value
+            )
+        ):
+            raise ValueError(
+                f"{name} must contain at most {MAX_ATTEMPT_EVIDENCE_ITEMS} strings "
+                f"of at most {MAX_ATTEMPT_EVIDENCE_ITEM_CHARS} characters"
+            )
+        encoded = json.dumps(list(value), ensure_ascii=False, separators=(",", ":"))
+        try:
+            encoded_size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"{name} contains invalid text") from exc
+        if encoded_size > MAX_EVENT_BYTES:
+            raise ValueError(f"{name} exceeds the durable audit limit")
+        return encoded
+
+    @staticmethod
+    def _decode_attempt_evidence(value: object) -> list[str]:
+        try:
+            decoded = json.loads(value) if isinstance(value, str) else None
+        except (TypeError, ValueError, RecursionError):
+            decoded = None
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) > MAX_ATTEMPT_EVIDENCE_ITEMS
+            or any(
+                not isinstance(item, str) or len(item) > MAX_ATTEMPT_EVIDENCE_ITEM_CHARS
+                for item in decoded
+            )
+        ):
+            return []
+        return decoded
 
     def finish_attempt(
         self,
@@ -313,6 +515,10 @@ class StateStore:
         summary: str = "",
         candidate: str | None = None,
         confidence: float | None = None,
+        evidence: list[str] | tuple[str, ...] = (),
+        next_steps: list[str] | tuple[str, ...] = (),
+        tool_count: int = 0,
+        failure_class: str | None = None,
     ) -> None:
         allowed = {
             "candidate",
@@ -327,14 +533,34 @@ class StateStore:
             raise ValueError("invalid attempt status")
         if confidence is not None and not 0 <= confidence <= 1:
             raise ValueError("confidence must be in [0, 1]")
+        evidence_json = self._encode_attempt_evidence("evidence", evidence)
+        next_steps_json = self._encode_attempt_evidence("next_steps", next_steps)
+        if type(tool_count) is not int or not 0 <= tool_count <= 100:
+            raise ValueError("tool_count must be an integer in [0, 100]")
+        if failure_class is not None and (
+            not isinstance(failure_class, str) or failure_class not in _FAILURE_CLASSES
+        ):
+            raise ValueError("failure_class is not a recognized closed class")
         with self.transaction() as connection:
             changed = connection.execute(
                 """
                 UPDATE attempts
-                SET finished_at=?, status=?, summary=?, candidate=?, confidence=?
+                SET finished_at=?, status=?, summary=?, candidate=?, confidence=?,
+                    evidence_json=?, next_steps_json=?, tool_count=?, failure_class=?
                 WHERE id=? AND status='running'
                 """,
-                (self._now(), status, summary[:4000], candidate, confidence, attempt_id),
+                (
+                    self._now(),
+                    status,
+                    summary[:4000],
+                    candidate,
+                    confidence,
+                    evidence_json,
+                    next_steps_json,
+                    tool_count,
+                    failure_class,
+                    attempt_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise ValueError("attempt is absent or not running")
@@ -370,6 +596,52 @@ class StateStore:
                 (run_id, challenge_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def prior_attempts_for_lane(
+        self,
+        run_id: str,
+        challenge_id: int,
+        lane: int,
+        *,
+        before_episode: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return terminal carryable lane history without candidate values."""
+        if before_episode is not None and (type(before_episode) is not int or before_episode < 0):
+            raise ValueError("before_episode must be a nonnegative integer")
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 100):
+            raise ValueError("limit must be an integer in [1, 100]")
+        conditions = ["run_id=?", "challenge_id=?", "lane=?"]
+        parameters: list[object] = [run_id, challenge_id, lane]
+        conditions.append("status NOT IN ('running', 'candidate')")
+        if before_episode is not None:
+            conditions.append("episode < ?")
+            parameters.append(before_episode)
+        query = f"""
+            SELECT episode, status, summary, evidence_json, next_steps_json,
+                   tool_count, failure_class
+            FROM attempts
+            WHERE {" AND ".join(conditions)}
+            ORDER BY episode DESC, started_at DESC, id DESC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        rows = list(reversed(rows))
+        return [
+            {
+                "episode": row["episode"],
+                "status": row["status"],
+                "summary": row["summary"],
+                "evidence": self._decode_attempt_evidence(row["evidence_json"]),
+                "next_steps": self._decode_attempt_evidence(row["next_steps_json"]),
+                "tool_count": row["tool_count"],
+                "failure_class": row["failure_class"],
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _candidate_fingerprint(candidate: str) -> str:
