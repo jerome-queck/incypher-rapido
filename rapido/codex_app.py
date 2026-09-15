@@ -109,16 +109,23 @@ INTERRUPT_TIMEOUT_SECONDS = 2.0
 
 _ARTIFACT_TOOLS = {
     "audio_metadata",
+    "decompress_gzip",
+    "dicom_metadata",
+    "disassemble_elf",
+    "elf_symbols",
     "extract_archive",
     "extract_strings",
     "image_metadata",
     "inspect_binary",
+    "inspect_elf",
+    "inspect_filesystem",
     "inspect_file",
     "list_tar",
     "list_zip",
     "read_bytes",
     "read_text",
     "search_text",
+    "wav_analyze",
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
 _TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}

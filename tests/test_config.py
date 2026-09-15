@@ -15,8 +15,8 @@ def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     assert config.run_seconds == 19_800
     assert config.max_artifact_bytes == 64 * 1024 * 1024
     assert config.max_challenge_bytes == 128 * 1024 * 1024
-    assert config.max_workspace_bytes == 512 * 1024 * 1024
-    assert config.max_lane_workspace_bytes == 192 * 1024 * 1024
+    assert config.max_workspace_bytes == 500 * 1024 * 1024 * 1024
+    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
     assert config.challenge_ids == ()
 
 
@@ -53,7 +53,19 @@ def test_rejects_unsupported_or_unsafe_configuration(name: str, value: str) -> N
 
 def test_workspace_budget_must_cover_all_lane_copies() -> None:
     with pytest.raises(ConfigError, match="source plus every lane"):
-        RuntimeConfig.from_env({"RAPIDO_ATTEMPTS_PER_CHALLENGE": "4"})
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_ATTEMPTS_PER_CHALLENGE": "4",
+                "RAPIDO_MAX_WORKSPACE_BYTES": str(512 * 1024 * 1024),
+            }
+        )
+
+
+def test_workspace_budget_can_match_large_external_runtime_storage() -> None:
+    configured = 500 * 1024 * 1024 * 1024
+    config = RuntimeConfig.from_env({"RAPIDO_MAX_WORKSPACE_BYTES": str(configured)})
+    assert config.max_workspace_bytes == configured
+    assert config.max_lane_workspace_bytes > 200 * 1024 * 1024 * 1024
 
 
 def test_requires_board_token_only_for_board_work() -> None:

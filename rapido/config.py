@@ -195,9 +195,9 @@ class RuntimeConfig:
         max_workspace_bytes = _integer(
             values,
             "RAPIDO_MAX_WORKSPACE_BYTES",
-            512 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
             minimum=3 * 1024,
-            maximum=2 * 1024 * 1024 * 1024,
+            maximum=500 * 1024 * 1024 * 1024,
         )
         minimum_workspace_bytes = max_challenge_bytes * (attempts_per_challenge + 1)
         if max_workspace_bytes < minimum_workspace_bytes:

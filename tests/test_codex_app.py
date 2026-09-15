@@ -195,7 +195,20 @@ def make_client(process: FakeProcess, tmp_path: Path, **kwargs: Any) -> CodexApp
     )
 
 
-@pytest.mark.parametrize("name", ("image_metadata", "audio_metadata", "inspect_binary", "binary"))
+@pytest.mark.parametrize(
+    "name",
+    (
+        "image_metadata",
+        "audio_metadata",
+        "inspect_binary",
+        "binary",
+        "inspect_elf",
+        "elf_symbols",
+        "disassemble_elf",
+        "dicom_metadata",
+        "wav_analyze",
+    ),
+)
 def test_canonical_metadata_tools_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {"path": "artifacts/input.bin"})
 

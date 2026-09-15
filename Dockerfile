@@ -32,7 +32,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates file binutils \
+    && apt-get install --yes --no-install-recommends ca-certificates file binutils e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
 # node is copied from a target-platform stage; Codex's native optional package

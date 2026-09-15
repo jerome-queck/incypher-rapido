@@ -70,7 +70,7 @@ Important settings:
 | `RAPIDO_RUN_SECONDS` | `19800` | Work-admission deadline (5.5 hours) |
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | Maximum one downloaded artifact |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source bytes before lane copies |
-| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912` | Source, lane copies, and cumulative workspace-file cap |
+| `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Source, lane copies, and cumulative workspace-file cap |
 | `RAPIDO_CHALLENGE_IDS` | empty | Optional unique comma-separated qualified challenge IDs; empty means full catalogue |
 | `RAPIDO_SUBMIT_CANDIDATES` | `false` | Serial exact-agreement submissions when true |
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Global ceiling for wrong or indeterminate effects |
@@ -81,6 +81,7 @@ Important settings:
 ```sh
 .venv/bin/ruff check rapido tests scripts
 PYTHONPATH=. .venv/bin/pytest -q
+PYTHONPATH=. .venv/bin/python scripts/sustainability_acceptance.py --cycles 96
 docker build -t rapido:local .
 ```
 
