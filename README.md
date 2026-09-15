@@ -62,7 +62,7 @@ Important settings:
 
 | Variable | Default | Contract |
 |---|---:|---|
-| `RAPIDO_MODEL` | `gpt-6-astra` | Exact app-server catalogue match; no fallback |
+| `RAPIDO_MODEL` | `gpt-daybreak-blue-latest` | Security-focused exact app-server catalogue match; no fallback |
 | `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by that model |
 | `RAPIDO_CONCURRENCY` | `2` | Minimum two; reserved for queue policy |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `2` | Independent concurrent lanes |

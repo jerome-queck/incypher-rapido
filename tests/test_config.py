@@ -8,7 +8,7 @@ from rapido.config import ConfigError, RuntimeConfig, validate_codex_home
 def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     config = RuntimeConfig.from_env({})
     assert config.board_url == "https://hackathon.in-cypher.com"
-    assert config.model == "gpt-6-astra"
+    assert config.model == "gpt-daybreak-blue-latest"
     assert config.reasoning_effort == "xhigh"
     assert config.concurrency == 2
     assert config.attempts_per_challenge == 2

@@ -209,7 +209,7 @@ class RuntimeConfig:
             board_url=_origin(values),
             board_token=token,
             team_key=team_key,
-            model=_text(values, "RAPIDO_MODEL", "gpt-6-astra"),
+            model=_text(values, "RAPIDO_MODEL", "gpt-daybreak-blue-latest"),
             reasoning_effort=effort,
             concurrency=_integer(values, "RAPIDO_CONCURRENCY", 2, minimum=2, maximum=8),
             attempts_per_challenge=attempts_per_challenge,

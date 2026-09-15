@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--codex-home", type=Path, required=True)
     result.add_argument("--work-root", type=Path, required=True)
     result.add_argument("--expected-sha256", required=True)
-    result.add_argument("--model", default="gpt-6-astra")
+    result.add_argument("--model", default="gpt-daybreak-blue-latest")
     result.add_argument("--effort", default="xhigh")
     result.add_argument("--timeout", type=float, default=300)
     result.add_argument("--max-workspace-bytes", type=int, default=192 * 1024 * 1024)
