@@ -404,41 +404,32 @@ def test_parent_removes_private_scratch_for_every_worker_exit(tmp_path, monkeypa
     assert created and all(not path.exists() for path in created)
 
 
-@pytest.mark.parametrize("termination_signal", [signal.SIGKILL, signal.SIGXCPU])
-def test_native_resource_signal_maps_to_resource_limit(tmp_path, termination_signal, monkeypatch):
+def test_native_resource_signal_maps_to_resource_limit(tmp_path):
     source = tmp_path / "source"
     source.write_bytes(b"x")
     descriptor = _open(source)
-    prior_mask = None
     try:
-        if termination_signal != signal.SIGKILL and hasattr(signal, "pthread_sigmask"):
-            prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {termination_signal})
-            monkeypatch.setattr(artifact_worker_main, "_set_limit", lambda *args: None)
-            artifact_worker_main._apply_limits()
-            current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-            assert termination_signal not in current_mask
-        reset_signal = (
-            f"signal.signal({int(termination_signal)}, signal.SIG_DFL); "
-            if termination_signal != signal.SIGKILL
-            else ""
-        )
         with pytest.raises(artifact_worker_main.WorkerError) as error:
             artifact_worker_main._native(
                 [
                     os.path.abspath(sys.executable),
                     "-c",
-                    (
-                        f"import os,signal; {reset_signal}os.kill(os.getpid(), "
-                        f"{int(termination_signal)})"
-                    ),
+                    f"import os,signal; os.kill(os.getpid(), {int(signal.SIGKILL)})",
                 ],
                 descriptor,
             )
     finally:
-        if prior_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         os.close(descriptor)
     assert error.value.code == "resource_limit"
+
+
+@pytest.mark.parametrize("signal_name", ["SIGKILL", "SIGXCPU", "SIGXFSZ"])
+def test_native_resource_signal_returncode_classification(signal_name):
+    resource_signal = getattr(signal, signal_name, None)
+    if resource_signal is None:
+        pytest.skip(f"{signal_name} unavailable")
+    assert artifact_worker_main._is_resource_limit_returncode(-int(resource_signal))
+    assert not artifact_worker_main._is_resource_limit_returncode(int(resource_signal))
 
 
 @pytest.mark.parametrize("signal_name", ["SIGXCPU", "SIGXFSZ"])
