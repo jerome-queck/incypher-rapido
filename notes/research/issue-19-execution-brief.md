@@ -233,9 +233,10 @@ instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance
 or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
 The calibration keeps P20 but uses exact overrides of 90 seconds per initial lane, 4 seconds per
 Board request, 20 seconds for instance readiness, and 20 seconds for cleanup. At the current proven
-single-instance bound, the known nine dynamic initial waves consume at most 1,170 seconds and the
+single-instance bound, the known nine dynamic initial waves consume at most 1,242 seconds, including
+one preflight GET and one create POST per wave, and the
 other six consume at most two P5 waves, or 180 seconds. Initial catalogue entries are durably queued
-before any successor, leaving 450 seconds for catalogue qualification, downloads, native startup,
+before any successor, leaving 378 seconds for catalogue qualification, downloads, native startup,
 and evidence-earned routes. Do not start if a fresh preflight changes the 15-challenge or
 nine-dynamic catalogue assumption, or measured Board latency does not fit the four-second request
 budget. Production and final-acceptance defaults remain 1,800/15/120/45 seconds respectively.
