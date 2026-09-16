@@ -1,0 +1,342 @@
+{
+  "adapters": [
+    {
+      "adapter": "sqlite_transaction",
+      "cases": [
+        {
+          "case": "clean_commit_reopen",
+          "committed_count": 1,
+          "survived": true
+        },
+        {
+          "case": "crash_after_catalogue_write",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": false
+        },
+        {
+          "case": "crash_after_commit_return",
+          "committed_count": 1,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": true
+        },
+        {
+          "case": "crash_after_material",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": false
+        },
+        {
+          "acknowledged": false,
+          "case": "explicit_rollback",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "reconciliation_actions": 0
+        },
+        {
+          "case": "filesystem_safety",
+          "durability_domains_observed": 1,
+          "integrity": true,
+          "persistent_bytes_observed": 225280,
+          "symlink_rejected": true,
+          "unsafe_entry_count": 0
+        },
+        {
+          "case": "peer_retention",
+          "committed_count": 1,
+          "peer_a_retained": true,
+          "peer_b_acknowledged": false
+        },
+        {
+          "case": "public_leak",
+          "leak_count": 0
+        },
+        {
+          "case": "replay_and_conflict",
+          "committed_count": 1,
+          "conflict_accepted": false,
+          "replay_inserted": false
+        },
+        {
+          "acknowledged": true,
+          "case": "same_process_commit",
+          "committed_count": 1,
+          "retrieved": true
+        },
+        {
+          "case": "scope_isolation",
+          "scope_bypass_count": 0
+        }
+      ],
+      "cost": {
+        "durability_domains": 1,
+        "persistent_bytes": 225280,
+        "reconciliation_actions": 0
+      },
+      "metrics": {
+        "acknowledged_loss_count": 0,
+        "conflict_acceptance_count": 0,
+        "duplicate_logical_record_count": 0,
+        "integrity_failure_count": 0,
+        "peer_loss_count": 0,
+        "post_reconciliation_residue_count": 0,
+        "public_leak_count": 0,
+        "reconciliation_actions": 0,
+        "scope_bypass_count": 0,
+        "unacknowledged_committed_count": 0,
+        "unsafe_entry_count": 0
+      }
+    },
+    {
+      "adapter": "file_index",
+      "cases": [
+        {
+          "case": "clean_commit_reopen",
+          "committed_count": 1,
+          "survived": true
+        },
+        {
+          "case": "crash_after_catalogue_write",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 1,
+          "survived": false
+        },
+        {
+          "case": "crash_after_commit_return",
+          "committed_count": 1,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": true
+        },
+        {
+          "case": "crash_after_material",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 1,
+          "survived": false
+        },
+        {
+          "acknowledged": false,
+          "case": "explicit_rollback",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "reconciliation_actions": 0
+        },
+        {
+          "case": "filesystem_safety",
+          "durability_domains_observed": 2,
+          "integrity": true,
+          "persistent_bytes_observed": 270608,
+          "symlink_rejected": true,
+          "unsafe_entry_count": 0
+        },
+        {
+          "case": "peer_retention",
+          "committed_count": 1,
+          "peer_a_retained": true,
+          "peer_b_acknowledged": false
+        },
+        {
+          "case": "public_leak",
+          "leak_count": 0
+        },
+        {
+          "case": "replay_and_conflict",
+          "committed_count": 1,
+          "conflict_accepted": false,
+          "replay_inserted": false
+        },
+        {
+          "acknowledged": true,
+          "case": "same_process_commit",
+          "committed_count": 1,
+          "retrieved": true
+        },
+        {
+          "case": "scope_isolation",
+          "scope_bypass_count": 0
+        }
+      ],
+      "cost": {
+        "durability_domains": 2,
+        "persistent_bytes": 270608,
+        "reconciliation_actions": 2
+      },
+      "metrics": {
+        "acknowledged_loss_count": 0,
+        "conflict_acceptance_count": 0,
+        "duplicate_logical_record_count": 0,
+        "integrity_failure_count": 0,
+        "peer_loss_count": 0,
+        "post_reconciliation_residue_count": 0,
+        "public_leak_count": 0,
+        "reconciliation_actions": 2,
+        "scope_bypass_count": 0,
+        "unacknowledged_committed_count": 0,
+        "unsafe_entry_count": 0
+      }
+    },
+    {
+      "adapter": "volatile",
+      "cases": [
+        {
+          "case": "clean_commit_reopen",
+          "committed_count": 0,
+          "survived": false
+        },
+        {
+          "case": "crash_after_catalogue_write",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": false
+        },
+        {
+          "case": "crash_after_commit_return",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": false
+        },
+        {
+          "case": "crash_after_material",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "exit_code": 91,
+          "leak_count": 0,
+          "reconciliation_actions": 0,
+          "survived": false
+        },
+        {
+          "acknowledged": false,
+          "case": "explicit_rollback",
+          "committed_count": 0,
+          "dangling_count": 0,
+          "reconciliation_actions": 0
+        },
+        {
+          "case": "filesystem_safety",
+          "durability_domains_observed": 0,
+          "integrity": true,
+          "persistent_bytes_observed": 0,
+          "symlink_rejected": true,
+          "unsafe_entry_count": 0
+        },
+        {
+          "case": "peer_retention",
+          "committed_count": 1,
+          "peer_a_retained": true,
+          "peer_b_acknowledged": false
+        },
+        {
+          "case": "public_leak",
+          "leak_count": 0
+        },
+        {
+          "case": "replay_and_conflict",
+          "committed_count": 1,
+          "conflict_accepted": false,
+          "replay_inserted": false
+        },
+        {
+          "acknowledged": true,
+          "case": "same_process_commit",
+          "committed_count": 1,
+          "retrieved": true
+        },
+        {
+          "case": "scope_isolation",
+          "scope_bypass_count": 0
+        }
+      ],
+      "cost": {
+        "durability_domains": 0,
+        "persistent_bytes": 0,
+        "reconciliation_actions": 0
+      },
+      "metrics": {
+        "acknowledged_loss_count": 2,
+        "conflict_acceptance_count": 0,
+        "duplicate_logical_record_count": 0,
+        "integrity_failure_count": 0,
+        "peer_loss_count": 0,
+        "post_reconciliation_residue_count": 0,
+        "public_leak_count": 0,
+        "reconciliation_actions": 0,
+        "scope_bypass_count": 0,
+        "unacknowledged_committed_count": 0,
+        "unsafe_entry_count": 0
+      }
+    }
+  ],
+  "fixture": {
+    "board_enabled": false,
+    "container_enabled": false,
+    "model_enabled": false,
+    "network_enabled": false,
+    "repetitions": 1
+  },
+  "gate": {
+    "failures": [],
+    "passed": true,
+    "selected": "sqlite_transaction"
+  },
+  "provenance": {
+    "artifact_command": "PYTHONPATH=. python3 scripts/issue19_vault_comparison.py --pretty --output-root <fresh-0700-dir>",
+    "elapsed_seconds": 0.39847,
+    "environment": {
+      "filesystem_block_size": 1048576,
+      "filesystem_fragment_size": 4096,
+      "machine": "arm64",
+      "platform_release": "27.0.0",
+      "platform_system": "Darwin",
+      "python_implementation": "CPython",
+      "python_version": "3.14.7",
+      "root_mode": "0700",
+      "sqlite_file_mode": "0600",
+      "sqlite_journal_mode": "wal",
+      "sqlite_synchronous": 2,
+      "sqlite_version": "3.53.4"
+    },
+    "fixture_version": "issue-19-vault-comparison-v1",
+    "result_format": "json.dumps(sort_keys=True, indent=2) plus newline",
+    "script_sha256": "3774df8944ceb4d18cf5886dc3edac688cd6f7d0f110963689b7abcfc3308461",
+    "source_base_commit": "3a1390f4370721997a147e15392e1bc3c3a48d15"
+  },
+  "schema_version": 1,
+  "selection": {
+    "adapter": "sqlite_transaction",
+    "criterion": [
+      "durability_domains",
+      "reconciliation_actions",
+      "persistent_bytes"
+    ],
+    "eligible": [
+      "sqlite_transaction",
+      "file_index"
+    ],
+    "ineligible": [
+      "volatile"
+    ]
+  }
+}

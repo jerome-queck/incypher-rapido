@@ -240,13 +240,12 @@ live conversion. Later implementation must drive the same corpus through its rea
 and add a separate event-backed green gate from actual durable records without deleting or
 rewriting the recorded baseline arm.
 
-### E2/E3 controller and vault comparisons
+### E2 vault and E3 controller comparisons
 
 Daybreak/xhigh exploratory lanes compared a closed table, graph reducer, and scored policy, plus
-single-SQLite, encrypted-file/index, and volatile candidate-retention designs. Those lanes returned
-useful hypotheses but no durable source/config/result artifact. Their reported numeric results are
-therefore **not accepted evidence** and are intentionally omitted. E2/E3 remain pending until a
-reproducible sanitized harness is committed and independently reviewed.
+single-SQLite, file/index, and volatile candidate-retention designs. Their original numeric reports
+had no durable source/config/result artifact and remain unaccepted. E3 routing stays pending until
+its own reproducible harness exists.
 
 The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
 two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
@@ -254,12 +253,35 @@ material route fingerprint. Policy, provenance, disagreement, timeout, quota, an
 remain contained until later slices add validated authorization, verifier, checkpoint, reset, or
 Board-contract facts. Tool and safely identified local-container failures may dispatch one changed
 route; persistent failures cannot turn episode, timestamp, or retry ordinal into a change. This is
-a tracer under test, not the final E2 selection.
+a tracer under test, not the final E3 selection.
 
-The candidate-vault design likewise remains provisional. Exactly-once Board POST is impossible
-without remote idempotency; the current enforceable boundary remains durable at-most-once
-reservation plus fenced ambiguity. Any later vault comparison must test crash atomicity, peer
-retention, public leakage, replay, and the same-UID/root limitation.
+E2 now has a reproducible, effect-free storage-subdecision candidate at
+`scripts/issue19_vault_comparison.py`, with the exact sanitized result in
+`notes/research/issue-19-vault-comparison-v1.json` (SHA-256
+`1ad4b10786e3bcbd59c75b82b3c2cd5c401f9a90f94519ebb96eedcf7c7927f0`). It runs 11
+same-process, reopen, rollback, three real `os._exit(91)` crash-point, replay/conflict, peer,
+scope, privacy, and filesystem cases for each of three adapters. Metrics are recomputed from case
+rows after exact adapter/case schema and raw invariant validation. Selection cost is recomputed from
+raw storage observations; five normalized full replays are identical; altered rows, costs, schemas,
+and every safety class fail the gate. The artifact records the base commit, fixture, script digest,
+pretty-output command/format, elapsed observation, Python/SQLite/platform, filesystem block sizes,
+permissions, and SQLite durability settings.
+
+SQLite and file/index both had zero acknowledged loss, ghost commitment, conflict acceptance,
+duplicate record, peer loss, scope bypass, public leak, reconciled residue, unsafe entry, or
+integrity failure. Volatile storage lost two acknowledged records across reopen/post-commit crash
+and was disqualified. File/index needed two orphan-reconciliation actions and two durability
+domains; SQLite needed zero and one. Development storage observations were 225,280 and 270,608
+bytes respectively. The safety-first requirement was fixed, but the domain/action/bytes tie-break
+was written after these measurements and is therefore post-observation, not pre-registered. It
+provisionally selects the single SQLite transaction domain. Timing is deliberately not a decision
+metric. Independent Daybreak re-review is clean. A prospective Linux final-image replay remains
+required before treating this storage subdecision as accepted; full E2 still must compare admission
+behavior, not only persistence.
+
+Exactly-once Board POST remains impossible without remote idempotency; the current enforceable
+boundary is durable at-most-once reservation plus fenced ambiguity. The comparison claims interface
+confinement, not secrecy from same-UID/root access, and does not test power-loss durability.
 
 ## Selected architecture contract
 
@@ -349,14 +371,15 @@ review rejected a false-positive combined-failure fixture before accepting its c
 All are covered by focused regression tests; final Daybreak/xhigh review found no P0-P3 defects.
 
 Local validation after repairs: Ruff/format/`git diff --check` clean; 633 passed and 1 skipped on
-Python 3.11 and 3.12. The reproducible E2/E3 comparison remains a separate pending gate.
+Python 3.11 and 3.12. Full E2 admission and E3 outcome comparisons remain separate pending gates;
+the E2 storage subcomparison passed independent review but still awaits final-image replay.
 
 ## Acceptance ledger
 
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
-| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router/vault exploratory results unaccepted pending durable harness |
+| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router merged; E2 storage subcomparison durable but provisional after post-observation tie-break; full E2/E3 comparisons pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and no-unchanged dispatch implemented; validated gated routes pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | pending |
@@ -394,10 +417,14 @@ Python 3.11 and 3.12. The reproducible E2/E3 comparison remains a separate pendi
 | Core journal fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; one P1 terminal-overwrite crash window found and fixed test-first; clean re-review pending, no fallback |
 | Core journal clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, 81 focused tests clean, no fallback |
 | Adaptive-router exploratory comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete but unaccepted: no durable source/config/result artifact; harness pending, no fallback |
-| Candidate-vault exploratory comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete but unaccepted: no durable source/config/result artifact; harness pending, no fallback |
+| Candidate-vault exploratory comparison | `gpt-daybreak-blue-latest` / `xhigh` | original numeric report unaccepted; superseded by the durable storage harness below, no fallback |
 | Adaptive-router independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete; eight P1 and three P2 defects found and repaired test-first; clean re-review pending, no fallback |
 | Adaptive-router fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; two P1 and one P2 found, plus one false-positive fixture rejected; all fixed test-first, no fallback |
 | Adaptive-router clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, corrected escalation integration verified, no fallback |
+| Candidate-vault comparison harness | `gpt-daybreak-blue-latest` / `xhigh` | complete; durable effect-free three-adapter storage subcomparison, full E2 behavior gate still pending, no fallback |
+| Candidate-vault comparison review | `gpt-daybreak-blue-latest` / `xhigh` | rejected; raw gate, E2/E3 identity, pre-registration, provenance, and ledger defects found; fixes applied, re-review pending, no fallback |
+| Candidate-vault comparison fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | rejected; volatile crash stages were collapsed and rollback acknowledgements ungated; fixes applied, clean re-review pending, no fallback |
+| Candidate-vault comparison clean review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, focused and full dual-version suites clean, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -408,8 +435,8 @@ switch, not provider fallback inside a solver run.
 ## Open decisions
 
 - Exact policy-compatible context variant selected by E1.
-- Candidate-verification recipe and vault selected by a reproducible E3 comparison.
-- E1-approved policy route, exact per-route budgets, and router selected by a reproducible E2 comparison.
+- Candidate-verification recipe and vault selected by the full reproducible E2 comparison.
+- E1-approved policy route, exact per-route budgets, and router selected by a reproducible E3 comparison.
 - Parallel lane/local-worker profile selected by E4.
 - Current Board inactive-instance contract established by E6.
 - Exact merged commit, final image digest, final challenge order, deadlines, and measurement sampler
