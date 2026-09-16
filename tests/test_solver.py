@@ -486,6 +486,8 @@ def test_developer_instructions_truthfully_bound_authorized_ctf_scope() -> None:
     assert "organizer explicitly provides" in normalized
     assert "board-issued target" in normalized
     assert "never probe, discover, or interact with any outside system" in normalized
+    assert "derive_artifact with the source path and byte range" in normalized
+    assert "returned content-addressed path" in normalized
     offline = " ".join(OFFLINE_DEVELOPER_INSTRUCTIONS.lower().split())
     assert "synthetic, offline acceptance fixture" in offline
     assert "no external target access is authorized or provided" in offline

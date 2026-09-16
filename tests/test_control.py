@@ -271,6 +271,107 @@ class MixedBoundaryRuntime(BoundaryRuntime):
         return await UnsolvedBoundaryRuntime.solve(self, workspace, prompt, **kwargs)
 
 
+class PersistentPrimaryRuntime(BoundaryRuntime):
+    def __init__(self, candidate: str, checkpoint: str) -> None:
+        super().__init__(candidate)
+        self.checkpoint = checkpoint
+        self.continuations: list[dict[str, object]] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        del workspace
+        document = json.loads(prompt)
+        callback = kwargs.get("continuation_callback")
+        if kwargs.get("model") != "gpt-daybreak-blue-latest" or not callable(callback):
+            return await UnsolvedBoundaryRuntime.solve(self, Path(), prompt, **kwargs)
+        self.calls.append((document, dict(kwargs)))
+        checkpoint_candidate = (
+            "INCYPHER{answer}" if self.checkpoint == "ineligible" else self._candidate
+        )
+        checkpoint_digest = hashlib.sha256(checkpoint_candidate.encode()).hexdigest()
+        checkpoint_calls: list[dict[str, object]] = []
+        if self.checkpoint == "supplied":
+            checkpoint_calls.append(
+                {
+                    "name": "inspect_file",
+                    "success": True,
+                    "source_bound": True,
+                    "candidate_sensitive": True,
+                    "candidate_sha256s": [],
+                    "supplied_candidate_sha256s": [checkpoint_digest],
+                    "host_observation": project_tool_observation(
+                        "inspect_file",
+                        success=True,
+                        source_bound=True,
+                        candidate_sensitive=True,
+                        supplied_candidate_sha256s=(checkpoint_digest,),
+                    ),
+                }
+            )
+        elif self.checkpoint == "incomplete":
+            checkpoint_calls.append({"name": "inspect_file", "success": "unknown"})
+        checkpoint = type(
+            "PrimaryCheckpoint",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "candidate" if self.checkpoint != "unsolved" else "unsolved",
+                        "candidate": (
+                            checkpoint_candidate if self.checkpoint != "unsolved" else None
+                        ),
+                        "confidence": 0.5,
+                        "summary": "unfinished primary checkpoint",
+                        "evidence": ["hypothesis"] if self.checkpoint != "unsolved" else [],
+                        "next_steps": ["continue"],
+                    }
+                ),
+                "tool_calls": checkpoint_calls,
+            },
+        )()
+        follow_up = callback(checkpoint, float(kwargs["timeout"]) - 1.0)
+        assert isinstance(follow_up, str)
+        self.continuations.append(json.loads(follow_up))
+        candidate_digest = hashlib.sha256(self._candidate.encode()).hexdigest()
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            candidate_sensitive=True,
+            candidate_sha256s=(candidate_digest,),
+        )
+        candidate = type(
+            "PrimaryCandidate",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "candidate",
+                        "candidate": self._candidate,
+                        "confidence": 0.9,
+                        "summary": "primary derived a source-bound candidate",
+                        "evidence": ["fixture bytes"],
+                        "next_steps": [],
+                    }
+                ),
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": True,
+                        "candidate_sha256s": [candidate_digest],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+        assert callback(candidate, float(kwargs["timeout"]) - 2.0) is None
+        return candidate
+
+
 class CandidateVerifierRuntime(BoundaryRuntime):
     def __init__(self, candidate: str, verifier_candidate: str | None) -> None:
         super().__init__(candidate)
@@ -491,11 +592,19 @@ class DynamicPhaseRuntime(UnsolvedBoundaryRuntime):
     def __init__(self) -> None:
         super().__init__("unused")
         self.prompts: list[tuple[dict[str, object], bool]] = []
+        self.continuations: list[tuple[str, str, bool]] = []
 
     async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
         del workspace
         document = json.loads(prompt)
         self.prompts.append((document, kwargs.get("tool_registry") is not None))
+        self.continuations.append(
+            (
+                str(document["execution_phase"]),
+                str(kwargs.get("model")),
+                callable(kwargs.get("continuation_callback")),
+            )
+        )
         observation = project_tool_observation(
             "inspect_file",
             success=True,
@@ -743,6 +852,49 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
         assert kwargs["reasoning_effort"] == job.effort
         assert document["control_route"]["model"] == job.model
         assert document["control_route"]["effort"] == job.effort
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "reason"),
+    (
+        ("unsolved", "unsolved"),
+        ("provenance", "candidate_unobserved"),
+        ("ineligible", "candidate_ineligible"),
+        ("supplied", "candidate_supplied"),
+        ("incomplete", "candidate_evidence_incomplete"),
+    ),
+)
+def test_daybreak_primary_continues_changed_same_session_until_source_bound_candidate(
+    tmp_path: Path, checkpoint: str, reason: str
+) -> None:
+    candidate = "INCYPHER{persistent_primary_source_proof}"
+    runtime = PersistentPrimaryRuntime(candidate, checkpoint)
+    config = replace(
+        _config(tmp_path),
+        attempts_per_challenge=4,
+        concurrency=4,
+        lead_lanes=1,
+        episodes_per_challenge=1,
+        submit_candidates=True,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=runtime,
+        )
+    )
+
+    assert report.solved == 1
+    assert len(runtime.continuations) == 1
+    follow_up = runtime.continuations[0]
+    assert follow_up["label"] == "TRUSTED_PRIMARY_SOLVER_CONTINUATION"
+    assert follow_up["continuation_round"] == 1
+    assert follow_up["reason"] == reason
+    assert follow_up["remaining_milliseconds"] == 14_000
+    initial = runtime.calls[0][0]
+    assert "primary flag solver, not a coordinator" in initial["task"]
 
 
 def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
@@ -1057,6 +1209,16 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     assert all(has_target for _, has_target in live)
     assert all(document["same_run_memory"] for document, _ in live)
     assert {job.role for job in view.jobs if job.episode == 1} == {"recovery"}
+    assert not any(
+        continued
+        for phase, model, continued in runtime.continuations
+        if phase == "local_analysis" and model == "gpt-daybreak-blue-latest"
+    )
+    assert any(
+        continued
+        for phase, model, continued in runtime.continuations
+        if phase == "shared_instance" and model == "gpt-daybreak-blue-latest"
+    )
 
 
 @pytest.mark.parametrize("invalid_connection", (False, True))
