@@ -1478,6 +1478,7 @@ class Orchestrator:
         run_id: str,
         run_root: Path,
         challenges: list[Challenge],
+        catalogue_ranks: dict[int, int],
         deadline: float,
         outcomes: dict[int, str],
     ) -> dict[int, str]:
@@ -1489,6 +1490,26 @@ class Orchestrator:
 
         def enqueue(challenge: Challenge, episode: int, reason: str) -> None:
             queued_at = time.monotonic()
+            self.state.admit_control_wave(
+                run_id,
+                challenge.id,
+                episode,
+                catalogue_ranks[challenge.id],
+                self.config.attempts_per_challenge,
+                {
+                    "budget": {
+                        "attempt_seconds": self.config.attempt_seconds,
+                        "max_lane_workspace_bytes": self.config.max_lane_workspace_bytes,
+                    },
+                    "context_policy": "fresh_lane_with_typed_same_run_history",
+                    "deadline_policy": "minimum_of_attempt_and_run_deadline",
+                    "effort": self.config.reasoning_effort,
+                    "model": self.config.model,
+                    "role": "specialist",
+                    "tactic": "baseline",
+                    "tool_policy": "bounded_offline_registry",
+                },
+            )
             queue.put_nowait((challenge, episode, queued_at))
             self.state.event(
                 run_id,
@@ -1518,6 +1539,7 @@ class Orchestrator:
             active.add(challenge.id)
             peak_active = max(peak_active, len(active))
             admitted_episodes += 1
+            self.state.start_control_wave(run_id, challenge.id, episode)
             self.state.event(
                 run_id,
                 "challenge_episode_admitted",
@@ -1574,6 +1596,7 @@ class Orchestrator:
                         return
                     challenge, episode, queued_at = item
                     terminal = await execute_episode(challenge, episode, queued_at)
+                    self.state.finish_control_wave(run_id, challenge.id, episode, terminal)
                     cleanup_pending = bool(self.state.owned_instances())
                     should_retry = (
                         terminal in {"unsolved", "error"}
@@ -1670,7 +1693,8 @@ class Orchestrator:
             challenges = await self._challenge_catalogue(deadline, identity)
             challenge_count = len(challenges)
             eligible: list[Challenge] = []
-            for challenge in challenges:
+            catalogue_entries: list[tuple[int, int, bool]] = []
+            for catalogue_rank, challenge in enumerate(challenges):
                 self.state.upsert_challenge(
                     challenge.id,
                     challenge.name,
@@ -1678,9 +1702,14 @@ class Orchestrator:
                     challenge.type,
                     challenge.value,
                 )
-                if challenge.type != "standard" and (
-                    challenge.type != "dynamic_iac" or not self.config.manage_dynamic_instances
-                ):
+                executable = not (
+                    challenge.type != "standard"
+                    and (
+                        challenge.type != "dynamic_iac" or not self.config.manage_dynamic_instances
+                    )
+                )
+                catalogue_entries.append((catalogue_rank, challenge.id, executable))
+                if not executable:
                     self.state.set_challenge_status(challenge.id, "unsupported")
                     self.state.event(
                         run_id,
@@ -1697,11 +1726,16 @@ class Orchestrator:
                     outcomes[challenge.id] = "unsupported"
                     continue
                 eligible.append(challenge)
+            self.state.record_control_catalogue(run_id, catalogue_entries)
             if eligible:
                 await self._run_challenge_queue(
                     run_id,
                     run_root,
                     eligible,
+                    {
+                        challenge_id: catalogue_rank
+                        for catalogue_rank, challenge_id, _ in catalogue_entries
+                    },
                     deadline,
                     outcomes,
                 )
@@ -1709,15 +1743,18 @@ class Orchestrator:
             self.state.finish_run(run_id, status)
         except RunDeadlineReached:
             status = "deadline"
+            self.state.interrupt_control_run(run_id, "run_deadline")
             self.state.finish_run(run_id, status)
         except (asyncio.CancelledError, KeyboardInterrupt):
             try:
+                self.state.interrupt_control_run(run_id, "supervisor_interrupted")
                 self.state.finish_run(run_id, "interrupted")
             except ValueError:
                 pass
             raise
         except BaseException:
             try:
+                self.state.interrupt_control_run(run_id, "run_failed")
                 self.state.finish_run(run_id, "failed")
             except ValueError:
                 pass

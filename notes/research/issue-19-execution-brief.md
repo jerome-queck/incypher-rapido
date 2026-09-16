@@ -278,18 +278,45 @@ rewriting the recorded baseline arm.
 Each focused PR must preserve unrelated work, pass Python 3.11/3.12 and Linux AMD64/ARM64 CI, and
 be squash-merged only after independent review is resolved.
 
+### Core implementation tracer: durable job journal
+
+The first core tracer adds the public `DurableJobControl.drive(config, board=..., runtime=...)`
+and `DurableJobControl.inspect(state_path, run_id=None)` seams. The existing Board and runtime
+interfaces remain the only effect boundaries. Complete per-run catalogue membership plus initial
+Specialist lane identities, catalogue rank, episode, material route fingerprint, truthful lane
+terminal, and admitted/started/closed event sequences are written in the same SQLite transaction
+domain as run state. Inspection uses one read transaction and returns only sanitized job and run
+metadata; retained solver candidates and their digests are deliberately absent. Pending Board
+effects and owned instances are intentionally state-wide safety counts, even while inspecting a
+prior run.
+
+The tracer establishes a measured substrate, not the final scheduler: the existing orchestrator
+still owns execution order, and adaptive routing, private vault, independent verification, durable
+queue authority, and same-run recovery remain subsequent red/green tracers. Public boundary tests
+prove sanitized round-trip inspection; stable order across reopened inspection; unchanged-route
+identity across episodes; material-route separation; live queued/running projection; graceful
+deadline closure; and process-loss recovery after a real `os._exit`. This recovery preserves a
+lane terminal committed immediately before process loss, interrupts only unfinished jobs, and
+closes the lost run before starting a new run; it does not yet resume the same run. The first
+independent Daybreak/xhigh review found five P1 defects and one P2 overclaim. Re-review found one
+further P1 terminal-overwrite crash window. All were addressed test-first. A third Daybreak/xhigh
+release review found no P0-P3 defects; CI remains the release gate.
+
+Local release validation: Ruff and `git diff --check` clean; 604 passed and 1 skipped on both
+Python 3.11 and 3.12.
+
 ## Acceptance ledger
 
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; behavior arms pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: material route identity durable and unchanged baseline retry detected; adaptive routes pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | pending |
-| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | pending |
+| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | pending |
-| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | pending |
+| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
 | Board inactive semantics established | E6 independent evidence | pending |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | pending |
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending |
@@ -314,6 +341,12 @@ be squash-merged only after independent review is resolved.
 | Red replay clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; rejected a speculative green gate and triggered an evidence-only red-baseline correction |
 | Evidence-only red replay release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; release accepted with no P0-P3 findings, no fallback |
 | Python 3.12 CI signal-fixture investigation | `gpt-5.6-luna` / `xhigh` | complete; confirmed inherited `SIGXCPU=SIG_IGN`, test-only reset selected, no fallback |
+| Core public-seam/test design | `gpt-5.6-luna` / `xhigh` | complete; narrow non-live tracer sequence, no fallback |
+| Core state/recovery design | `gpt-daybreak-blue-latest` / `xhigh` | complete; durable journal and at-most-once crash constraints, no fallback |
+| Core routing/vault design | `gpt-daybreak-blue-latest` / `xhigh` | complete; failure fingerprints and private-retention boundaries, no fallback |
+| Core journal independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete; five P1 defects and one P2 overclaim found, all addressed test-first; re-review pending, no fallback |
+| Core journal fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; one P1 terminal-overwrite crash window found and fixed test-first; clean re-review pending, no fallback |
+| Core journal clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, 81 focused tests clean, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
