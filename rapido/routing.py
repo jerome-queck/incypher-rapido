@@ -45,6 +45,7 @@ _ROUTABLE_TOOL_FAILURES = frozenset(
         "bad_request",
         "context_window_exceeded",
         "invalid_value",
+        "no_progress",
         "response_stream_connection_failed",
         "response_stream_disconnected",
         "sandbox_error",
@@ -204,6 +205,19 @@ def baseline_route(
     )
 
 
+def instance_follow_on_route(current: RouteSpec) -> RouteSpec:
+    """Move a dynamic challenge from local analysis to one shared live instance."""
+    return replace(
+        current,
+        role="recovery",
+        tactic="instance_enabled_follow_on",
+        context_profile="typed_local_history_with_fresh_target",
+        tool_policy="bounded_registry_with_assigned_target",
+        verification_recipe="source_reobservation_after_local_analysis",
+        workspace_generation=current.workspace_generation + 1,
+    )
+
+
 def classify_failure(
     *,
     terminal: str,
@@ -246,6 +260,8 @@ def classify_failure(
             return FailureSignal(kind, matched[0])
     if terminal == "error" and attempt_count == 0:
         return FailureSignal("container", "unclassified_pre_lane_failure")
+    if terminal == "unsolved" and attempt_count > 0:
+        return FailureSignal("tool", "stalled_without_candidate")
     return None
 
 
@@ -285,6 +301,7 @@ def route_failure(request: RouteRequest) -> RouteDecision:
         )
     if failure.kind == "disagreement":
         if failure.subreason not in {
+            "board_rejected_candidate",
             "distinct_source_candidates",
             "retained_candidate_requires_verification",
         }:
@@ -293,16 +310,24 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 "disagreement_verifier_unavailable",
                 "no durable private candidate fact authorizes verifier dispatch",
             )
-        rule_id = "private_source_reobservation_v1"
-        successor = replace(
-            request.current,
-            role="verifier",
-            tactic="independent_source_reobservation",
-            context_profile="fresh_source_only_no_candidate_carry",
-            verification_recipe="fresh_source_reobservation_v1",
-            attempt_seconds=min(7_200, max(300, request.current.attempt_seconds * 2)),
-            deadline_policy="evidence_earned_within_original_run_deadline",
-        )
+        if failure.subreason == "board_rejected_candidate":
+            rule_id = "board_rejection_recovery_v1"
+            successor = replace(
+                request.current,
+                role="recovery",
+                tactic="alternate_candidate_after_board_rejection",
+                context_profile="typed_facts_without_rejected_candidate",
+                workspace_generation=request.current.workspace_generation + 1,
+            )
+        else:
+            rule_id = "private_source_reobservation_v1"
+            successor = replace(
+                request.current,
+                role="verifier",
+                tactic="independent_source_reobservation",
+                context_profile="fresh_source_only_no_candidate_carry",
+                verification_recipe="fresh_source_reobservation_v1",
+            )
     if failure.kind == "timeout":
         return _terminal(
             request,
@@ -335,12 +360,22 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 "tool_unsafe_native_failure",
                 "authorization or unclassified provider failure is not retryable",
             )
-        rule_id = "tool_alternate_representation_v1"
-        successor = replace(
-            request.current,
-            tactic="alternate_representation",
-            context_profile="fresh_without_failed_tool_assumption",
-        )
+        if failure.subreason == "stalled_without_candidate":
+            rule_id = "typed_peer_recovery_v1"
+            successor = replace(
+                request.current,
+                role="recovery",
+                tactic="typed_peer_recovery",
+                context_profile="durable_facts_only",
+                workspace_generation=request.current.workspace_generation + 1,
+            )
+        else:
+            rule_id = "tool_alternate_representation_v1"
+            successor = replace(
+                request.current,
+                tactic="alternate_representation",
+                context_profile="fresh_without_failed_tool_assumption",
+            )
     elif failure.kind == "container":
         if failure.subreason == "unclassified_pre_lane_failure":
             return _terminal(
@@ -403,5 +438,6 @@ __all__ = [
     "RouteSpec",
     "baseline_route",
     "classify_failure",
+    "instance_follow_on_route",
     "route_failure",
 ]

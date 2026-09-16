@@ -154,7 +154,6 @@ class RuntimeConfig:
     profile: str
     memory_arm: str
     challenge_ids: tuple[int, ...]
-    wrong_submission_ceiling: int
     submit_candidates: bool
     manage_dynamic_instances: bool
 
@@ -205,7 +204,7 @@ class RuntimeConfig:
 
         active_challenges = _integer(values, "RAPIDO_ACTIVE_CHALLENGES", 5, minimum=1, maximum=8)
         episodes_per_challenge = _integer(
-            values, "RAPIDO_EPISODES_PER_CHALLENGE", 2, minimum=1, maximum=4
+            values, "RAPIDO_EPISODES_PER_CHALLENGE", 3, minimum=1, maximum=4
         )
         dynamic_concurrency = _integer(
             values, "RAPIDO_DYNAMIC_CONCURRENCY", 1, minimum=1, maximum=1
@@ -290,7 +289,7 @@ class RuntimeConfig:
             dynamic_concurrency=dynamic_concurrency,
             attempts_per_challenge=attempts_per_challenge,
             attempt_seconds=_integer(
-                values, "RAPIDO_ATTEMPT_SECONDS", 1_800, minimum=15, maximum=7200
+                values, "RAPIDO_ATTEMPT_SECONDS", 800, minimum=15, maximum=7200
             ),
             instance_ready_seconds=instance_ready_seconds,
             instance_cleanup_seconds=instance_cleanup_seconds,
@@ -305,9 +304,6 @@ class RuntimeConfig:
             profile=profile,
             memory_arm=memory_arm,
             challenge_ids=_challenge_ids(values),
-            wrong_submission_ceiling=_integer(
-                values, "RAPIDO_WRONG_SUBMISSION_CEILING", 2, minimum=0, maximum=10
-            ),
             submit_candidates=_boolean(values, "RAPIDO_SUBMIT_CANDIDATES", True),
             manage_dynamic_instances=_boolean(values, "RAPIDO_MANAGE_DYNAMIC_INSTANCES", True),
         )
@@ -343,7 +339,6 @@ class RuntimeConfig:
             "profile": self.profile,
             "memory_arm": self.memory_arm,
             "challenge_ids": list(self.challenge_ids),
-            "wrong_submission_ceiling": self.wrong_submission_ceiling,
             "submit_candidates": self.submit_candidates,
             "manage_dynamic_instances": self.manage_dynamic_instances,
             "board_token_present": bool(self.board_token),

@@ -14,6 +14,8 @@ import pytest
 
 from rapido.board import Challenge, Verdict
 from rapido.config import RuntimeConfig
+from rapido.control import DurableJobControl
+from rapido.evidence import project_tool_observation
 from rapido.orchestrator import Orchestrator
 from rapido.state import StateStore
 
@@ -359,6 +361,55 @@ class BlockingDynamicRuntime:
         self.closed = True
 
 
+class SolveAndReplaceRuntime:
+    def __init__(self, candidate: str) -> None:
+        self.candidate = candidate
+        self.release = asyncio.Event()
+        self.sixth_started = asyncio.Event()
+        self.cancelled_winner_peers = 0
+        self.admissions: list[tuple[int, int]] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> SimpleNamespace:
+        document = json.loads(prompt)
+        challenge_id = int(document["challenge"]["id"])
+        lane = int(document["lane"])
+        self.admissions.append((challenge_id, lane))
+        if challenge_id == 6:
+            self.sixth_started.set()
+        if challenge_id == 1 and lane == 0:
+            await asyncio.sleep(0.02)
+            candidate_hash = hashlib.sha256(self.candidate.encode()).hexdigest()
+            observation = project_tool_observation(
+                "inspect_file",
+                success=True,
+                source_bound=True,
+                candidate_sensitive=True,
+                candidate_sha256s=(candidate_hash,),
+            )
+            result = turn(document, self.candidate)
+            result.tool_calls[0].update(
+                {
+                    "candidate_sensitive": True,
+                    "host_observation": observation,
+                    "supplied_candidate_sha256s": [],
+                }
+            )
+            return result
+        try:
+            await self.release.wait()
+            return turn(document)
+        except asyncio.CancelledError:
+            if challenge_id == 1:
+                self.cancelled_winner_peers += 1
+            raise
+
+    async def close(self) -> None:
+        pass
+
+
 def assert_drained(cfg: RuntimeConfig, board: OfflineBoard, store: StateStore) -> None:
     assert board.active_instances == {}
     assert store.owned_instances() == []
@@ -390,7 +441,40 @@ def test_distinct_challenges_fill_four_turn_capacity_without_oversubscription(
     asyncio.run(exercise())
 
 
-def test_fifo_coverage_precedes_successors_and_carry_is_lane_local(tmp_path: Path) -> None:
+def test_correct_closes_one_of_five_engagements_and_admits_next(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        candidate = "INCYPHER{engagement_replacement}"
+        cfg = config(
+            tmp_path,
+            active_challenges=5,
+            concurrency=20,
+            attempts_per_challenge=4,
+            submit_candidates=True,
+        )
+        board = OfflineBoard([challenge(index) for index in range(1, 7)])
+        runtime = SolveAndReplaceRuntime(candidate)
+        task = asyncio.create_task(DurableJobControl.drive(cfg, board=board, runtime=runtime))
+        try:
+            await asyncio.wait_for(runtime.sixth_started.wait(), timeout=2)
+            assert runtime.cancelled_winner_peers == 3
+            assert {challenge_id for challenge_id, _ in runtime.admissions[:20]} == {
+                1,
+                2,
+                3,
+                4,
+                5,
+            }
+        finally:
+            runtime.release.set()
+            report = await task
+
+        assert report.solved == 1
+        assert board.submissions == [(1, candidate)]
+
+    asyncio.run(exercise())
+
+
+def test_engagement_slots_hold_successors_and_carry_is_lane_local(tmp_path: Path) -> None:
     async def exercise() -> None:
         cfg = config(
             tmp_path,
@@ -408,30 +492,29 @@ def test_fifo_coverage_precedes_successors_and_carry_is_lane_local(tmp_path: Pat
                 runtime,
             ).run()
         )
-        episode_zero = asyncio.create_task(runtime.all_episode_zero_admitted.wait())
         episode_one = asyncio.create_task(runtime.episode_one_admitted.wait())
         try:
-            done, _ = await asyncio.wait(
-                {episode_zero, episode_one},
-                timeout=1,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            assert episode_zero in done, "episode 1 bypassed unseen challenge episode 0"
+            await asyncio.wait_for(episode_one, timeout=1)
+            assert not runtime.all_episode_zero_admitted.is_set()
         finally:
             runtime.release_slow_episode_zero.set()
             await task
-            for waiter in (episode_zero, episode_one):
+            for waiter in (episode_one,):
                 if not waiter.done():
                     waiter.cancel()
-            await asyncio.gather(episode_zero, episode_one, return_exceptions=True)
+            await asyncio.gather(episode_one, return_exceptions=True)
 
-        first_episode_one = min(
-            index for index, (_, episode, _) in enumerate(runtime.admissions) if episode == 1
+        challenge_one_successor = min(
+            index
+            for index, (challenge_id, episode, _) in enumerate(runtime.admissions)
+            if challenge_id == 1 and episode == 1
         )
-        last_episode_zero = max(
-            index for index, (_, episode, _) in enumerate(runtime.admissions) if episode == 0
+        challenge_three_initial = min(
+            index
+            for index, (challenge_id, episode, _) in enumerate(runtime.admissions)
+            if challenge_id == 3 and episode == 0
         )
-        assert last_episode_zero < first_episode_one
+        assert challenge_one_successor < challenge_three_initial
         assert runtime.overlapping_episode_violations == []
         assert runtime.invalid_carry == []
         assert runtime.invalid_observations == []
@@ -463,7 +546,7 @@ def test_catalogue_solved_metadata_does_not_create_run_local_solve(
     store.close()
 
 
-def test_simultaneous_candidates_serialize_post_and_atomically_stop_at_risk_one(
+def test_simultaneous_unlimited_candidates_serialize_without_global_risk_cap(
     tmp_path: Path,
 ) -> None:
     async def exercise() -> None:
@@ -471,7 +554,6 @@ def test_simultaneous_candidates_serialize_post_and_atomically_stop_at_risk_one(
         cfg = config(
             tmp_path,
             submit_candidates=True,
-            wrong_submission_ceiling=1,
         )
         board = SerializedRiskBoard([challenge(1), challenge(2)])
         runtime = FourTurnBarrierRuntime(candidates=candidates)
@@ -489,10 +571,10 @@ def test_simultaneous_candidates_serialize_post_and_atomically_stop_at_risk_one(
             board.release_first.set()
             report = await task
 
-        assert len(board.submissions) == 1
-        assert store.submission_risk_count() == 1
-        assert report.unsolved == 1
-        assert report.candidates == 1
+        assert len(board.submissions) == 2
+        assert store.submission_risk_count() == 2
+        assert report.unsolved == 2
+        assert report.candidates == 0
         store.close()
 
     asyncio.run(exercise())

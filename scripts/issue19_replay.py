@@ -240,6 +240,11 @@ class _InertRuntime:
             return _Turn("", status="failed", failure_class="usage_limit_exceeded")
         if fixture.name == "container":
             raise OSError("inert container-boundary representative")
+        if fixture.name == "board" and document["execution_phase"] == "local_analysis":
+            return _Turn(
+                _finding(),
+                tool_calls=[_observation_call(success=True, source_bound=True)],
+            )
         raise AssertionError("the Board representative must stop before runtime.solve")
 
     async def close(self) -> None:
@@ -1067,6 +1072,17 @@ def _case_satisfied(case: dict[str, Any], run_id: str) -> bool:
     if fixture.name == "board":
         expected_initial = []
         expected_retry = []
+    expected_episode_observation = (
+        {
+            "initial": {"admitted": False, "completed": False},
+            "retry": {"admitted": False, "completed": False},
+        }
+        if fixture.name == "board"
+        else {
+            "initial": {"admitted": True, "completed": True},
+            "retry": {"admitted": True, "completed": True},
+        }
+    )
     failure_evidence = case["initial_failure_evidence"]
     gap_sequences = case["gap_event_sequences"]
     if (
@@ -1079,11 +1095,7 @@ def _case_satisfied(case: dict[str, Any], run_id: str) -> bool:
         or failure_evidence["event_sequences"][0] <= 0
         or set(gap_sequences) != set(_GAP_EVENT_KINDS)
         or any(gap_sequences.values())
-        or case["episode_observation"]
-        != {
-            "initial": {"admitted": True, "completed": True},
-            "retry": {"admitted": True, "completed": True},
-        }
+        or case["episode_observation"] != expected_episode_observation
         or case["initial_failure_observed"] is not True
         or case["unresolved_after_retry"] is not True
         or case["board_mutation_calls"] != 0
@@ -1143,17 +1155,25 @@ def _expected_red_gate(report: dict[str, Any]) -> dict[str, Any]:
     episode_observations = coverage["episode_observations"]
     if (
         coverage["catalogue_entries"] != CHALLENGE_COUNT
-        or coverage["initial_admitted"] != CHALLENGE_COUNT
-        or coverage["initial_completed"] != CHALLENGE_COUNT
-        or coverage["retry_admitted"] != CHALLENGE_COUNT
-        or coverage["retry_completed"] != CHALLENGE_COUNT
+        or coverage["initial_admitted"] != CHALLENGE_COUNT - 1
+        or coverage["initial_completed"] != CHALLENGE_COUNT - 1
+        or coverage["retry_admitted"] != CHALLENGE_COUNT - 1
+        or coverage["retry_completed"] != CHALLENGE_COUNT - 1
         or coverage["initial_order"] != coverage["retry_order"]
-        or sorted(coverage["initial_order"]) != expected_ids
-        or coverage["all_initial_admitted_before_first_retry"] is not True
+        or sorted(coverage["initial_order"])
+        != [challenge_id for challenge_id in expected_ids if challenge_id != BOARD_CASE_ID]
+        or coverage["all_initial_admitted_before_first_retry"] is not False
         or [item["challenge_id"] for item in episode_observations] != expected_ids
         or any(
-            item["initial"] != {"admitted": True, "completed": True}
-            or item["retry"] != {"admitted": True, "completed": True}
+            (
+                item["initial"] != {"admitted": False, "completed": False}
+                or item["retry"] != {"admitted": False, "completed": False}
+            )
+            if item["challenge_id"] == BOARD_CASE_ID
+            else (
+                item["initial"] != {"admitted": True, "completed": True}
+                or item["retry"] != {"admitted": True, "completed": True}
+            )
             for item in episode_observations
         )
     ):

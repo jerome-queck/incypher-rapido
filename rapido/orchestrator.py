@@ -12,6 +12,7 @@ import stat
 import time
 import urllib.parse
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -40,7 +41,7 @@ from .memory import (
     project_memory,
 )
 from .memory import HostObservation as MemoryHostObservation
-from .routing import RouteSpec, baseline_route
+from .routing import RouteSpec, baseline_route, instance_follow_on_route
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_PRIOR_ATTEMPTS,
@@ -78,6 +79,7 @@ class NativeRuntime(Protocol):
         output_schema: dict[str, Any],
         timeout: float,
         tool_registry: Any | None = None,
+        progress_callback: Callable[[], None] | None = None,
     ) -> NativeTurn: ...
 
     async def close(self) -> None: ...
@@ -85,6 +87,10 @@ class NativeRuntime(Protocol):
 
 class RunDeadlineReached(TimeoutError):
     """The whole-run work deadline elapsed."""
+
+
+class NoProgressError(TimeoutError):
+    """A native lane made no host-visible tool progress for its bounded window."""
 
 
 _NATIVE_FAILURE_CLASSES = frozenset(
@@ -140,6 +146,7 @@ class LaneResult:
     terminal_status: str
     tool_call_count: int
     tool_calls: tuple[ToolCallEvidence, ...]
+    submission_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +178,7 @@ _RUN_ROOT_NAME = re.compile(r"run-[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DURABLE_TOOL_CALLS = 10
 _MAX_DURABLE_TOOL_HASHES = 2
+_NO_PROGRESS_SECONDS = 600.0
 _DURABLE_TOOL_NAMES = frozenset(
     {
         "audio_metadata",
@@ -365,7 +373,6 @@ class Orchestrator:
         self.state = state
         self.runtime = runtime
         self._slots = asyncio.Semaphore(config.concurrency)
-        self._dynamic_slots = asyncio.Semaphore(config.dynamic_concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
 
@@ -451,8 +458,11 @@ class Orchestrator:
         raise AssertionError("unreachable Board read retry state")
 
     async def _cleanup_owned_instances(self, deadline: float) -> None:
+        clean = True
         for record in self.state.owned_instances():
-            await self._cleanup_instance_record(record, deadline)
+            clean = await self._cleanup_instance_record(record, deadline) and clean
+        if not clean or self.state.owned_instances():
+            raise BoardError("owned instance cleanup remains indeterminate")
 
     async def _cleanup_instance_record(self, record: dict[str, Any], deadline: float) -> bool:
         run_id = str(record["run_id"])
@@ -533,11 +543,15 @@ class Orchestrator:
             )
             return False
         if _instance_receipt(current) != expected_receipt:
-            self.state.mark_instance(run_id, challenge_id, "removed")
             self.state.event(
                 run_id,
                 "instance_cleanup",
-                {"challenge_id": challenge_id, "status": "skipped_replaced", "reason": reason},
+                {
+                    "challenge_id": challenge_id,
+                    "status": "manual_reconciliation_required",
+                    "reason": reason,
+                    "detail": "Board generation no longer matches owned receipt",
+                },
             )
             return False
         try:
@@ -615,7 +629,12 @@ class Orchestrator:
         raise BoardError("dynamic instance ownership receipt could not be recovered")
 
     async def _start_instance(
-        self, run_id: str, challenge: Challenge, deadline: float
+        self,
+        run_id: str,
+        challenge: Challenge,
+        deadline: float,
+        *,
+        on_create_attempt: Callable[[], None] | None = None,
     ) -> tuple[tuple[TargetEndpoint, ...], str]:
         """Persist intent, create once, poll boundedly, and parse Board-issued endpoints."""
         existing = await self._board_read(deadline, self.board.instance, "GET", challenge.id)
@@ -630,6 +649,8 @@ class Orchestrator:
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
         if deadline - time.monotonic() <= transport_timeout:
             raise RunDeadlineReached
+        if on_create_attempt is not None:
+            on_create_attempt()
         create_task = asyncio.create_task(
             asyncio.to_thread(self.board.instance, "POST", challenge.id)
         )
@@ -788,12 +809,32 @@ class Orchestrator:
             raise BoardError("Board identity changed during qualification")
         details.sort(
             key=lambda challenge: (
-                challenge.type != "dynamic_iac",
                 _category_rank(challenge.category),
                 challenge.value,
                 challenge.id,
             )
         )
+        balanced: list[Challenge] = []
+        standard_slots = max(1, self.config.active_challenges - 1)
+        for solved in (False, True):
+            group = [challenge for challenge in details if challenge.solved is solved]
+            dynamics = [challenge for challenge in group if challenge.type == "dynamic_iac"]
+            standards = [challenge for challenge in group if challenge.type == "standard"]
+            others = [
+                challenge
+                for challenge in group
+                if challenge.type not in {"dynamic_iac", "standard"}
+            ]
+            while dynamics or standards:
+                if dynamics:
+                    balanced.append(dynamics.pop(0))
+                for _ in range(standard_slots):
+                    if standards:
+                        balanced.append(standards.pop(0))
+                    elif dynamics:
+                        balanced.append(dynamics.pop(0))
+            balanced.extend(others)
+        details = balanced
         if self.config.challenge_ids:
             available = {challenge.id for challenge in details}
             missing = sorted(set(self.config.challenge_ids) - available)
@@ -810,7 +851,9 @@ class Orchestrator:
         episode: int,
         deadline: float,
         workspace_generation: int = 0,
+        lane_count: int | None = None,
     ) -> list[tuple[Path, list[str]]]:
+        lanes = self.config.attempts_per_challenge if lane_count is None else lane_count
         challenge_root = (
             run_root
             / f"challenge-{challenge.id}"
@@ -844,14 +887,11 @@ class Orchestrator:
                 raise BoardError("challenge artifacts exceed the aggregate byte limit")
             source_paths.append(destination)
 
-        if (
-            total_bytes * (self.config.attempts_per_challenge + 1)
-            > self.config.max_challenge_workspace_bytes
-        ):
+        if total_bytes * (lanes + 1) > self.config.max_challenge_workspace_bytes:
             raise BoardError("challenge artifact copies exceed the workspace byte limit")
 
         workspaces: list[tuple[Path, list[str]]] = []
-        for lane in range(self.config.attempts_per_challenge):
+        for lane in range(lanes):
             workspace = challenge_root / f"lane-{lane}"
             artifact_root = workspace / "artifacts"
             artifact_root.mkdir(parents=True, exist_ok=False)
@@ -1149,6 +1189,7 @@ class Orchestrator:
         timeout_seconds: float,
         target_endpoints: tuple[TargetEndpoint, ...] = (),
         route: RouteSpec | None = None,
+        candidate_submitter: Callable[[str], Awaitable[str]] | None = None,
     ) -> LaneResult:
         attempt_id = f"{run_id}:{challenge.id}:{episode}:{lane}"
         run_evidence = self._run_evidence
@@ -1192,6 +1233,7 @@ class Orchestrator:
         tool_calls: tuple[ToolCallEvidence, ...] = ()
         tool_evidence_complete = False
         target_registry = None
+        submission_status: str | None = None
 
         def finish_attempt(
             status: str,
@@ -1270,6 +1312,13 @@ class Orchestrator:
                     if self._adaptive_control and self.config.peer_profile == "mixed_v1"
                     else None
                 ),
+                execution_phase=(
+                    "shared_instance"
+                    if target_endpoints
+                    else "local_analysis"
+                    if challenge.type == "dynamic_iac"
+                    else "standard"
+                ),
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -1288,6 +1337,13 @@ class Orchestrator:
                     },
                 )
             if same_run_memory is not None:
+                if (
+                    target_endpoints
+                    and route is not None
+                    and route.role == "recovery"
+                    and not same_run_memory.records
+                ):
+                    raise EvidenceError("shared-instance recovery has no typed local memory")
                 self.state.event(
                     run_id,
                     "same_run_memory_projected",
@@ -1304,8 +1360,14 @@ class Orchestrator:
                         **candidate_memory.public_counts(),
                     },
                 )
+            progress_at = time.monotonic()
+
+            def note_progress() -> None:
+                nonlocal progress_at
+                progress_at = time.monotonic()
+
             async with asyncio.timeout(timeout_seconds + 5):
-                turn = await self.runtime.solve(
+                solve_call = self.runtime.solve(
                     workspace,
                     turn_prompt,
                     developer_instructions=DEVELOPER_INSTRUCTIONS,
@@ -1314,7 +1376,41 @@ class Orchestrator:
                     output_schema=SOLVER_OUTPUT_SCHEMA,
                     timeout=timeout_seconds,
                     tool_registry=target_registry,
+                    progress_callback=note_progress,
                 )
+                if timeout_seconds <= _NO_PROGRESS_SECONDS:
+                    turn = await solve_call
+                else:
+                    solve_task = asyncio.create_task(solve_call)
+                    try:
+                        while True:
+                            quiet_remaining = _NO_PROGRESS_SECONDS - (
+                                time.monotonic() - progress_at
+                            )
+                            done, _ = await asyncio.wait(
+                                {solve_task},
+                                timeout=max(0.0, quiet_remaining),
+                            )
+                            if done:
+                                turn = solve_task.result()
+                                break
+                            if time.monotonic() - progress_at < _NO_PROGRESS_SECONDS:
+                                continue
+                            solve_task.cancel()
+                            cancelled = (await asyncio.gather(solve_task, return_exceptions=True))[
+                                0
+                            ]
+                            error = NoProgressError(
+                                "native turn exceeded its no-tool-progress window"
+                            )
+                            result = getattr(cancelled, "result", None)
+                            if result is not None:
+                                error.result = result
+                            raise error
+                    finally:
+                        if not solve_task.done():
+                            solve_task.cancel()
+                            await asyncio.gather(solve_task, return_exceptions=True)
             tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
                 turn.tool_calls
             )
@@ -1362,6 +1458,7 @@ class Orchestrator:
         except TimeoutError as exc:
             finding = None
             terminal = "timeout"
+            no_progress = isinstance(exc, NoProgressError)
             timeout_calls = getattr(getattr(exc, "result", None), "tool_calls", None)
             tool_count_known = isinstance(timeout_calls, list)
             if tool_count_known:
@@ -1370,10 +1467,14 @@ class Orchestrator:
                 )
             finish_attempt(
                 terminal,
-                evidence_gap="turn_timeout",
-                summary="native turn exceeded deadline",
+                evidence_gap="turn_no_progress" if no_progress else "turn_timeout",
+                summary=(
+                    "native turn made no host-visible tool progress"
+                    if no_progress
+                    else "native turn exceeded deadline"
+                ),
                 tool_count=tool_call_count,
-                failure_class="timeout",
+                failure_class="no_progress" if no_progress else "timeout",
             )
             self.state.event(
                 run_id,
@@ -1382,6 +1483,7 @@ class Orchestrator:
                     "challenge_id": challenge.id,
                     "episode": episode,
                     "lane": lane,
+                    "reason": "no_progress" if no_progress else "deadline",
                     "tool_call_count": tool_call_count if tool_count_known else None,
                 },
             )
@@ -1523,6 +1625,12 @@ class Orchestrator:
         finally:
             if target_registry is not None:
                 target_registry.close()
+        if (
+            finding is not None
+            and finding.candidate is not None
+            and candidate_submitter is not None
+        ):
+            submission_status = await candidate_submitter(finding.candidate)
         return LaneResult(
             episode,
             lane,
@@ -1532,6 +1640,7 @@ class Orchestrator:
             terminal,
             tool_call_count,
             tool_calls,
+            submission_status,
         )
 
     def _withhold_candidate(
@@ -1563,25 +1672,41 @@ class Orchestrator:
         """Serialize eligibility, reservation, Board effect, and finalization."""
         fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
         async with self._submission_lock:
-            if self._adaptive_control and not self.state.candidate_is_verified(
-                run_id, challenge.id, candidate
-            ):
+            if self.state.challenge_has_correct_submission(run_id, challenge.id):
                 return self._withhold_candidate(
-                    run_id, challenge.id, fingerprint, "candidate_unverified"
+                    run_id, challenge.id, fingerprint, "challenge_already_solved_in_run"
+                )
+            if self.state.challenge_unresolved_submission_count(challenge.id) > 0:
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "submission_pending_reconciliation"
+                )
+            unlimited = challenge.max_attempts in (None, 0)
+            prior_wrong = self.state.challenge_incorrect_submission_count(challenge.id)
+            verified = self.state.candidate_is_verified(run_id, challenge.id, candidate)
+            qualified = verified
+            if self._adaptive_control and not qualified and (not unlimited or prior_wrong > 0):
+                return self._withhold_candidate(
+                    run_id,
+                    challenge.id,
+                    fingerprint,
+                    "candidate_unverified_after_limit_or_wrong",
                 )
             transport_timeout = float(getattr(self.board, "timeout", 15.0))
             if deadline - time.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
-            try:
-                current = await self._board_read(deadline, self.board.challenge, challenge.id)
-            except (BoardError, RunDeadlineReached):
-                return self._withhold_candidate(
-                    run_id, challenge.id, fingerprint, "eligibility_refresh_failed"
-                )
-            if self.state.submission_risk_count() >= self.config.wrong_submission_ceiling:
-                return self._withhold_candidate(
-                    run_id, challenge.id, fingerprint, "submission_risk_ceiling"
-                )
+            current = challenge
+            if not unlimited:
+                try:
+                    current = await self._board_read(deadline, self.board.challenge, challenge.id)
+                except (BoardError, RunDeadlineReached):
+                    return self._withhold_candidate(
+                        run_id, challenge.id, fingerprint, "eligibility_refresh_failed"
+                    )
+                unlimited = current.max_attempts in (None, 0)
+                if self._adaptive_control and not qualified and not unlimited:
+                    return self._withhold_candidate(
+                        run_id, challenge.id, fingerprint, "candidate_unverified_after_limit"
+                    )
             if (
                 not current.solved
                 and current.max_attempts not in (None, 0)
@@ -1637,6 +1762,7 @@ class Orchestrator:
         *,
         episode: int = 0,
         route: RouteSpec | None = None,
+        lane_count: int | None = None,
     ) -> str:
         self.state.set_challenge_status(challenge.id, "running")
         try:
@@ -1646,6 +1772,7 @@ class Orchestrator:
                 episode,
                 deadline,
                 0 if route is None else route.workspace_generation,
+                lane_count,
             )
         except RunDeadlineReached:
             self.state.set_challenge_status(challenge.id, "unsolved")
@@ -1660,6 +1787,11 @@ class Orchestrator:
                 self.state.record_control_failure_origin(run_id, challenge.id, episode, "container")
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
+        if self._adaptive_control:
+            started_lanes = self.state.start_control_wave(run_id, challenge.id, episode)
+            if lane_count is not None and started_lanes != lane_count:
+                raise RuntimeError("control wave lane count changed before execution")
+            lane_count = started_lanes
         remaining = max(0.0, deadline - time.monotonic())
         attempt_seconds = self.config.attempt_seconds if route is None else route.attempt_seconds
         timeout = min(float(attempt_seconds), remaining)
@@ -1679,7 +1811,16 @@ class Orchestrator:
                     timeout,
                     target_endpoints,
                     route,
+                    submit_from_lane if self._adaptive_control else None,
                 )
+
+        async def submit_from_lane(candidate: str) -> str:
+            fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+            if not self.config.submit_candidates:
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "submissions_disabled"
+                )
+            return await self._submit_candidate(run_id, challenge, candidate, deadline)
 
         pending = {
             asyncio.create_task(scheduled_lane(lane, workspace, artifacts))
@@ -1692,6 +1833,13 @@ class Orchestrator:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     results.append(task.result())
+                if any(result.submission_status == "solved" for result in results):
+                    winner_found = True
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    pending.clear()
+                    break
                 current_findings = [
                     result.finding for result in results if result.finding is not None
                 ]
@@ -1764,6 +1912,16 @@ class Orchestrator:
         verified_candidate = (
             self.state.verified_candidate(run_id, challenge.id) if self._adaptive_control else None
         )
+        if any(result.submission_status == "solved" for result in results):
+            self.state.set_challenge_status(challenge.id, "solved")
+            return "solved"
+        if (
+            self._adaptive_control
+            and verified_candidate is None
+            and self.state.pending_candidate_count(run_id, challenge.id) > 0
+        ):
+            self.state.set_challenge_status(challenge.id, "candidate")
+            return "candidate"
         if parallel < 2 and verified_candidate is None:
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
@@ -1773,13 +1931,6 @@ class Orchestrator:
             if self._adaptive_control
             else admitted_candidate(findings, challenge.description)
         )
-        if (
-            self._adaptive_control
-            and candidate is None
-            and self.state.pending_candidate_count(run_id, challenge.id) > 0
-        ):
-            self.state.set_challenge_status(challenge.id, "candidate")
-            return "candidate"
         if candidate is None:
             terminals = {result.terminal_status for result in results}
             status = "unsupported" if terminals == {"unsupported"} else "unsolved"
@@ -1804,6 +1955,7 @@ class Orchestrator:
         *,
         episode: int = 0,
         route: RouteSpec | None = None,
+        lane_count: int | None = None,
     ) -> str:
         """Own the complete create/use/delete lifecycle for one dynamic challenge."""
         try:
@@ -1849,6 +2001,7 @@ class Orchestrator:
                 endpoints,
                 episode=episode,
                 route=route,
+                lane_count=lane_count,
             )
         finally:
             cleanup_deadline = time.monotonic() + self.config.instance_cleanup_seconds
@@ -1887,37 +2040,23 @@ class Orchestrator:
         deadline: float,
         outcomes: dict[int, str],
     ) -> dict[int, str]:
-        """Run a fair episode queue while keeping policy and ownership internal."""
-        queue: asyncio.Queue[tuple[Challenge, int, float, RouteSpec] | None] = asyncio.Queue()
+        """Keep five challenge engagements active; auxiliary waves stay inside them."""
+        queue: asyncio.PriorityQueue[tuple[int, Challenge | None, float]] = asyncio.PriorityQueue()
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
+        dynamic_ids = {challenge.id for challenge in challenges if challenge.type == "dynamic_iac"}
+        instance_condition = asyncio.Condition()
+        instance_holders: set[int] = set()
+        instance_completed: set[int] = set()
         initial_route = baseline_route(
             model=self.config.model,
             effort=self.config.reasoning_effort,
             attempt_seconds=self.config.attempt_seconds,
         )
 
-        def enqueue(
-            challenge: Challenge,
-            episode: int,
-            reason: str,
-            route: RouteSpec,
-            *,
-            already_admitted: bool = False,
-        ) -> None:
+        def record_queued(challenge: Challenge, episode: int, reason: str) -> float:
             queued_at = time.monotonic()
-            if not already_admitted:
-                self.state.admit_control_wave(
-                    run_id,
-                    challenge.id,
-                    episode,
-                    catalogue_ranks[challenge.id],
-                    self.config.attempts_per_challenge,
-                    route,
-                    self._initial_peer_assignments() if episode == 0 else None,
-                )
-            queue.put_nowait((challenge, episode, queued_at, route))
             self.state.event(
                 run_id,
                 "challenge_episode_queued",
@@ -1927,9 +2066,20 @@ class Orchestrator:
                     "reason": reason,
                 },
             )
+            return queued_at
 
         for challenge in challenges:
-            enqueue(challenge, 0, "initial_coverage", initial_route)
+            self.state.admit_control_wave(
+                run_id,
+                challenge.id,
+                0,
+                catalogue_ranks[challenge.id],
+                self.config.attempts_per_challenge,
+                initial_route,
+                self._initial_peer_assignments(),
+            )
+            queued_at = record_queued(challenge, 0, "initial_coverage")
+            queue.put_nowait((catalogue_ranks[challenge.id], challenge, queued_at))
             if challenge.solved:
                 self.state.event(
                     run_id,
@@ -1938,13 +2088,17 @@ class Orchestrator:
                 )
 
         async def execute_episode(
-            challenge: Challenge, episode: int, queued_at: float, route: RouteSpec
+            challenge: Challenge,
+            episode: int,
+            queued_at: float,
+            route: RouteSpec,
+            target_endpoints: tuple[TargetEndpoint, ...],
         ) -> str:
-            nonlocal admitted_episodes, peak_active
+            nonlocal admitted_episodes
             if time.monotonic() >= deadline:
                 raise RunDeadlineReached
-            if challenge.id in active:
-                raise RuntimeError("challenge episode overlap violated")
+            if challenge.id not in active:
+                raise RuntimeError("challenge episode escaped its engagement")
             if route.backoff_policy == "bounded_60_seconds":
                 if deadline - time.monotonic() <= 60:
                     raise RunDeadlineReached
@@ -1960,10 +2114,12 @@ class Orchestrator:
                 await asyncio.sleep(60)
             elif route.backoff_policy != "none":
                 raise ValueError("unsupported durable backoff policy")
-            active.add(challenge.id)
-            peak_active = max(peak_active, len(active))
             admitted_episodes += 1
-            self.state.start_control_wave(run_id, challenge.id, episode)
+            lane_count = (
+                self.state.control_wave_lane_count(run_id, challenge.id, episode)
+                if self._adaptive_control
+                else self.config.attempts_per_challenge
+            )
             self.state.event(
                 run_id,
                 "challenge_episode_admitted",
@@ -1972,71 +2128,247 @@ class Orchestrator:
                     "episode": episode,
                     "queue_wait_seconds": round(time.monotonic() - queued_at, 3),
                     "active_challenges": len(active),
+                    "auxiliary": route.role in {"recovery", "verifier"},
+                    "execution_phase": (
+                        "shared_instance"
+                        if target_endpoints
+                        else "local_analysis"
+                        if challenge.type == "dynamic_iac"
+                        else "standard"
+                    ),
                 },
             )
             try:
-                if challenge.type == "dynamic_iac":
-                    async with self._dynamic_slots:
-                        if self.state.owned_instances():
-                            self.state.event(
-                                run_id,
-                                "dynamic_admission_blocked",
-                                {
-                                    "challenge_id": challenge.id,
-                                    "episode": episode,
-                                    "reason": "cleanup_pending",
-                                },
-                            )
-                            if self._adaptive_control:
-                                self.state.record_control_failure_origin(
-                                    run_id, challenge.id, episode, "board"
-                                )
-                            self.state.set_challenge_status(challenge.id, "error")
-                            return "error"
-                        return await self._solve_dynamic_challenge(
-                            run_id,
-                            run_root,
-                            challenge,
-                            deadline,
-                            episode=episode,
-                            route=route if self._adaptive_control else None,
-                        )
                 return await self._solve_challenge(
                     run_id,
                     run_root,
                     challenge,
                     deadline,
+                    target_endpoints,
                     episode=episode,
                     route=route if self._adaptive_control else None,
+                    lane_count=lane_count,
                 )
             finally:
                 challenge_root = run_root / f"challenge-{challenge.id}"
-                try:
-                    await self._drain_rmtree(challenge_root / f"episode-{episode}")
-                    with suppress(FileNotFoundError, OSError):
-                        challenge_root.rmdir()
-                finally:
-                    active.remove(challenge.id)
+                await self._drain_rmtree(challenge_root / f"episode-{episode}")
+                with suppress(FileNotFoundError, OSError):
+                    challenge_root.rmdir()
 
-        async def worker() -> None:
-            while True:
-                item = await queue.get()
-                try:
-                    if item is None:
-                        return
-                    challenge, episode, queued_at, route = item
-                    terminal = await execute_episode(challenge, episode, queued_at, route)
-                    cleanup_pending = bool(self.state.owned_instances())
-                    should_retry = (
-                        (
-                            terminal in {"unsolved", "error"}
-                            or self._adaptive_control
-                            and terminal == "candidate"
+        async def run_engagement(challenge: Challenge, initial_queued_at: float) -> None:
+            nonlocal peak_active
+            episode = 0
+            route = initial_route
+            queued_at = initial_queued_at
+            target_endpoints: tuple[TargetEndpoint, ...] = ()
+            receipt: str | None = None
+            lease_acquired = False
+            create_attempted = False
+            outcome: str | None = None
+            active.add(challenge.id)
+            peak_active = max(peak_active, len(active))
+            self.state.event(
+                run_id,
+                "challenge_engagement_started",
+                {"challenge_id": challenge.id, "active_challenges": len(active)},
+            )
+
+            async def acquire_instance() -> None:
+                nonlocal create_attempted, lease_acquired, receipt, target_endpoints
+                self.state.event(
+                    run_id,
+                    "instance_lease_waiting",
+                    {"challenge_id": challenge.id, "episode": episode},
+                )
+                async with instance_condition:
+                    while True:
+                        eligible = sorted(
+                            active & dynamic_ids - instance_completed - instance_holders,
+                            key=catalogue_ranks.__getitem__,
                         )
-                        and episode + 1 < self.config.episodes_per_challenge
-                        and time.monotonic() < deadline
-                        and not (challenge.type == "dynamic_iac" and cleanup_pending)
+                        if (
+                            len(instance_holders) < self.config.dynamic_concurrency
+                            and challenge.id
+                            in eligible[: self.config.dynamic_concurrency - len(instance_holders)]
+                        ):
+                            instance_holders.add(challenge.id)
+                            lease_acquired = True
+                            break
+                        await instance_condition.wait()
+                existing = self.state.owned_instances()
+                unsafe = any(record["status"] != "owned" for record in existing)
+                if unsafe or len(existing) >= self.config.dynamic_concurrency:
+                    self.state.event(
+                        run_id,
+                        "instance_lease_blocked",
+                        {
+                            "challenge_id": challenge.id,
+                            "episode": episode,
+                            "reason": "cleanup_indeterminate",
+                        },
                     )
+                    raise BoardError("instance manager is fenced by indeterminate ownership")
+                self.state.event(
+                    run_id,
+                    "instance_lease_granted",
+                    {"challenge_id": challenge.id, "episode": episode},
+                )
+
+                def note_create_attempt() -> None:
+                    nonlocal create_attempted
+                    create_attempted = True
+
+                target_endpoints, receipt = await self._start_instance(
+                    run_id,
+                    challenge,
+                    deadline,
+                    on_create_attempt=note_create_attempt,
+                )
+
+            async def release_instance() -> bool:
+                nonlocal lease_acquired, receipt, target_endpoints
+                if not lease_acquired:
+                    return True
+
+                cancelled: asyncio.CancelledError | None = None
+
+                async def drain_cleanup(cleanup: asyncio.Task[bool]) -> bool:
+                    nonlocal cancelled
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError as exc:
+                            cancelled = exc
+                    result = cleanup.result()
+                    return result
+
+                clean = True
+                try:
+                    records = [
+                        record
+                        for record in self.state.owned_instances()
+                        if record["run_id"] == run_id and record["challenge_id"] == challenge.id
+                    ]
+                    if receipt is not None:
+                        cleanup = asyncio.create_task(
+                            self._delete_instance(
+                                run_id,
+                                challenge.id,
+                                time.monotonic() + self.config.instance_cleanup_seconds,
+                                expected_receipt=receipt,
+                                reason="engagement_complete",
+                            )
+                        )
+                        clean = await drain_cleanup(cleanup)
+                    elif records:
+                        cleanup = asyncio.create_task(
+                            self._cleanup_instance_record(
+                                records[0],
+                                time.monotonic() + self.config.instance_cleanup_seconds,
+                            )
+                        )
+                        clean = await drain_cleanup(cleanup)
+                    remaining = [
+                        record
+                        for record in self.state.owned_instances()
+                        if record["run_id"] == run_id and record["challenge_id"] == challenge.id
+                    ]
+                    clean = clean and not remaining
+                    self.state.event(
+                        run_id,
+                        "instance_lease_released" if clean else "instance_lease_poisoned",
+                        {
+                            "challenge_id": challenge.id,
+                            "episode": episode,
+                            **({} if clean else {"reason": "cleanup_indeterminate"}),
+                        },
+                    )
+                finally:
+                    lease_acquired = False
+                    receipt = None
+                    target_endpoints = ()
+                    async with instance_condition:
+                        instance_holders.discard(challenge.id)
+                        if create_attempted:
+                            instance_completed.add(challenge.id)
+                        instance_condition.notify_all()
+                if not clean:
+                    return False
+                if cancelled is not None:
+                    raise cancelled
+                return True
+
+            try:
+                while True:
+                    needs_instance = challenge.type == "dynamic_iac" and (
+                        not self._adaptive_control
+                        or route.tactic == "instance_enabled_follow_on"
+                        or lease_acquired
+                    )
+                    if needs_instance and not lease_acquired:
+                        try:
+                            await acquire_instance()
+                        except BoardError:
+                            if self._adaptive_control:
+                                self.state.record_control_failure_origin(
+                                    run_id, challenge.id, episode, "board"
+                                )
+                            self.state.set_challenge_status(challenge.id, "error")
+                            if not await release_instance():
+                                raise BoardError("instance startup cleanup remained indeterminate")
+                            terminal = "error"
+                        else:
+                            terminal = await execute_episode(
+                                challenge, episode, queued_at, route, target_endpoints
+                            )
+                    else:
+                        terminal = await execute_episode(
+                            challenge, episode, queued_at, route, target_endpoints
+                        )
+
+                    has_successor_budget = (
+                        episode + 1 < self.config.episodes_per_challenge
+                        and time.monotonic() < deadline
+                    )
+                    dynamic_local_follow_on = (
+                        self._adaptive_control
+                        and challenge.type == "dynamic_iac"
+                        and not lease_acquired
+                        and not create_attempted
+                        and route.tactic != "instance_enabled_follow_on"
+                        and terminal in {"candidate", "unsolved", "error"}
+                        and has_successor_budget
+                    )
+                    should_retry = (
+                        terminal in {"unsolved", "error", "candidate"}
+                        and has_successor_budget
+                        and not (
+                            challenge.type == "dynamic_iac"
+                            and create_attempted
+                            and not lease_acquired
+                        )
+                    )
+                    if dynamic_local_follow_on:
+                        successor = instance_follow_on_route(route)
+                        assignments = tuple(
+                            ("recovery", model, effort)
+                            for _, model, effort in self._initial_peer_assignments()
+                        )
+                        self.state.finish_and_admit_control_wave(
+                            run_id=run_id,
+                            challenge_id=challenge.id,
+                            source_episode=episode,
+                            next_episode=episode + 1,
+                            catalogue_rank=catalogue_ranks[challenge.id],
+                            terminal=terminal,
+                            route=successor,
+                            assignments=assignments,
+                            reason="local_analysis_complete",
+                        )
+                        episode += 1
+                        route = successor
+                        queued_at = record_queued(challenge, episode, "local_analysis_complete")
+                        continue
                     if self._adaptive_control:
                         decision = self.state.finish_and_decide_control_wave(
                             run_id=run_id,
@@ -2053,21 +2385,56 @@ class Orchestrator:
                         )
                         if decision is not None and decision.disposition == "dispatch":
                             assert decision.successor is not None
-                            enqueue(
-                                challenge,
-                                episode + 1,
-                                decision.failure.kind,
-                                decision.successor,
-                                already_admitted=True,
-                            )
-                        else:
-                            outcomes[challenge.id] = terminal
+                            episode += 1
+                            route = decision.successor
+                            queued_at = record_queued(challenge, episode, decision.failure.kind)
+                            continue
                     else:
                         self.state.finish_control_wave(run_id, challenge.id, episode, terminal)
                         if should_retry:
-                            enqueue(challenge, episode + 1, terminal, route)
-                        else:
-                            outcomes[challenge.id] = terminal
+                            episode += 1
+                            self.state.admit_control_wave(
+                                run_id,
+                                challenge.id,
+                                episode,
+                                catalogue_ranks[challenge.id],
+                                self.config.attempts_per_challenge,
+                                route,
+                            )
+                            queued_at = record_queued(challenge, episode, terminal)
+                            continue
+                    outcome = terminal
+                    break
+            finally:
+                clean = True
+                try:
+                    clean = await release_instance()
+                finally:
+                    active.remove(challenge.id)
+                    async with instance_condition:
+                        instance_condition.notify_all()
+                if not clean:
+                    raise BoardError("instance cleanup did not prove absence")
+            assert outcome is not None
+            outcomes[challenge.id] = outcome
+            self.state.event(
+                run_id,
+                "challenge_engagement_closed",
+                {
+                    "challenge_id": challenge.id,
+                    "terminal": outcome,
+                    "active_challenges": len(active),
+                },
+            )
+
+        async def worker() -> None:
+            while True:
+                item = await queue.get()
+                try:
+                    _, challenge, queued_at = item
+                    if challenge is None:
+                        return
+                    await run_engagement(challenge, queued_at)
                 finally:
                     queue.task_done()
 
@@ -2089,13 +2456,26 @@ class Orchestrator:
                 await failed_worker
                 raise RuntimeError("challenge queue worker exited before drain")
             for _ in workers:
-                queue.put_nowait(None)
+                queue.put_nowait((2**31, None, 0.0))
             await asyncio.gather(*workers)
         finally:
             for task in (join, timer, *workers):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(join, timer, *workers, return_exceptions=True)
+            shutdown = await asyncio.gather(join, timer, *workers, return_exceptions=True)
+            if self.state.owned_instances():
+                raise BoardError("instance cleanup remained indeterminate during queue shutdown")
+            failure = next(
+                (
+                    result
+                    for result in shutdown
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, (asyncio.CancelledError, RunDeadlineReached))
+                ),
+                None,
+            )
+            if failure is not None:
+                raise failure
         self.state.event(
             run_id,
             "challenge_queue_summary",

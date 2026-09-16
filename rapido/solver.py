@@ -486,12 +486,15 @@ def build_turn_prompt(
     control_route: RouteSpec | None = None,
     same_run_memory: MemoryProjection | None = None,
     agent_role: str | None = None,
+    execution_phase: str = "standard",
 ) -> str:
     """Serialize challenge data plus bounded, explicitly untrusted successor context."""
     if type(lane) is not int or lane < 0:
         raise ValueError("lane must be a non-negative integer")
     if type(episode) is not int or not 0 <= episode <= MAX_CARRY_EPISODE:
         raise ValueError("episode is outside the permitted range")
+    if execution_phase not in {"standard", "local_analysis", "shared_instance"}:
+        raise ValueError("execution phase is invalid")
     if isinstance(prior_attempts, (str, bytes)):
         raise TypeError("prior_attempts must be a sequence of AttemptCarry values")
     try:
@@ -543,6 +546,7 @@ def build_turn_prompt(
         "label": "UNTRUSTED_CHALLENGE_DATA",
         "lane": lane,
         "episode": episode,
+        "execution_phase": execution_phase,
         "lineage": lane,
         "strategy": _LANE_STRATEGIES[lane % len(_LANE_STRATEGIES)],
         "challenge": {
@@ -584,6 +588,19 @@ def build_turn_prompt(
         )
     elif agent_role is not None:
         raise ValueError("agent role requires a control route")
+    if execution_phase == "local_analysis":
+        document["task"] = (
+            "This is the local analysis phase: no live instance exists yet. Mine the provided "
+            "artifacts, test locally, and leave concrete evidence and next steps for the later "
+            "shared-instance phase. Do not report unsupported merely because target tools are "
+            "absent. " + str(document["task"])
+        )
+    elif execution_phase == "shared_instance":
+        document["task"] = (
+            "This challenge's one live instance is shared by all peer lanes. Use the assigned "
+            "target tools and typed local-analysis memory to test the strongest hypotheses first. "
+            + str(document["task"])
+        )
     _fit_challenge_description(document, challenge.description)
     if prior_observations is not None:
         _fit_observation_bundle(document, prior_observations)

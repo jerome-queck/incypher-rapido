@@ -16,11 +16,11 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert config.peer_profile == "mixed_v1"
     assert config.concurrency == 20
     assert config.active_challenges == 5
-    assert config.episodes_per_challenge == 2
+    assert config.episodes_per_challenge == 3
     assert config.dynamic_concurrency == 1
     assert config.memory_arm == "typed_challenge_v1"
     assert config.attempts_per_challenge == 4
-    assert config.attempt_seconds == 1_800
+    assert config.attempt_seconds == 800
     assert config.board_timeout_seconds == 15
     assert config.instance_ready_seconds == 120
     assert config.instance_cleanup_seconds == 45
@@ -35,7 +35,7 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert config.manage_dynamic_instances is True
     public = config.public_record()
     assert public["active_challenges"] == 5
-    assert public["episodes_per_challenge"] == 2
+    assert public["episodes_per_challenge"] == 3
     assert public["dynamic_concurrency"] == 1
     assert public["memory_arm"] == "typed_challenge_v1"
     assert public["board_timeout_seconds"] == 15

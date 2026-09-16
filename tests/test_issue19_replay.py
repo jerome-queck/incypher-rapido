@@ -89,14 +89,21 @@ def test_expected_red_is_empirical_all_15_and_truthful() -> None:
 
     coverage = result["coverage"]
     assert coverage["catalogue_entries"] == 15
-    assert coverage["initial_admitted"] == coverage["initial_completed"] == 15
-    assert coverage["retry_admitted"] == coverage["retry_completed"] == 15
+    assert coverage["initial_admitted"] == coverage["initial_completed"] == 14
+    assert coverage["retry_admitted"] == coverage["retry_completed"] == 14
     assert coverage["initial_order"] == coverage["retry_order"]
-    assert sorted(coverage["initial_order"]) == list(range(1, 16))
-    assert coverage["all_initial_admitted_before_first_retry"] is True
+    assert sorted(coverage["initial_order"]) == [
+        challenge_id for challenge_id in range(1, 16) if challenge_id != HARNESS.BOARD_CASE_ID
+    ]
+    assert coverage["all_initial_admitted_before_first_retry"] is False
     assert [item["challenge_id"] for item in coverage["episode_observations"]] == list(range(1, 16))
     assert all(
-        item[phase] == {"admitted": True, "completed": True}
+        item[phase]
+        == (
+            {"admitted": False, "completed": False}
+            if item["challenge_id"] == HARNESS.BOARD_CASE_ID
+            else {"admitted": True, "completed": True}
+        )
         for item in coverage["episode_observations"]
         for phase in ("initial", "retry")
     )
@@ -194,12 +201,10 @@ def test_adaptive_control_routes_eight_failures_without_unchanged_retry(tmp_path
     report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
 
-    initial = {
-        decision.failure_kind: decision
-        for decision in view.route_decisions
-        if decision.source_episode == 0
-    }
-    assert set(initial) >= {
+    first: dict[str, object] = {}
+    for decision in view.route_decisions:
+        first.setdefault(decision.failure_kind, decision)
+    assert set(first) >= {
         "policy",
         "provenance",
         "disagreement",
@@ -210,7 +215,7 @@ def test_adaptive_control_routes_eight_failures_without_unchanged_retry(tmp_path
         "container",
     }
     assert {
-        kind: initial[kind].disposition
+        kind: first[kind].disposition
         for kind in (
             "policy",
             "provenance",
@@ -231,6 +236,7 @@ def test_adaptive_control_routes_eight_failures_without_unchanged_retry(tmp_path
         "board": "contain",
         "container": "dispatch",
     }
+    assert first["board"].source_episode == 1
     assert all(
         decision.changed_axes
         and decision.successor_route_fingerprint != decision.source_route_fingerprint

@@ -109,11 +109,19 @@ def test_durable_private_candidate_facts_dispatch_verifier(subreason: str) -> No
         "tactic",
         "context_profile",
         "verification_recipe",
-        "attempt_seconds",
-        "deadline_policy",
     }
-    assert decision.successor.attempt_seconds == 1_800
-    assert decision.successor.deadline_policy == "evidence_earned_within_original_run_deadline"
+    assert decision.successor.attempt_seconds == 900
+    assert decision.successor.deadline_policy == "minimum_of_attempt_and_run_deadline"
+
+
+def test_board_rejected_candidate_dispatches_changed_recovery_route() -> None:
+    decision = route_failure(_request("disagreement", subreason="board_rejected_candidate"))
+    assert decision.disposition == "dispatch"
+    assert decision.rule_id == "board_rejection_recovery_v1"
+    assert decision.successor is not None
+    assert decision.successor.role == "recovery"
+    assert decision.successor.tactic == "alternate_candidate_after_board_rejection"
+    assert decision.changed_axes
 
 
 def test_classifier_uses_typed_pre_lane_origin() -> None:

@@ -18,7 +18,7 @@ import json
 import os
 import re
 import urllib.parse
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -365,6 +365,7 @@ class _TurnState:
     taint_state_bytes: int = 0
     candidate_hashes: int = 0
     tool_request_active: bool = False
+    progress_callback: Callable[[], None] | None = None
     last_event: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1566,6 +1567,9 @@ class CodexAppClient:
                 )
             except (TypeError, ValueError):
                 call_record["host_observation"] = None
+            if state.progress_callback is not None:
+                with suppress(Exception):
+                    state.progress_callback()
         await self._send_response(message_id, result=payload)
 
     async def _handle_notification(self, method: str, params: Any) -> None:
@@ -1775,6 +1779,7 @@ class CodexAppClient:
         model: str | None = None,
         reasoning_effort: str | None = None,
         raise_on_timeout: bool = True,
+        progress_callback: Callable[[], None] | None = None,
     ) -> TurnResult:
         target_thread = thread_id or self.thread_id
         if not target_thread:
@@ -1809,7 +1814,11 @@ class CodexAppClient:
             }
         params["outputSchema"] = copy.deepcopy(dict(output_schema))
 
-        state = _TurnState(thread_id=target_thread, completion=loop.create_future())
+        state = _TurnState(
+            thread_id=target_thread,
+            completion=loop.create_future(),
+            progress_callback=progress_callback,
+        )
         self._anonymous_turns.append(state)
         self._pending_turns[target_thread] = state
         try:
@@ -1892,6 +1901,7 @@ class CodexAppClient:
         tool_registry: ToolRegistry | None = None,
         workspace_registry: WorkspaceThreadRegistry | MutableMapping[str, str] | None = None,
         raise_on_timeout: bool = True,
+        progress_callback: Callable[[], None] | None = None,
     ) -> TurnResult:
         """Start the app-server/thread as needed and execute one structured turn."""
         loop = asyncio.get_running_loop()
@@ -1963,6 +1973,7 @@ class CodexAppClient:
                 model=selected_model,
                 reasoning_effort=selected_effort,
                 raise_on_timeout=raise_on_timeout,
+                progress_callback=progress_callback,
             )
         finally:
             self._retire_thread(str(workspace), thread_id)

@@ -26,8 +26,8 @@ from rapido.orchestrator import Orchestrator
 from rapido.state import StateStore
 
 SCHEMA_VERSION = 2
-FIXTURE_VERSION = "issue-19-candidate-flow-comparison-v2"
-SOURCE_BASE_COMMIT = "a2fe384000244061a6fda4f07fe30bc19a24f4b0"
+FIXTURE_VERSION = "issue-19-candidate-flow-comparison-v3"
+SOURCE_BASE_COMMIT = "d1478bc3630ea616f56127808b4d6300b35ed4fe"
 _ARMS = ("exact_agreement", "private_verification")
 _CASES = (
     "peer_agreement",
@@ -112,7 +112,7 @@ class _Board:
             100,
             ("/files/source.json",),
             False,
-            0,
+            3,
             0,
             None,
             None,
