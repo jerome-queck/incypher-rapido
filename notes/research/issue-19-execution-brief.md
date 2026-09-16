@@ -641,7 +641,7 @@ comparison green while independent review is pending.
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | in progress: calibration reached 20 simultaneous attempts, 1,362 tools, 92 sampled PIDs, and 347.2 MiB sampled RAM; conversion, not local capacity, dominated; final proof pending |
-| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: same-run continuation locally verified through real process loss, original deadline, durable ordering/memory, effect fencing, and cleanup; final-image rehearsal pending |
+| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: exact merged image verified through real process loss, same-run continuation, private candidate retention, changed verification, original deadline, durable ordering/memory, effect fencing, and cleanup; final live proof pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; diagnostic produced two new correct solves and cumulative at least five, but began only 13 challenges |
@@ -787,7 +787,25 @@ ordering, recovered checkpoint/host-observation memory, correct-intent reconcili
 and challenge-material mismatch rejection, terminal fast-path completion, unaffected progress beside
 a pending effect, expiry without solver start, receiptless create-intent fencing, successful receipt
 cleanup, and mismatched-receipt containment. Ruff, 178 focused tests, and the full 796-passed/1-skipped
-suite are clean. Final-image crash rehearsal and the acceptance run remain pending.
+suite are clean. The acceptance run remains pending.
+
+### Exact-image recovery rehearsal
+
+After PR #42 merged, commit `b1c235b21f74964876ab17c05ed63f627d7caabe` built locally for
+Linux ARM64 as `sha256:95a1399e36ec492afbdafeb54c3d32b8abe15bf7a7b247f2f3a1f9f6ba9f2ac9`.
+Codex reported `0.154.0`; the offline tooling acceptance passed under the competition CPU, memory,
+PID, read-only-root, tmpfs, dropped-capability, and no-new-privileges bounds with networking
+disabled.
+
+A separate no-network rehearsal used one fresh named state volume and no auth or Board credential.
+The first container called real `os._exit(23)` immediately after a source-bound Daybreak candidate
+was committed by the continuation callback. A second container using the same exact image and
+volume reopened the same run, retained one private candidate, dispatched one Verifier, completed
+both synthetic challenges, closed every durable job, and reported zero Board writes, pending
+submissions, and owned instances. This proves the merged recovery mechanism inside the production
+image; it is not a live solve or a substitute for the 19,800-second acceptance run.
+After this sanitized record was pushed, the exact rehearsal volume and container names were absent;
+the image was retained, and no authentication state existed to preserve or remove.
 
 ## Model/effort ledger
 
@@ -868,7 +886,6 @@ and honest closeout remain pending.
 
 - Live-measure the merged persistent Daybreak and content-addressed artifact-lineage changes before
   authorizing the final acceptance run.
-- Rehearse same-run crash continuation in the exact final image before final acceptance.
 - Re-measure the focused changes before any 19,800-second run; the completed calibration cannot
   lower the final acceptance contract.
 - Register the exact merged final commit, image digest, challenge order, deadlines, and sampler
