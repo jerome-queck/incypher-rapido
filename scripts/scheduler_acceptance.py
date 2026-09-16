@@ -165,6 +165,8 @@ def _config(root: Path, arm: Arm) -> RuntimeConfig:
             "RAPIDO_ATTEMPT_SECONDS": "15",
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
+            "RAPIDO_PEER_PROFILE": "uniform_v1",
+            "RAPIDO_MEMORY_ARM": "lane_local_v1",
         }
     )
 

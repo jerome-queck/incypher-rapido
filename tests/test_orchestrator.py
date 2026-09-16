@@ -462,6 +462,11 @@ def config(tmp_path: Path, *, submit: bool = True) -> RuntimeConfig:
             "RAPIDO_CODEX_HOME": str(tmp_path / "auth"),
             "RAPIDO_SUBMIT_CANDIDATES": "true" if submit else "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
+            "RAPIDO_ACTIVE_CHALLENGES": "2",
+            "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
+            "RAPIDO_CONCURRENCY": "4",
+            "RAPIDO_PEER_PROFILE": "uniform_v1",
+            "RAPIDO_MEMORY_ARM": "lane_local_v1",
         }
     )
     return replace(base, run_seconds=60, attempt_seconds=15, episodes_per_challenge=1)

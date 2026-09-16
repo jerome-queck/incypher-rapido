@@ -79,18 +79,25 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 |---|---:|---|
 | `RAPIDO_MODEL` | `gpt-daybreak-blue-latest` | Exact app-server catalogue match; no fallback. |
 | `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by the selected model. |
-| `RAPIDO_CONCURRENCY` | `4` | Lane admission bound, measured for two complete 2-lane waves; range 2–8. |
-| `RAPIDO_ACTIVE_CHALLENGES` | `2` | Configured active-set partition; accepted range 1–4. |
+| `RAPIDO_SPECIALIST_MODEL` | `gpt-5.6-luna` | Exact peer-specialist model; no fallback. |
+| `RAPIDO_SPECIALIST_REASONING_EFFORTS` | `max,xhigh,max` | Repeating effort plan for non-lead lanes. |
+| `RAPIDO_LEAD_LANES` | `1` | Primary-model Lead lanes in every initial challenge wave. |
+| `RAPIDO_PEER_PROFILE` | `mixed_v1` | Mixed direct-peer scheduler. `uniform_v1` exists for frozen historical replay. |
+| `RAPIDO_CONCURRENCY` | `20` | Lane admission bound; accepted range 2–32. |
+| `RAPIDO_ACTIVE_CHALLENGES` | `5` | Configured active-set partition; accepted range 1–8. |
 | `RAPIDO_EPISODES_PER_CHALLENGE` | `2` | Configured episode bound; accepted range 1–4. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
-| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `2` | Independent lane count; accepted range 2–8. |
-| `RAPIDO_ATTEMPT_SECONDS` | `900` | Per-lane interrupt deadline. |
+| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: one Lead plus three Specialists by default; accepted range 2–8. |
+| `RAPIDO_ATTEMPT_SECONDS` | `1800` | Initial per-lane interrupt deadline. |
+| `RAPIDO_BOARD_TIMEOUT_SECONDS` | `15` | One bounded Board request. |
+| `RAPIDO_INSTANCE_READY_SECONDS` | `120` | Dynamic-instance readiness budget. |
+| `RAPIDO_INSTANCE_CLEANUP_SECONDS` | `45` | Dynamic cleanup budget; must cover three Board requests. |
 | `RAPIDO_RUN_SECONDS` | `19800` | Work-admission budget (5.5 hours). |
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | One artifact ceiling. |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source-byte ceiling. |
 | `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Run-wide ceiling; active challenges partition it. |
 | `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
-| `RAPIDO_MEMORY_ARM` | `lane_local_v1` | Registered memory arm. `typed_challenge_v1` shares only sanitized typed earlier-episode host/controller facts; Verifier `same_run_memory` remains empty. |
+| `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
 | `RAPIDO_SUBMIT_CANDIDATES` | `true` | Serial exact-agreement submissions; explicit false is developer-only. |
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Wrong/indeterminate submission-risk ceiling. |
@@ -113,14 +120,17 @@ and follow-up issue [#19](https://github.com/jerome-queck/incypher-rapido/issues
 
 The effective non-secret configuration is printed by `config`. Never publish state/work folders:
 attempt rows can contain candidate values, while submission records retain fingerprints and
-verdicts. The default `lane_local_v1` memory arm carries bounded, immutable, sanitized typed
-analysis plus host/controller facts from earlier episodes in the same lane. The experimental
+verdicts. The `lane_local_v1` comparison arm carries bounded, immutable, sanitized typed analysis
+plus host/controller facts from earlier episodes in the same lane. The selected default
 `typed_challenge_v1` arm also shares sanitized host/controller facts across lanes, but never
 cross-lane model prose. Every verifier `same_run_memory` projection is empty; private controller
 state still retains candidates for verification. Raw tool payloads, payload-derived digests,
 authorities, paths, credentials, and candidate fingerprints are never carried into public memory.
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
+The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
+Initial work defaults to Daybreak/xhigh plus Luna max/xhigh/max for each challenge. A routed
+Verifier or Recovery wave uses the primary exact model and remains inside the original run deadline.
 
 ## Stop, restart, and cleanup
 

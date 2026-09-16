@@ -128,14 +128,21 @@ class RuntimeConfig:
     board_url: str
     board_token: str
     team_key: str
+    board_timeout_seconds: int
     model: str
     reasoning_effort: str
+    specialist_model: str
+    specialist_reasoning_efforts: tuple[str, ...]
+    lead_lanes: int
+    peer_profile: str
     concurrency: int
     active_challenges: int
     episodes_per_challenge: int
     dynamic_concurrency: int
     attempts_per_challenge: int
     attempt_seconds: int
+    instance_ready_seconds: int
+    instance_cleanup_seconds: int
     run_seconds: int
     max_artifact_bytes: int
     max_challenge_bytes: int
@@ -168,26 +175,54 @@ class RuntimeConfig:
 
         effort = _text(values, "RAPIDO_REASONING_EFFORT", "xhigh")
         supported_efforts = {"low", "medium", "high", "xhigh", "max", "ultra"}
-        if effort not in supported_efforts:
-            raise ConfigError(
-                "RAPIDO_REASONING_EFFORT must be low, medium, high, xhigh, max, or ultra"
-            )
+        specialist_efforts = tuple(
+            item.strip()
+            for item in _text(
+                values,
+                "RAPIDO_SPECIALIST_REASONING_EFFORTS",
+                "max,xhigh,max",
+            ).split(",")
+        )
+        if (
+            effort not in supported_efforts
+            or not specialist_efforts
+            or len(specialist_efforts) > 8
+            or any(item not in supported_efforts for item in specialist_efforts)
+        ):
+            raise ConfigError("reasoning effort must be low, medium, high, xhigh, max, or ultra")
 
         profile = _text(values, "RAPIDO_PROFILE", "practice")
         if profile not in {"economy", "practice", "competition"}:
             raise ConfigError("RAPIDO_PROFILE must be economy, practice, or competition")
 
-        memory_arm = _text(values, "RAPIDO_MEMORY_ARM", "lane_local_v1")
+        peer_profile = _text(values, "RAPIDO_PEER_PROFILE", "mixed_v1")
+        if peer_profile not in {"mixed_v1", "uniform_v1"}:
+            raise ConfigError("RAPIDO_PEER_PROFILE must be mixed_v1 or uniform_v1")
+
+        memory_arm = _text(values, "RAPIDO_MEMORY_ARM", "typed_challenge_v1")
         if memory_arm not in {"lane_local_v1", "typed_challenge_v1"}:
             raise ConfigError("RAPIDO_MEMORY_ARM must be lane_local_v1 or typed_challenge_v1")
 
-        active_challenges = _integer(values, "RAPIDO_ACTIVE_CHALLENGES", 2, minimum=1, maximum=4)
+        active_challenges = _integer(values, "RAPIDO_ACTIVE_CHALLENGES", 5, minimum=1, maximum=8)
         episodes_per_challenge = _integer(
             values, "RAPIDO_EPISODES_PER_CHALLENGE", 2, minimum=1, maximum=4
         )
         dynamic_concurrency = _integer(
             values, "RAPIDO_DYNAMIC_CONCURRENCY", 1, minimum=1, maximum=1
         )
+        board_timeout_seconds = _integer(
+            values, "RAPIDO_BOARD_TIMEOUT_SECONDS", 15, minimum=1, maximum=120
+        )
+        instance_ready_seconds = _integer(
+            values, "RAPIDO_INSTANCE_READY_SECONDS", 120, minimum=2, maximum=600
+        )
+        instance_cleanup_seconds = _integer(
+            values, "RAPIDO_INSTANCE_CLEANUP_SECONDS", 45, minimum=3, maximum=600
+        )
+        if instance_ready_seconds <= board_timeout_seconds:
+            raise ConfigError("RAPIDO_INSTANCE_READY_SECONDS must exceed the Board timeout")
+        if instance_cleanup_seconds < board_timeout_seconds * 3:
+            raise ConfigError("RAPIDO_INSTANCE_CLEANUP_SECONDS must cover three Board requests")
 
         max_artifact_bytes = _integer(
             values,
@@ -206,9 +241,16 @@ class RuntimeConfig:
         if max_challenge_bytes < max_artifact_bytes:
             raise ConfigError("RAPIDO_MAX_CHALLENGE_BYTES must cover one maximum artifact")
         attempts_per_challenge = _integer(
-            values, "RAPIDO_ATTEMPTS_PER_CHALLENGE", 2, minimum=2, maximum=8
+            values, "RAPIDO_ATTEMPTS_PER_CHALLENGE", 4, minimum=2, maximum=8
         )
-        concurrency = _integer(values, "RAPIDO_CONCURRENCY", 4, minimum=2, maximum=8)
+        lead_lanes = _integer(
+            values,
+            "RAPIDO_LEAD_LANES",
+            1,
+            minimum=1,
+            maximum=attempts_per_challenge,
+        )
+        concurrency = _integer(values, "RAPIDO_CONCURRENCY", 20, minimum=2, maximum=32)
         required_concurrency = active_challenges * attempts_per_challenge
         if concurrency < required_concurrency:
             raise ConfigError(
@@ -235,16 +277,23 @@ class RuntimeConfig:
             board_url=_origin(values),
             board_token=token,
             team_key=team_key,
+            board_timeout_seconds=board_timeout_seconds,
             model=_text(values, "RAPIDO_MODEL", "gpt-daybreak-blue-latest"),
             reasoning_effort=effort,
+            specialist_model=_text(values, "RAPIDO_SPECIALIST_MODEL", "gpt-5.6-luna"),
+            specialist_reasoning_efforts=specialist_efforts,
+            lead_lanes=lead_lanes,
+            peer_profile=peer_profile,
             concurrency=concurrency,
             active_challenges=active_challenges,
             episodes_per_challenge=episodes_per_challenge,
             dynamic_concurrency=dynamic_concurrency,
             attempts_per_challenge=attempts_per_challenge,
             attempt_seconds=_integer(
-                values, "RAPIDO_ATTEMPT_SECONDS", 900, minimum=15, maximum=7200
+                values, "RAPIDO_ATTEMPT_SECONDS", 1_800, minimum=15, maximum=7200
             ),
+            instance_ready_seconds=instance_ready_seconds,
+            instance_cleanup_seconds=instance_cleanup_seconds,
             run_seconds=_integer(values, "RAPIDO_RUN_SECONDS", 19_800, minimum=60, maximum=172_800),
             max_artifact_bytes=max_artifact_bytes,
             max_challenge_bytes=max_challenge_bytes,
@@ -267,14 +316,21 @@ class RuntimeConfig:
         """Effective non-secret settings suitable for logs and run evidence."""
         return {
             "board_url": self.board_url,
+            "board_timeout_seconds": self.board_timeout_seconds,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "specialist_model": self.specialist_model,
+            "specialist_reasoning_efforts": list(self.specialist_reasoning_efforts),
+            "lead_lanes": self.lead_lanes,
+            "peer_profile": self.peer_profile,
             "concurrency": self.concurrency,
             "active_challenges": self.active_challenges,
             "episodes_per_challenge": self.episodes_per_challenge,
             "dynamic_concurrency": self.dynamic_concurrency,
             "attempts_per_challenge": self.attempts_per_challenge,
             "attempt_seconds": self.attempt_seconds,
+            "instance_ready_seconds": self.instance_ready_seconds,
+            "instance_cleanup_seconds": self.instance_cleanup_seconds,
             "run_seconds": self.run_seconds,
             "max_artifact_bytes": self.max_artifact_bytes,
             "max_challenge_bytes": self.max_challenge_bytes,

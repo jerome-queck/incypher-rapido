@@ -330,10 +330,13 @@ def _config(root: Path) -> RuntimeConfig:
             "RAPIDO_MODEL": MODEL,
             "RAPIDO_REASONING_EFFORT": REASONING_EFFORT,
             "RAPIDO_ACTIVE_CHALLENGES": "1",
+            "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
             "RAPIDO_CONCURRENCY": "2",
             "RAPIDO_EPISODES_PER_CHALLENGE": "2",
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "true",
+            "RAPIDO_PEER_PROFILE": "uniform_v1",
+            "RAPIDO_MEMORY_ARM": "lane_local_v1",
         }
     )
     return replace(base, run_seconds=60, attempt_seconds=15)

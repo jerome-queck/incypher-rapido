@@ -12,6 +12,7 @@ CONTAINER_DOC = ROOT / "deploy" / "CONTAINER.md"
 DOCKERIGNORE = ROOT / ".dockerignore"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TOOLING_ACCEPTANCE = ROOT / "scripts" / "tooling_acceptance.py"
+SETUP = ROOT / "scripts" / "setup_container.sh"
 
 
 def test_image_is_target_platform_python_and_pinned_codex() -> None:
@@ -99,6 +100,30 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
     assert "empty auth volume intentionally fails `run`" in text
     assert "Board-only `preflight` does not start or validate" in text
     assert "RAPIDO_MAX_WORKSPACE_BYTES=536870912000" in text
+
+
+def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> None:
+    text = SETUP.read_text()
+    for value in (
+        'write_env RAPIDO_MODEL "gpt-daybreak-blue-latest"',
+        'write_env RAPIDO_SPECIALIST_MODEL "gpt-5.6-luna"',
+        'write_env RAPIDO_SPECIALIST_REASONING_EFFORTS "max,xhigh,max"',
+        'write_env RAPIDO_LEAD_LANES "1"',
+        'write_env RAPIDO_PEER_PROFILE "mixed_v1"',
+        'write_env RAPIDO_MEMORY_ARM "typed_challenge_v1"',
+        'write_env RAPIDO_CONCURRENCY "20"',
+        'write_env RAPIDO_ACTIVE_CHALLENGES "5"',
+        'write_env RAPIDO_ATTEMPTS_PER_CHALLENGE "4"',
+        'write_env RAPIDO_ATTEMPT_SECONDS "1800"',
+        'write_env RAPIDO_BOARD_TIMEOUT_SECONDS "15"',
+        'write_env RAPIDO_INSTANCE_READY_SECONDS "120"',
+        'write_env RAPIDO_INSTANCE_CLEANUP_SECONDS "45"',
+        '--env-file "$ENV_FILE"',
+        'assert value["active_challenges"] == 5',
+        'assert value["attempts_per_challenge"] == 4',
+        'assert value["concurrency"] == 20',
+    ):
+        assert value in text
 
 
 def test_compose_template_allows_bounded_shutdown_cleanup() -> None:

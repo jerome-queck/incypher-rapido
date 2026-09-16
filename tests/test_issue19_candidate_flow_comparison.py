@@ -30,7 +30,8 @@ def _normalized(result: dict[str, object]) -> dict[str, object]:
     provenance.pop("elapsed_seconds")
     provenance.pop("environment")
     # Behavior replay is independent of the immutable source manifest recorded
-    # by the earlier E2 run; later production commits must change that manifest.
+    # by the earlier E2 run; later compatibility and production commits must change it.
+    provenance.pop("script_sha256")
     provenance.pop("production_source")
     observations = normalized["observations"]
     assert isinstance(observations, list)

@@ -78,6 +78,23 @@ def test_authorization_and_unknown_native_failures_are_contained(subreason: str)
     assert decision.rule_id == "tool_unsafe_native_failure"
 
 
+def test_quota_failure_earns_one_bounded_wait_without_model_fallback() -> None:
+    decision = route_failure(
+        _request(
+            "quota",
+            subreason="rate_limit_exceeded",
+            remaining_milliseconds=120_000,
+        )
+    )
+    assert decision.disposition == "dispatch"
+    assert decision.rule_id == "quota_bounded_wait_v1"
+    assert decision.successor is not None
+    assert decision.changed_axes == ("tactic", "backoff_policy")
+    assert decision.successor.backoff_policy == "bounded_60_seconds"
+    assert decision.successor.model == "gpt-daybreak-blue-latest"
+    assert decision.successor.effort == "xhigh"
+
+
 @pytest.mark.parametrize(
     "subreason", ("distinct_source_candidates", "retained_candidate_requires_verification")
 )
@@ -92,7 +109,11 @@ def test_durable_private_candidate_facts_dispatch_verifier(subreason: str) -> No
         "tactic",
         "context_profile",
         "verification_recipe",
+        "attempt_seconds",
+        "deadline_policy",
     }
+    assert decision.successor.attempt_seconds == 1_800
+    assert decision.successor.deadline_policy == "evidence_earned_within_original_run_deadline"
 
 
 def test_classifier_uses_typed_pre_lane_origin() -> None:

@@ -31,6 +31,9 @@ class JobView:
     episode: int
     phase: str
     role: str
+    agent_role: str
+    model: str
+    effort: str
     lane: int
     state: str
     route_fingerprint: str
@@ -188,8 +191,9 @@ class DurableJobControl:
                 )
             job_rows = connection.execute(
                 """
-                SELECT job_id, challenge_id, catalogue_rank, episode, phase, role, lane, state,
-                       route_fingerprint, admitted_sequence, started_sequence, closed_sequence
+                SELECT job_id, challenge_id, catalogue_rank, episode, phase, role,
+                       agent_role, model, effort, lane, state, route_fingerprint,
+                       admitted_sequence, started_sequence, closed_sequence
                 FROM control_jobs WHERE run_id=?
                 ORDER BY admitted_sequence, lane
                 """,
@@ -236,6 +240,9 @@ class DurableJobControl:
                         episode=int(job["episode"]),
                         phase=str(job["phase"]),
                         role=str(job["role"]),
+                        agent_role=str(job["agent_role"]),
+                        model=str(job["model"]),
+                        effort=str(job["effort"]),
                         lane=int(job["lane"]),
                         state=str(job["state"]),
                         route_fingerprint=str(_public_fingerprint(job["route_fingerprint"])),

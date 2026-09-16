@@ -485,6 +485,7 @@ def build_turn_prompt(
     prior_observations: EvidenceBundle | None = None,
     control_route: RouteSpec | None = None,
     same_run_memory: MemoryProjection | None = None,
+    agent_role: str | None = None,
 ) -> str:
     """Serialize challenge data plus bounded, explicitly untrusted successor context."""
     if type(lane) is not int or lane < 0:
@@ -568,15 +569,21 @@ def build_turn_prompt(
     if route_document is not None:
         document["control_route"] = route_document
         role = str(route_document["role"])
+        assigned_role = role if agent_role is None else agent_role
+        if assigned_role not in {"lead", "specialist", "verifier", "recovery"}:
+            raise ValueError("agent role is invalid")
+        document["agent_role"] = assigned_role
         tactic = str(route_document["tactic"])
         context_profile = str(route_document["context_profile"])
         document["strategy"] = (
             f"{document['strategy']}; controller tactic={tactic}; context={context_profile}"
         )
         document["task"] = (
-            f"Act only as the assigned {role} using the controller-selected tactic and context. "
-            + str(document["task"])
+            f"Act only as the assigned {assigned_role} using the controller-selected tactic and "
+            "context. " + str(document["task"])
         )
+    elif agent_role is not None:
+        raise ValueError("agent role requires a control route")
     _fit_challenge_description(document, challenge.description)
     if prior_observations is not None:
         _fit_observation_bundle(document, prior_observations)

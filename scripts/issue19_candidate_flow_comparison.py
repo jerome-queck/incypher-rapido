@@ -296,11 +296,14 @@ def _config(root: Path, arm: str) -> RuntimeConfig:
             "RAPIDO_CODEX_HOME": str(auth),
             "RAPIDO_SUBMIT_CANDIDATES": "true",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
+            "RAPIDO_PEER_PROFILE": "uniform_v1",
+            "RAPIDO_MEMORY_ARM": "lane_local_v1",
         }
     )
     return replace(
         base,
         active_challenges=1,
+        attempts_per_challenge=2,
         concurrency=2,
         episodes_per_challenge=2,
         run_seconds=60,

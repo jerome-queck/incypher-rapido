@@ -9,7 +9,7 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -281,6 +281,9 @@ class StateStore:
                 catalogue_rank INTEGER NOT NULL,
                 phase TEXT NOT NULL,
                 role TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
                 lane INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 route_fingerprint TEXT NOT NULL,
@@ -347,7 +350,11 @@ class StateStore:
     def _migrate_control_jobs(self) -> None:
         """Atomically establish control_routes as the sole route JSON authority."""
 
-        def has_route_foreign_key() -> bool:
+        def current_schema() -> bool:
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(control_jobs)").fetchall()
+            }
             mappings = {
                 (str(row["from"]), str(row["to"]))
                 for row in self._connection.execute(
@@ -355,18 +362,22 @@ class StateStore:
                 ).fetchall()
                 if str(row["table"]) == "control_routes"
             }
-            return mappings == {
+            return {"agent_role", "model", "effort"} <= columns and mappings == {
                 ("run_id", "run_id"),
                 ("challenge_id", "challenge_id"),
                 ("route_fingerprint", "route_fingerprint"),
             }
 
-        if has_route_foreign_key():
+        if current_schema():
             return
         migration_table = "control_jobs__route_authority_migration"
         with self.transaction() as connection:
-            if has_route_foreign_key():
+            if current_schema():
                 return
+            old_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(control_jobs)").fetchall()
+            }
             if (
                 connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -396,6 +407,9 @@ class StateStore:
                     catalogue_rank INTEGER NOT NULL,
                     phase TEXT NOT NULL,
                     role TEXT NOT NULL,
+                    agent_role TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    effort TEXT NOT NULL,
                     lane INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     route_fingerprint TEXT NOT NULL,
@@ -408,17 +422,40 @@ class StateStore:
                 )
                 """
             )
+            agent_role = "jobs.agent_role" if "agent_role" in old_columns else "jobs.role"
+            model = (
+                "jobs.model"
+                if "model" in old_columns
+                else "COALESCE((SELECT attempt.model FROM attempts AS attempt "
+                "WHERE attempt.run_id=jobs.run_id AND attempt.challenge_id=jobs.challenge_id "
+                "AND attempt.episode=jobs.episode AND attempt.lane=jobs.lane), "
+                "json_extract(routes.route_json, '$.model'), 'legacy-unavailable')"
+            )
+            effort = (
+                "jobs.effort"
+                if "effort" in old_columns
+                else "COALESCE((SELECT attempt.effort FROM attempts AS attempt "
+                "WHERE attempt.run_id=jobs.run_id AND attempt.challenge_id=jobs.challenge_id "
+                "AND attempt.episode=jobs.episode AND attempt.lane=jobs.lane), "
+                "json_extract(routes.route_json, '$.effort'), 'legacy-unavailable')"
+            )
             connection.execute(
                 f"""
                 INSERT INTO {migration_table}(
                   job_id, run_id, challenge_id, episode, catalogue_rank, phase,
-                  role, lane, state, route_fingerprint, admitted_sequence,
+                  role, agent_role, model, effort, lane, state, route_fingerprint, admitted_sequence,
                   started_sequence, closed_sequence
                 )
-                SELECT job_id, run_id, challenge_id, episode, catalogue_rank, phase,
-                       role, lane, state, route_fingerprint, admitted_sequence,
-                       started_sequence, closed_sequence
-                FROM control_jobs
+                SELECT jobs.job_id, jobs.run_id, jobs.challenge_id, jobs.episode,
+                       jobs.catalogue_rank, jobs.phase, jobs.role,
+                       {agent_role}, {model}, {effort}, jobs.lane, jobs.state,
+                       jobs.route_fingerprint, jobs.admitted_sequence,
+                       jobs.started_sequence, jobs.closed_sequence
+                FROM control_jobs AS jobs
+                LEFT JOIN control_routes AS routes
+                  ON routes.run_id=jobs.run_id
+                 AND routes.challenge_id=jobs.challenge_id
+                 AND routes.route_fingerprint=jobs.route_fingerprint
                 """
             )
             connection.execute("DROP TABLE control_jobs")
@@ -684,6 +721,8 @@ class StateStore:
         lane: int | str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        *,
+        require_control_assignment: bool = False,
     ) -> None:
         # Accept the pre-episode positional form while callers migrate to the
         # canonical (episode, lane, model, effort) form.
@@ -693,9 +732,26 @@ class StateStore:
             lane, model, effort, episode = episode, lane, model, 0
         if type(episode) is not int or episode < 0:
             raise ValueError("episode must be a nonnegative integer")
-        if type(lane) is not int or model is None or not isinstance(effort, str):
+        if (
+            type(lane) is not int
+            or not isinstance(model, str)
+            or not model
+            or not isinstance(effort, str)
+            or not effort
+        ):
             raise ValueError("invalid attempt identity")
         with self.transaction() as connection:
+            if require_control_assignment:
+                assignment = connection.execute(
+                    "SELECT model, effort FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=? "
+                    "AND state='running'",
+                    (run_id, challenge_id, episode, lane),
+                ).fetchone()
+                if assignment is None:
+                    raise ValueError("attempt has no running control assignment")
+                if (str(assignment["model"]), str(assignment["effort"])) != (model, effort):
+                    raise ValueError("attempt model or effort differs from control assignment")
             connection.execute(
                 """
                 INSERT INTO attempts(
@@ -1055,9 +1111,22 @@ class StateStore:
         catalogue_rank: int,
         lanes: int,
         route: RouteSpec,
+        assignments: Sequence[tuple[str, str, str]] | None = None,
         *,
         require_unused_route: bool,
     ) -> None:
+        if assignments is None:
+            assignments = tuple((route.role, route.model, route.effort) for _ in range(lanes))
+        if len(assignments) != lanes:
+            raise ValueError("control assignments do not match the wave")
+        for assignment in assignments:
+            if (
+                not isinstance(assignment, tuple)
+                or len(assignment) != 3
+                or assignment[0] not in {"lead", "specialist", "verifier", "recovery"}
+                or any(not isinstance(value, str) or not value for value in assignment)
+            ):
+                raise ValueError("control assignment is invalid")
         phase = "initial" if episode == 0 else "retry"
         route_json = json.dumps(route.as_dict(), sort_keys=True, separators=(",", ":"))
         fingerprint = route.fingerprint
@@ -1071,7 +1140,7 @@ class StateStore:
         ).rowcount
         if require_unused_route and inserted != 1:
             raise ValueError("control route was already admitted")
-        for lane in range(lanes):
+        for lane, (agent_role, model, effort) in enumerate(assignments):
             job_id = f"{run_id}:{challenge_id}:{episode}:{route.role}:{lane}"
             sequence = cls._control_event(
                 connection,
@@ -1091,8 +1160,9 @@ class StateStore:
                 """
                 INSERT INTO control_jobs(
                   job_id, run_id, challenge_id, episode, catalogue_rank,
-                  phase, role, lane, state, route_fingerprint, admitted_sequence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                  phase, role, agent_role, model, effort, lane, state,
+                  route_fingerprint, admitted_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     job_id,
@@ -1102,6 +1172,9 @@ class StateStore:
                     catalogue_rank,
                     phase,
                     route.role,
+                    agent_role,
+                    model,
+                    effort,
                     lane,
                     fingerprint,
                     sequence,
@@ -1116,6 +1189,7 @@ class StateStore:
         catalogue_rank: int,
         lanes: int,
         route: RouteSpec,
+        assignments: Sequence[tuple[str, str, str]] | None = None,
     ) -> None:
         with self.transaction() as connection:
             self._admit_control_wave(
@@ -1126,6 +1200,7 @@ class StateStore:
                 catalogue_rank,
                 lanes,
                 route,
+                assignments,
                 require_unused_route=False,
             )
 
@@ -1163,6 +1238,20 @@ class StateStore:
                     "UPDATE control_jobs SET state='running', started_sequence=? WHERE job_id=?",
                     (sequence, row["job_id"]),
                 )
+
+    def control_assignment(
+        self, run_id: str, challenge_id: int, episode: int, lane: int
+    ) -> tuple[str, str, str]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT agent_role, model, effort FROM control_jobs "
+                "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=? "
+                "AND state='running'",
+                (run_id, challenge_id, episode, lane),
+            ).fetchone()
+        if row is None:
+            raise ValueError("running control assignment is absent")
+        return str(row["agent_role"]), str(row["model"]), str(row["effort"])
 
     def record_comparison_lane_completion(
         self,
@@ -1961,6 +2050,21 @@ class StateStore:
         if decision.disposition == "dispatch":
             if decision.successor is None:
                 raise AssertionError("dispatch requires a successor route")
+            assignments = None
+            if decision.successor.role not in {"verifier", "recovery"}:
+                assignment_rows = connection.execute(
+                    "SELECT agent_role, model, effort FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
+                    (run_id, challenge_id, source_episode),
+                ).fetchall()
+                assignments = tuple(
+                    (
+                        str(row["agent_role"]),
+                        str(row["model"]),
+                        str(row["effort"]),
+                    )
+                    for row in assignment_rows
+                )
             self._admit_control_wave(
                 connection,
                 run_id,
@@ -1969,6 +2073,7 @@ class StateStore:
                 catalogue_rank,
                 lanes,
                 decision.successor,
+                assignments,
                 require_unused_route=True,
             )
         return decision

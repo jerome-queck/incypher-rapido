@@ -7,20 +7,22 @@ import asyncio
 import json
 import signal
 import sys
+from collections.abc import Awaitable
 from dataclasses import asdict
 from typing import Any
 
 from .board import BoardClient, BoardError
 from .codex_app import CodexAppClient, CodexAppError
 from .config import ConfigError, RuntimeConfig, validate_codex_home
-from .orchestrator import Orchestrator, _challenge_coherence_key
+from .control import DurableJobControl
+from .orchestrator import _challenge_coherence_key
 from .state import StateStore
 
 
-async def _run_with_shutdown(orchestrator: Orchestrator):
+async def _run_with_shutdown(operation: Awaitable[Any]):
     """Translate SIGTERM into structured task cancellation and durable cleanup."""
     loop = asyncio.get_running_loop()
-    task = asyncio.create_task(orchestrator.run())
+    task = asyncio.create_task(operation)
     installed = False
     try:
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
@@ -66,6 +68,7 @@ def _preflight() -> int:
     board = BoardClient(
         config.board_url,
         config.board_token,
+        timeout=config.board_timeout_seconds,
         artifact_limit=config.max_artifact_bytes,
     )
     if not board.anonymous_identity_is_rejected():
@@ -131,9 +134,9 @@ def _run() -> int:
     board = BoardClient(
         config.board_url,
         config.board_token,
+        timeout=config.board_timeout_seconds,
         artifact_limit=config.max_artifact_bytes,
     )
-    state = StateStore(config.state_path)
     runtime = CodexAppClient(
         env=_codex_child_env(config),
         binary=config.codex_binary,
@@ -143,13 +146,12 @@ def _run() -> int:
         max_workspace_bytes=config.max_lane_workspace_bytes,
     )
     try:
-        try:
-            report = asyncio.run(_run_with_shutdown(Orchestrator(config, board, state, runtime)))
-        except asyncio.CancelledError:
-            print(json.dumps({"status": "interrupted"}), file=sys.stderr)
-            return 130
-    finally:
-        state.close()
+        report = asyncio.run(
+            _run_with_shutdown(DurableJobControl.drive(config, board=board, runtime=runtime))
+        )
+    except asyncio.CancelledError:
+        print(json.dumps({"status": "interrupted"}), file=sys.stderr)
+        return 130
     print(json.dumps(asdict(report), sort_keys=True))
     return 0 if report.status in {"completed", "deadline"} else 1
 
