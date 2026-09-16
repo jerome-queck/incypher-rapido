@@ -231,7 +231,7 @@ calibration and report back. It tests mixed peers, typed memory, tools, routing,
 instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance, authorize closure,
 or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
 The first calibration used 60-second lanes and falsified that budget. A later diagnostic inverted
-the owner's requested budgets. The corrected next calibration changes only the competition outer
+the owner's requested budgets. The corrected calibration changed only the competition outer
 budget to 1,800 seconds. The qualified all-15 catalogue remains queued, Board-unsolved challenges
 first, while five challenge engagements stay active. Recovery and Verifier agents are auxiliary
 work inside an active engagement and do not consume one of those five identities. A correct solve
@@ -239,7 +239,7 @@ cancels siblings, records the solve, removes and verifies any shared instance, c
 engagement, then admits the next queued challenge. Per-agent budget remains 800 seconds, P20,
 Board request 15 seconds, instance readiness 120 seconds, and cleanup 45 seconds. No successor may
 exceed 800 seconds; host-visible tool progress resets only the 600-second no-progress cutoff, not
-the absolute lane budget. Merged source and image digest will be registered after fresh read-only
+the absolute lane budget. Merged source and image digest were registered after fresh read-only
 qualification and before fresh state creation. Final-acceptance budgets remain pending the owner's
 post-calibration decision; its outer gate remains 19,800 seconds.
 
@@ -636,16 +636,16 @@ comparison green while independent review is pending.
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: eight-class routing is live; ordinary stalls, no-tool progress, wrong candidates, local-container failures, and private-candidate disagreement all change route or contain; Board calibration pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: mixed Lead/Specialist P4 waves, one fresh Daybreak Verifier, and mixed Recovery waves are integrated; dynamic Recovery receives nonzero typed local memory in focused tests; native proof pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: changed dynamic Recovery routes worked live, but provenance containment loses useful hypotheses; same-chat corrective routing pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: live P20 initial waves and mixed Recovery produced two new correct solves with nonzero typed memory; persistent Daybreak continuation pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
-| Productive bounded resource scaling | E4 measurements and selected profile | in progress: default is five challenge waves/four direct peers/P20; prior P16/298.2-MiB/84-PID result was scheduler-constrained; corrected native calibration pending |
+| Productive bounded resource scaling | E4 measurements and selected profile | in progress: calibration reached 20 simultaneous attempts, 1,362 tools, 92 sampled PIDs, and 347.2 MiB sampled RAM; conversion, not local capacity, dominated; final proof pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
-| Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | next corrected 1,800-second calibration and final 19,800-second registrations pending |
-| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending |
-| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending |
+| Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
+| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; diagnostic produced two new correct solves and cumulative at least five, but began only 13 challenges |
+| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; diagnostic trace places changed shared-instance Recovery routing on both solve paths, with typed memory participating but no counterfactual causality claim |
 | No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | pending |
 | Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | pending |
 | #19 closed honestly | GitHub closeout linked to merged evidence | pending |
@@ -703,12 +703,39 @@ run before another live job starts.
 The shared-instance Recovery prompt must contain nonempty typed earlier-episode memory. Unlimited
 challenges submit the first source-bound candidate immediately through durable reserve/POST/finalize;
 `correct` cancels siblings and triggers early instance deletion. Limited challenges require one
-fresh Daybreak verifier. After an HTTP-200 wrong verdict, a changed mixed Recovery wave must produce
-two independent source-bound lanes before a different candidate can submit. Pending or unread
+fresh Daybreak verifier. After an HTTP-200 wrong verdict, a changed mixed Recovery wave may derive
+a new candidate, but one fresh-source Daybreak Verifier must independently reproduce it before
+submission. Pending or unread
 effects fence every later submission. The global artificial wrong ceiling was removed; Board limits
 remain authoritative. Every lane is capped at 800 seconds; a lane with no host-visible tool progress
-for 600 seconds is interrupted and classified for a changed route. These are locally verified only;
-the exact-image 1,800-second Board calibration remains pending.
+for 600 seconds is interrupted and classified for a changed route. The exact-image calibration
+verified this control path live and exposed the persistent-Daybreak/provenance work recorded below.
+
+### Owner constraint recorded during the corrected calibration
+
+This applies to the next implementation/run and does not alter the frozen calibration image or
+protocol. Daybreak/xhigh is each challenge's primary solver as well as its Lead. A Daybreak turn
+that returns before its cumulative 800-second challenge budget without `correct` must continue in
+the same native conversation with a changed, evidence-specific prompt. Continue until `correct`,
+the cumulative budget expires, or a genuine terminal blocker is proven. In particular, a
+candidate-provenance rejection must request fresh tool-backed proof for that exact hypothesis in
+the same conversation instead of discarding the work. Luna peers remain parallel supporting
+solvers. Continuations must preserve private state and typed memory, consume the original budget,
+and never repeat an unchanged prompt. The global deterministic coordinator remains outside the five
+challenge engagements and P20 solver lanes; any future model coordinator is auxiliary and must earn
+its cost in a controlled comparison.
+
+### Corrected 30-minute calibration result
+
+The registered exact-image run completed with two new HTTP-200 `correct` solves, both produced by
+Daybreak/xhigh Recovery lanes after nonzero typed-memory projection and shared-instance routing.
+Immediate submission, sibling cancellation, instance removal, and lease transfer worked. Peak
+running attempts reached P20 across the initial five engagements. The initial-five 0/5 result
+failed the fixed 3/5 diagnostic checkpoint; 14 plausible hypotheses were lost to provenance
+enforcement, and non-correct Daybreak turns ended after a median 65.233 seconds instead of consuming
+their remaining budget. Full facts and next fixes are in
+[`issue-19-corrected-calibration-evidence-2026-09-17.md`](issue-19-corrected-calibration-evidence-2026-09-17.md).
+This run does not replace the 19,800-second acceptance run.
 
 ## Model/effort ledger
 
@@ -765,7 +792,10 @@ the exact-image 1,800-second Board calibration remains pending.
 | Repeated main CI signal/lifecycle review | `gpt-daybreak-blue-latest` / `xhigh` | complete; inherited blocked `SIGXCPU` root cause and no-overwrite M1 artifact lifecycle fixes verified before PR #32, no fallback |
 | M1 clean-source result review | `gpt-daybreak-blue-latest` / `xhigh` | complete; source/protocol/addendum hashes, 112 rows, raw selector, privacy, replay, and zero-effect evidence independently recomputed with no P0-P3 findings, no fallback |
 | Live engagement implementation review | `gpt-daybreak-blue-latest` / `xhigh` | complete after fixes for deadline cleanup propagation, deterministic instance lease order, one-create containment, and local-error episode preservation; final review found no P0-P3 findings, no fallback |
-| Live engagement focused verification | `gpt-daybreak-blue-latest` / `xhigh` | 40/40 repeated dynamic lifecycle/order runs and 115 focused tests clean; exact-image calibration pending, no fallback |
+| Live engagement focused verification | `gpt-daybreak-blue-latest` / `xhigh` | 40/40 repeated dynamic lifecycle/order runs and 115 focused tests clean; exact-image calibration completed, no fallback |
+| Corrected 1,800-second live calibration | Daybreak/xhigh Leads and Recovery; Luna max/xhigh Specialists | completed exact registered run; two new correct solves, P20, nonzero typed memory, no fallback |
+| Corrected calibration lifecycle audit | `gpt-daybreak-blue-latest` / `xhigh` | clean: DB/FKs, jobs, effects, four instance lifecycles, two all-nine Board rounds, container, and workspace verified; no fallback |
+| Corrected calibration result/contribution audit | `gpt-daybreak-blue-latest` / `xhigh` | clean: both corrects traced to Daybreak Recovery, immediate submit/cancel/cleanup/advance and typed-memory participation verified; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -775,10 +805,12 @@ switch, not provider fallback inside a solver run.
 
 ## Open decisions
 
-- Merge the reviewed calibration-readiness slice, then register its exact image digest/source and
-  corrected 1,800-second protocol before creating fresh state.
-- Use the calibration to decide whether further throughput changes are justified; it cannot lower
-  the final 19,800-second acceptance contract.
+- Implement the owner-required persistent same-chat Daybreak primary solver under one cumulative
+  800-second challenge budget; simplify its objective-first prompt.
+- Preserve artifact/decode source lineage with opaque host handles and route provenance rejection
+  back to the same Daybreak conversation with the exact proof gap.
 - Implement and verify same-run crash continuation before final acceptance.
+- Re-measure the focused changes before any 19,800-second run; the completed calibration cannot
+  lower the final acceptance contract.
 - Register the exact merged final commit, image digest, challenge order, deadlines, and sampler
   before the acceptance state exists.
