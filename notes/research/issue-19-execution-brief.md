@@ -252,16 +252,38 @@ calibration compares only the memory arm at fixed P4 capacity and preserves orac
 improving either conversion or duplicate/source-bound work. Only then does E4 vary P2/P4/P6/P8.
 M1 cannot lower E4 or final acceptance.
 
-The local M1 implementation now connects the durable attempt/evidence/vault rows to that exact
-projection and the production prompt builder behind explicit `RAPIDO_MEMORY_ARM` selection. SQL
-removes cross-lane model prose before projection; evidence exposes a digest-free typed memory view;
-private proposal/verification rows are bounded by the target episode; and candidate completeness
-requires a successful source-bound, non-reflected observation. The Verifier projection is empty even
-while the controller retains private verification state. A changed-route integration fixture proves
-both earlier lanes' distinct host facts reach each successor Specialist under
-`typed_challenge_v1`. Post-implementation local validation is 749 passed, one host skip. This is
-implementation evidence only: the registered deterministic comparison, independent release review,
-merge/CI, and fixed-P4 Daybreak native confirmation remain pending.
+PR #31 squash-merged the M1 implementation as
+`84542dbfe4cdb24cb58129b7d2dd0675da541639`. It connects durable attempt/evidence/vault rows to the
+registered projection and production prompt builder behind explicit `RAPIDO_MEMORY_ARM` selection.
+SQL removes cross-lane model prose before projection; evidence exposes a digest-free typed memory
+view; private proposal/verification rows are bounded by the target episode; and candidate
+completeness requires a successful source-bound, non-reflected observation. The Verifier projection
+is empty while the controller retains private verification state. A changed-route integration
+fixture proves both earlier lanes' distinct host facts reach each successor Specialist under
+`typed_challenge_v1`. Independent implementation and harness reviews were clean. Local release
+validation was 749 passed and one host skip; all four PR checks passed.
+
+The post-merge `main` run exposed the same inherited-`SIGXCPU` failure seen in three earlier main
+runs. Resetting the child signal disposition was insufficient because the child also inherited the
+parent's blocked signal mask, leaving its self-signal pending and allowing exit 0. PR #32
+squash-merged `a592e90d1f0fb38128ec864ce827b496d7b01640`: the artifact worker now unblocks native resource
+signals before applying limits, the regression deliberately starts with `SIGXCPU` blocked, and the
+M1 writer validates before an atomic no-overwrite install. Local release validation was 753 passed
+and one host skip. PR checks and post-merge `main` run
+[`35106519460`](https://github.com/jerome-queck/incypher-rapido/actions/runs/35106519460) passed Python
+3.11/3.12 and Linux amd64/arm64.
+
+The registered command then generated
+[`issue-19-memory-comparison-v1.json`](issue-19-memory-comparison-v1.json) from clean merged source
+`a592e90d1f0fb38128ec864ce827b496d7b01640`. Artifact SHA-256 is
+`053851cfdb3701da49a4df8e1e87d444162b655a13a053caa8414e5fb5f83400`. All 112 rows, exact ordering,
+schema, and insertion permutations passed. Both arms were eligible; `typed_challenge_v1` exposed 48
+useful records versus 20 for `lane_local_v1`, with zero repeated fingerprints in either arm, no row
+violations, and zero model, network, Board, container, instance, submission, or target effects. An
+unchanged rerun failed closed without altering the installed artifact. Independent clean-source
+Daybreak/xhigh review independently replayed all rows and commitments, verified 28 source hashes and
+the production-tree digest, and found no P0-P3 issue. Selection remains provisional until the
+registered fixed-P4 Daybreak/xhigh native comparison passes.
 
 ### E0 red-baseline result
 
@@ -562,7 +584,7 @@ comparison green while independent review is pending.
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and clean-source E3 result merged/generated; live-controller promotion pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: typed same-run projection and changed-route cross-lane reuse implemented locally; deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; M1 comparison/review and full four-role/recovery proof pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: merged typed same-run projection exposes 48 useful records versus 20 lane-local with no duplicate regression; deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; native M1 and full four-role/recovery proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | pending |
@@ -626,6 +648,9 @@ comparison green while independent review is pending.
 | M1 memory-core implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; frozen fixture, privacy, private-context, dual-Python import, and static checks green, no fallback |
 | M1 state/evidence independent review | `gpt-daybreak-blue-latest` / `xhigh` | release held for future-episode verification influence, raw manifest digest access, cross-lane prose access, and broad private rows; all corrected before integration, clean re-review pending, no fallback |
 | M1 narrow test lane | requested `gpt-5.6-luna` / `xhigh` | rejected as model-valid delegated evidence because effective selection was unavailable; tests retained only after main-agent inspection and full-suite execution, no fallback |
+| M1 implementation and harness release reviews | `gpt-daybreak-blue-latest` / `xhigh` | complete; privacy, source linkage, replay, fixture derivation, and exact selector clean before PR #31, no fallback |
+| Repeated main CI signal/lifecycle review | `gpt-daybreak-blue-latest` / `xhigh` | complete; inherited blocked `SIGXCPU` root cause and no-overwrite M1 artifact lifecycle fixes verified before PR #32, no fallback |
+| M1 clean-source result review | `gpt-daybreak-blue-latest` / `xhigh` | complete; source/protocol/addendum hashes, 112 rows, raw selector, privacy, replay, and zero-effect evidence independently recomputed with no P0-P3 findings, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
