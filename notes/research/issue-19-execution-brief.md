@@ -292,20 +292,27 @@ tamper-gated. Exact per-arm config byte constants, context/event accounting, rep
 exclusions, null/type and FIFO-flag semantics, result-container schema, input-derived invocation
 predicate, and full-protocol operation totals are also fixed.
 
-The E3 implementation now exists locally on `codex/issue-19-routing-policies` but no result has
-been generated: the protocol requires measurement from its clean merged commit. It runs the four
-arms through real `StateStore` transactions, typed host-bound facts, atomic close/decision/admission,
-route-unique replay, strict raw-row recomputation, source/config hashing, and active disabled-surface
-fencing. The 30-test E3 suite includes the full 2,160-row registered operation totals, raw arm
+The E3 implementation squash-merged in PR #28 as `093925e781c4bfd80d38b5108c1db01576f61296`.
+Its 30-test suite covers the full 2,160-row registered operation totals, raw arm
 permutation/synthetic winners/ties, direct native-socket and child-process blocking, new-thread
 profiling, decision/fact/route tamper rejection, rollback injection, and a real `os._exit(73)`
-transaction crash followed by clean recovery. Independent Daybreak/xhigh review successively found
-fact-link replay, raw-row, crash, and surface-monitor bypasses; the final pass found no P0-P3
-blockers. PR #28's first Python 3.11 CI run then exposed retained heap noise after the harness
-installed a non-removable audit hook in the shared test process. The fix keeps reversible profiling
-and entry-point fences for imports/tests, and installs strong alias-proof audit interception only in
-the disposable canonical comparison process. The full local suite is green at 709 passed and one
-skipped; CI rerun, fix re-review, and clean-merge measurement remain required.
+transaction crash followed by clean recovery. The first Python 3.11 CI run exposed retained heap
+noise from a non-removable audit hook in the shared test process. The merged fix keeps reversible
+profiling and entry-point fences for imports/tests, and installs strong alias-proof audit
+interception only in the disposable canonical process. Local release verification was 709 passed
+and one skipped; rerun CI passed Python 3.11/3.12 and Linux amd64/arm64.
+
+The preregistered command then generated
+[`issue-19-routing-policy-comparison-v1.json`](issue-19-routing-policy-comparison-v1.json) from that
+clean merged source. Artifact SHA-256 is
+`491401dd71f9c2209bad332703f002839292c6904c04d886313bdf0dca76501f`. All 2,160 rows and exact
+operation totals replayed; `closed_rule_table` won the frozen selector after the three eligible
+policies tied on safety, conversion, unproductive dispatch, tool count, context bytes, and durable
+event bytes, because it used 5,120 policy operations versus 7,500 and 8,440. FIFO was ineligible.
+Every disabled-surface, effect, instance, residue, and leak counter is zero. Independent
+Daybreak/xhigh review verified all 27 merged-source hashes, raw selection, replay/config/fact
+digests, privacy, and 30/30 focused tests with no blocker. This is development E3 evidence only;
+live-controller promotion and every final-image/live gate remain pending.
 
 The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
 two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
@@ -500,8 +507,8 @@ comparison green while independent review is pending.
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
-| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; E3 protocol and implementation have 30 local tests, focused PR CI/merge and clean-source result pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer merged; comparison-only gated policy arms and unique-route replay implemented locally; E3 result and live-controller promotion pending |
+| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and clean-source E3 result merged/generated; live-controller promotion pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; full four-role/recovery proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
@@ -560,7 +567,8 @@ comparison green while independent review is pending.
 | E3 operation-count addendum review | `gpt-daybreak-blue-latest` / `xhigh` | complete after successive holds fixed config-byte, invocation, accounting, replay, and parent-schema ambiguities; final review found no P0-P3 findings, no fallback |
 | E3 policy/state/harness implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; 30 E3 tests cover 2,160 rows, raw selection, native/thread/process fences, atomic crash recovery, and replay tamper rejection; no measurement before clean merge, no fallback |
 | E3 implementation independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete after holds for fact-link replay, raw-row/crash evidence, and native/thread/process monitor bypasses; final review found no P0-P3 blockers, no fallback |
-| E3 CI memory-lifecycle fix review | `gpt-daybreak-blue-latest` / `xhigh` | complete; cached socket/process aliases blocked, global/profile restoration proven, and 8-process A/B showed old global hook worsened a separate pre-existing heap-threshold flake from 3/8 to 7/8 failures; current code clean, CI rerun remains required, no fallback |
+| E3 CI memory-lifecycle fix review | `gpt-daybreak-blue-latest` / `xhigh` | complete; cached socket/process aliases blocked, global/profile restoration proven, and 8-process A/B showed old global hook worsened a separate pre-existing heap-threshold flake from 3/8 to 7/8 failures; rerun CI green, no fallback |
+| E3 clean-source result review | `gpt-daybreak-blue-latest` / `xhigh` | complete; 2,160 rows, source/protocol hashes, operation totals, raw selector, replay, privacy, and zero-effect/leak gates independently verified; no blockers, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
