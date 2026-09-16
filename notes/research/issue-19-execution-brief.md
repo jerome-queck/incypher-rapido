@@ -240,6 +240,27 @@ live conversion. Later implementation must drive the same corpus through its rea
 and add a separate event-backed green gate from actual durable records without deleting or
 rewriting the recorded baseline arm.
 
+### E2/E3 controller and vault comparisons
+
+Daybreak/xhigh exploratory lanes compared a closed table, graph reducer, and scored policy, plus
+single-SQLite, encrypted-file/index, and volatile candidate-retention designs. Those lanes returned
+useful hypotheses but no durable source/config/result artifact. Their reported numeric results are
+therefore **not accepted evidence** and are intentionally omitted. E2/E3 remain pending until a
+reproducible sanitized harness is committed and independently reviewed.
+
+The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
+two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
+material route fingerprint. Policy, provenance, disagreement, timeout, quota, and Board failures
+remain contained until later slices add validated authorization, verifier, checkpoint, reset, or
+Board-contract facts. Tool and safely identified local-container failures may dispatch one changed
+route; persistent failures cannot turn episode, timestamp, or retry ordinal into a change. This is
+a tracer under test, not the final E2 selection.
+
+The candidate-vault design likewise remains provisional. Exactly-once Board POST is impossible
+without remote idempotency; the current enforceable boundary remains durable at-most-once
+reservation plus fenced ambiguity. Any later vault comparison must test crash atomicity, peer
+retention, public leakage, replay, and the same-UID/root limitation.
+
 ## Selected architecture contract
 
 - **Lead:** deterministic controller projection chooses the next typed engagement from durable
@@ -291,8 +312,8 @@ effects and owned instances are intentionally state-wide safety counts, even whi
 prior run.
 
 The tracer establishes a measured substrate, not the final scheduler: the existing orchestrator
-still owns execution order, and adaptive routing, private vault, independent verification, durable
-queue authority, and same-run recovery remain subsequent red/green tracers. Public boundary tests
+still owns execution order, and private vault, independent verification, durable queue authority,
+and same-run recovery remain subsequent red/green tracers. Public boundary tests
 prove sanitized round-trip inspection; stable order across reopened inspection; unchanged-route
 identity across episodes; material-route separation; live queued/running projection; graceful
 deadline closure; and process-loss recovery after a real `os._exit`. This recovery preserves a
@@ -305,13 +326,38 @@ release review found no P0-P3 defects; CI remains the release gate.
 Local release validation: Ruff and `git diff --check` clean; 604 passed and 1 skipped on both
 Python 3.11 and 3.12.
 
+### Adaptive failure-router tracer
+
+`DurableJobControl.drive` now enables a closed adaptive path while direct `Orchestrator.run`
+retains the empirical red-baseline behavior. Exactly eight candidate-free failure signals cover
+policy, provenance, disagreement, timeout, tool, quota, Board, and container outcomes. Board and
+container origins are recorded at their catch boundaries instead of inferred from challenge type.
+Authorization and unclassified native failures fail closed. A tool failure can dispatch one
+alternate tactic/context; a safely typed local-container failure can dispatch one Recovery role in
+a workspace path bound to its generation. No other route dispatches until a later slice supplies a
+database-validated prerequisite. Generic unsolved analysis is contained rather than mislabeled.
+
+Routes have one durable JSON authority in `control_routes`; jobs reference it by a composite
+foreign key. Wave closure, failure classification, decision recording, and successor admission
+commit in one SQLite transaction. A fault-injected admission failure proves the prior wave remains
+running and no partial decision survives. Public inspection feature-detects the preceding schema,
+validates decision enums/axes, and exposes only base64url-labelled fingerprints. The E0 production
+fixture proves all eight signals, material changes for every dispatch, no unchanged third attempt,
+and no candidate value or digest in public output. The original review rejected eight P1 and three
+P2 defects; the first re-review found two further P1 defects and one P2 vocabulary drift. A later
+review rejected a false-positive combined-failure fixture before accepting its corrected sequence.
+All are covered by focused regression tests; final Daybreak/xhigh review found no P0-P3 defects.
+
+Local validation after repairs: Ruff/format/`git diff --check` clean; 633 passed and 1 skipped on
+Python 3.11 and 3.12. The reproducible E2/E3 comparison remains a separate pending gate.
+
 ## Acceptance ledger
 
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
-| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; behavior arms pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: material route identity durable and unchanged baseline retry detected; adaptive routes pending |
+| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router/vault exploratory results unaccepted pending durable harness |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and no-unchanged dispatch implemented; validated gated routes pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
@@ -347,6 +393,11 @@ Python 3.11 and 3.12.
 | Core journal independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete; five P1 defects and one P2 overclaim found, all addressed test-first; re-review pending, no fallback |
 | Core journal fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; one P1 terminal-overwrite crash window found and fixed test-first; clean re-review pending, no fallback |
 | Core journal clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, 81 focused tests clean, no fallback |
+| Adaptive-router exploratory comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete but unaccepted: no durable source/config/result artifact; harness pending, no fallback |
+| Candidate-vault exploratory comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete but unaccepted: no durable source/config/result artifact; harness pending, no fallback |
+| Adaptive-router independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete; eight P1 and three P2 defects found and repaired test-first; clean re-review pending, no fallback |
+| Adaptive-router fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; two P1 and one P2 found, plus one false-positive fixture rejected; all fixed test-first, no fallback |
+| Adaptive-router clean release review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, corrected escalation integration verified, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -357,8 +408,8 @@ switch, not provider fallback inside a solver run.
 ## Open decisions
 
 - Exact policy-compatible context variant selected by E1.
-- Candidate-verification recipe set supported by released static fixtures.
-- Failure-specific routing matrix and per-route budgets selected by E1-E3.
+- Candidate-verification recipe and vault selected by a reproducible E3 comparison.
+- E1-approved policy route, exact per-route budgets, and router selected by a reproducible E2 comparison.
 - Parallel lane/local-worker profile selected by E4.
 - Current Board inactive-instance contract established by E6.
 - Exact merged commit, final image digest, final challenge order, deadlines, and measurement sampler

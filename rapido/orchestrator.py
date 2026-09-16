@@ -27,6 +27,7 @@ from .evidence import (
     project_tool_observation,
     seal_unavailable_attempt_evidence,
 )
+from .routing import RouteSpec, baseline_route
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_PRIOR_ATTEMPTS,
@@ -334,6 +335,8 @@ def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
 
 
 class Orchestrator:
+    _adaptive_control = False
+
     def __init__(
         self,
         config: RuntimeConfig,
@@ -736,9 +739,19 @@ class Orchestrator:
         return details
 
     async def _prepare_workspaces(
-        self, run_root: Path, challenge: Challenge, episode: int, deadline: float
+        self,
+        run_root: Path,
+        challenge: Challenge,
+        episode: int,
+        deadline: float,
+        workspace_generation: int = 0,
     ) -> list[tuple[Path, list[str]]]:
-        challenge_root = run_root / f"challenge-{challenge.id}" / f"episode-{episode}"
+        challenge_root = (
+            run_root
+            / f"challenge-{challenge.id}"
+            / f"episode-{episode}"
+            / f"generation-{workspace_generation}"
+        )
         source_root = challenge_root / "source"
         source_root.mkdir(parents=True, exist_ok=False)
         source_paths: list[Path] = []
@@ -872,6 +885,7 @@ class Orchestrator:
         artifact_paths: list[str],
         timeout_seconds: float,
         target_endpoints: tuple[TargetEndpoint, ...] = (),
+        route: RouteSpec | None = None,
     ) -> LaneResult:
         attempt_id = f"{run_id}:{challenge.id}:{episode}:{lane}"
         run_evidence = self._run_evidence
@@ -951,6 +965,7 @@ class Orchestrator:
                     lane,
                     before_episode=episode,
                 ),
+                control_route=route,
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -1285,14 +1300,28 @@ class Orchestrator:
         target_endpoints: tuple[TargetEndpoint, ...] = (),
         *,
         episode: int = 0,
+        route: RouteSpec | None = None,
     ) -> str:
         self.state.set_challenge_status(challenge.id, "running")
         try:
-            workspaces = await self._prepare_workspaces(run_root, challenge, episode, deadline)
+            workspaces = await self._prepare_workspaces(
+                run_root,
+                challenge,
+                episode,
+                deadline,
+                0 if route is None else route.workspace_generation,
+            )
         except RunDeadlineReached:
             self.state.set_challenge_status(challenge.id, "unsolved")
             raise
-        except (BoardError, OSError):
+        except BoardError:
+            if self._adaptive_control:
+                self.state.record_control_failure_origin(run_id, challenge.id, episode, "board")
+            self.state.set_challenge_status(challenge.id, "error")
+            return "error"
+        except OSError:
+            if self._adaptive_control:
+                self.state.record_control_failure_origin(run_id, challenge.id, episode, "container")
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
         remaining = max(0.0, deadline - time.monotonic())
@@ -1312,6 +1341,7 @@ class Orchestrator:
                     artifacts,
                     timeout,
                     target_endpoints,
+                    route,
                 )
 
         pending = {
@@ -1410,6 +1440,7 @@ class Orchestrator:
         deadline: float,
         *,
         episode: int = 0,
+        route: RouteSpec | None = None,
     ) -> str:
         """Own the complete create/use/delete lifecycle for one dynamic challenge."""
         try:
@@ -1432,7 +1463,12 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     with suppress(Exception):
                         await cleanup
-            if isinstance(exc, (BoardError, RunDeadlineReached)):
+            if isinstance(exc, BoardError):
+                if self._adaptive_control:
+                    self.state.record_control_failure_origin(run_id, challenge.id, episode, "board")
+                self.state.set_challenge_status(challenge.id, "error")
+                return "error"
+            if isinstance(exc, RunDeadlineReached):
                 self.state.set_challenge_status(challenge.id, "error")
                 return "error"
             raise
@@ -1446,6 +1482,7 @@ class Orchestrator:
                 deadline,
                 endpoints,
                 episode=episode,
+                route=route,
             )
         finally:
             cleanup_deadline = time.monotonic() + 45.0
@@ -1469,6 +1506,8 @@ class Orchestrator:
             if cancelled is not None:
                 raise cancelled
         if not cleanup_ok:
+            if self._adaptive_control:
+                self.state.record_control_failure_origin(run_id, challenge.id, episode, "board")
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
         return terminal
@@ -1483,34 +1522,35 @@ class Orchestrator:
         outcomes: dict[int, str],
     ) -> dict[int, str]:
         """Run a fair episode queue while keeping policy and ownership internal."""
-        queue: asyncio.Queue[tuple[Challenge, int, float] | None] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[Challenge, int, float, RouteSpec] | None] = asyncio.Queue()
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
+        initial_route = baseline_route(
+            model=self.config.model,
+            effort=self.config.reasoning_effort,
+            attempt_seconds=self.config.attempt_seconds,
+        )
 
-        def enqueue(challenge: Challenge, episode: int, reason: str) -> None:
+        def enqueue(
+            challenge: Challenge,
+            episode: int,
+            reason: str,
+            route: RouteSpec,
+            *,
+            already_admitted: bool = False,
+        ) -> None:
             queued_at = time.monotonic()
-            self.state.admit_control_wave(
-                run_id,
-                challenge.id,
-                episode,
-                catalogue_ranks[challenge.id],
-                self.config.attempts_per_challenge,
-                {
-                    "budget": {
-                        "attempt_seconds": self.config.attempt_seconds,
-                        "max_lane_workspace_bytes": self.config.max_lane_workspace_bytes,
-                    },
-                    "context_policy": "fresh_lane_with_typed_same_run_history",
-                    "deadline_policy": "minimum_of_attempt_and_run_deadline",
-                    "effort": self.config.reasoning_effort,
-                    "model": self.config.model,
-                    "role": "specialist",
-                    "tactic": "baseline",
-                    "tool_policy": "bounded_offline_registry",
-                },
-            )
-            queue.put_nowait((challenge, episode, queued_at))
+            if not already_admitted:
+                self.state.admit_control_wave(
+                    run_id,
+                    challenge.id,
+                    episode,
+                    catalogue_ranks[challenge.id],
+                    self.config.attempts_per_challenge,
+                    route,
+                )
+            queue.put_nowait((challenge, episode, queued_at, route))
             self.state.event(
                 run_id,
                 "challenge_episode_queued",
@@ -1522,7 +1562,7 @@ class Orchestrator:
             )
 
         for challenge in challenges:
-            enqueue(challenge, 0, "initial_coverage")
+            enqueue(challenge, 0, "initial_coverage", initial_route)
             if challenge.solved:
                 self.state.event(
                     run_id,
@@ -1530,7 +1570,9 @@ class Orchestrator:
                     {"challenge_id": challenge.id, "run_local_verified": False},
                 )
 
-        async def execute_episode(challenge: Challenge, episode: int, queued_at: float) -> str:
+        async def execute_episode(
+            challenge: Challenge, episode: int, queued_at: float, route: RouteSpec
+        ) -> str:
             nonlocal admitted_episodes, peak_active
             if time.monotonic() >= deadline:
                 raise RunDeadlineReached
@@ -1563,6 +1605,10 @@ class Orchestrator:
                                     "reason": "cleanup_pending",
                                 },
                             )
+                            if self._adaptive_control:
+                                self.state.record_control_failure_origin(
+                                    run_id, challenge.id, episode, "board"
+                                )
                             self.state.set_challenge_status(challenge.id, "error")
                             return "error"
                         return await self._solve_dynamic_challenge(
@@ -1571,6 +1617,7 @@ class Orchestrator:
                             challenge,
                             deadline,
                             episode=episode,
+                            route=route if self._adaptive_control else None,
                         )
                 return await self._solve_challenge(
                     run_id,
@@ -1578,6 +1625,7 @@ class Orchestrator:
                     challenge,
                     deadline,
                     episode=episode,
+                    route=route if self._adaptive_control else None,
                 )
             finally:
                 challenge_root = run_root / f"challenge-{challenge.id}"
@@ -1594,9 +1642,8 @@ class Orchestrator:
                 try:
                     if item is None:
                         return
-                    challenge, episode, queued_at = item
-                    terminal = await execute_episode(challenge, episode, queued_at)
-                    self.state.finish_control_wave(run_id, challenge.id, episode, terminal)
+                    challenge, episode, queued_at, route = item
+                    terminal = await execute_episode(challenge, episode, queued_at, route)
                     cleanup_pending = bool(self.state.owned_instances())
                     should_retry = (
                         terminal in {"unsolved", "error"}
@@ -1604,10 +1651,37 @@ class Orchestrator:
                         and time.monotonic() < deadline
                         and not (challenge.type == "dynamic_iac" and cleanup_pending)
                     )
-                    if should_retry:
-                        enqueue(challenge, episode + 1, terminal)
+                    if self._adaptive_control:
+                        decision = self.state.finish_and_decide_control_wave(
+                            run_id=run_id,
+                            challenge_id=challenge.id,
+                            source_episode=episode,
+                            next_episode=episode + 1,
+                            catalogue_rank=catalogue_ranks[challenge.id],
+                            lanes=self.config.attempts_per_challenge,
+                            terminal=terminal,
+                            attempts_remaining=should_retry,
+                            remaining_milliseconds=max(
+                                0, int((deadline - time.monotonic()) * 1000)
+                            ),
+                        )
+                        if decision is not None and decision.disposition == "dispatch":
+                            assert decision.successor is not None
+                            enqueue(
+                                challenge,
+                                episode + 1,
+                                decision.failure.kind,
+                                decision.successor,
+                                already_admitted=True,
+                            )
+                        else:
+                            outcomes[challenge.id] = terminal
                     else:
-                        outcomes[challenge.id] = terminal
+                        self.state.finish_control_wave(run_id, challenge.id, episode, terminal)
+                        if should_retry:
+                            enqueue(challenge, episode + 1, terminal, route)
+                        else:
+                            outcomes[challenge.id] = terminal
                 finally:
                     queue.task_done()
 

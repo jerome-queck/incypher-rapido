@@ -8,7 +8,10 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import asdict, replace
 from pathlib import Path
+
+from rapido.control import DurableJobControl
 
 SPEC = importlib.util.spec_from_file_location(
     "issue19_replay",
@@ -181,6 +184,99 @@ def test_expected_red_is_empirical_all_15_and_truthful() -> None:
     assert lifecycle["temporary_scope_removed"] is True
     assert lifecycle["descriptor_count_observation"]["identity_checked"] is False
     assert lifecycle["descriptor_count_observation"]["leak_absence_claimed"] is False
+
+
+def test_adaptive_control_routes_eight_failures_without_unchanged_retry(tmp_path: Path) -> None:
+    config = HARNESS._config(tmp_path)
+    board = HARNESS._InertBoard()
+    runtime = HARNESS._InertRuntime()
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    initial = {
+        decision.failure_kind: decision
+        for decision in view.route_decisions
+        if decision.source_episode == 0
+    }
+    assert set(initial) >= {
+        "policy",
+        "provenance",
+        "disagreement",
+        "timeout",
+        "tool",
+        "quota",
+        "board",
+        "container",
+    }
+    assert {
+        kind: initial[kind].disposition
+        for kind in (
+            "policy",
+            "provenance",
+            "disagreement",
+            "timeout",
+            "tool",
+            "quota",
+            "board",
+            "container",
+        )
+    } == {
+        "policy": "contain",
+        "provenance": "contain",
+        "disagreement": "contain",
+        "timeout": "contain",
+        "tool": "dispatch",
+        "quota": "contain",
+        "board": "contain",
+        "container": "dispatch",
+    }
+    assert all(
+        decision.changed_axes
+        and decision.successor_route_fingerprint != decision.source_route_fingerprint
+        for decision in view.route_decisions
+        if decision.disposition == "dispatch"
+    )
+    assert all(
+        decision.successor_route_fingerprint is None
+        for decision in view.route_decisions
+        if decision.disposition != "dispatch"
+    )
+    for challenge_id in range(1, 16):
+        episode_routes = {
+            job.episode: job.route_fingerprint
+            for job in view.jobs
+            if job.challenge_id == challenge_id
+        }
+        assert len(episode_routes) == len(set(episode_routes.values()))
+    encoded = json.dumps(asdict(view), sort_keys=True)
+    assert HARNESS._SYNTHETIC_PROVENANCE_VALUE not in encoded
+    assert all(value not in encoded for value in HARNESS._SYNTHETIC_DISAGREEMENT_VALUES)
+    assert re.search(r"\b[0-9a-f]{64}\b", encoded) is None
+
+
+def test_persistent_failure_is_contained_before_an_unchanged_third_route(
+    tmp_path: Path,
+) -> None:
+    config = replace(HARNESS._config(tmp_path), challenge_ids=(5,), episodes_per_challenge=4)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=HARNESS._InertBoard(),
+            runtime=HARNESS._InertRuntime(),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert {job.episode for job in view.jobs} == {0, 1}
+    assert len({job.route_fingerprint for job in view.jobs}) == 2
+    assert [decision.disposition for decision in view.route_decisions] == [
+        "dispatch",
+        "contain",
+    ]
+    assert view.route_decisions[-1].rule_id == "no_changed_route"
+    assert all(job.state != "queued" for job in view.jobs)
 
 
 def test_twenty_normalized_replays_are_identical() -> None:

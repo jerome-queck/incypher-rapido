@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sqlite3
 import stat
@@ -12,7 +13,14 @@ from typing import Any
 
 from .config import RuntimeConfig
 from .orchestrator import NativeRuntime, Orchestrator, RunReport
+from .routing import DISPOSITIONS, FAILURE_KINDS, ROUTE_AXES
 from .state import StateStore
+
+
+class _AdaptiveOrchestrator(Orchestrator):
+    """Private adaptive entry point owned by DurableJobControl."""
+
+    _adaptive_control = True
 
 
 @dataclass(frozen=True)
@@ -20,6 +28,7 @@ class JobView:
     job_id: str
     challenge_id: int
     catalogue_rank: int
+    episode: int
     phase: str
     role: str
     lane: int
@@ -31,6 +40,21 @@ class JobView:
 
 
 @dataclass(frozen=True)
+class RouteDecisionView:
+    decision_sequence: int
+    challenge_id: int
+    source_episode: int
+    failure_kind: str
+    failure_subreason: str
+    disposition: str
+    rule_id: str
+    source_route_fingerprint: str
+    successor_route_fingerprint: str | None
+    changed_axes: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
 class ControlView:
     run_id: str
     status: str
@@ -39,6 +63,16 @@ class ControlView:
     pending_submission_count: int
     owned_instance_count: int
     jobs: tuple[JobView, ...]
+    route_decisions: tuple[RouteDecisionView, ...]
+
+
+def _public_fingerprint(value: object | None) -> str | None:
+    if value is None:
+        return None
+    raw = str(value)
+    if len(raw) != 64 or any(character not in "0123456789abcdef" for character in raw):
+        raise ValueError("durable route fingerprint is invalid")
+    return "sha256:" + base64.urlsafe_b64encode(bytes.fromhex(raw)).decode("ascii").rstrip("=")
 
 
 def _read_only_connection(path: Path) -> sqlite3.Connection:
@@ -54,6 +88,20 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _changed_axes(value: object) -> tuple[str, ...]:
+    try:
+        decoded = json.loads(str(value))
+    except json.JSONDecodeError as exc:
+        raise ValueError("durable changed axes are invalid") from exc
+    if (
+        not isinstance(decoded, list)
+        or any(not isinstance(item, str) or item not in ROUTE_AXES for item in decoded)
+        or len(set(decoded)) != len(decoded)
+    ):
+        raise ValueError("durable changed axes are invalid")
+    return tuple(decoded)
+
+
 class DurableJobControl:
     """Own one production run and expose only sanitized durable facts."""
 
@@ -61,7 +109,7 @@ class DurableJobControl:
     async def drive(config: RuntimeConfig, *, board: Any, runtime: NativeRuntime) -> RunReport:
         state = StateStore(config.state_path)
         try:
-            return await Orchestrator(config, board, state, runtime).run()
+            return await _AdaptiveOrchestrator(config, board, state, runtime).run()
         finally:
             state.close()
 
@@ -107,13 +155,37 @@ class DurableJobControl:
             )
             job_rows = connection.execute(
                 """
-                SELECT job_id, challenge_id, catalogue_rank, phase, role, lane, state,
+                SELECT job_id, challenge_id, catalogue_rank, episode, phase, role, lane, state,
                        route_fingerprint, admitted_sequence, started_sequence, closed_sequence
                 FROM control_jobs WHERE run_id=?
                 ORDER BY admitted_sequence, lane
                 """,
                 (selected_run_id,),
             ).fetchall()
+            has_decisions = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_route_decisions'"
+            ).fetchone()
+            decision_rows = (
+                []
+                if has_decisions is None
+                else connection.execute(
+                    """
+                    SELECT decision_sequence, challenge_id, source_episode,
+                           failure_kind, failure_subreason, disposition, rule_id,
+                           source_route_fingerprint, successor_route_fingerprint,
+                           changed_axes_json, reason
+                    FROM control_route_decisions WHERE run_id=?
+                    ORDER BY decision_sequence
+                    """,
+                    (selected_run_id,),
+                ).fetchall()
+            )
+            for decision in decision_rows:
+                if (
+                    str(decision["failure_kind"]) not in FAILURE_KINDS
+                    or str(decision["disposition"]) not in DISPOSITIONS
+                ):
+                    raise ValueError("durable route decision is invalid")
             return ControlView(
                 run_id=selected_run_id,
                 status=str(row["status"]),
@@ -126,16 +198,12 @@ class DurableJobControl:
                         job_id=str(job["job_id"]),
                         challenge_id=int(job["challenge_id"]),
                         catalogue_rank=int(job["catalogue_rank"]),
+                        episode=int(job["episode"]),
                         phase=str(job["phase"]),
                         role=str(job["role"]),
                         lane=int(job["lane"]),
                         state=str(job["state"]),
-                        route_fingerprint=(
-                            "sha256:"
-                            + base64.urlsafe_b64encode(bytes.fromhex(str(job["route_fingerprint"])))
-                            .decode("ascii")
-                            .rstrip("=")
-                        ),
+                        route_fingerprint=str(_public_fingerprint(job["route_fingerprint"])),
                         admitted_sequence=int(job["admitted_sequence"]),
                         started_sequence=(
                             None
@@ -148,9 +216,29 @@ class DurableJobControl:
                     )
                     for job in job_rows
                 ),
+                route_decisions=tuple(
+                    RouteDecisionView(
+                        decision_sequence=int(decision["decision_sequence"]),
+                        challenge_id=int(decision["challenge_id"]),
+                        source_episode=int(decision["source_episode"]),
+                        failure_kind=str(decision["failure_kind"]),
+                        failure_subreason=str(decision["failure_subreason"]),
+                        disposition=str(decision["disposition"]),
+                        rule_id=str(decision["rule_id"]),
+                        source_route_fingerprint=str(
+                            _public_fingerprint(decision["source_route_fingerprint"])
+                        ),
+                        successor_route_fingerprint=_public_fingerprint(
+                            decision["successor_route_fingerprint"]
+                        ),
+                        changed_axes=_changed_axes(decision["changed_axes_json"]),
+                        reason=str(decision["reason"]),
+                    )
+                    for decision in decision_rows
+                ),
             )
         finally:
             connection.close()
 
 
-__all__ = ["ControlView", "DurableJobControl", "JobView"]
+__all__ = ["ControlView", "DurableJobControl", "JobView", "RouteDecisionView"]
