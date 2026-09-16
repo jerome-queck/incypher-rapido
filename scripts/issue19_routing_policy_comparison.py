@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import _socket
 import argparse
 import base64
 import hashlib
@@ -11,6 +12,7 @@ import math
 import os
 import platform
 import resource
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -82,6 +84,9 @@ _SURFACE_FUNCTIONS = {
     },
 }
 
+_ACTIVE_SURFACE_MONITOR: DisabledSurfaceMonitor | None = None
+_AUDIT_FENCE_INSTALLED = False
+
 
 class DisabledSurfaceMonitor:
     """Count actual calls into every surface forbidden by the E3 protocol."""
@@ -90,6 +95,7 @@ class DisabledSurfaceMonitor:
         self.counts = {name: 0 for name in PARENT["disabled_surfaces"]}
         self._previous: object = None
         self._previous_thread: object = None
+        self._restorations: list[tuple[object, str, object]] = []
 
     def _profile(self, frame: FrameType, event: str, argument: object) -> None:
         del argument
@@ -104,6 +110,28 @@ class DisabledSurfaceMonitor:
             if function in functions and module.startswith("rapido."):
                 self.counts[surface] += 1
 
+    def _block(self, owner: object, name: str, surface: str) -> None:
+        original = getattr(owner, name)
+        label = "process" if surface == "containers" else surface
+
+        def blocked(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.counts[surface] += 1
+            raise RuntimeError(f"comparison blocked a disabled {label} surface")
+
+        self._restorations.append((owner, name, original))
+        setattr(owner, name, blocked)
+
+    def _restore(self) -> None:
+        global _ACTIVE_SURFACE_MONITOR
+        if _ACTIVE_SURFACE_MONITOR is self:
+            _ACTIVE_SURFACE_MONITOR = None
+        sys.setprofile(self._previous)
+        threading.setprofile(self._previous_thread)
+        while self._restorations:
+            owner, name, original = self._restorations.pop()
+            setattr(owner, name, original)
+
     def __enter__(self) -> Self:
         global _ACTIVE_SURFACE_MONITOR
         self._previous = sys.getprofile()
@@ -115,19 +143,23 @@ class DisabledSurfaceMonitor:
         ):
             raise RuntimeError("comparison requires exclusive disabled-surface profiling")
         _ACTIVE_SURFACE_MONITOR = self
-        sys.setprofile(self._profile)
-        threading.setprofile(self._profile)
+        try:
+            self._block(_socket, "socket", "network")
+            self._block(socket, "socket", "network")
+            self._block(subprocess, "Popen", "containers")
+            for name in ("fork", "forkpty", "posix_spawn", "posix_spawnp", "system"):
+                if hasattr(os, name):
+                    self._block(os, name, "containers")
+            sys.setprofile(self._profile)
+            threading.setprofile(self._profile)
+        except BaseException:
+            self._restore()
+            raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        global _ACTIVE_SURFACE_MONITOR
         del exc_type, exc, traceback
-        _ACTIVE_SURFACE_MONITOR = None
-        sys.setprofile(None)
-        threading.setprofile(None)
-
-
-_ACTIVE_SURFACE_MONITOR: DisabledSurfaceMonitor | None = None
+        self._restore()
 
 
 def _disabled_surface_audit(event: str, arguments: tuple[object, ...]) -> None:
@@ -145,7 +177,13 @@ def _disabled_surface_audit(event: str, arguments: tuple[object, ...]) -> None:
         raise RuntimeError("comparison blocked a disabled process surface")
 
 
-sys.addaudithook(_disabled_surface_audit)
+def install_process_audit_fence() -> None:
+    """Install the non-removable fence only in the disposable CLI process."""
+
+    global _AUDIT_FENCE_INSTALLED
+    if not _AUDIT_FENCE_INSTALLED:
+        sys.addaudithook(_disabled_surface_audit)
+        _AUDIT_FENCE_INSTALLED = True
 
 
 def _canonical(value: object) -> bytes:
@@ -1177,6 +1215,7 @@ def main() -> None:
     output_root = args.output.with_name(f".{args.output.name}.work")
     if output_root.exists():
         raise FileExistsError("comparison work root already exists")
+    install_process_audit_fence()
     try:
         result = run_comparison(output_root, repetitions=args.repetitions)
         if not result["gate"]["passed"]:

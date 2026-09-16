@@ -4,6 +4,7 @@ import _socket
 import copy
 import importlib.util
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -199,6 +200,10 @@ def test_result_contains_no_private_canary_or_disabled_surface_call(tmp_path: Pa
 
 
 def test_disabled_surface_monitor_counts_real_profiled_calls() -> None:
+    original_socket = _socket.socket
+    original_public_socket = socket.socket
+    original_popen = subprocess.Popen
+
     def surface_call() -> None:
         return None
 
@@ -220,10 +225,17 @@ def test_disabled_surface_monitor_counts_real_profiled_calls() -> None:
         invoke("rapido.state", reserve_submission)
         with pytest.raises(RuntimeError, match="network"):
             _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        with pytest.raises(RuntimeError, match="network"):
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         with pytest.raises(RuntimeError, match="process"):
             subprocess.run([sys.executable, "-c", "pass"], check=False)
 
     assert all(count > 0 for count in monitor.counts.values())
+    assert _socket.socket is original_socket
+    assert socket.socket is original_public_socket
+    assert subprocess.Popen is original_popen
+    restored_socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    restored_socket.close()
 
 
 def test_disabled_surface_monitor_profiles_new_threads() -> None:
@@ -237,6 +249,32 @@ def test_disabled_surface_monitor_profiles_new_threads() -> None:
         thread.join()
 
     assert monitor.counts["model_inference"] > 0
+
+
+def test_disposable_process_audit_fence_blocks_precaptured_alias() -> None:
+    code = f"""
+import _socket
+import importlib.util
+import sys
+from pathlib import Path
+
+path = Path({str(ROOT / "scripts" / "issue19_routing_policy_comparison.py")!r})
+spec = importlib.util.spec_from_file_location('routing_comparison_child', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+cached_socket = _socket.socket
+module.install_process_audit_fence()
+with module.DisabledSurfaceMonitor() as monitor:
+    try:
+        cached_socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    except RuntimeError as error:
+        assert 'network' in str(error)
+    else:
+        raise AssertionError('pre-captured socket alias bypassed the audit fence')
+assert monitor.counts['network'] > 0
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_result_validator_rejects_stored_views_fixture_and_source_tampering(
