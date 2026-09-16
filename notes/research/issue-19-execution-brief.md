@@ -507,10 +507,10 @@ remains a release gate; this result makes no live-conversion claim.
 
 A post-implementation v3 compatibility replay is stored at
 `notes/research/issue-19-candidate-flow-comparison-v3.json` (SHA-256
-`21b5b1ba1d663589b7a1c056e868f46c154e2811d93d14b853003cfe1d98ff75`). This is a regression
+`b96eb569ea86b3433a866fe871be890e60f57c178549e9a7b42eb97bb2a09fcc`). This is a regression
 check, not a retrospective replacement for the registered v2 architecture decision. Its 240 raw
 observations bind the current production tree SHA-256
-`dcdfbc2d0b3bd4a2e3e9ff679fbb60ef2d3866eadd56984418094e7ef43d24c3`. Exact agreement converted
+`aade18aead98aa2b3c7b3032784056ff145a76ffb55a81c647bfa9fe0b85a18a`. Exact agreement converted
 20 cases with 440 tool calls; private verification converted 60 with 320 tool calls. Both had zero
 false admissions, prompt leaks, or model/effort mismatches, and the gate again selected
 `private_verification`.

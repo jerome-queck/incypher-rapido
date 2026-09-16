@@ -425,6 +425,14 @@ class HangingBoundaryRuntime(BoundaryRuntime):
         raise AssertionError("deadline must cancel the hanging turn")
 
 
+class LiveHangingBoundaryRuntime(UnsolvedBoundaryRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        if kwargs.get("tool_registry") is None:
+            return await super().solve(workspace, prompt, **kwargs)
+        await asyncio.sleep(60)
+        raise AssertionError("deadline must cancel the live turn")
+
+
 class ToolRetryMemoryRuntime(UnsolvedBoundaryRuntime):
     def __init__(self) -> None:
         super().__init__("unused")
@@ -1164,13 +1172,36 @@ def test_indeterminate_cleanup_poison_is_durable_and_fences_reassignment(
     board = IndeterminateCleanupBoundaryBoard([_challenge(2, challenge_type="dynamic_iac")])
     config = replace(_config(tmp_path), manage_dynamic_instances=True, episodes_per_challenge=2)
 
-    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+    with pytest.raises(BoardError, match="cleanup remained indeterminate"):
         asyncio.run(
             DurableJobControl.drive(config, board=board, runtime=UnsolvedBoundaryRuntime("unused"))
         )
     first = DurableJobControl.inspect(config.state_path)
     assert first.owned_instance_count == 1
     assert first.status == "failed"
+
+
+def test_deadline_never_hides_indeterminate_instance_cleanup(tmp_path: Path) -> None:
+    board = IndeterminateCleanupBoundaryBoard([_challenge(2, challenge_type="dynamic_iac")])
+    config = replace(
+        _config(tmp_path),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=2,
+        run_seconds=0.5,
+    )
+
+    with pytest.raises(BoardError, match="cleanup remained indeterminate"):
+        asyncio.run(
+            DurableJobControl.drive(
+                config,
+                board=board,
+                runtime=LiveHangingBoundaryRuntime("unused"),
+            )
+        )
+    view = DurableJobControl.inspect(config.state_path)
+    assert view.status == "failed"
+    assert view.owned_instance_count == 1
+    assert board.active
 
 
 def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path) -> None:
@@ -1420,7 +1451,7 @@ def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) 
 def test_dynamic_workspace_then_cleanup_failure_escalates_and_contains(tmp_path: Path) -> None:
     board = WorkspaceAndCleanupFailureBoard([_file_challenge(1, challenge_type="dynamic_iac")])
     config = replace(_config(tmp_path), manage_dynamic_instances=True, episodes_per_challenge=2)
-    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+    with pytest.raises(BoardError, match="cleanup remained indeterminate"):
         asyncio.run(
             DurableJobControl.drive(
                 config,

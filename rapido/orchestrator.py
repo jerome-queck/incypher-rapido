@@ -373,7 +373,6 @@ class Orchestrator:
         self.state = state
         self.runtime = runtime
         self._slots = asyncio.Semaphore(config.concurrency)
-        self._dynamic_slots = asyncio.Semaphore(config.dynamic_concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
 
@@ -2039,6 +2038,10 @@ class Orchestrator:
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
+        dynamic_ids = {challenge.id for challenge in challenges if challenge.type == "dynamic_iac"}
+        instance_condition = asyncio.Condition()
+        instance_holders: set[int] = set()
+        instance_completed: set[int] = set()
         initial_route = baseline_route(
             model=self.config.model,
             effort=self.config.reasoning_effort,
@@ -2169,8 +2172,21 @@ class Orchestrator:
                     "instance_lease_waiting",
                     {"challenge_id": challenge.id, "episode": episode},
                 )
-                await self._dynamic_slots.acquire()
-                lease_acquired = True
+                async with instance_condition:
+                    while True:
+                        eligible = sorted(
+                            active & dynamic_ids - instance_completed - instance_holders,
+                            key=catalogue_ranks.__getitem__,
+                        )
+                        if (
+                            len(instance_holders) < self.config.dynamic_concurrency
+                            and challenge.id
+                            in eligible[: self.config.dynamic_concurrency - len(instance_holders)]
+                        ):
+                            instance_holders.add(challenge.id)
+                            lease_acquired = True
+                            break
+                        await instance_condition.wait()
                 existing = self.state.owned_instances()
                 unsafe = any(record["status"] != "owned" for record in existing)
                 if unsafe or len(existing) >= self.config.dynamic_concurrency:
@@ -2197,6 +2213,7 @@ class Orchestrator:
                     return True
 
                 cancelled: asyncio.CancelledError | None = None
+                created = receipt is not None
 
                 async def drain_cleanup(cleanup: asyncio.Task[bool]) -> bool:
                     nonlocal cancelled
@@ -2253,7 +2270,11 @@ class Orchestrator:
                     lease_acquired = False
                     receipt = None
                     target_endpoints = ()
-                    self._dynamic_slots.release()
+                    async with instance_condition:
+                        instance_holders.discard(challenge.id)
+                        if created:
+                            instance_completed.add(challenge.id)
+                        instance_condition.notify_all()
                 if not clean:
                     return False
                 if cancelled is not None:
@@ -2365,6 +2386,8 @@ class Orchestrator:
                     clean = await release_instance()
                 finally:
                     active.remove(challenge.id)
+                    async with instance_condition:
+                        instance_condition.notify_all()
                 if not clean:
                     raise BoardError("instance cleanup did not prove absence")
             assert outcome is not None
@@ -2414,7 +2437,20 @@ class Orchestrator:
             for task in (join, timer, *workers):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(join, timer, *workers, return_exceptions=True)
+            shutdown = await asyncio.gather(join, timer, *workers, return_exceptions=True)
+            if self.state.owned_instances():
+                raise BoardError("instance cleanup remained indeterminate during queue shutdown")
+            failure = next(
+                (
+                    result
+                    for result in shutdown
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, (asyncio.CancelledError, RunDeadlineReached))
+                ),
+                None,
+            )
+            if failure is not None:
+                raise failure
         self.state.event(
             run_id,
             "challenge_queue_summary",

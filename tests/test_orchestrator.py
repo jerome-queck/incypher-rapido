@@ -696,7 +696,7 @@ def test_completion_never_deletes_replaced_generation(tmp_path: Path) -> None:
     dynamic = challenge(2, challenge_type="dynamic_iac")
     board = FakeBoard([dynamic])
     store = StateStore(tmp_path / "state.sqlite3")
-    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+    with pytest.raises(BoardError, match="cleanup remained indeterminate"):
         asyncio.run(Orchestrator(cfg, board, store, ReplaceDuringSolveRuntime(board)).run())
     assert board.instance_calls == [("GET", 2), ("POST", 2), ("GET", 2), ("GET", 2)]
     assert board.active_instances[2]["connection_info"] == "http://127.0.0.2:8135/"
