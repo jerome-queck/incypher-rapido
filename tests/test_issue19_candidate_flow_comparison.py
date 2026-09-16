@@ -29,6 +29,9 @@ def _normalized(result: dict[str, object]) -> dict[str, object]:
     assert isinstance(provenance, dict)
     provenance.pop("elapsed_seconds")
     provenance.pop("environment")
+    # Behavior replay is independent of the immutable source manifest recorded
+    # by the earlier E2 run; later production commits must change that manifest.
+    provenance.pop("production_source")
     observations = normalized["observations"]
     assert isinstance(observations, list)
     for row in observations:

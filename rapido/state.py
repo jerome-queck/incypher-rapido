@@ -11,6 +11,7 @@ import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,12 +25,32 @@ from .routing import (
     classify_failure,
     route_failure,
 )
+from .routing_policy import (
+    OPERATION_PROTOCOL_SHA256,
+    PARENT_PROTOCOL_SHA256,
+    ComparisonContract,
+    ComparisonDecision,
+    PolicyEvaluation,
+    PolicyInput,
+    RouteFact,
+    authorize_comparison_evaluation,
+    evaluate_comparison_policy,
+)
 
 MAX_EVENT_BYTES = 128 * 1024
 MAX_ATTEMPT_EVIDENCE_ITEMS = 20
 MAX_ATTEMPT_EVIDENCE_ITEM_CHARS = 1000
 
 _FAILURE_CLASSES = KNOWN_FAILURE_CLASSES
+
+
+@dataclass(frozen=True)
+class ComparisonRouteTrace:
+    decision_sequence: int | None
+    fact_sequences: tuple[int, ...]
+    evaluation: PolicyEvaluation
+    decision: ComparisonDecision
+    decision_digest: str
 
 
 class StateStore:
@@ -193,6 +214,55 @@ class StateStore:
                 changed_axes_json TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 UNIQUE(run_id, challenge_id, source_episode)
+            );
+            CREATE TABLE IF NOT EXISTS control_route_comparison_facts (
+                fact_sequence INTEGER PRIMARY KEY REFERENCES control_events(sequence),
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL,
+                fact_id TEXT NOT NULL,
+                fact_type TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                value TEXT NOT NULL,
+                payload_event_sequence INTEGER NOT NULL,
+                origin TEXT NOT NULL CHECK(origin = 'comparison_fixture'),
+                protocol_digest TEXT NOT NULL,
+                UNIQUE(run_id, challenge_id, episode, fact_id),
+                UNIQUE(run_id, challenge_id, episode, payload_event_sequence, fact_id)
+            );
+            CREATE TABLE IF NOT EXISTS control_route_comparison_decisions (
+                decision_sequence INTEGER PRIMARY KEY REFERENCES control_events(sequence),
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                source_episode INTEGER NOT NULL,
+                arm TEXT NOT NULL,
+                policy_config_digest TEXT NOT NULL,
+                policy_input_json TEXT NOT NULL,
+                policy_input_digest TEXT NOT NULL,
+                failure_kind TEXT,
+                failure_subreason TEXT,
+                disposition TEXT NOT NULL CHECK(disposition IN ('contain', 'dispatch')),
+                recipe_id TEXT,
+                source_route_fingerprint TEXT NOT NULL,
+                successor_route_fingerprint TEXT,
+                changed_axes_json TEXT NOT NULL,
+                operation_count INTEGER NOT NULL,
+                policy_config_bytes INTEGER NOT NULL,
+                source_fact_public_metadata_digest TEXT NOT NULL,
+                comparison_protocol_digest TEXT NOT NULL,
+                operation_protocol_digest TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                decision_digest TEXT NOT NULL,
+                UNIQUE(run_id, challenge_id, source_episode)
+            );
+            CREATE TABLE IF NOT EXISTS control_route_comparison_decision_facts (
+                decision_sequence INTEGER NOT NULL
+                  REFERENCES control_route_comparison_decisions(decision_sequence),
+                fact_sequence INTEGER NOT NULL
+                  REFERENCES control_route_comparison_facts(fact_sequence),
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY(decision_sequence, ordinal),
+                UNIQUE(decision_sequence, fact_sequence)
             );
             CREATE TABLE IF NOT EXISTS control_failure_origins (
                 run_id TEXT NOT NULL REFERENCES runs(id),
@@ -1093,6 +1163,35 @@ class StateStore:
                     (sequence, row["job_id"]),
                 )
 
+    def record_comparison_lane_completion(
+        self,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        lane: int,
+    ) -> int:
+        if type(lane) is not int or lane < 0:
+            raise ValueError("comparison lane is invalid")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT job_id FROM control_jobs WHERE run_id=? AND challenge_id=? "
+                "AND episode=? AND lane=? AND state='running'",
+                (run_id, challenge_id, episode, lane),
+            ).fetchone()
+            if row is None:
+                raise ValueError("comparison lane is absent or not running")
+            return self._control_event(
+                connection,
+                run_id,
+                "comparison_lane_completed",
+                str(row["job_id"]),
+                {
+                    "challenge_id": challenge_id,
+                    "episode": episode,
+                    "lane": lane,
+                },
+            )
+
     @classmethod
     def _finish_control_wave(
         cls,
@@ -1199,6 +1298,520 @@ class StateStore:
                 "run_id, challenge_id, episode, origin, event_sequence) VALUES (?, ?, ?, ?, ?)",
                 (run_id, challenge_id, episode, origin, sequence),
             )
+
+    def record_comparison_used_route(
+        self,
+        run_id: str,
+        challenge_id: int,
+        route: RouteSpec,
+    ) -> None:
+        """Seed observed route history for the effect-free comparison only."""
+        with self.transaction() as connection:
+            sequence = self._control_event(
+                connection,
+                run_id,
+                "comparison_used_route_recorded",
+                None,
+                {
+                    "challenge_id": challenge_id,
+                    "route_fingerprint": route.fingerprint,
+                },
+            )
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO control_routes(
+                  run_id, challenge_id, route_fingerprint, first_episode, route_json
+                ) VALUES (?, ?, ?, 0, ?)
+                """,
+                (
+                    run_id,
+                    challenge_id,
+                    route.fingerprint,
+                    json.dumps(route.as_dict(), sort_keys=True, separators=(",", ":")),
+                ),
+            ).rowcount
+            if inserted != 1:
+                raise ValueError("comparison used route was already present")
+            connection.execute(
+                "UPDATE control_events SET data_json=? WHERE sequence=?",
+                (
+                    json.dumps(
+                        {
+                            "challenge_id": challenge_id,
+                            "route_fingerprint": route.fingerprint,
+                            "route_recorded": True,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    sequence,
+                ),
+            )
+
+    def record_comparison_route_facts(
+        self,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        facts: tuple[RouteFact, ...],
+        *,
+        protocol_digest: str,
+    ) -> tuple[int, ...]:
+        """Commit oracle-blind public fixture facts under the exact protocol binding."""
+        if protocol_digest != PARENT_PROTOCOL_SHA256:
+            raise ValueError("comparison fact protocol binding is invalid")
+        order = tuple((fact.event_sequence, fact.fact_id) for fact in facts)
+        if order != tuple(sorted(order)) or len(set(order)) != len(order):
+            raise ValueError("comparison fact order is invalid")
+        sequences: list[int] = []
+        with self.transaction() as connection:
+            for fact in facts:
+                sequence = self._control_event(
+                    connection,
+                    run_id,
+                    "comparison_route_fact_recorded",
+                    None,
+                    {
+                        "challenge_id": challenge_id,
+                        "episode": episode,
+                        **fact.as_dict(),
+                    },
+                )
+                connection.execute(
+                    """
+                    INSERT INTO control_route_comparison_facts(
+                      fact_sequence, run_id, challenge_id, episode, fact_id,
+                      fact_type, scope, value, payload_event_sequence, origin,
+                      protocol_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'comparison_fixture', ?)
+                    """,
+                    (
+                        sequence,
+                        run_id,
+                        challenge_id,
+                        episode,
+                        fact.fact_id,
+                        fact.fact_type,
+                        fact.scope,
+                        fact.value,
+                        fact.event_sequence,
+                        protocol_digest,
+                    ),
+                )
+                sequences.append(sequence)
+        return tuple(sequences)
+
+    @staticmethod
+    def _comparison_decision_value(decision: ComparisonDecision) -> dict[str, object]:
+        value = asdict(decision)
+        value["successor"] = None if decision.successor is None else decision.successor.as_dict()
+        return value
+
+    @classmethod
+    def _comparison_trace(
+        cls,
+        *,
+        decision_sequence: int | None,
+        fact_sequences: tuple[int, ...],
+        evaluation: PolicyEvaluation,
+        decision: ComparisonDecision,
+    ) -> ComparisonRouteTrace:
+        payload = {
+            "decision": cls._comparison_decision_value(decision),
+            "evaluation": asdict(evaluation),
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return ComparisonRouteTrace(
+            decision_sequence=decision_sequence,
+            fact_sequences=fact_sequences,
+            evaluation=evaluation,
+            decision=decision,
+            decision_digest=digest,
+        )
+
+    @staticmethod
+    def _comparison_fact_rows(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        value: PolicyInput,
+        contract: ComparisonContract,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = tuple(
+            connection.execute(
+                """
+                SELECT facts.fact_sequence, facts.fact_id, facts.fact_type,
+                       facts.scope, facts.value, facts.payload_event_sequence,
+                       facts.origin, facts.protocol_digest, events.kind,
+                       events.data_json
+                FROM control_route_comparison_facts AS facts
+                JOIN control_events AS events ON events.sequence=facts.fact_sequence
+                WHERE facts.run_id=? AND facts.challenge_id=? AND facts.episode=?
+                ORDER BY payload_event_sequence, fact_id
+                """,
+                (run_id, challenge_id, episode),
+            ).fetchall()
+        )
+        if len(rows) != len(value.facts):
+            raise ValueError("comparison fact host binding is incomplete")
+        for row, fact in zip(rows, value.facts, strict=True):
+            if (
+                str(row["origin"]) != "comparison_fixture"
+                or str(row["protocol_digest"]) != contract.parent_protocol_sha256
+            ):
+                raise ValueError("comparison fact protocol binding is invalid")
+            observed = {
+                "event_sequence": int(row["payload_event_sequence"]),
+                "fact_id": str(row["fact_id"]),
+                "fact_type": str(row["fact_type"]),
+                "scope": str(row["scope"]),
+                "value": str(row["value"]),
+            }
+            expected_event = {
+                "challenge_id": challenge_id,
+                "episode": episode,
+                **fact.as_dict(),
+            }
+            try:
+                event_value = json.loads(str(row["data_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("comparison fact event is invalid") from exc
+            if (
+                observed != fact.as_dict()
+                or str(row["kind"]) != "comparison_route_fact_recorded"
+                or event_value != expected_event
+            ):
+                raise ValueError("comparison fact host binding does not match policy input")
+        return rows
+
+    @staticmethod
+    def _comparison_source_route(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        challenge_id: int,
+        source_episode: int,
+    ) -> RouteSpec:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT routes.route_json
+            FROM control_jobs AS jobs
+            JOIN control_routes AS routes
+              ON routes.run_id=jobs.run_id
+             AND routes.challenge_id=jobs.challenge_id
+             AND routes.route_fingerprint=jobs.route_fingerprint
+            WHERE jobs.run_id=? AND jobs.challenge_id=? AND jobs.episode=?
+            """,
+            (run_id, challenge_id, source_episode),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("comparison source wave has no unique route")
+        try:
+            return RouteSpec.from_dict(json.loads(str(rows[0]["route_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("comparison source route is invalid") from exc
+
+    def finish_and_compare_control_wave(
+        self,
+        *,
+        run_id: str,
+        challenge_id: int,
+        source_episode: int,
+        next_episode: int,
+        catalogue_rank: int,
+        lanes: int,
+        policy_input: PolicyInput,
+        arm: str,
+        contract: ComparisonContract,
+    ) -> ComparisonRouteTrace:
+        """Close, compare, journal, and admit in one effect-free SQLite transaction."""
+        if (
+            contract.parent_protocol_sha256 != PARENT_PROTOCOL_SHA256
+            or contract.operation_protocol_sha256 != OPERATION_PROTOCOL_SHA256
+        ):
+            raise ValueError("comparison contract protocol binding is invalid")
+        if next_episode != source_episode + 1 or catalogue_rank != 1 or lanes != 2:
+            raise ValueError("comparison admission shape differs from the frozen fixture")
+        with self.transaction() as connection:
+            fact_rows = self._comparison_fact_rows(
+                connection,
+                run_id=run_id,
+                challenge_id=challenge_id,
+                episode=source_episode,
+                value=policy_input,
+                contract=contract,
+            )
+            source = self._comparison_source_route(
+                connection,
+                run_id=run_id,
+                challenge_id=challenge_id,
+                source_episode=source_episode,
+            )
+            expected_source = contract.route_templates.get(policy_input.current_route_id)
+            if expected_source is None or source.fingerprint != expected_source.fingerprint:
+                raise ValueError("comparison source route does not match policy input")
+            all_route_fingerprints = {
+                str(row["route_fingerprint"])
+                for row in connection.execute(
+                    "SELECT route_fingerprint FROM control_routes "
+                    "WHERE run_id=? AND challenge_id=?",
+                    (run_id, challenge_id),
+                ).fetchall()
+            }
+            expected_used = {
+                contract.route_templates[recipe_id].fingerprint
+                for recipe_id in policy_input.used_successor_recipe_ids
+            }
+            if all_route_fingerprints - {source.fingerprint} != expected_used:
+                raise ValueError("comparison used routes do not match policy input")
+            evaluation = evaluate_comparison_policy(arm, policy_input, contract)
+            decision = authorize_comparison_evaluation(policy_input, evaluation, contract)
+            self._finish_control_wave(
+                connection,
+                run_id,
+                challenge_id,
+                source_episode,
+                "completed" if decision.disposition == "no_route" else "error",
+            )
+            fact_sequences = tuple(int(row["fact_sequence"]) for row in fact_rows)
+            trace = self._comparison_trace(
+                decision_sequence=None,
+                fact_sequences=fact_sequences,
+                evaluation=evaluation,
+                decision=decision,
+            )
+            if decision.disposition == "no_route":
+                return trace
+            sequence = self._control_event(
+                connection,
+                run_id,
+                "comparison_failure_route_decision",
+                None,
+                {
+                    "challenge_id": challenge_id,
+                    "changed_axes": list(decision.changed_axes),
+                    "disposition": decision.disposition,
+                    "failure_kind": decision.failure_kind,
+                    "failure_subreason": decision.failure_subreason,
+                    "recipe_id": decision.recipe_id,
+                    "source_episode": source_episode,
+                    "source_route_fingerprint": decision.source_fingerprint,
+                    "successor_route_fingerprint": decision.successor_fingerprint,
+                },
+            )
+            decision_value = self._comparison_decision_value(decision)
+            connection.execute(
+                """
+                INSERT INTO control_route_comparison_decisions(
+                  decision_sequence, run_id, challenge_id, source_episode, arm,
+                  policy_config_digest, policy_input_json, policy_input_digest,
+                  failure_kind, failure_subreason, disposition, recipe_id,
+                  source_route_fingerprint, successor_route_fingerprint,
+                  changed_axes_json, operation_count, policy_config_bytes,
+                  source_fact_public_metadata_digest, comparison_protocol_digest,
+                  operation_protocol_digest, decision_json, decision_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sequence,
+                    run_id,
+                    challenge_id,
+                    source_episode,
+                    arm,
+                    evaluation.policy_config_digest,
+                    json.dumps(policy_input.as_dict(), sort_keys=True, separators=(",", ":")),
+                    policy_input.digest,
+                    decision.failure_kind,
+                    decision.failure_subreason,
+                    decision.disposition,
+                    decision.recipe_id,
+                    decision.source_fingerprint,
+                    decision.successor_fingerprint,
+                    json.dumps(list(decision.changed_axes), separators=(",", ":")),
+                    evaluation.operation_count,
+                    evaluation.policy_config_bytes,
+                    policy_input.source_fact_public_metadata_digest,
+                    contract.parent_protocol_sha256,
+                    contract.operation_protocol_sha256,
+                    json.dumps(decision_value, sort_keys=True, separators=(",", ":")),
+                    trace.decision_digest,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO control_route_comparison_decision_facts("
+                "decision_sequence, fact_sequence, ordinal) VALUES (?, ?, ?)",
+                [
+                    (sequence, fact_sequence, ordinal)
+                    for ordinal, fact_sequence in enumerate(fact_sequences)
+                ],
+            )
+            if decision.disposition == "dispatch":
+                if decision.successor is None:
+                    raise AssertionError("comparison dispatch has no successor")
+                self._admit_control_wave(
+                    connection,
+                    run_id,
+                    challenge_id,
+                    next_episode,
+                    catalogue_rank,
+                    lanes,
+                    decision.successor,
+                    require_unused_route=arm != "fifo_unchanged",
+                )
+            return ComparisonRouteTrace(
+                decision_sequence=sequence,
+                fact_sequences=fact_sequences,
+                evaluation=evaluation,
+                decision=decision,
+                decision_digest=trace.decision_digest,
+            )
+
+    def replay_comparison_route_decision(
+        self,
+        decision_sequence: int | None,
+        contract: ComparisonContract,
+    ) -> ComparisonRouteTrace:
+        if type(decision_sequence) is not int:
+            raise ValueError("comparison decision sequence is absent")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM control_route_comparison_decisions WHERE decision_sequence=?",
+                (decision_sequence,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("comparison decision is absent")
+            if (
+                str(row["comparison_protocol_digest"]) != contract.parent_protocol_sha256
+                or str(row["operation_protocol_digest"]) != contract.operation_protocol_sha256
+            ):
+                raise ValueError("comparison replay protocol binding changed")
+            value = PolicyInput.from_dict(json.loads(str(row["policy_input_json"])))
+            if value.digest != str(row["policy_input_digest"]):
+                raise ValueError("comparison replay input digest changed")
+            evaluation = evaluate_comparison_policy(str(row["arm"]), value, contract)
+            decision = authorize_comparison_evaluation(value, evaluation, contract)
+            fact_rows = self._comparison_fact_rows(
+                self._connection,
+                run_id=str(row["run_id"]),
+                challenge_id=int(row["challenge_id"]),
+                episode=int(row["source_episode"]),
+                value=value,
+                contract=contract,
+            )
+            fact_sequences = tuple(int(fact["fact_sequence"]) for fact in fact_rows)
+            links = self._connection.execute(
+                "SELECT ordinal, fact_sequence "
+                "FROM control_route_comparison_decision_facts "
+                "WHERE decision_sequence=? ORDER BY ordinal",
+                (decision_sequence,),
+            ).fetchall()
+            if (
+                tuple(int(link["ordinal"]) for link in links) != tuple(range(len(fact_rows)))
+                or tuple(int(link["fact_sequence"]) for link in links) != fact_sequences
+            ):
+                raise ValueError("comparison replay fact links changed")
+            event = self._connection.execute(
+                "SELECT run_id, kind, job_id, data_json FROM control_events WHERE sequence=?",
+                (decision_sequence,),
+            ).fetchone()
+            expected_event = {
+                "challenge_id": int(row["challenge_id"]),
+                "changed_axes": list(decision.changed_axes),
+                "disposition": decision.disposition,
+                "failure_kind": decision.failure_kind,
+                "failure_subreason": decision.failure_subreason,
+                "recipe_id": decision.recipe_id,
+                "source_episode": int(row["source_episode"]),
+                "source_route_fingerprint": decision.source_fingerprint,
+                "successor_route_fingerprint": decision.successor_fingerprint,
+            }
+            if event is None:
+                raise ValueError("comparison replay decision event is absent")
+            try:
+                event_value = json.loads(str(event["data_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("comparison replay decision event is invalid") from exc
+            if (
+                str(event["run_id"]) != str(row["run_id"])
+                or str(event["kind"]) != "comparison_failure_route_decision"
+                or event["job_id"] is not None
+                or event_value != expected_event
+            ):
+                raise ValueError("comparison replay decision event changed")
+            expected_routes = {
+                contract.route_templates[
+                    value.current_route_id
+                ].fingerprint: contract.route_templates[value.current_route_id]
+            }
+            for recipe_id in value.used_successor_recipe_ids:
+                route = contract.route_templates[recipe_id]
+                expected_routes[route.fingerprint] = route
+            if decision.disposition == "dispatch":
+                if decision.successor is None:
+                    raise ValueError("comparison replay successor is absent")
+                expected_routes[decision.successor.fingerprint] = decision.successor
+            route_rows = self._connection.execute(
+                "SELECT route_fingerprint, route_json FROM control_routes "
+                "WHERE run_id=? AND challenge_id=?",
+                (str(row["run_id"]), int(row["challenge_id"])),
+            ).fetchall()
+            observed_routes = {str(route["route_fingerprint"]): route for route in route_rows}
+            if set(observed_routes) != set(expected_routes):
+                raise ValueError("comparison replay route set changed")
+            for fingerprint, expected_route in expected_routes.items():
+                if str(observed_routes[fingerprint]["route_json"]) != json.dumps(
+                    expected_route.as_dict(), sort_keys=True, separators=(",", ":")
+                ):
+                    raise ValueError("comparison replay route changed")
+            successor_jobs = self._connection.execute(
+                "SELECT lane, route_fingerprint FROM control_jobs "
+                "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
+                (
+                    str(row["run_id"]),
+                    int(row["challenge_id"]),
+                    int(row["source_episode"]) + 1,
+                ),
+            ).fetchall()
+            if decision.disposition == "dispatch":
+                if tuple(int(job["lane"]) for job in successor_jobs) != (0, 1) or any(
+                    str(job["route_fingerprint"]) != decision.successor_fingerprint
+                    for job in successor_jobs
+                ):
+                    raise ValueError("comparison replay successor admission changed")
+            elif successor_jobs:
+                raise ValueError("comparison replay has an unauthorized successor admission")
+        trace = self._comparison_trace(
+            decision_sequence=decision_sequence,
+            fact_sequences=fact_sequences,
+            evaluation=evaluation,
+            decision=decision,
+        )
+        if (
+            evaluation.policy_config_digest != str(row["policy_config_digest"])
+            or evaluation.operation_count != int(row["operation_count"])
+            or evaluation.policy_config_bytes != int(row["policy_config_bytes"])
+            or value.source_fact_public_metadata_digest
+            != str(row["source_fact_public_metadata_digest"])
+            or decision.failure_kind != row["failure_kind"]
+            or decision.failure_subreason != row["failure_subreason"]
+            or decision.disposition != str(row["disposition"])
+            or decision.recipe_id != row["recipe_id"]
+            or decision.source_fingerprint != str(row["source_route_fingerprint"])
+            or decision.successor_fingerprint != row["successor_route_fingerprint"]
+            or json.dumps(list(decision.changed_axes), separators=(",", ":"))
+            != str(row["changed_axes_json"])
+            or json.dumps(
+                self._comparison_decision_value(decision), sort_keys=True, separators=(",", ":")
+            )
+            != str(row["decision_json"])
+            or trace.decision_digest != str(row["decision_digest"])
+        ):
+            raise ValueError("comparison replay diverged")
+        return trace
 
     def _decide_control_successor(
         self,
