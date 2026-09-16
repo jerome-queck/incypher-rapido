@@ -1,5 +1,10 @@
 # Dynamic target acceptance — 2026-09-15
 
+> Historical exact-image evidence. Later issue-11 results and changed Board inactive-instance
+> behavior are recorded in
+> [the 2026-09-16 completion evidence](issue-11-completion-evidence-2026-09-16.md). Measurements
+> below remain facts about the 2026-09-15 run; "current" and "final" are date-scoped.
+
 Status: passed for the current qualified practice Board and exact final image
 `rapido@sha256:e8c14d8e28ddfbefcc5cc96571e2d382eccfdc654f8140d0948ab10d95a28ebb`,
 built from runtime commit `673bddc`. This is sanitized evidence: no credentials, candidate values,
