@@ -1,9 +1,14 @@
+import os
 import sqlite3
 import stat
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
+from rapido.routing import baseline_route
 from rapido.state import MAX_EVENT_BYTES, StateStore
 
 
@@ -120,6 +125,263 @@ def test_finishing_attempt_is_single_transition(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not running"):
         store.finish_attempt("attempt-1", "failed")
     store.close()
+
+
+def test_private_candidate_and_attempt_close_roll_back_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "private-run"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 2, route)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("attempt-1", run_id, 1, 0, 0, route.model, route.effort)
+    original = store._retain_candidate
+
+    def fail_after_insert(*args: object, **kwargs: object) -> None:
+        original(*args, **kwargs)
+        raise RuntimeError("fault after private insert")
+
+    monkeypatch.setattr(store, "_retain_candidate", fail_after_insert)
+    with pytest.raises(RuntimeError, match="fault after private insert"):
+        store.finish_attempt(
+            "attempt-1",
+            "candidate",
+            candidate="INCYPHER{atomic_private_close}",
+            retain_private_candidate=True,
+        )
+
+    attempt = store._connection.execute(
+        "SELECT status, candidate FROM attempts WHERE id='attempt-1'"
+    ).fetchone()
+    assert tuple(attempt) == ("running", None)
+    assert store._connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 0
+    store.close()
+
+
+def test_private_candidate_source_identity_is_immutable(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "private-run"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 2, route)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("attempt-1", run_id, 1, 0, 0, route.model, route.effort)
+    first = "INCYPHER{immutable_private_source}"
+    store.finish_attempt(
+        "attempt-1",
+        "candidate",
+        candidate=first,
+        retain_private_candidate=True,
+    )
+    with pytest.raises(ValueError, match="not running"):
+        store.finish_attempt(
+            "attempt-1",
+            "candidate",
+            candidate="INCYPHER{altered_replay}",
+            retain_private_candidate=True,
+        )
+    row = store._connection.execute(
+        "SELECT candidate FROM candidate_proposals WHERE source_attempt_id='attempt-1'"
+    ).fetchone()
+    assert bytes(row["candidate"]).decode() == first
+    assert (
+        store._connection.execute("SELECT candidate FROM attempts WHERE id='attempt-1'").fetchone()[
+            0
+        ]
+        is None
+    )
+    store.close()
+
+
+def test_private_candidate_source_scope_is_database_bound(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    store.start_run("source-run", {})
+    store.start_run("forged-run", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("source-run", [(0, 1, True)])
+    store.admit_control_wave("source-run", 1, 0, 0, 1, route)
+    store.start_control_wave("source-run", 1, 0)
+    store.start_attempt("source-attempt", "source-run", 1, 0, 0, route.model, route.effort)
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store._connection.execute(
+            """
+            INSERT INTO candidate_proposals(
+              source_attempt_id, run_id, challenge_id, episode, lane, role, recipe_kind,
+              candidate_key, candidate, retained_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "source-attempt",
+                "forged-run",
+                1,
+                0,
+                0,
+                "specialist",
+                "source_bound_tool_observation_v1",
+                b"x" * 32,
+                b"INCYPHER{scope_forgery}",
+                "2026-09-16T00:00:00+00:00",
+            ),
+        )
+    assert store._connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 0
+    store.close()
+
+
+@pytest.mark.parametrize("crash_before_commit", (True, False))
+def test_private_candidate_crash_boundary_is_atomic(
+    tmp_path: Path, crash_before_commit: bool
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    code = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+
+        from rapido.routing import baseline_route
+        from rapido.state import StateStore
+
+        path = Path(sys.argv[1])
+        crash_before_commit = sys.argv[2] == "pre"
+        store = StateStore(path)
+        run_id = "crash-run"
+        route = baseline_route(
+            model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15
+        )
+        store.start_run(run_id, {})
+        store.upsert_challenge(1, "A", "crypto", "standard", 100)
+        store.record_control_catalogue(run_id, [(0, 1, True)])
+        store.admit_control_wave(run_id, 1, 0, 0, 2, route)
+        store.start_control_wave(run_id, 1, 0)
+        store.start_attempt("attempt-1", run_id, 1, 0, 0, route.model, route.effort)
+        if crash_before_commit:
+            store._connection.create_function("crash_now", 0, lambda: os._exit(29))
+            store._connection.execute(
+                "CREATE TEMP TRIGGER crash_private AFTER INSERT ON candidate_proposals "
+                "BEGIN SELECT crash_now(); END"
+            )
+        store.finish_attempt(
+            "attempt-1",
+            "candidate",
+            candidate="INCYPHER{crash_atomic_private}",
+            retain_private_candidate=True,
+        )
+        os._exit(29)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(path), "pre" if crash_before_commit else "post"],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        timeout=10,
+    )
+    assert completed.returncode == 29
+
+    reopened = StateStore(path)
+    attempt = reopened._connection.execute(
+        "SELECT status, candidate FROM attempts WHERE id='attempt-1'"
+    ).fetchone()
+    proposal_count = reopened._connection.execute(
+        "SELECT COUNT(*) FROM candidate_proposals"
+    ).fetchone()[0]
+    if crash_before_commit:
+        assert tuple(attempt) == ("running", None)
+        assert proposal_count == 0
+    else:
+        assert tuple(attempt) == ("candidate", None)
+        assert proposal_count == 1
+    reopened.close()
+
+
+@pytest.mark.parametrize("crash_before_commit", (True, False))
+def test_private_verification_crash_boundary_is_atomic(
+    tmp_path: Path, crash_before_commit: bool
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    code = textwrap.dedent(
+        """
+        import os
+        import sys
+        from dataclasses import replace
+        from pathlib import Path
+
+        from rapido.routing import baseline_route
+        from rapido.state import StateStore
+
+        path = Path(sys.argv[1])
+        crash_before_commit = sys.argv[2] == "pre"
+        store = StateStore(path)
+        run_id = "verification-crash-run"
+        candidate = "INCYPHER{verification_crash_atomic}"
+        producer = baseline_route(
+            model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15
+        )
+        verifier = replace(
+            producer,
+            role="verifier",
+            tactic="independent_source_reobservation",
+            context_profile="fresh_source_only_no_candidate_carry",
+            verification_recipe="fresh_source_reobservation_v1",
+        )
+        store.start_run(run_id, {})
+        store.upsert_challenge(1, "A", "crypto", "standard", 100)
+        store.record_control_catalogue(run_id, [(0, 1, True)])
+        store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
+        store.start_control_wave(run_id, 1, 0)
+        store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+        store.finish_attempt(
+            "producer", "candidate", candidate=candidate, retain_private_candidate=True
+        )
+        store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
+        store.start_control_wave(run_id, 1, 1)
+        store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+        if crash_before_commit:
+            store._connection.create_function("crash_now", 0, lambda: os._exit(31))
+            store._connection.execute(
+                "CREATE TEMP TRIGGER crash_verification "
+                "AFTER INSERT ON candidate_verifications BEGIN SELECT crash_now(); END"
+            )
+        store.finish_attempt(
+            "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+        )
+        os._exit(31)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(path), "pre" if crash_before_commit else "post"],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        timeout=10,
+    )
+    assert completed.returncode == 31
+
+    reopened = StateStore(path)
+    verifier = reopened._connection.execute(
+        "SELECT status, candidate FROM attempts WHERE id='verifier'"
+    ).fetchone()
+    proposal_count = reopened._connection.execute(
+        "SELECT COUNT(*) FROM candidate_proposals"
+    ).fetchone()[0]
+    verification_count = reopened._connection.execute(
+        "SELECT COUNT(*) FROM candidate_verifications"
+    ).fetchone()[0]
+    if crash_before_commit:
+        assert tuple(verifier) == ("running", None)
+        assert proposal_count == 1
+        assert verification_count == 0
+    else:
+        assert tuple(verifier) == ("candidate", None)
+        assert proposal_count == 2
+        assert verification_count == 1
+    reopened.close()
 
 
 def test_event_sequence_is_monotonic(tmp_path: Path) -> None:

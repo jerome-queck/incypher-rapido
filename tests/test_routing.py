@@ -78,6 +78,23 @@ def test_authorization_and_unknown_native_failures_are_contained(subreason: str)
     assert decision.rule_id == "tool_unsafe_native_failure"
 
 
+@pytest.mark.parametrize(
+    "subreason", ("distinct_source_candidates", "retained_candidate_requires_verification")
+)
+def test_durable_private_candidate_facts_dispatch_verifier(subreason: str) -> None:
+    decision = route_failure(_request("disagreement", subreason=subreason))
+    assert decision.disposition == "dispatch"
+    assert decision.successor is not None
+    assert decision.successor.role == "verifier"
+    assert decision.successor.verification_recipe == "fresh_source_reobservation_v1"
+    assert set(decision.changed_axes) == {
+        "role",
+        "tactic",
+        "context_profile",
+        "verification_recipe",
+    }
+
+
 def test_classifier_uses_typed_pre_lane_origin() -> None:
     board = classify_failure(
         terminal="error",

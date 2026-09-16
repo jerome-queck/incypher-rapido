@@ -591,8 +591,7 @@ def admitted_candidate(
         if finding.status != "candidate" or finding.candidate is None:
             continue
         candidate = finding.candidate
-        inner = candidate.partition("{")[2].removesuffix("}")
-        if candidate in challenge_description or _is_placeholder(inner):
+        if not candidate_is_eligible(candidate, challenge_description):
             continue
         groups.setdefault(candidate, []).append(finding)
     eligible = [
@@ -608,6 +607,14 @@ def admitted_candidate(
         )
     )
     return eligible[0][0]
+
+
+def candidate_is_eligible(candidate: str, challenge_description: str) -> bool:
+    """Reject unsupported shapes, placeholders, and values copied from challenge prose."""
+    if not isinstance(candidate, str) or FLAG_RE.fullmatch(candidate) is None:
+        return False
+    inner = candidate.partition("{")[2].removesuffix("}")
+    return candidate not in challenge_description and not _is_placeholder(inner)
 
 
 __all__ = [
@@ -629,5 +636,6 @@ __all__ = [
     "SolverOutputError",
     "admitted_candidate",
     "build_turn_prompt",
+    "candidate_is_eligible",
     "project_attempt_carry",
 ]

@@ -224,7 +224,7 @@ def test_adaptive_control_routes_eight_failures_without_unchanged_retry(tmp_path
     } == {
         "policy": "contain",
         "provenance": "contain",
-        "disagreement": "contain",
+        "disagreement": "dispatch",
         "timeout": "contain",
         "tool": "dispatch",
         "quota": "contain",

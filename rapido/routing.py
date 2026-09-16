@@ -220,8 +220,17 @@ def classify_failure(
         raise ValueError("failure origin is invalid")
     if terminal == "error" and failure_origin is not None:
         return FailureSignal(failure_origin, f"{failure_origin}_catch_boundary_failure")
-    if candidate_identity_count > 1:
-        return FailureSignal("disagreement", "distinct_source_candidates")
+    if terminal == "solved" or terminal == "candidate" and candidate_identity_count == 0:
+        return None
+    if candidate_identity_count > 0:
+        return FailureSignal(
+            "disagreement",
+            (
+                "distinct_source_candidates"
+                if candidate_identity_count > 1
+                else "retained_candidate_requires_verification"
+            ),
+        )
     groups: tuple[tuple[FailureKind, frozenset[str]], ...] = (
         ("policy", _POLICY_FAILURES),
         ("provenance", _PROVENANCE_FAILURES),
@@ -268,11 +277,29 @@ def route_failure(request: RouteRequest) -> RouteDecision:
     rule_id = ""
     if failure.kind == "policy":
         return _terminal(request, "policy_unapproved", "no validated authorized route fact exists")
-    if failure.kind in {"provenance", "disagreement"}:
+    if failure.kind == "provenance":
         return _terminal(
             request,
-            f"{failure.kind}_verifier_unavailable",
-            "no validated private verifier route fact exists",
+            "provenance_rejected",
+            "unproven candidate material cannot enter the private verifier path",
+        )
+    if failure.kind == "disagreement":
+        if failure.subreason not in {
+            "distinct_source_candidates",
+            "retained_candidate_requires_verification",
+        }:
+            return _terminal(
+                request,
+                "disagreement_verifier_unavailable",
+                "no durable private candidate fact authorizes verifier dispatch",
+            )
+        rule_id = "private_source_reobservation_v1"
+        successor = replace(
+            request.current,
+            role="verifier",
+            tactic="independent_source_reobservation",
+            context_profile="fresh_source_only_no_candidate_carry",
+            verification_recipe="fresh_source_reobservation_v1",
         )
     if failure.kind == "timeout":
         return _terminal(
@@ -326,7 +353,7 @@ def route_failure(request: RouteRequest) -> RouteDecision:
             context_profile="durable_facts_only",
             workspace_generation=1,
         )
-    else:  # pragma: no cover - closed by FailureSignal validation and terminal branches
+    elif failure.kind != "disagreement":  # pragma: no cover - closed above
         raise AssertionError("unreachable failure kind")
 
     assert successor is not None
