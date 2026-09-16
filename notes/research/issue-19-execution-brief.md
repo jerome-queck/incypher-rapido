@@ -202,6 +202,7 @@ review, merged source, exact image, and protocol are fixed.
 | E1 | One authorized-context/prompt variable at a time, submission disabled | Exact model/effort, completion/refusal, first tool call, elapsed, tool count, provenance result | Select only a policy-compatible variant with no scope expansion or safety weakening |
 | E2 | Exact peer agreement vs private-retention plus independent deterministic verification | Qualified candidates, false admissions, provenance subreason, elapsed/tool count | New path admits only source-bound deterministic verification and never model assertion alone |
 | E3 | FIFO unchanged episode vs failure-specific Lead routing | Per-class conversion, repeated action fingerprints, coverage, elapsed, tool count | Selected route changes tactic/context/tool/role/budget after every failure and improves or preserves safe conversion |
+| M1 | Current lane-local carry vs typed challenge-wide earlier-episode memory | Useful context, duplicate tactics/observations, prompt bytes, source linkage, replay, scope/privacy violations | Select typed memory only if it exposes strictly more useful cross-lane context with zero safety regression; confirm conversion in E4 |
 | E4 | 2, 4, 6, then 8 inference lanes and scaled local-analysis workers | CPU, RSS, PIDs, model quota/latency, queue wait, Board/instance pressure, conversion | Stop increasing at first measured non-host bottleneck or safety boundary; keep full-wave admission |
 | E5 | Crash points before/after queue admission, evidence/vault commit, submission intent/response, instance create/delete | Replay order, lost/duplicated work/effects, cleanup, DB integrity, residue | One durable owner; no duplicate POST, lost closed work, stale lane, or leaked instance/workspace |
 | E6 | Read-only current Board inactive-instance observations with exact request contract | HTTP status, validated body shape, endpoint/timestamp presence, repeated coherence | Mutation allowed only after documented inactive semantics are positively established |
@@ -209,6 +210,40 @@ review, merged source, exact image, and protocol are fixed.
 Every experiment records exact source, fixture identity, model/effort when used, configuration,
 elapsed time, and a sanitized result. Native calibration is not a submission probe. Live solver
 runs always use Daybreak/xhigh; Luna is restricted to narrow non-live fixtures/tests.
+
+### M1 typed-memory comparison registration
+
+M1 is frozen before implementation or result generation in
+[`issue-19-memory-comparison-protocol-v1.json`](issue-19-memory-comparison-protocol-v1.json), SHA-256
+`4605399b8ff84acef4ecbcd30bd1856a86b8e3792d94f03fd525db4d70cd8a6e`. It compares exactly two
+production projections: `lane_local_v1`, the current maximum-four same-lane attempt carry plus
+same-lane evidence, and `typed_challenge_v1`, bounded eligible earlier episodes from the same run
+and challenge across lanes. The latter composes existing SQLite records; it does not add a database,
+RAM cache, retained workspace, agent mesh, or candidate-derived prompt field.
+
+The typed projection has six closed record kinds: untrusted analysis claim, host observation,
+controller tactic outcome, typed failure, private candidate context, and verification. Arbitrary
+analysis prose remains same-lane only. Across lanes, Specialist and Recovery may receive only closed
+host/controller fields from earlier episodes. Same-episode peers remain isolated. Verifier receives
+fresh source and its recipe only. Candidate context stays controller-private, is excluded from
+usefulness scoring, and must join proposal → source attempt → role/route → complete evidence
+manifest → a matching successful source-bound observation.
+
+The protocol freezes all 14 fixtures, four insertion permutations, closed public fields,
+ordering, greedy truncation, canonical byte accounting, privacy denials, 112 sanitized raw-result
+rows, usefulness/duplicate definitions, and raw-derived selector. Both arms receive identical input,
+a 64-KiB projection budget, and the existing 128-KiB total prompt cap. The result must come from a
+clean merged source using the exact registered command. No Board, native model, network, container,
+submission, instance, or target effect is permitted.
+
+`typed_challenge_v1` is eligible only with exact replay after reopen; deterministic source ordering;
+100% proposal-to-complete-source-context linkage; strictly more useful other-lane records than
+`lane_local_v1`; no increase in repeated tactic/observation count; and zero stale, cross-run,
+cross-challenge, current-episode, verifier-peer, candidate, digest/encoding, authority, or prompt-cap
+violation. A tie keeps `lane_local_v1`. Selection remains provisional until Daybreak/xhigh E4
+calibration compares only the memory arm at fixed P4 capacity and preserves oracle correctness while
+improving either conversion or duplicate/source-bound work. Only then does E4 vary P2/P4/P6/P8.
+M1 cannot lower E4 or final acceptance.
 
 ### E0 red-baseline result
 

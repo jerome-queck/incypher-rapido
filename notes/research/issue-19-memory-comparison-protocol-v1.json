@@ -1,0 +1,595 @@
+{
+  "schema_version": 1,
+  "experiment": "M1",
+  "effect_policy": {
+    "board": false,
+    "containers": false,
+    "instances": false,
+    "model_inference": false,
+    "network": false,
+    "submissions": false,
+    "targets": false
+  },
+  "arms": [
+    {
+      "id": "lane_local_v1",
+      "same_lane_analysis_claims": true,
+      "same_lane_host_observations": true,
+      "other_lane_host_observations": false,
+      "other_lane_controller_records": false
+    },
+    {
+      "id": "typed_challenge_v1",
+      "same_lane_analysis_claims": true,
+      "same_lane_host_observations": true,
+      "other_lane_host_observations": true,
+      "other_lane_controller_records": true
+    }
+  ],
+  "projection": {
+    "run_scope": "exact",
+    "challenge_scope": "exact",
+    "episode_rule": "source_episode < target_episode",
+    "verifier_prompt_record_count": 0,
+    "cross_lane_allowed_kinds": [
+      "host_observation",
+      "tactic_outcome",
+      "failure"
+    ],
+    "same_lane_allowed_kinds": [
+      "analysis_claim",
+      "host_observation",
+      "tactic_outcome",
+      "failure"
+    ],
+    "controller_private_kinds": [
+      "candidate_context",
+      "verification"
+    ],
+    "kind_order": [
+      "host_observation",
+      "tactic_outcome",
+      "failure",
+      "analysis_claim"
+    ],
+    "ordering": [
+      "source_episode_desc",
+      "source_lane_asc",
+      "source_attempt_id_asc",
+      "kind_order_asc",
+      "record_id_asc"
+    ],
+    "deduplication": "before byte selection retain only the first canonical record for each exact repeated_fingerprint; records without a fingerprint remain distinct",
+    "selection": "after deduplication iterate canonical order and retain a record only when canonical compact JSON for the whole public projection remains <= projection_bytes; do not backfill a rejected record",
+    "projection_bytes": 65536,
+    "prompt_bytes": 131072,
+    "byte_accounting": "UTF-8 length of JSON encoded with ensure_ascii=true, sort_keys=true, separators=[comma,colon]",
+    "cross_lane_analysis_prose_allowed": false,
+    "candidate_context_in_prompt": false,
+    "verification_in_prompt": false
+  },
+  "public_record_fields": {
+    "analysis_claim": [
+      "kind",
+      "record_id",
+      "source_episode",
+      "source_lane",
+      "status",
+      "summary",
+      "evidence",
+      "next_steps",
+      "tool_count"
+    ],
+    "host_observation": [
+      "kind",
+      "record_id",
+      "source_episode",
+      "source_lane",
+      "complete",
+      "gap",
+      "tool",
+      "success",
+      "source_bound",
+      "facts"
+    ],
+    "tactic_outcome": [
+      "kind",
+      "record_id",
+      "source_episode",
+      "source_lane",
+      "role",
+      "tactic",
+      "tool_profile",
+      "status"
+    ],
+    "failure": [
+      "record_id",
+      "source_episode",
+      "source_lane",
+      "kind",
+      "failure_kind",
+      "subreason"
+    ]
+  },
+  "privacy": {
+    "forbidden_field_fragments": [
+      "authority",
+      "candidate",
+      "credential",
+      "digest",
+      "endpoint",
+      "key",
+      "password",
+      "path",
+      "receipt",
+      "secret",
+      "token"
+    ],
+    "forbidden_value_forms": [
+      "raw candidate",
+      "sha256(candidate)",
+      "hex(candidate)",
+      "base64(candidate)",
+      "base64url(candidate)",
+      "urlencode(candidate)",
+      "absolute path",
+      "URL authority",
+      "credential canary"
+    ],
+    "field_matching": "within every projected memory record recursively visit every mapping key and sequence element; NFKC-normalize and Unicode-casefold keys; reject a key when any forbidden_field_fragment is a substring",
+    "value_matching": "within every projected memory record recursively visit every string/bytes scalar; reject an exact canary or listed encoding after NFKC normalization, any 64-character lowercase hexadecimal value, any absolute POSIX path, or any URL with a nonempty authority; top-level source/protocol/projection commitments are allowed only when independently recomputed and not candidate-derived",
+    "sanitization": "remove every rejected mapping entry and sequence element recursively; replace a rejected required analysis summary with the empty string; retain an otherwise empty record only with its nonprivate required metadata",
+    "candidate_sensitive_host_observation_policy": "retain record metadata and safe non-candidate facts only; remove every digest and candidate-derived field",
+    "private_context_public_fields": [
+      "complete_context_count",
+      "invalid_context_count",
+      "rejected_context_count",
+      "pending_count",
+      "verified_count"
+    ]
+  },
+  "fixture_generator": {
+    "pending_candidate_canary": "INCYPHER{m1_private_pending}",
+    "pending_candidate_sha256": "6a9f9e6cc825a52725ca417bb038de740b143fd334937fa3b9103f22554f787e",
+    "pending_candidate_hex": "494e4359504845527b6d315f707269766174655f70656e64696e677d",
+    "pending_candidate_base64": "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ==",
+    "pending_candidate_base64url": "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ",
+    "pending_candidate_urlencoded": "INCYPHER%7Bm1_private_pending%7D",
+    "verified_candidate_canary": "INCYPHER{m1_private_verified}",
+    "verified_candidate_sha256": "ec7911098c1317072e9e5d7601805a25486fee14cc7715ebb73f8d784e56817e",
+    "credential_canary": "M1_PRIVATE_TOKEN_7f4a",
+    "absolute_path_canary": "/private/m1/source.bin",
+    "authority_canary": "https://private.example.test/source",
+    "large_fact": "ASCII X repeated payload_bytes times",
+    "insertion_permutations": [
+      "declared",
+      "reverse",
+      "rotate_left_one",
+      "even_then_odd"
+    ]
+  },
+  "fixture_defaults": {
+    "target": {
+      "run_id": "run-A",
+      "challenge_id": 101,
+      "episode": 2,
+      "lane": 0,
+      "role": "specialist",
+      "challenge": {
+        "id": 101,
+        "name": "M1 fixed local memory fixture",
+        "category": "misc",
+        "type": "standard",
+        "description": "Use only provided local fixture facts.",
+        "value": 100
+      },
+      "artifact_paths": ["artifacts/source.txt"]
+    },
+    "control_route": {
+      "role": "specialist",
+      "tactic": "m1_fixture",
+      "context_profile": "m1_arm_under_test",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "backoff_policy": "none",
+      "attempt_seconds": 60,
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "model": "gpt-daybreak-blue-latest",
+      "effort": "xhigh",
+      "workspace_generation": 0
+    },
+    "prompt_construction": "call production build_turn_prompt with the expanded target challenge, artifact_paths, lane, episode, expanded control_route with role equal to target.role, no target endpoints, and only the arm projection as prior memory",
+    "role_route_overrides": {
+      "specialist": {"role": "specialist", "verification_recipe": "none"},
+      "recovery": {"role": "recovery", "verification_recipe": "none"},
+      "verifier": {"role": "verifier", "verification_recipe": "fresh_source_reobservation_v1"}
+    },
+    "allowed_target_overrides": ["episode", "lane", "role"],
+    "record": {
+      "run_id": "run-A",
+      "challenge_id": 101,
+      "source_episode": 0,
+      "source_lane": 0,
+      "source_attempt_id": "attempt-default"
+    },
+    "expected_private": {
+      "complete_context_count": 0,
+      "invalid_context_count": 0,
+      "rejected_context_count": 0,
+      "pending_count": 0,
+      "verified_count": 0
+    },
+    "expansion": "deep-copy target and record defaults; merge one named template into each record; apply only listed literal overrides; unknown fields or templates are protocol errors",
+    "allowed_record_overrides": [
+      "record_id",
+      "run_id",
+      "challenge_id",
+      "source_episode",
+      "source_lane",
+      "source_attempt_id",
+      "template",
+      "facts",
+      "payload_bytes"
+    ]
+  },
+  "record_templates": {
+    "safe_host": {
+      "kind": "host_observation",
+      "complete": true,
+      "gap": null,
+      "tool": "search_text",
+      "success": true,
+      "source_bound": true,
+      "facts": {"format": "text", "match_count": 1}
+    },
+    "tactic": {
+      "kind": "tactic_outcome",
+      "role": "specialist",
+      "tactic": "alternate_representation",
+      "tool_profile": "artifact_local",
+      "status": "unsolved"
+    },
+    "failure": {
+      "kind": "failure",
+      "failure_kind": "tool",
+      "subreason": "source_observation_incomplete"
+    },
+    "incomplete_host": {
+      "kind": "host_observation",
+      "complete": false,
+      "gap": "turn_failed",
+      "tool": "inspect_artifact",
+      "success": null,
+      "source_bound": false,
+      "facts": {}
+    },
+    "private_host": {
+      "kind": "host_observation",
+      "complete": true,
+      "gap": null,
+      "tool": "search_text",
+      "success": true,
+      "source_bound": true,
+      "facts": {
+        "safe_count": 1,
+        "NestedCandidate": "INCYPHER{m1_private_pending}",
+        "candidate_sha256": "6a9f9e6cc825a52725ca417bb038de740b143fd334937fa3b9103f22554f787e",
+        "candidate_hex": "494e4359504845527b6d315f707269766174655f70656e64696e677d",
+        "candidate_base64": "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ==",
+        "candidate_base64url": "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ",
+        "candidate_urlencoded": "INCYPHER%7Bm1_private_pending%7D",
+        "CredentialToken": "M1_PRIVATE_TOKEN_7f4a",
+        "ArtifactPath": "/private/m1/source.bin",
+        "EndpointAuthority": "https://private.example.test/source"
+      }
+    },
+    "private_host_verified": {
+      "kind": "host_observation",
+      "complete": true,
+      "gap": null,
+      "tool": "search_text",
+      "success": true,
+      "source_bound": true,
+      "facts": {
+        "safe_count": 1,
+        "NestedCandidate": "INCYPHER{m1_private_verified}",
+        "candidate_sha256": "ec7911098c1317072e9e5d7601805a25486fee14cc7715ebb73f8d784e56817e"
+      }
+    },
+    "private_analysis": {
+      "kind": "analysis_claim",
+      "status": "unsolved",
+      "summary": "INCYPHER{m1_private_pending}",
+      "evidence": [
+        "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ==",
+        "SU5DWVBIRVJ7bTFfcHJpdmF0ZV9wZW5kaW5nfQ",
+        "494e4359504845527b6d315f707269766174655f70656e64696e677d",
+        "INCYPHER%7Bm1_private_pending%7D",
+        "6a9f9e6cc825a52725ca417bb038de740b143fd334937fa3b9103f22554f787e",
+        "M1_PRIVATE_TOKEN_7f4a"
+      ],
+      "next_steps": [
+        "/private/m1/source.bin",
+        "https://private.example.test/source"
+      ],
+      "tool_count": 1
+    }
+  },
+  "fixtures": [
+    {
+      "id": "same_lane_closed_evidence",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "safe_host", "record_id": "same-host", "source_attempt_id": "same-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": ["same-host"], "typed_challenge_v1": ["same-host"]},
+      "expected_useful": {"lane_local_v1": ["same-host"], "typed_challenge_v1": ["same-host"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "other_lane_closed_evidence",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "safe_host", "record_id": "other-host", "source_lane": 1, "source_attempt_id": "other-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["other-host"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": ["other-host"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "other_lane_failure_route",
+      "target_overrides": {"episode": 1, "role": "recovery"},
+      "source_records": [
+        {"template": "tactic", "record_id": "other-tactic", "source_lane": 1, "source_attempt_id": "route-a0"},
+        {"template": "failure", "record_id": "other-failure", "source_lane": 1, "source_attempt_id": "route-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["other-tactic", "other-failure"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": ["other-tactic", "other-failure"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "two_lane_deterministic_ordering",
+      "target_overrides": {},
+      "source_records": [
+        {"template": "safe_host", "record_id": "lane1-e0", "source_episode": 0, "source_lane": 1, "source_attempt_id": "order-1-0", "facts": {"format": "text", "match_count": 3}},
+        {"template": "safe_host", "record_id": "lane0-e1", "source_episode": 1, "source_lane": 0, "source_attempt_id": "order-0-1"},
+        {"template": "safe_host", "record_id": "lane0-e0", "source_episode": 0, "source_lane": 0, "source_attempt_id": "order-0-0", "facts": {"format": "text", "match_count": 2}},
+        {"template": "safe_host", "record_id": "lane1-e1-duplicate", "source_episode": 1, "source_lane": 1, "source_attempt_id": "order-1-1"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": ["lane0-e1", "lane0-e0"], "typed_challenge_v1": ["lane0-e1", "lane0-e0", "lane1-e0"]},
+      "expected_useful": {"lane_local_v1": ["lane0-e1", "lane0-e0"], "typed_challenge_v1": ["lane0-e1", "lane0-e0", "lane1-e0"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 1},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "pending_private_candidate",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "private_host", "record_id": "candidate-host-redacted", "source_lane": 1, "source_attempt_id": "pending-producer"}
+      ],
+      "private_rows": [
+        {"table": "candidate_proposals", "source_attempt_id": "pending-producer", "run_id": "run-A", "challenge_id": 101, "episode": 0, "lane": 1, "role": "specialist", "recipe_kind": "source_bound_tool_observation_v1", "candidate": "INCYPHER{m1_private_pending}"}
+      ],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["candidate-host-redacted"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {"complete_context_count": 1, "pending_count": 1}
+    },
+    {
+      "id": "verified_private_candidate",
+      "target_overrides": {"role": "verifier"},
+      "source_records": [
+        {"template": "private_host_verified", "record_id": "verified-producer-host", "source_episode": 0, "source_lane": 0, "source_attempt_id": "verified-producer"},
+        {"template": "private_host_verified", "record_id": "verified-verifier-host", "source_episode": 1, "source_lane": 1, "source_attempt_id": "verified-verifier"},
+        {"template": "safe_host", "record_id": "eligible-peer-host", "source_episode": 1, "source_lane": 1, "source_attempt_id": "eligible-peer"}
+      ],
+      "private_rows": [
+        {"table": "candidate_proposals", "source_attempt_id": "verified-producer", "run_id": "run-A", "challenge_id": 101, "episode": 0, "lane": 0, "role": "specialist", "recipe_kind": "source_bound_tool_observation_v1", "candidate": "INCYPHER{m1_private_verified}"},
+        {"table": "candidate_proposals", "source_attempt_id": "verified-verifier", "run_id": "run-A", "challenge_id": 101, "episode": 1, "lane": 1, "role": "verifier", "recipe_kind": "fresh_source_reobservation_v1", "candidate": "INCYPHER{m1_private_verified}"},
+        {"table": "candidate_verifications", "run_id": "run-A", "challenge_id": 101, "producer_attempt_id": "verified-producer", "verifier_attempt_id": "verified-verifier", "recipe_kind": "fresh_source_reobservation_v1", "candidate": "INCYPHER{m1_private_verified}"}
+      ],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {"complete_context_count": 1, "verified_count": 1}
+    },
+    {
+      "id": "current_episode_exclusion",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "safe_host", "record_id": "current-host", "source_episode": 1, "source_lane": 1, "source_attempt_id": "current-a1"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "cross_challenge_exclusion",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "safe_host", "record_id": "cross-challenge-host", "challenge_id": 202, "source_lane": 1, "source_attempt_id": "cross-challenge-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "cross_run_exclusion",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "safe_host", "record_id": "cross-run-host", "run_id": "run-B", "source_lane": 1, "source_attempt_id": "cross-run-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "incomplete_manifest_handling",
+      "target_overrides": {"episode": 1, "role": "recovery"},
+      "source_records": [
+        {"template": "incomplete_host", "record_id": "incomplete-metadata", "source_lane": 1, "source_attempt_id": "incomplete-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["incomplete-metadata"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "reopen_replay",
+      "target_overrides": {"episode": 1, "role": "recovery"},
+      "source_records": [
+        {"template": "safe_host", "record_id": "replay-host", "source_lane": 1, "source_attempt_id": "replay-a0"},
+        {"template": "tactic", "record_id": "replay-tactic", "source_lane": 1, "source_attempt_id": "replay-a0"},
+        {"template": "failure", "record_id": "replay-failure", "source_lane": 1, "source_attempt_id": "replay-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["replay-host", "replay-tactic", "replay-failure"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": ["replay-host", "replay-tactic", "replay-failure"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "prompt_budget_truncation",
+      "target_overrides": {"episode": 3},
+      "source_records": [
+        {"template": "safe_host", "record_id": "large-e0", "source_episode": 0, "source_attempt_id": "large-a0", "facts": {"blob": {"generator": "large_fact", "payload_bytes": 24000}, "ordinal": 0}},
+        {"template": "safe_host", "record_id": "large-e1", "source_episode": 1, "source_attempt_id": "large-a1", "facts": {"blob": {"generator": "large_fact", "payload_bytes": 24000}, "ordinal": 1}},
+        {"template": "safe_host", "record_id": "large-e2", "source_episode": 2, "source_attempt_id": "large-a2", "facts": {"blob": {"generator": "large_fact", "payload_bytes": 24000}, "ordinal": 2}}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": ["large-e2", "large-e1"], "typed_challenge_v1": ["large-e2", "large-e1"]},
+      "expected_useful": {"lane_local_v1": ["large-e2", "large-e1"], "typed_challenge_v1": ["large-e2", "large-e1"]},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "same_lane_recursive_privacy",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "private_analysis", "record_id": "analysis-redacted", "source_attempt_id": "privacy-a0"}
+      ],
+      "private_rows": [],
+      "expected_visible": {"lane_local_v1": ["analysis-redacted"], "typed_challenge_v1": ["analysis-redacted"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {}
+    },
+    {
+      "id": "invalid_candidate_context_rejected",
+      "target_overrides": {"episode": 1},
+      "source_records": [
+        {"template": "incomplete_host", "record_id": "invalid-candidate-metadata", "source_lane": 1, "source_attempt_id": "invalid-producer"}
+      ],
+      "private_rows": [
+        {"table": "candidate_proposals", "source_attempt_id": "invalid-producer", "run_id": "run-A", "challenge_id": 101, "episode": 0, "lane": 1, "role": "specialist", "recipe_kind": "source_bound_tool_observation_v1", "candidate": "INCYPHER{m1_private_pending}"}
+      ],
+      "expected_visible": {"lane_local_v1": [], "typed_challenge_v1": ["invalid-candidate-metadata"]},
+      "expected_useful": {"lane_local_v1": [], "typed_challenge_v1": []},
+      "expected_deduplicated": {"lane_local_v1": 0, "typed_challenge_v1": 0},
+      "expected_private_overrides": {"rejected_context_count": 1}
+    }
+  ],
+  "raw_rows": {
+    "count": 112,
+    "order": ["case_declared", "arm_declared", "permutation_declared"],
+    "fields": [
+      "case_id",
+      "arm_id",
+      "permutation",
+      "visible_record_ids",
+      "visible_kind_counts",
+      "useful_record_count",
+      "repeated_fingerprint_count",
+      "deduplicated_record_count",
+      "omitted_record_count",
+      "encoded_bytes",
+      "projection_sha256",
+      "reopen_projection_sha256",
+      "prompt_bytes",
+      "prompt_sha256",
+      "reopen_prompt_sha256",
+      "complete_context_count",
+      "invalid_context_count",
+      "rejected_context_count",
+      "pending_count",
+      "verified_count",
+      "verifier_peer_record_count",
+      "violations"
+    ]
+  },
+  "metrics": {
+    "useful_record": "visible record_id is listed in fixture expected_useful for that arm",
+    "repeated_fingerprint": {
+      "host_observation": ["kind", "complete", "gap", "tool", "source_bound", "success", "canonical_sanitized_facts"],
+      "tactic_outcome": ["kind", "role", "tactic", "tool_profile", "status"],
+      "failure": ["kind", "failure_kind", "subreason"],
+      "analysis_claim": ["kind", "status", "summary", "evidence", "next_steps", "tool_count"]
+    },
+    "repeated_fingerprint_count": "number of visible post-deduplication records after the first record with the same exact per-kind fingerprint",
+    "deduplicated_record_count": "number of otherwise eligible records removed by exact fingerprint deduplication",
+    "omitted_record_count": "number of in-scope, privacy-safe, post-deduplication records rejected only by projection byte selection",
+    "eligible": "all 112 raw rows exactly match expected visibility/order/deduplication and the expanded expected_private vector; every permutation for one case/arm has identical projection_sha256 and prompt_sha256; reopen hashes equal original hashes; all violations and invalid_context_count are zero; every raw encoded_bytes <= projection.projection_bytes; every raw prompt_bytes <= projection.prompt_bytes; verifier_peer_record_count is zero",
+    "selection": "if both eligible, select typed_challenge_v1 only when its summed useful_record_count is strictly greater and its summed repeated_fingerprint_count is <= lane_local_v1; otherwise select lane_local_v1; no other tie-break"
+  },
+  "result": {
+    "required": [
+      "schema_version",
+      "protocol_sha256",
+      "source",
+      "fixture_commitments",
+      "raw_rows",
+      "summaries",
+      "gate",
+      "selection",
+      "provenance"
+    ],
+    "raw_rows_required": true,
+    "source_schema": ["clean", "commit", "files", "production_tree_sha256"],
+    "fixture_commitments_schema": ["protocol_sha256", "expanded_fixture_sha256", "permutation_sha256"],
+    "provenance_schema": ["command", "effect_counters", "environment", "started_at", "finished_at"],
+    "effect_counter_fields": ["board", "containers", "instances", "model_inference", "network", "submissions", "targets"],
+    "candidate_or_credential_derived_values_forbidden": true,
+    "validator_recomputes_from_raw_rows": true,
+    "source_must_be_clean_merged_commit": true
+  },
+  "native_confirmation": {
+    "required_before_E4_scaling": true,
+    "fixture_path": "notes/research/issue-19-memory-native-fixtures-v1.json",
+    "fixture_must_be_merged_before_measurement": true,
+    "arms": ["lane_local_v1", "typed_challenge_v1"],
+    "arm_order": ["AB", "BA"],
+    "task_count": 4,
+    "active_challenges": 2,
+    "lanes_per_episode": 2,
+    "concurrency": 4,
+    "episodes_per_challenge": 2,
+    "total_attempts_per_challenge": 4,
+    "model": "gpt-daybreak-blue-latest",
+    "reasoning_effort": "xhigh",
+    "submissions": false,
+    "instances": false,
+    "board": false,
+    "network": false,
+    "task_runs_per_arm": 8,
+    "oracle_valid_count": "sum of task-runs with the exact fixture oracle independently re-observed in successful source-bound evidence",
+    "repeated_tool_observation_rate": "sum of repeated tool-observation fingerprints divided by max(1,sum of all tool-observation fingerprints) across the eight task-runs",
+    "useful_source_bound_rate": "sum of successful nonduplicate source-bound observations divided by the summed work-window seconds across the eight task-runs",
+    "selection": "typed arm must have oracle_valid_count >= baseline and all safety gates; then confirm typed only if oracle_valid_count >= baseline + 1 OR [baseline repeated_tool_observation_rate > 0 AND typed repeated_tool_observation_rate <= 0.75 * baseline AND typed useful_source_bound_rate >= 0.90 * baseline]; otherwise retain lane_local_v1"
+  },
+  "registered_command": "python scripts/issue19_memory_comparison.py --protocol notes/research/issue-19-memory-comparison-protocol-v1.json --output notes/research/issue-19-memory-comparison-v1.json"
+}
