@@ -26,6 +26,15 @@ MAX_NATIVE_OUTPUT_BYTES = 32 * 1024
 NATIVE_TIMEOUT_SECONDS = 2.5
 MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 SCRATCH_FILE_LIMIT_BYTES = 8 * 1024 * 1024
+_RESOURCE_LIMIT_SIGNALS = frozenset(
+    int(value)
+    for value in (
+        getattr(signal, "SIGXCPU", None),
+        getattr(signal, "SIGXFSZ", None),
+        signal.SIGKILL,
+    )
+    if isinstance(value, signal.Signals)
+)
 
 _ADAPTER_FORMATS = {
     "disassembly": {"elf", "pe"},
@@ -89,6 +98,10 @@ def _apply_limits() -> None:
     # The final Linux runtime receives the enforceable address-space ceiling.
     if sys.platform != "darwin" and hasattr(resource, "RLIMIT_AS"):
         _set_limit(resource.RLIMIT_AS, MEMORY_LIMIT_BYTES)
+
+
+def _is_resource_limit_returncode(returncode: int) -> bool:
+    return returncode < 0 and -returncode in _RESOURCE_LIMIT_SIGNALS
 
 
 def _descriptors() -> tuple[int, int]:
@@ -237,16 +250,7 @@ def _native(argv: list[str], descriptor: int) -> dict[str, Any]:
             returncode = process.wait(timeout=0.25)
         except subprocess.TimeoutExpired as exc:
             raise _fail("tool_failed", "native inspector did not stop") from exc
-        if (
-            reason is None
-            and returncode < 0
-            and -returncode
-            in {
-                getattr(signal, "SIGXCPU", signal.SIGKILL),
-                getattr(signal, "SIGXFSZ", signal.SIGKILL),
-                signal.SIGKILL,
-            }
-        ):
+        if reason is None and _is_resource_limit_returncode(returncode):
             raise _fail("resource_limit", "native inspector exceeded a resource limit")
         return {
             "returncode": returncode,
