@@ -15,10 +15,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from .board import BoardClient, BoardError, BoardTransportError, Challenge, Verdict
+from .board import FLAG_RE, BoardClient, BoardError, BoardTransportError, Challenge, Verdict
 from .config import RuntimeConfig
 from .evidence import (
     EvidenceBatch,
@@ -39,6 +40,7 @@ from .memory import (
     MemoryTarget,
     TacticOutcome,
     project_memory,
+    sanitize_public_value,
 )
 from .memory import HostObservation as MemoryHostObservation
 from .routing import RouteSpec, baseline_route, instance_follow_on_route
@@ -93,6 +95,10 @@ class RunDeadlineReached(TimeoutError):
 
 class NoProgressError(TimeoutError):
     """A native lane made no host-visible tool progress for its bounded window."""
+
+
+class RecoveryBlocked(RuntimeError):
+    """A process-lost run cannot safely resume until its ambiguous effect is reconciled."""
 
 
 _NATIVE_FAILURE_CLASSES = frozenset(
@@ -335,16 +341,15 @@ def _instance_receipt(result: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
-    """Stable fields; timeout and attachment signatures are live Board values."""
-    stable_files = tuple(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-        )
+def _stable_challenge_files(challenge: Challenge) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (parsed.scheme, parsed.netloc, parsed.path)
         for parsed in (urllib.parse.urlsplit(file_ref) for file_ref in challenge.files)
     )
+
+
+def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
+    """Stable fields; timeout and attachment signatures are live Board values."""
     return (
         challenge.id,
         challenge.name,
@@ -352,12 +357,32 @@ def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
         challenge.type,
         challenge.description,
         challenge.value,
-        stable_files,
+        _stable_challenge_files(challenge),
         challenge.solved,
         challenge.max_attempts,
         challenge.attempts,
         challenge.shared,
     )
+
+
+def _challenge_material_sha256(challenge: Challenge) -> str:
+    """Bind same-run memory to stable solver inputs, excluding mutable Board counters."""
+    encoded = json.dumps(
+        {
+            "id": challenge.id,
+            "name": challenge.name,
+            "category": challenge.category,
+            "type": challenge.type,
+            "description": challenge.description,
+            "value": challenge.value,
+            "files": _stable_challenge_files(challenge),
+            "shared": challenge.shared,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 class Orchestrator:
@@ -377,6 +402,29 @@ class Orchestrator:
         self._slots = asyncio.Semaphore(config.concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
+
+    def _run_report(
+        self,
+        run_id: str,
+        status: str,
+        challenge_count: int,
+        outcomes: dict[int, str],
+    ) -> RunReport:
+        counts = {name: 0 for name in ("solved", "candidate", "unsolved", "unsupported", "error")}
+        for terminal in outcomes.values():
+            if terminal in counts:
+                counts[terminal] += 1
+        return RunReport(
+            run_id=run_id,
+            status=status,
+            challenge_count=challenge_count,
+            solved=counts["solved"],
+            candidates=counts["candidate"],
+            unsolved=counts["unsolved"],
+            unsupported=counts["unsupported"],
+            errors=counts["error"],
+            overlapping_waves=self.state.overlapping_wave_count(run_id),
+        )
 
     def _initial_peer_assignments(self) -> tuple[tuple[str, str, str], ...]:
         if self.config.peer_profile == "uniform_v1":
@@ -466,7 +514,11 @@ class Orchestrator:
         if not clean or self.state.owned_instances():
             raise BoardError("owned instance cleanup remains indeterminate")
 
-    async def _cleanup_instance_record(self, record: dict[str, Any], deadline: float) -> bool:
+    async def _cleanup_instance_record(
+        self,
+        record: dict[str, Any],
+        deadline: float,
+    ) -> bool:
         run_id = str(record["run_id"])
         challenge_id = int(record["challenge_id"])
         expected_receipt = record.get("receipt_sha256")
@@ -1153,6 +1205,38 @@ class Orchestrator:
                         facts=observation.facts,
                     )
                 )
+            for observation in source["checkpoint_observations"]:
+                if (
+                    type(observation.get("ordinal")) is not int
+                    or type(observation.get("complete")) is not bool
+                    or observation.get("gap") is not None
+                    and not isinstance(observation.get("gap"), str)
+                    or not isinstance(observation.get("tool"), str)
+                    or observation.get("success") is not None
+                    and type(observation.get("success")) is not bool
+                    or type(observation.get("source_bound")) is not bool
+                    or not isinstance(observation.get("facts"), dict)
+                ):
+                    raise EvidenceError("durable primary checkpoint observation is invalid")
+                records.append(
+                    MemoryHostObservation(
+                        record_id=(
+                            f"{source['source_attempt_id']}:checkpoint:"
+                            f"{int(observation['ordinal'])}"
+                        ),
+                        run_id=run_id,
+                        challenge_id=challenge_id,
+                        source_episode=source["source_episode"],
+                        source_lane=source["source_lane"],
+                        source_attempt_id=source["source_attempt_id"],
+                        complete=observation["complete"],
+                        gap=(None if observation["gap"] is None else str(observation["gap"])),
+                        tool=str(observation["tool"]),
+                        success=observation["success"],
+                        source_bound=observation["source_bound"],
+                        facts=observation["facts"],
+                    )
+                )
         for failure in self.state.same_run_memory_failures(
             run_id,
             challenge_id,
@@ -1406,6 +1490,8 @@ class Orchestrator:
                 nonlocal continuation_round
                 if not persistent_primary or turn.status != "completed":
                     return None
+                checkpoint: SolverFinding | None = None
+                qualified_candidate = False
                 try:
                     checkpoint = SolverFinding.from_message(turn.text)
                     _, checkpoint_calls, checkpoint_complete = _normalize_tool_calls(
@@ -1418,11 +1504,82 @@ class Orchestrator:
                     reason = "solver_output"
                 else:
                     if checkpoint.candidate is not None:
-                        return None
-                    reason = checkpoint.status
-                if remaining_seconds is not None and remaining_seconds <= 1:
+                        qualified_candidate = True
+                        reason = "qualified_candidate"
+                    else:
+                        reason = checkpoint.status
+                if (
+                    not qualified_candidate
+                    and remaining_seconds is not None
+                    and remaining_seconds <= 1
+                ):
                     return None
-                continuation_round += 1
+                if not qualified_candidate:
+                    continuation_round += 1
+                checkpoint_tool_count, checkpoint_calls, checkpoint_complete = (
+                    _normalize_tool_calls(turn.tool_calls)
+                )
+                checkpoint_observations = []
+                for ordinal, call in enumerate(checkpoint_calls[-_MAX_DURABLE_TOOL_CALLS:]):
+                    facts = sanitize_public_value(call.observation.facts)
+                    checkpoint_observations.append(
+                        {
+                            "ordinal": ordinal,
+                            "complete": checkpoint_complete,
+                            "gap": None if checkpoint_complete else "provenance_incomplete",
+                            "tool": call.name,
+                            "success": call.success,
+                            "source_bound": call.source_bound,
+                            "facts": facts if isinstance(facts, dict) else {},
+                        }
+                    )
+                checkpoint_text = (
+                    ()
+                    if checkpoint is None
+                    else (checkpoint.summary, *checkpoint.evidence, *checkpoint.next_steps)
+                )
+                candidate_free_checkpoint = (
+                    checkpoint is not None
+                    and checkpoint.candidate is None
+                    and not any(FLAG_RE.search(value) for value in checkpoint_text)
+                )
+                self.state.checkpoint_attempt(
+                    attempt_id,
+                    summary=(
+                        checkpoint.summary
+                        if candidate_free_checkpoint
+                        else (
+                            "primary checkpoint retained a qualified private candidate"
+                            if qualified_candidate
+                            else f"primary checkpoint requires {reason}"
+                        )
+                    ),
+                    candidate=(
+                        checkpoint.candidate
+                        if qualified_candidate and checkpoint is not None
+                        else None
+                    ),
+                    evidence=(checkpoint.evidence if candidate_free_checkpoint else ()),
+                    next_steps=(
+                        checkpoint.next_steps
+                        if candidate_free_checkpoint
+                        else ("continue with changed evidence-specific work",)
+                    ),
+                    observations=checkpoint_observations,
+                    tool_count=min(100, checkpoint_tool_count),
+                )
+                if qualified_candidate:
+                    self.state.event(
+                        run_id,
+                        "primary_candidate_checkpointed",
+                        {
+                            "challenge_id": challenge.id,
+                            "episode": episode,
+                            "lane": lane,
+                            "tool_call_count": checkpoint_tool_count,
+                        },
+                    )
+                    return None
                 self.state.event(
                     run_id,
                     "primary_solver_continued",
@@ -1432,6 +1589,7 @@ class Orchestrator:
                         "lane": lane,
                         "continuation_round": continuation_round,
                         "reason": reason,
+                        "tool_call_count": checkpoint_tool_count,
                         "remaining_milliseconds": (
                             None
                             if remaining_seconds is None
@@ -2099,9 +2257,13 @@ class Orchestrator:
         catalogue_ranks: dict[int, int],
         deadline: float,
         outcomes: dict[int, str],
+        *,
+        resumed: bool = False,
     ) -> dict[int, str]:
         """Keep five challenge engagements active; auxiliary waves stay inside them."""
-        queue: asyncio.PriorityQueue[tuple[int, Challenge | None, float]] = asyncio.PriorityQueue()
+        queue: asyncio.PriorityQueue[tuple[int, Challenge | None, float, int, RouteSpec]] = (
+            asyncio.PriorityQueue()
+        )
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
@@ -2128,24 +2290,37 @@ class Orchestrator:
             )
             return queued_at
 
-        for challenge in challenges:
-            self.state.admit_control_wave(
-                run_id,
-                challenge.id,
-                0,
-                catalogue_ranks[challenge.id],
-                self.config.attempts_per_challenge,
-                initial_route,
-                self._initial_peer_assignments(),
-            )
-            queued_at = record_queued(challenge, 0, "initial_coverage")
-            queue.put_nowait((catalogue_ranks[challenge.id], challenge, queued_at))
-            if challenge.solved:
-                self.state.event(
-                    run_id,
-                    "prior_board_solved_ignored",
-                    {"challenge_id": challenge.id, "run_local_verified": False},
+        challenges_by_id = {challenge.id: challenge for challenge in challenges}
+        if resumed:
+            for wave in self.state.queued_control_waves(run_id, exclude_pending_submissions=True):
+                challenge = challenges_by_id.get(wave.challenge_id)
+                if challenge is None:
+                    raise RecoveryBlocked("durable queued challenge is absent from the Board")
+                queued_at = record_queued(challenge, wave.episode, "supervisor_restart")
+                replay_priority = (
+                    wave.catalogue_rank if wave.episode == 0 else 2**30 + wave.catalogue_rank
                 )
+                queue.put_nowait(
+                    (
+                        replay_priority,
+                        challenge,
+                        queued_at,
+                        wave.episode,
+                        wave.route,
+                    )
+                )
+        else:
+            for challenge in challenges:
+                queued_at = record_queued(challenge, 0, "initial_coverage")
+                queue.put_nowait(
+                    (catalogue_ranks[challenge.id], challenge, queued_at, 0, initial_route)
+                )
+                if challenge.solved:
+                    self.state.event(
+                        run_id,
+                        "prior_board_solved_ignored",
+                        {"challenge_id": challenge.id, "run_local_verified": False},
+                    )
 
         async def execute_episode(
             challenge: Challenge,
@@ -2215,10 +2390,15 @@ class Orchestrator:
                 with suppress(FileNotFoundError, OSError):
                     challenge_root.rmdir()
 
-        async def run_engagement(challenge: Challenge, initial_queued_at: float) -> None:
+        async def run_engagement(
+            challenge: Challenge,
+            initial_queued_at: float,
+            initial_episode: int,
+            resumed_route: RouteSpec,
+        ) -> None:
             nonlocal peak_active
-            episode = 0
-            route = initial_route
+            episode = initial_episode
+            route = resumed_route
             queued_at = initial_queued_at
             target_endpoints: tuple[TargetEndpoint, ...] = ()
             receipt: str | None = None
@@ -2386,8 +2566,9 @@ class Orchestrator:
                             challenge, episode, queued_at, route, target_endpoints
                         )
 
+                    recovery_allowance = self.state.recovery_dispatch_count(run_id, challenge.id)
                     has_successor_budget = (
-                        episode + 1 < self.config.episodes_per_challenge
+                        episode + 1 < self.config.episodes_per_challenge + recovery_allowance
                         and time.monotonic() < deadline
                     )
                     dynamic_local_follow_on = (
@@ -2491,10 +2672,10 @@ class Orchestrator:
             while True:
                 item = await queue.get()
                 try:
-                    _, challenge, queued_at = item
+                    _, challenge, queued_at, episode, route = item
                     if challenge is None:
                         return
-                    await run_engagement(challenge, queued_at)
+                    await run_engagement(challenge, queued_at, episode, route)
                 finally:
                     queue.task_done()
 
@@ -2516,7 +2697,7 @@ class Orchestrator:
                 await failed_worker
                 raise RuntimeError("challenge queue worker exited before drain")
             for _ in workers:
-                queue.put_nowait((2**31, None, 0.0))
+                queue.put_nowait((2**31, None, 0.0, 0, initial_route))
             await asyncio.gather(*workers)
         finally:
             for task in (join, timer, *workers):
@@ -2548,61 +2729,116 @@ class Orchestrator:
         return outcomes
 
     async def run(self) -> RunReport:
-        deadline = time.monotonic() + self.config.run_seconds
         self._ensure_private_work_root()
         self.state.acquire_supervisor(
             self.config.codex_home / ".rapido-supervisor.lock",
             self.config.work_root / ".rapido-work.lock",
         )
         try:
-            self.state.recover_interrupted()
+            session = self.state.start_or_resume_run(uuid.uuid4().hex, self.config.public_record())
             seal_unavailable_attempt_evidence(self.state)
         except BaseException:
             self.state.release_supervisor()
             raise
-        run_id = uuid.uuid4().hex
-        run_root = self.config.work_root / f"run-{run_id}"
+        run_id = session.run_id
         try:
-            self._ensure_private_work_root()
-            run_root.mkdir(mode=0o700, exist_ok=False)
-            self.state.start_run(run_id, self.config.public_record())
-            self._run_evidence = RunEvidence.open(self.state, run_id)
-        except BaseException:
+            started_at = datetime.fromisoformat(session.started_at)
+            if started_at.tzinfo is None:
+                raise ValueError("running run has a timezone-free start time")
+            elapsed = (datetime.now(UTC) - started_at.astimezone(UTC)).total_seconds()
+            if elapsed < -1:
+                raise ValueError("wall clock precedes the durable run start")
+        except (TypeError, ValueError) as exc:
             self.state.release_supervisor()
-            raise
+            raise RuntimeError("running run has an invalid durable deadline") from exc
+        remaining_run_seconds = max(0.0, float(self.config.run_seconds) - max(0.0, elapsed))
+        deadline = time.monotonic() + remaining_run_seconds
+        run_root = self.config.work_root / f"run-{run_id}"
         outcomes: dict[int, str] = {}
         challenge_count = 0
         status = "failed"
         try:
-            await self._cleanup_stale_workspaces(deadline, run_root)
+            if session.resumed:
+                identity_deadline = time.monotonic() + max(
+                    float(self.config.instance_cleanup_seconds),
+                    float(self.config.board_timeout_seconds * 3 + 1),
+                )
+                try:
+                    identity = await self._qualified_identity(identity_deadline)
+                    await self._cleanup_owned_instances(
+                        time.monotonic() + float(self.config.instance_cleanup_seconds)
+                    )
+                except BoardError as exc:
+                    raise RecoveryBlocked(
+                        "Board recovery reconciliation remained indeterminate"
+                    ) from exc
+
+                if deadline - time.monotonic() > 0:
+                    self.state.resume_control_waves(
+                        run_id,
+                        max(0, int((deadline - time.monotonic()) * 1000)),
+                    )
+                durable_catalogue = self.state.control_catalogue_entries(run_id)
+                outcomes.update(self.state.run_terminal_outcomes(run_id))
+                challenge_count = len(durable_catalogue)
+                pending_effects = self.state.pending_submission_intents()
+                if durable_catalogue and not pending_effects and len(outcomes) == challenge_count:
+                    status = "completed"
+                    self.state.finish_run(run_id, status)
+                    return self._run_report(run_id, status, challenge_count, outcomes)
+                if pending_effects and deadline - time.monotonic() <= 0:
+                    raise RecoveryBlocked(
+                        "pending submission effect requires explicit reconciliation"
+                    )
+            else:
+                identity = await self._qualified_identity(deadline)
+                await self._cleanup_owned_instances(deadline)
+            self._ensure_private_work_root()
+            if session.resumed and run_root.exists():
+                await self._remove_tree_before(
+                    run_root,
+                    time.monotonic() + float(self.config.instance_cleanup_seconds),
+                )
+            run_root.mkdir(mode=0o700, exist_ok=False)
+            self._run_evidence = RunEvidence.open(self.state, run_id)
+            await self._cleanup_stale_workspaces(
+                (
+                    time.monotonic() + float(self.config.instance_cleanup_seconds)
+                    if session.resumed
+                    else deadline
+                ),
+                run_root,
+            )
+            if session.resumed:
+                self.state.resume_control_waves(
+                    run_id,
+                    max(0, int((deadline - time.monotonic()) * 1000)),
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
-            identity = await self._qualified_identity(deadline)
-            await self._cleanup_owned_instances(deadline)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RunDeadlineReached
-            try:
-                await asyncio.wait_for(self.runtime.start(), timeout=remaining)
-            except TimeoutError as exc:
-                raise RunDeadlineReached from exc
-            await self._validate_peer_models(run_id, deadline)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RunDeadlineReached
+            if not self._adaptive_control:
+                try:
+                    await asyncio.wait_for(self.runtime.start(), timeout=remaining)
+                except TimeoutError as exc:
+                    raise RunDeadlineReached from exc
+                await self._validate_peer_models(run_id, deadline)
             challenges = await self._challenge_catalogue(deadline, identity)
             challenge_count = len(challenges)
+            durable_catalogue = (
+                self.state.control_catalogue_entries(run_id) if session.resumed else []
+            )
+            durable_signature = (
+                self.state.control_catalogue_signature(run_id) if durable_catalogue else {}
+            )
+            durable_contexts = (
+                self.state.control_catalogue_contexts(run_id) if durable_catalogue else {}
+            )
             eligible: list[Challenge] = []
             catalogue_entries: list[tuple[int, int, bool]] = []
+            current_signature: dict[int, tuple[str, str, str, int, bool]] = {}
+            current_contexts: dict[int, str] = {}
             for catalogue_rank, challenge in enumerate(challenges):
-                self.state.upsert_challenge(
-                    challenge.id,
-                    challenge.name,
-                    challenge.category,
-                    challenge.type,
-                    challenge.value,
-                )
                 executable = not (
                     challenge.type != "standard"
                     and (
@@ -2610,6 +2846,28 @@ class Orchestrator:
                     )
                 )
                 catalogue_entries.append((catalogue_rank, challenge.id, executable))
+                current_signature[challenge.id] = (
+                    challenge.name,
+                    challenge.category,
+                    challenge.type,
+                    challenge.value,
+                    executable,
+                )
+                current_contexts[challenge.id] = _challenge_material_sha256(challenge)
+                if executable:
+                    eligible.append(challenge)
+            if durable_signature and durable_signature != current_signature:
+                raise RecoveryBlocked("Board catalogue identity changed during same-run recovery")
+            if durable_contexts and durable_contexts != current_contexts:
+                raise RecoveryBlocked("Board challenge material changed during same-run recovery")
+            for challenge, (_, _, executable) in zip(challenges, catalogue_entries, strict=True):
+                self.state.upsert_challenge(
+                    challenge.id,
+                    challenge.name,
+                    challenge.category,
+                    challenge.type,
+                    challenge.value,
+                )
                 if not executable:
                     self.state.set_challenge_status(challenge.id, "unsupported")
                     self.state.event(
@@ -2625,24 +2883,72 @@ class Orchestrator:
                         },
                     )
                     outcomes[challenge.id] = "unsupported"
-                    continue
-                eligible.append(challenge)
-            self.state.record_control_catalogue(run_id, catalogue_entries)
-            if eligible:
+            if not durable_catalogue:
+                initial_route = baseline_route(
+                    model=self.config.model,
+                    effort=self.config.reasoning_effort,
+                    attempt_seconds=self.config.attempt_seconds,
+                )
+                self.state.initialize_control_catalogue(
+                    run_id,
+                    catalogue_entries,
+                    self.config.attempts_per_challenge,
+                    initial_route,
+                    self._initial_peer_assignments(),
+                    current_contexts,
+                )
+            catalogue_ranks = {
+                challenge_id: catalogue_rank
+                for catalogue_rank, challenge_id, _ in (durable_catalogue or catalogue_entries)
+            }
+            outcomes.update(self.state.run_terminal_outcomes(run_id))
+            queued_waves = self.state.queued_control_waves(
+                run_id,
+                exclude_pending_submissions=session.resumed and self._adaptive_control,
+            )
+            if (
+                session.resumed
+                and not queued_waves
+                and len(outcomes) != challenge_count
+                and not self.state.pending_submission_intents()
+            ):
+                raise RecoveryBlocked("durable run has neither queued nor terminal challenge work")
+            if eligible and queued_waves:
+                if self._adaptive_control:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RunDeadlineReached
+                    try:
+                        await asyncio.wait_for(self.runtime.start(), timeout=remaining)
+                    except TimeoutError as exc:
+                        raise RunDeadlineReached from exc
+                    await self._validate_peer_models(run_id, deadline)
                 await self._run_challenge_queue(
                     run_id,
                     run_root,
                     eligible,
-                    {
-                        challenge_id: catalogue_rank
-                        for catalogue_rank, challenge_id, _ in catalogue_entries
-                    },
+                    catalogue_ranks,
                     deadline,
                     outcomes,
+                    resumed=session.resumed and bool(durable_catalogue),
                 )
+            outcomes.update(self.state.run_terminal_outcomes(run_id))
+            if self._adaptive_control and self.state.pending_submission_intents():
+                raise RecoveryBlocked("pending submission effect requires explicit reconciliation")
             status = "completed"
             self.state.finish_run(run_id, status)
+        except RecoveryBlocked as exc:
+            self.state.event(
+                run_id,
+                "recovery_blocked",
+                {"reason": str(exc)},
+            )
+            raise
         except RunDeadlineReached:
+            if self._adaptive_control and self.state.pending_submission_intents():
+                reason = "pending submission effect requires explicit reconciliation"
+                self.state.event(run_id, "recovery_blocked", {"reason": reason})
+                raise RecoveryBlocked(reason)
             status = "deadline"
             self.state.interrupt_control_run(run_id, "run_deadline")
             self.state.finish_run(run_id, status)
@@ -2666,21 +2972,7 @@ class Orchestrator:
             finally:
                 self._run_evidence = None
                 self.state.release_supervisor()
-        counts = {name: 0 for name in ("solved", "candidate", "unsolved", "unsupported", "error")}
-        for terminal in outcomes.values():
-            if terminal in counts:
-                counts[terminal] += 1
-        return RunReport(
-            run_id=run_id,
-            status=status,
-            challenge_count=challenge_count,
-            solved=counts["solved"],
-            candidates=counts["candidate"],
-            unsolved=counts["unsolved"],
-            unsupported=counts["unsupported"],
-            errors=counts["error"],
-            overlapping_waves=self.state.overlapping_wave_count(run_id),
-        )
+        return self._run_report(run_id, status, challenge_count, outcomes)
 
 
 __all__ = [

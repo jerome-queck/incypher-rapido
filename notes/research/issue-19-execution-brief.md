@@ -641,7 +641,7 @@ comparison green while independent review is pending.
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | in progress: calibration reached 20 simultaneous attempts, 1,362 tools, 92 sampled PIDs, and 347.2 MiB sampled RAM; conversion, not local capacity, dominated; final proof pending |
-| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
+| Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: same-run continuation locally verified through real process loss, original deadline, durable ordering/memory, effect fencing, and cleanup; final-image rehearsal pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; diagnostic produced two new correct solves and cumulative at least five, but began only 13 challenges |
@@ -752,6 +752,43 @@ content-addressed paths are now explicitly required for artifact range decoding 
 source bytes into model-supplied transforms. Focused tests cover same-thread reuse, shrinking budget,
 each corrective prompt, and source-bound conversion. Final live contribution remains unproven.
 
+### Same-run process-loss comparison and implementation decision
+
+Three independent Daybreak/xhigh reviews compared a separate recovery subsystem, a minimal
+same-state reopening seam, and reuse of the existing durable controller journal. The selected
+design reuses the existing run, catalogue, jobs, routes, attempts, events, typed memory, candidate
+vault, submission intents, and instance receipts. It adds no second scheduler or effect journal.
+On lease reacquisition, the store atomically identifies the sole `running` run, requires the exact
+public configuration, closes only process-lost running work, and admits one changed
+`process_restart` Recovery route. Reopening is idempotent and retains the original wall-clock start
+and deadline; downtime never earns more solve time.
+
+The initial catalogue and every episode-zero admission now commit in one transaction. Restart
+replays untouched episode-zero work before interrupted successors, preserves closed lanes and
+typed same-run memory, and compensates the episode ceiling only for proven process-restart
+dispatches. Every completed persistent-primary checkpoint durably retains candidate-free analysis,
+next steps, tool count, and sanitized host observations for the changed Recovery route. A qualified
+candidate is also committed to the private vault inside the callback before control returns to the
+runtime, closing the crash window between Daybreak discovery and normal attempt completion. Stable
+Board identity plus a description/stable-attachment material digest are rechecked while durable
+catalogue ranks remain authoritative. Before workspace cleanup or model startup, instances are
+reconciled under an independent bound. A receipt mismatch remains fenced; a receiptless active
+generation is never adopted or deleted because the Board offers no generation token that proves it
+belongs to the persisted create intent. An
+ambiguous submission fences only its challenge while unaffected work continues, then keeps the run
+open for explicit reconciliation; the candidate is never posted twice. An expired restart performs
+reconciliation and cleanup but admits no solver work; fully closed durable work finalizes without a
+runtime or catalogue fetch, while a pending submission keeps even an expired run open.
+
+Focused evidence includes real subprocess `os._exit(23)` cases after both candidate-free and
+qualified-candidate Daybreak checkpoints,
+same-run ID/deadline preservation, repeated pre-attempt restart routing, untouched-before-retry
+ordering, recovered checkpoint/host-observation memory, correct-intent reconciliation, configuration
+and challenge-material mismatch rejection, terminal fast-path completion, unaffected progress beside
+a pending effect, expiry without solver start, receiptless create-intent fencing, successful receipt
+cleanup, and mismatched-receipt containment. Ruff, 178 focused tests, and the full 796-passed/1-skipped
+suite are clean. Final-image crash rehearsal and the acceptance run remain pending.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -814,6 +851,8 @@ each corrective prompt, and source-bound conversion. Final live contribution rem
 | Persistent-primary diagnosis/design | `gpt-daybreak-blue-latest` / `xhigh` | one-thread cumulative-budget continuation selected; four-peer race and external deterministic coordinator retained; no fallback |
 | Early-exit focused reproduction | `gpt-5.6-luna` / `xhigh` | non-live only; reproduced one-turn terminalization and fresh-thread Recovery; no fallback |
 | Persistent-primary independent review | `gpt-daybreak-blue-latest` / `xhigh` | found provenance-subreason collapse and undeclared runtime callback; both fixed before release; no fallback |
+| Same-run recovery interface comparison and review | three independent `gpt-daybreak-blue-latest` / `xhigh` lanes | selected existing-journal reuse; found and drove fixes for correct reconciliation, initial-before-retry order, atomic admission, stable catalogue order, exact binary config, bounded cleanup, scoped Board failures, restart-only allowance, and receipt mismatch; no fallback |
+| Same-run recovery edge review | `gpt-daybreak-blue-latest` / `xhigh` | code paths clean; two P2 proof gaps closed with real qualified-candidate process loss and current-run receiptless-instance fencing tests; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -821,11 +860,15 @@ interrupted without accepting their partial output. All three comparisons were i
 re-dispatched as safe reliability-only work on exact Daybreak/xhigh. This is the contract's direct
 switch, not provider fallback inside a solver run.
 
+PR #38 had auto-closed #19 on 2026-09-17 despite its diagnostic-only protocol. The mismatch was
+detected during this recovery slice and #19 was reopened before further delivery; final acceptance
+and honest closeout remain pending.
+
 ## Open decisions
 
 - Live-measure the merged persistent Daybreak and content-addressed artifact-lineage changes before
   authorizing the final acceptance run.
-- Implement and verify same-run crash continuation before final acceptance.
+- Rehearse same-run crash continuation in the exact final image before final acceptance.
 - Re-measure the focused changes before any 19,800-second run; the completed calibration cannot
   lower the final acceptance contract.
 - Register the exact merged final commit, image digest, challenge order, deadlines, and sampler

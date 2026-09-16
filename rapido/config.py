@@ -336,6 +336,7 @@ class RuntimeConfig:
             "state_path": str(self.state_path),
             "work_root": str(self.work_root),
             "codex_home": str(self.codex_home),
+            "codex_binary": self.codex_binary,
             "profile": self.profile,
             "memory_arm": self.memory_arm,
             "challenge_ids": list(self.challenge_ids),
