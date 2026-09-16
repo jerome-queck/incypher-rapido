@@ -68,6 +68,7 @@ def _preflight() -> int:
     board = BoardClient(
         config.board_url,
         config.board_token,
+        timeout=config.board_timeout_seconds,
         artifact_limit=config.max_artifact_bytes,
     )
     if not board.anonymous_identity_is_rejected():
@@ -133,6 +134,7 @@ def _run() -> int:
     board = BoardClient(
         config.board_url,
         config.board_token,
+        timeout=config.board_timeout_seconds,
         artifact_limit=config.max_artifact_bytes,
     )
     runtime = CodexAppClient(

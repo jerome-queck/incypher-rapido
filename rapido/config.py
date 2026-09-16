@@ -128,6 +128,7 @@ class RuntimeConfig:
     board_url: str
     board_token: str
     team_key: str
+    board_timeout_seconds: int
     model: str
     reasoning_effort: str
     specialist_model: str
@@ -140,6 +141,8 @@ class RuntimeConfig:
     dynamic_concurrency: int
     attempts_per_challenge: int
     attempt_seconds: int
+    instance_ready_seconds: int
+    instance_cleanup_seconds: int
     run_seconds: int
     max_artifact_bytes: int
     max_challenge_bytes: int
@@ -207,6 +210,19 @@ class RuntimeConfig:
         dynamic_concurrency = _integer(
             values, "RAPIDO_DYNAMIC_CONCURRENCY", 1, minimum=1, maximum=1
         )
+        board_timeout_seconds = _integer(
+            values, "RAPIDO_BOARD_TIMEOUT_SECONDS", 15, minimum=1, maximum=120
+        )
+        instance_ready_seconds = _integer(
+            values, "RAPIDO_INSTANCE_READY_SECONDS", 120, minimum=2, maximum=600
+        )
+        instance_cleanup_seconds = _integer(
+            values, "RAPIDO_INSTANCE_CLEANUP_SECONDS", 45, minimum=3, maximum=600
+        )
+        if instance_ready_seconds <= board_timeout_seconds:
+            raise ConfigError("RAPIDO_INSTANCE_READY_SECONDS must exceed the Board timeout")
+        if instance_cleanup_seconds < board_timeout_seconds * 3:
+            raise ConfigError("RAPIDO_INSTANCE_CLEANUP_SECONDS must cover three Board requests")
 
         max_artifact_bytes = _integer(
             values,
@@ -261,6 +277,7 @@ class RuntimeConfig:
             board_url=_origin(values),
             board_token=token,
             team_key=team_key,
+            board_timeout_seconds=board_timeout_seconds,
             model=_text(values, "RAPIDO_MODEL", "gpt-daybreak-blue-latest"),
             reasoning_effort=effort,
             specialist_model=_text(values, "RAPIDO_SPECIALIST_MODEL", "gpt-5.6-luna"),
@@ -275,6 +292,8 @@ class RuntimeConfig:
             attempt_seconds=_integer(
                 values, "RAPIDO_ATTEMPT_SECONDS", 1_800, minimum=15, maximum=7200
             ),
+            instance_ready_seconds=instance_ready_seconds,
+            instance_cleanup_seconds=instance_cleanup_seconds,
             run_seconds=_integer(values, "RAPIDO_RUN_SECONDS", 19_800, minimum=60, maximum=172_800),
             max_artifact_bytes=max_artifact_bytes,
             max_challenge_bytes=max_challenge_bytes,
@@ -297,6 +316,7 @@ class RuntimeConfig:
         """Effective non-secret settings suitable for logs and run evidence."""
         return {
             "board_url": self.board_url,
+            "board_timeout_seconds": self.board_timeout_seconds,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "specialist_model": self.specialist_model,
@@ -309,6 +329,8 @@ class RuntimeConfig:
             "dynamic_concurrency": self.dynamic_concurrency,
             "attempts_per_challenge": self.attempts_per_challenge,
             "attempt_seconds": self.attempt_seconds,
+            "instance_ready_seconds": self.instance_ready_seconds,
+            "instance_cleanup_seconds": self.instance_cleanup_seconds,
             "run_seconds": self.run_seconds,
             "max_artifact_bytes": self.max_artifact_bytes,
             "max_challenge_bytes": self.max_challenge_bytes,

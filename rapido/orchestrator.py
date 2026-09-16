@@ -672,7 +672,7 @@ class Orchestrator:
                     self._recover_created_instance_receipt(
                         run_id,
                         challenge.id,
-                        min(deadline, time.monotonic() + 45.0),
+                        min(deadline, time.monotonic() + self.config.instance_cleanup_seconds),
                     )
                 )
                 while not recovery.done():
@@ -690,7 +690,7 @@ class Orchestrator:
                     except (BoardError, RunDeadlineReached):
                         self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
             raise cancelled
-        ready_deadline = min(deadline, time.monotonic() + 120.0)
+        ready_deadline = min(deadline, time.monotonic() + self.config.instance_ready_seconds)
         while ready_deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
             current = await self._board_read(
                 ready_deadline, self.board.instance, "GET", challenge.id
@@ -1819,7 +1819,10 @@ class Orchestrator:
             )
             if owned_record is not None:
                 cleanup = asyncio.create_task(
-                    self._cleanup_instance_record(owned_record, time.monotonic() + 45.0)
+                    self._cleanup_instance_record(
+                        owned_record,
+                        time.monotonic() + self.config.instance_cleanup_seconds,
+                    )
                 )
                 try:
                     await asyncio.shield(cleanup)
@@ -1848,7 +1851,7 @@ class Orchestrator:
                 route=route,
             )
         finally:
-            cleanup_deadline = time.monotonic() + 45.0
+            cleanup_deadline = time.monotonic() + self.config.instance_cleanup_seconds
             cleanup = asyncio.create_task(
                 self._delete_instance(
                     run_id,

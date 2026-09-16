@@ -89,6 +89,9 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: one Lead plus three Specialists by default; accepted range 2–8. |
 | `RAPIDO_ATTEMPT_SECONDS` | `1800` | Initial per-lane interrupt deadline. |
+| `RAPIDO_BOARD_TIMEOUT_SECONDS` | `15` | One bounded Board request. |
+| `RAPIDO_INSTANCE_READY_SECONDS` | `120` | Dynamic-instance readiness budget. |
+| `RAPIDO_INSTANCE_CLEANUP_SECONDS` | `45` | Dynamic cleanup budget; must cover three Board requests. |
 | `RAPIDO_RUN_SECONDS` | `19800` | Work-admission budget (5.5 hours). |
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | One artifact ceiling. |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source-byte ceiling. |

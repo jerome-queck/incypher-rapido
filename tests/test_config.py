@@ -21,6 +21,9 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert config.memory_arm == "typed_challenge_v1"
     assert config.attempts_per_challenge == 4
     assert config.attempt_seconds == 1_800
+    assert config.board_timeout_seconds == 15
+    assert config.instance_ready_seconds == 120
+    assert config.instance_cleanup_seconds == 45
     assert config.run_seconds == 19_800
     assert config.max_artifact_bytes == 64 * 1024 * 1024
     assert config.max_challenge_bytes == 128 * 1024 * 1024
@@ -35,6 +38,9 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert public["episodes_per_challenge"] == 2
     assert public["dynamic_concurrency"] == 1
     assert public["memory_arm"] == "typed_challenge_v1"
+    assert public["board_timeout_seconds"] == 15
+    assert public["instance_ready_seconds"] == 120
+    assert public["instance_cleanup_seconds"] == 45
     assert public["max_challenge_workspace_bytes"] == config.max_challenge_workspace_bytes
     assert public["max_lane_workspace_bytes"] == config.max_lane_workspace_bytes
 
@@ -51,6 +57,35 @@ def test_registered_typed_memory_arm_is_explicit_and_public() -> None:
     config = RuntimeConfig.from_env({"RAPIDO_MEMORY_ARM": "typed_challenge_v1"})
     assert config.memory_arm == "typed_challenge_v1"
     assert config.public_record()["memory_arm"] == "typed_challenge_v1"
+
+
+def test_short_calibration_budgets_are_explicit_and_safe() -> None:
+    config = RuntimeConfig.from_env(
+        {
+            "RAPIDO_ATTEMPT_SECONDS": "90",
+            "RAPIDO_BOARD_TIMEOUT_SECONDS": "4",
+            "RAPIDO_INSTANCE_READY_SECONDS": "20",
+            "RAPIDO_INSTANCE_CLEANUP_SECONDS": "20",
+        }
+    )
+    assert (
+        config.attempt_seconds,
+        config.board_timeout_seconds,
+        config.instance_ready_seconds,
+        config.instance_cleanup_seconds,
+    ) == (90, 4, 20, 20)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"RAPIDO_BOARD_TIMEOUT_SECONDS": "15", "RAPIDO_INSTANCE_READY_SECONDS": "15"},
+        {"RAPIDO_BOARD_TIMEOUT_SECONDS": "5", "RAPIDO_INSTANCE_CLEANUP_SECONDS": "14"},
+    ],
+)
+def test_instance_budgets_cover_board_requests(values: dict[str, str]) -> None:
+    with pytest.raises(ConfigError):
+        RuntimeConfig.from_env(values)
 
 
 @pytest.mark.parametrize(

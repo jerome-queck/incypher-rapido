@@ -231,13 +231,14 @@ Before any 19,800-second acceptance run, run one separately pre-registered 1,800
 calibration and report back. It tests mixed peers, typed memory, tools, routing, qualified submissions,
 instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance, authorize closure,
 or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
-The calibration keeps P20 but overrides only its initial lane deadline to 120 seconds. The known
-nine dynamic initial waves are serialized at the current proven instance bound, consuming at most
-1,080 seconds of lane time; the other six consume at most two P5 waves, or 240 seconds. Initial
-catalogue entries are durably queued before any successor, leaving 480 seconds for Board overhead,
-cleanup, and evidence-earned routes. Do not start if a fresh preflight changes the 15-challenge or
-nine-dynamic catalogue assumption. The production and final-acceptance initial deadline remains
-1,800 seconds.
+The calibration keeps P20 but uses exact overrides of 90 seconds per initial lane, 4 seconds per
+Board request, 20 seconds for instance readiness, and 20 seconds for cleanup. At the current proven
+single-instance bound, the known nine dynamic initial waves consume at most 1,170 seconds and the
+other six consume at most two P5 waves, or 180 seconds. Initial catalogue entries are durably queued
+before any successor, leaving 450 seconds for catalogue qualification, downloads, native startup,
+and evidence-earned routes. Do not start if a fresh preflight changes the 15-challenge or
+nine-dynamic catalogue assumption, or measured Board latency does not fit the four-second request
+budget. Production and final-acceptance defaults remain 1,800/15/120/45 seconds respectively.
 
 ### M1 typed-memory comparison registration
 
