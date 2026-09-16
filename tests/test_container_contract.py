@@ -114,7 +114,7 @@ def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> Non
         'write_env RAPIDO_CONCURRENCY "20"',
         'write_env RAPIDO_ACTIVE_CHALLENGES "5"',
         'write_env RAPIDO_ATTEMPTS_PER_CHALLENGE "4"',
-        'write_env RAPIDO_ATTEMPT_SECONDS "1800"',
+        'write_env RAPIDO_ATTEMPT_SECONDS "800"',
         'write_env RAPIDO_BOARD_TIMEOUT_SECONDS "15"',
         'write_env RAPIDO_INSTANCE_READY_SECONDS "120"',
         'write_env RAPIDO_INSTANCE_CLEANUP_SECONDS "45"',

@@ -59,6 +59,7 @@ _GAPS = frozenset(
     {
         "process_interrupted",
         "turn_timeout",
+        "turn_no_progress",
         "turn_cancelled",
         "turn_failed",
         "provenance_incomplete",

@@ -20,6 +20,7 @@ from .routing import (
     FAILURE_KINDS,
     FAILURE_ORIGINS,
     KNOWN_FAILURE_CLASSES,
+    FailureSignal,
     RouteDecision,
     RouteRequest,
     RouteSpec,
@@ -1217,7 +1218,7 @@ class StateStore:
                 ],
             )
 
-    def start_control_wave(self, run_id: str, challenge_id: int, episode: int) -> None:
+    def start_control_wave(self, run_id: str, challenge_id: int, episode: int) -> int:
         with self.transaction() as connection:
             rows = connection.execute(
                 "SELECT job_id, lane FROM control_jobs "
@@ -1238,6 +1239,20 @@ class StateStore:
                     "UPDATE control_jobs SET state='running', started_sequence=? WHERE job_id=?",
                     (sequence, row["job_id"]),
                 )
+        return len(rows)
+
+    def control_wave_lane_count(self, run_id: str, challenge_id: int, episode: int) -> int:
+        with self._lock:
+            count = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? AND state='queued'",
+                    (run_id, challenge_id, episode),
+                ).fetchone()[0]
+            )
+        if count < 1:
+            raise ValueError("control wave is absent or not queued")
+        return count
 
     def control_assignment(
         self, run_id: str, challenge_id: int, episode: int, lane: int
@@ -1292,12 +1307,13 @@ class StateStore:
         terminal: str,
     ) -> None:
         rows = connection.execute(
-            "SELECT job_id, lane FROM control_jobs "
-            "WHERE run_id=? AND challenge_id=? AND episode=? AND state='running' ORDER BY lane",
+            "SELECT job_id, lane, state FROM control_jobs "
+            "WHERE run_id=? AND challenge_id=? AND episode=? "
+            "AND state IN ('queued', 'running') ORDER BY lane",
             (run_id, challenge_id, episode),
         ).fetchall()
         if not rows:
-            raise ValueError("control wave is absent or not running")
+            raise ValueError("control wave is absent or already closed")
         for row in rows:
             attempt = connection.execute(
                 "SELECT status FROM attempts "
@@ -1332,6 +1348,47 @@ class StateStore:
     ) -> None:
         with self.transaction() as connection:
             self._finish_control_wave(connection, run_id, challenge_id, episode, terminal)
+
+    def finish_and_admit_control_wave(
+        self,
+        *,
+        run_id: str,
+        challenge_id: int,
+        source_episode: int,
+        next_episode: int,
+        catalogue_rank: int,
+        terminal: str,
+        route: RouteSpec,
+        assignments: Sequence[tuple[str, str, str]],
+        reason: str,
+    ) -> None:
+        """Atomically close one phase and admit its materially changed successor."""
+        with self.transaction() as connection:
+            self._finish_control_wave(connection, run_id, challenge_id, source_episode, terminal)
+            self._control_event(
+                connection,
+                run_id,
+                "phase_transition",
+                None,
+                {
+                    "challenge_id": challenge_id,
+                    "source_episode": source_episode,
+                    "next_episode": next_episode,
+                    "reason": reason,
+                    "successor_route_fingerprint": route.fingerprint,
+                },
+            )
+            self._admit_control_wave(
+                connection,
+                run_id,
+                challenge_id,
+                next_episode,
+                catalogue_rank,
+                len(assignments),
+                route,
+                assignments,
+                require_unused_route=True,
+            )
 
     def record_control_failure_origin(
         self,
@@ -1946,12 +2003,18 @@ class StateStore:
         candidate_identity_count = int(
             connection.execute(
                 """
-                SELECT COUNT(DISTINCT candidate_key)
-                FROM candidate_proposals
-                WHERE run_id=? AND challenge_id=? AND episode=?
-                  AND role IN ('specialist', 'recovery')
+                SELECT COUNT(DISTINCT proposal.candidate_key)
+                FROM candidate_proposals AS proposal
+                WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND proposal.role IN ('specialist', 'recovery')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM candidate_verifications AS verification
+                    WHERE verification.run_id=proposal.run_id
+                      AND verification.challenge_id=proposal.challenge_id
+                      AND verification.candidate_key=proposal.candidate_key
+                  )
                 """,
-                (run_id, challenge_id, source_episode),
+                (run_id, challenge_id),
             ).fetchone()[0]
         )
         origin_row = connection.execute(
@@ -1966,6 +2029,15 @@ class StateStore:
             candidate_identity_count=candidate_identity_count,
             attempt_count=len(attempts),
         )
+        current_run_wrong = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM submission_intents "
+                "WHERE first_run_id=? AND challenge_id=? AND status='incorrect'",
+                (run_id, challenge_id),
+            ).fetchone()[0]
+        )
+        if terminal == "candidate" and current_run_wrong > 0 and current.role == "specialist":
+            signal = FailureSignal("disagreement", "board_rejected_candidate")
         if signal is None:
             return None
         used_fingerprints = frozenset(
@@ -1986,8 +2058,7 @@ class StateStore:
         instances_safe = (
             int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM instances "
-                    "WHERE status IN ('creating', 'owned', 'cleanup_pending')"
+                    "SELECT COUNT(*) FROM instances WHERE status IN ('creating', 'cleanup_pending')"
                 ).fetchone()[0]
             )
             == 0
@@ -2051,7 +2122,20 @@ class StateStore:
             if decision.successor is None:
                 raise AssertionError("dispatch requires a successor route")
             assignments = None
-            if decision.successor.role not in {"verifier", "recovery"}:
+            successor_lanes = lanes
+            if decision.successor.role == "verifier":
+                successor_lanes = 1
+            elif decision.successor.role == "recovery":
+                assignment_rows = connection.execute(
+                    "SELECT model, effort FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
+                    (run_id, challenge_id, source_episode),
+                ).fetchall()
+                assignments = tuple(
+                    ("recovery", str(row["model"]), str(row["effort"])) for row in assignment_rows
+                )
+                successor_lanes = len(assignments)
+            else:
                 assignment_rows = connection.execute(
                     "SELECT agent_role, model, effort FROM control_jobs "
                     "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
@@ -2071,7 +2155,7 @@ class StateStore:
                 challenge_id,
                 next_episode,
                 catalogue_rank,
-                lanes,
+                successor_lanes,
                 decision.successor,
                 assignments,
                 require_unused_route=True,
@@ -2630,6 +2714,33 @@ class StateStore:
                 """
             ).fetchone()
         return int(row["count"])
+
+    def challenge_incorrect_submission_count(self, challenge_id: int) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM submission_intents "
+                "WHERE challenge_id=? AND status='incorrect'",
+                (challenge_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    def challenge_unresolved_submission_count(self, challenge_id: int) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM submission_intents "
+                "WHERE challenge_id=? AND status IN ('pending', 'unread')",
+                (challenge_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    def challenge_has_correct_submission(self, run_id: str, challenge_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM submissions "
+                "WHERE run_id=? AND challenge_id=? AND outcome='correct'",
+                (run_id, challenge_id),
+            ).fetchone()
+        return int(row["count"]) > 0
 
     def overlapping_wave_count(self, run_id: str) -> int:
         with self._lock:

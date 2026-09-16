@@ -224,22 +224,24 @@ four peers per challenge: Daybreak/xhigh Lead plus Luna max, xhigh, and max Spec
 
 The owner also requested light implementation-first engineering rather than TDD or framework
 expansion. Required security, lifecycle, memory, routing, recovery, review, and acceptance proofs
-remain unchanged. The initial lane deadline becomes 1,800 seconds; a longer successor must be earned
-by durable progress and cannot extend the original run deadline.
+remain unchanged.
 
 Before any 19,800-second acceptance run, run one separately pre-registered 1,800-second live Board
 calibration and report back. It tests mixed peers, typed memory, tools, routing, qualified submissions,
 instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance, authorize closure,
 or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
-The calibration keeps P20 but uses exact overrides of 60 seconds per initial lane, 10 seconds per
-Board request, 30 seconds for instance readiness, and 30 seconds for cleanup. At the current proven
-single-instance bound, the known nine dynamic initial waves consume at most 1,260 seconds, including
-one preflight GET and one create POST per wave; the other six consume at most two P5 waves, or 120
-seconds. Initial catalogue entries are durably queued before any successor, leaving 420 seconds for
-catalogue qualification, downloads, native startup, and evidence-earned routes. A four-second
-request budget was rejected before mutation after one read-only TLS handshake exceeded it. Do not
-start if a fresh preflight changes the 15-challenge or nine-dynamic catalogue assumption. Production
-and final-acceptance defaults remain 1,800/15/120/45 seconds respectively.
+The first calibration used 60-second lanes and falsified that budget. A later diagnostic inverted
+the owner's requested budgets. The corrected next calibration changes only the competition outer
+budget to 1,800 seconds. The qualified all-15 catalogue remains queued, Board-unsolved challenges
+first, while five challenge engagements stay active. Recovery and Verifier agents are auxiliary
+work inside an active engagement and do not consume one of those five identities. A correct solve
+cancels siblings, records the solve, removes and verifies any shared instance, closes the
+engagement, then admits the next queued challenge. Per-agent budget remains 800 seconds, P20,
+Board request 15 seconds, instance readiness 120 seconds, and cleanup 45 seconds. No successor may
+exceed 800 seconds; host-visible tool progress resets only the 600-second no-progress cutoff, not
+the absolute lane budget. Merged source and image digest will be registered after fresh read-only
+qualification and before fresh state creation. Final-acceptance budgets remain pending the owner's
+post-calibration decision; its outer gate remains 19,800 seconds.
 
 ### E6 current Board inactive semantics
 
@@ -503,6 +505,16 @@ vault and `fresh_source_reobservation_v1` recipe. Independent Daybreak/xhigh re-
 the 20-repetition v2 artifact/source hashes and found no P0-P3 defects. Linux final-image replay
 remains a release gate; this result makes no live-conversion claim.
 
+A post-implementation v3 compatibility replay is stored at
+`notes/research/issue-19-candidate-flow-comparison-v3.json` (SHA-256
+`21b5b1ba1d663589b7a1c056e868f46c154e2811d93d14b853003cfe1d98ff75`). This is a regression
+check, not a retrospective replacement for the registered v2 architecture decision. Its 240 raw
+observations bind the current production tree SHA-256
+`dcdfbc2d0b3bd4a2e3e9ff679fbb60ef2d3866eadd56984418094e7ef43d24c3`. Exact agreement converted
+20 cases with 440 tool calls; private verification converted 60 with 320 tool calls. Both had zero
+false admissions, prompt leaks, or model/effort mismatches, and the gate again selected
+`private_verification`.
+
 The implementation keeps durable candidate bytes and keys only in run/challenge-scoped private
 SQLite records. Specialist or Recovery proposals bind by database foreign keys to the immutable source attempt and a
 source-observation recipe. Verifier proposals bind by composite foreign keys to the exact same-run,
@@ -624,11 +636,11 @@ comparison green while independent review is pending.
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and clean-source E3 result merged/generated; live-controller promotion pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: merged typed same-run projection exposes 48 useful records versus 20 lane-local with no duplicate regression; deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; native M1 and full four-role/recovery proof pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: eight-class routing is live; ordinary stalls, no-tool progress, wrong candidates, local-container failures, and private-candidate disagreement all change route or contain; Board calibration pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: mixed Lead/Specialist P4 waves, one fresh Daybreak Verifier, and mixed Recovery waves are integrated; dynamic Recovery receives nonzero typed local memory in focused tests; native proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
-| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: calibration covered 15/15 before its Verifier retry and exercised an evidence-earned extension; final 19,800-second coverage pending |
-| Productive bounded resource scaling | E4 measurements and selected profile | in progress: P20-configured Board calibration observed P16 peak, 298.2 MiB, and 84 PIDs; short lanes and serialized dynamic lifecycle constrained the run, with no observed RAM/quota failure |
+| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue order and truthful pre-lease queued state implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; evidence-earned extension remains pending; final 19,800-second coverage pending |
+| Productive bounded resource scaling | E4 measurements and selected profile | in progress: default is five challenge waves/four direct peers/P20; prior P16/298.2-MiB/84-PID result was scheduler-constrained; corrected native calibration pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | complete for the 1,800-second calibration only; final 19,800-second registration pending |
@@ -671,6 +683,32 @@ Recovery agents as nonzero typed peer memory. The implementation slice also need
 a no-progress watchdog, role-specific successor lanes, sibling cancellation on `correct`, and early
 instance release. Full sanitized evidence is in
 [`issue-19-production-calibration-evidence-2026-09-17.md`](issue-19-production-calibration-evidence-2026-09-17.md).
+
+### Dynamic capacity and corrected live-path decision
+
+A Board-only changed-control ladder established the current team boundary before this patch: one
+dynamic instance reached ready state, while adding a second distinct challenge failed. Each second
+challenge then reached ready state alone; a changed pair again failed at level two. Every touched
+instance was removed and two final all-nine reads were inactive. The selected bound is therefore
+one live instance, not a guessed container limit.
+
+The corrected scheduler keeps five challenge waves active locally and launches four direct peers
+per wave (Daybreak/xhigh Lead plus Luna max/xhigh/max Specialists). A dynamic episode starts as
+artifact/local analysis with no Board mutation. Its changed Recovery route enters a single unified
+lease, starts durable jobs only after lease grant, creates one instance shared by all four peers,
+and deletes it before release. All dynamic initial phases close before any live lease; live tickets
+then follow durable episode/catalogue order. Indeterminate cleanup poisons the manager and fails the
+run before another live job starts.
+
+The shared-instance Recovery prompt must contain nonempty typed earlier-episode memory. Unlimited
+challenges submit the first source-bound candidate immediately through durable reserve/POST/finalize;
+`correct` cancels siblings and triggers early instance deletion. Limited challenges require one
+fresh Daybreak verifier. After an HTTP-200 wrong verdict, a changed mixed Recovery wave must produce
+two independent source-bound lanes before a different candidate can submit. Pending or unread
+effects fence every later submission. The global artificial wrong ceiling was removed; Board limits
+remain authoritative. Every lane is capped at 800 seconds; a lane with no host-visible tool progress
+for 600 seconds is interrupted and classified for a changed route. These are locally verified only;
+the exact-image 1,800-second Board calibration remains pending.
 
 ## Model/effort ledger
 

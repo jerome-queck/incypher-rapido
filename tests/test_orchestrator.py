@@ -696,14 +696,15 @@ def test_completion_never_deletes_replaced_generation(tmp_path: Path) -> None:
     dynamic = challenge(2, challenge_type="dynamic_iac")
     board = FakeBoard([dynamic])
     store = StateStore(tmp_path / "state.sqlite3")
-    report = asyncio.run(Orchestrator(cfg, board, store, ReplaceDuringSolveRuntime(board)).run())
-    assert report.errors == 1
+    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+        asyncio.run(Orchestrator(cfg, board, store, ReplaceDuringSolveRuntime(board)).run())
     assert board.instance_calls == [("GET", 2), ("POST", 2), ("GET", 2), ("GET", 2)]
     assert board.active_instances[2]["connection_info"] == "http://127.0.0.2:8135/"
+    assert store.owned_instances()[0]["status"] == "cleanup_pending"
     event = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='instance_cleanup'"
     ).fetchone()
-    assert '"status":"skipped_replaced"' in event["data_json"]
+    assert '"status":"manual_reconciliation_required"' in event["data_json"]
     store.close()
 
 
@@ -1191,13 +1192,14 @@ def test_stale_instance_generation_mismatch_never_deletes_replacement(
     store.mark_instance("old-run", 9, "owned", receipt_sha256=old_receipt)
     store.finish_run("old-run", "interrupted")
     board = ReplacedInstanceBoard([challenge(10, challenge_type="dynamic_iac")])
-    asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    with pytest.raises(BoardError, match="cleanup remains indeterminate"):
+        asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
     assert board.instance_calls == [("GET", 9)]
-    assert store.owned_instances() == []
+    assert store.owned_instances()[0]["status"] == "cleanup_pending"
     event = store._connection.execute(
         "SELECT data_json FROM events WHERE kind='instance_cleanup'"
     ).fetchone()
-    assert '"status":"skipped_replaced"' in event["data_json"]
+    assert '"status":"manual_reconciliation_required"' in event["data_json"]
     store.close()
 
 
@@ -1214,7 +1216,8 @@ def test_receiptless_stale_intent_never_authorizes_delete(tmp_path: Path) -> Non
         "connection_info": "http://127.0.0.1:8135/",
         "until": 100,
     }
-    asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    with pytest.raises(BoardError, match="cleanup remains indeterminate"):
+        asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
     assert board.instance_calls == [("GET", 9)]
     assert 9 in board.active_instances
     assert store.owned_instances()[0]["status"] == "cleanup_pending"
@@ -1234,7 +1237,8 @@ def test_indeterminate_instance_state_retains_cleanup_ownership(tmp_path: Path) 
     store.mark_instance("old-run", 9, "owned", receipt_sha256="a" * 64)
     store.finish_run("old-run", "interrupted")
     board = IndeterminateInstanceBoard([challenge(10, challenge_type="dynamic_iac")])
-    asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
+    with pytest.raises(BoardError, match="cleanup remains indeterminate"):
+        asyncio.run(Orchestrator(cfg, board, store, FakeRuntime({})).run())
     assert board.instance_calls == [("GET", 9)]
     assert store.owned_instances()[0]["status"] == "cleanup_pending"
     event = store._connection.execute(

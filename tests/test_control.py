@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import rapido.orchestrator as orchestrator_module
 from rapido.board import BoardError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.control import DurableJobControl
@@ -83,6 +84,51 @@ class IndeterminateCleanupBoundaryBoard(BoundaryBoard):
         return {"success": True, "status": 200, **self.active[challenge_id]}
 
 
+class ManagedInstanceBoundaryBoard(BoundaryBoard):
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.active: set[int] = set()
+        self.instance_calls: list[tuple[str, int]] = []
+        self.peak_active = 0
+
+    def instance(self, method: str, challenge_id: int) -> dict[str, object]:
+        self.instance_calls.append((method, challenge_id))
+        if method == "POST":
+            assert not self.active
+            self.active.add(challenge_id)
+            self.peak_active = max(self.peak_active, len(self.active))
+        elif method == "DELETE":
+            self.active.discard(challenge_id)
+            return {"success": True, "status": 200, "connection_info": "", "until": None}
+        elif method != "GET":
+            raise AssertionError("unexpected instance method")
+        if challenge_id in self.active:
+            return {
+                "success": True,
+                "status": 200,
+                "connection_info": "http://127.0.0.1:8135/",
+                "until": 100,
+            }
+        return {"success": False, "status": 404, "connection_info": "", "until": None}
+
+
+class WrongThenCorrectBoundaryBoard(BoundaryBoard):
+    def __init__(self, challenges: list[Challenge], correct: str) -> None:
+        super().__init__(challenges)
+        self.correct = correct
+
+    def submit(self, challenge_id: int, candidate: str) -> Verdict:
+        self.submissions.append((challenge_id, candidate))
+        outcome = "correct" if candidate == self.correct else "incorrect"
+        return Verdict(outcome, outcome, 200)
+
+
+class AlreadySolvedBoundaryBoard(BoundaryBoard):
+    def submit(self, challenge_id: int, candidate: str) -> Verdict:
+        self.submissions.append((challenge_id, candidate))
+        return Verdict("already_solved", "already solved", 200)
+
+
 class WorkspaceAndCleanupFailureBoard(BoundaryBoard):
     def __init__(self, challenges: list[Challenge]) -> None:
         super().__init__(challenges)
@@ -91,8 +137,11 @@ class WorkspaceAndCleanupFailureBoard(BoundaryBoard):
         self.download_calls = 0
 
     def download(self, file_ref: str, destination: Path, *, byte_limit: int) -> dict[str, object]:
-        del file_ref, destination, byte_limit
+        del file_ref
         self.download_calls += 1
+        if self.download_calls == 1:
+            destination.write_bytes(b"fixture")
+            return {"bytes": min(7, byte_limit), "redirect_hosts": ["board"]}
         raise OSError("local workspace write failed")
 
     def instance(self, method: str, challenge_id: int) -> dict[str, object]:
@@ -415,6 +464,104 @@ class ToolRetryMemoryRuntime(UnsolvedBoundaryRuntime):
         )()
 
 
+class DynamicPhaseRuntime(UnsolvedBoundaryRuntime):
+    def __init__(self) -> None:
+        super().__init__("unused")
+        self.prompts: list[tuple[dict[str, object], bool]] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        del workspace
+        document = json.loads(prompt)
+        self.prompts.append((document, kwargs.get("tool_registry") is not None))
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "fixture", "size": document["lane"] + 1},
+        )
+        await asyncio.sleep(0.01)
+        return type(
+            "DynamicPhaseTurn",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "unsolved",
+                        "candidate": None,
+                        "confidence": 0.3,
+                        "summary": "source inventory completed",
+                        "evidence": ["fixture inspected"],
+                        "next_steps": ["test the strongest hypothesis against the target"],
+                    }
+                ),
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": False,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+
+
+class WrongThenRecoveryRuntime(UnsolvedBoundaryRuntime):
+    def __init__(self, wrong: str, correct: str) -> None:
+        super().__init__("unused")
+        self.wrong = wrong
+        self.correct = correct
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        episode = int(document["episode"])
+        lane = int(document["lane"])
+        if episode == 0 and lane != 0:
+            return await super().solve(workspace, prompt, **kwargs)
+        candidate = self.wrong if episode == 0 else self.correct
+        candidate_digest = hashlib.sha256(candidate.encode()).hexdigest()
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            candidate_sensitive=True,
+            candidate_sha256s=(candidate_digest,),
+        )
+        await asyncio.sleep(0.01)
+        return type(
+            "WrongThenRecoveryTurn",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "candidate",
+                        "candidate": candidate,
+                        "confidence": 0.9,
+                        "summary": "source-derived candidate",
+                        "evidence": ["fixture bytes"],
+                        "next_steps": [],
+                    }
+                ),
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": True,
+                        "candidate_sha256s": [candidate_digest],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+
+
 def _config(tmp_path: Path) -> RuntimeConfig:
     (tmp_path / "auth").mkdir(exist_ok=True)
     base = RuntimeConfig.from_env(
@@ -447,6 +594,10 @@ def _challenge(challenge_id: int, *, challenge_type: str = "standard") -> Challe
         None,
         None,
     )
+
+
+def _limited_challenge(challenge_id: int, *, challenge_type: str = "standard") -> Challenge:
+    return replace(_challenge(challenge_id, challenge_type=challenge_type), max_attempts=3)
 
 
 def _file_challenge(challenge_id: int, *, challenge_type: str) -> Challenge:
@@ -702,14 +853,14 @@ def test_incomplete_host_evidence_cannot_enter_private_vault(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("delayed_lane", (0, 1))
-def test_distinct_verified_candidates_are_fenced_independent_of_completion_order(
+def test_one_fresh_verifier_resolves_disagreement_independent_of_completion_order(
     tmp_path: Path, delayed_lane: int
 ) -> None:
     candidates = (
         "INCYPHER{verified_identity_a}",
         "INCYPHER{verified_identity_b}",
     )
-    board = BoundaryBoard([_challenge(1)])
+    board = BoundaryBoard([_limited_challenge(1)])
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
     report = asyncio.run(
@@ -721,15 +872,14 @@ def test_distinct_verified_candidates_are_fenced_independent_of_completion_order
     )
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
 
-    assert board.submissions == []
-    assert view.verified_candidate_count == 2
-    assert view.pending_candidate_count == 0
-    assert sum(job.role == "verifier" and job.state == "candidate" for job in view.jobs) == 2
+    assert board.submissions == [(1, candidates[0])]
+    assert view.verified_candidate_count == 1
+    assert view.pending_candidate_count == 1
+    assert sum(job.role == "verifier" and job.state == "candidate" for job in view.jobs) == 1
     store = StateStore(config.state_path)
-    assert store.verified_candidate(report.run_id, 1) is None
-    assert all(
-        not store.candidate_is_verified(report.run_id, 1, candidate) for candidate in candidates
-    )
+    assert store.verified_candidate(report.run_id, 1) == candidates[0]
+    assert store.candidate_is_verified(report.run_id, 1, candidates[0])
+    assert not store.candidate_is_verified(report.run_id, 1, candidates[1])
     store.close()
 
 
@@ -737,7 +887,7 @@ def test_distinct_verified_candidates_are_fenced_independent_of_completion_order
 def test_submission_requires_same_run_private_verification(tmp_path: Path, matches: bool) -> None:
     candidate = "INCYPHER{verification_gates_submission}"
     verifier = candidate if matches else "INCYPHER{independent_mismatch}"
-    board = BoundaryBoard([_challenge(1)])
+    board = BoundaryBoard([_limited_challenge(1)])
     runtime = CandidateVerifierRuntime(candidate, verifier)
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
@@ -749,6 +899,154 @@ def test_submission_requires_same_run_private_verification(tmp_path: Path, match
     assert view.pending_candidate_count == int(not matches)
     with sqlite3.connect(config.state_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 2
+
+
+def test_first_unlimited_candidate_submits_immediately_without_verifier(tmp_path: Path) -> None:
+    candidate = "INCYPHER{immediate_unlimited_candidate}"
+    board = BoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=3, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=board, runtime=MixedBoundaryRuntime(candidate))
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 1
+    assert board.submissions == [(1, candidate)]
+    assert {job.role for job in view.jobs} == {"specialist"}
+    assert view.verified_candidate_count == 0
+
+
+def test_limited_candidate_waits_for_one_fresh_verifier(tmp_path: Path) -> None:
+    candidate = "INCYPHER{peer_agreement_qualification}"
+    board = BoundaryBoard([_limited_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=3, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 1
+    assert board.submissions == [(1, candidate)]
+    assert {job.role for job in view.jobs} == {"specialist", "verifier"}
+    assert sum(job.role == "verifier" for job in view.jobs) == 1
+
+
+def test_wrong_unlimited_candidate_routes_recovery_before_second_submission(
+    tmp_path: Path,
+) -> None:
+    wrong = "INCYPHER{first_hypothesis_wrong}"
+    correct = "INCYPHER{recovery_peer_agreement}"
+    board = WrongThenCorrectBoundaryBoard([_challenge(1)], correct)
+    config = replace(_config(tmp_path), episodes_per_challenge=3, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=WrongThenRecoveryRuntime(wrong, correct),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 1
+    assert board.submissions == [(1, wrong), (1, correct)]
+    assert {job.role for job in view.jobs} == {"specialist", "recovery", "verifier"}
+    assert view.route_decisions[0].rule_id == "board_rejection_recovery_v1"
+    assert view.route_decisions[1].rule_id == "private_source_reobservation_v1"
+
+
+def test_already_solved_candidate_is_verified_then_engagement_closes(tmp_path: Path) -> None:
+    candidate = "INCYPHER{fresh_candidate_for_solved_board_item}"
+    board = AlreadySolvedBoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=CandidateVerifierRuntime(candidate, candidate),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 0
+    assert report.candidates == 1
+    assert board.submissions == [(1, candidate)]
+    assert {job.role for job in view.jobs} == {"specialist", "verifier"}
+    assert view.pending_candidate_count == 0
+    assert view.verified_candidate_count == 1
+
+
+def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
+    tmp_path: Path,
+) -> None:
+    challenges = [
+        _challenge(1, challenge_type="dynamic_iac"),
+        _challenge(2, challenge_type="dynamic_iac"),
+    ]
+    board = ManagedInstanceBoundaryBoard(challenges)
+    runtime = DynamicPhaseRuntime()
+    config = replace(
+        _config(tmp_path),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=2,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert board.peak_active == 1
+    assert board.active == set()
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [
+        ("POST", 1),
+        ("POST", 2),
+    ]
+    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [
+        ("DELETE", 1),
+        ("DELETE", 2),
+    ]
+    local = [item for item in runtime.prompts if item[0]["execution_phase"] == "local_analysis"]
+    live = [item for item in runtime.prompts if item[0]["execution_phase"] == "shared_instance"]
+    assert len(local) == len(live) == 4
+    assert all(not has_target for _, has_target in local)
+    assert all(has_target for _, has_target in live)
+    assert all(document["same_run_memory"] for document, _ in live)
+    assert {job.role for job in view.jobs if job.episode == 1} == {"recovery"}
+
+
+def test_limited_dynamic_candidate_uses_same_instance_for_verifier(tmp_path: Path) -> None:
+    candidate = "INCYPHER{limited_dynamic_verified}"
+    dynamic = replace(
+        _challenge(1, challenge_type="dynamic_iac"),
+        max_attempts=3,
+    )
+    board = ManagedInstanceBoundaryBoard([dynamic])
+    runtime = CandidateVerifierRuntime(candidate, candidate)
+    config = replace(
+        _config(tmp_path),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=3,
+        submit_candidates=True,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 1
+    assert board.submissions == [(1, candidate)]
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [("DELETE", 1)]
+    assert {job.role for job in view.jobs} == {"specialist", "recovery", "verifier"}
+    auxiliary = [
+        (document["control_route"]["role"], kwargs["tool_registry"] is not None)
+        for document, kwargs in runtime.prompts
+        if document["control_route"]["role"] in {"recovery", "verifier"}
+    ]
+    assert {role for role, _ in auxiliary} == {"recovery", "verifier"}
+    assert all(has_target for _, has_target in auxiliary)
 
 
 @pytest.mark.parametrize(
@@ -800,7 +1098,7 @@ def test_cross_challenge_verifier_values_cannot_qualify(tmp_path: Path) -> None:
         1: "INCYPHER{challenge_one_private}",
         2: "INCYPHER{challenge_two_private}",
     }
-    board = BoundaryBoard([_challenge(1), _challenge(2)])
+    board = BoundaryBoard([_limited_challenge(1), _limited_challenge(2)])
     runtime = CrossChallengeVerifierRuntime(candidates)
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
@@ -815,7 +1113,7 @@ def test_cross_challenge_verifier_values_cannot_qualify(tmp_path: Path) -> None:
 def test_prior_run_candidate_cannot_qualify_current_run(tmp_path: Path) -> None:
     prior = "INCYPHER{prior_run_private_value}"
     current = "INCYPHER{current_run_private_value}"
-    board = BoundaryBoard([_challenge(1)])
+    board = BoundaryBoard([_limited_challenge(1)])
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
     first_report = asyncio.run(
@@ -860,22 +1158,19 @@ def test_pending_effect_count_is_global_when_inspecting_prior_or_current_run(
     assert board.submissions == [(1, candidate)]
 
 
-def test_owned_instance_count_is_global_when_inspecting_prior_or_current_run(
+def test_indeterminate_cleanup_poison_is_durable_and_fences_reassignment(
     tmp_path: Path,
 ) -> None:
     board = IndeterminateCleanupBoundaryBoard([_challenge(2, challenge_type="dynamic_iac")])
-    config = replace(_config(tmp_path), manage_dynamic_instances=True)
+    config = replace(_config(tmp_path), manage_dynamic_instances=True, episodes_per_challenge=2)
 
-    first_report = asyncio.run(
-        DurableJobControl.drive(config, board=board, runtime=UnsolvedBoundaryRuntime("unused"))
-    )
-    second_report = asyncio.run(
-        DurableJobControl.drive(config, board=board, runtime=UnsolvedBoundaryRuntime("unused"))
-    )
-
-    first = DurableJobControl.inspect(config.state_path, run_id=first_report.run_id)
-    second = DurableJobControl.inspect(config.state_path, run_id=second_report.run_id)
-    assert first.owned_instance_count == second.owned_instance_count == 1
+    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+        asyncio.run(
+            DurableJobControl.drive(config, board=board, runtime=UnsolvedBoundaryRuntime("unused"))
+        )
+    first = DurableJobControl.inspect(config.state_path)
+    assert first.owned_instance_count == 1
+    assert first.status == "failed"
 
 
 def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path) -> None:
@@ -897,7 +1192,7 @@ def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path
     assert {(job.challenge_id, job.catalogue_rank) for job in view.jobs} == {(1, 1)}
 
 
-def test_unclassified_analysis_is_contained_and_config_changes_change_routes(
+def test_unsolved_analysis_routes_to_typed_recovery_and_config_changes_change_routes(
     tmp_path: Path,
 ) -> None:
     board = BoundaryBoard([_challenge(1)])
@@ -909,8 +1204,13 @@ def test_unclassified_analysis_is_contained_and_config_changes_change_routes(
     first = DurableJobControl.inspect(base.state_path, run_id=first_report.run_id)
     initial_routes = {job.route_fingerprint for job in first.jobs if job.phase == "initial"}
     assert len(initial_routes) == 1
-    assert not [job for job in first.jobs if job.phase == "retry"]
-    assert first.route_decisions == ()
+    retry_jobs = [job for job in first.jobs if job.phase == "retry"]
+    assert len(retry_jobs) == 2
+    assert {job.role for job in retry_jobs} == {"recovery"}
+    assert [(item.failure_kind, item.disposition) for item in first.route_decisions] == [
+        ("tool", "dispatch"),
+        ("tool", "contain"),
+    ]
 
     changed = replace(base, episodes_per_challenge=1, attempt_seconds=14)
     second_report = asyncio.run(
@@ -1120,22 +1420,23 @@ def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) 
 def test_dynamic_workspace_then_cleanup_failure_escalates_and_contains(tmp_path: Path) -> None:
     board = WorkspaceAndCleanupFailureBoard([_file_challenge(1, challenge_type="dynamic_iac")])
     config = replace(_config(tmp_path), manage_dynamic_instances=True, episodes_per_challenge=2)
-    report = asyncio.run(
-        DurableJobControl.drive(
-            config,
-            board=board,
-            runtime=UnsolvedBoundaryRuntime("unused"),
+    with pytest.raises(BoardError, match="cleanup did not prove absence"):
+        asyncio.run(
+            DurableJobControl.drive(
+                config,
+                board=board,
+                runtime=UnsolvedBoundaryRuntime("unused"),
+            )
         )
-    )
-    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
-    assert report.status == "completed"
-    assert [(item.failure_kind, item.disposition) for item in view.route_decisions] == [
-        ("board", "contain")
-    ]
-    assert {job.episode for job in view.jobs} == {0}
-    assert board.post_calls == board.download_calls == 1
+    view = DurableJobControl.inspect(config.state_path)
+    assert view.status == "failed"
+    assert {job.episode for job in view.jobs} == {0, 1}
+    assert board.post_calls == 1
+    assert board.download_calls == 2
     assert board.get_calls >= 3
     assert view.owned_instance_count == 1
+    assert all(job.started_sequence is not None for job in view.jobs if job.episode == 0)
+    assert all(job.started_sequence is None for job in view.jobs if job.episode == 1)
 
 
 def test_inspect_is_consistent_while_one_wave_runs_and_another_is_queued(tmp_path: Path) -> None:
@@ -1197,6 +1498,35 @@ def test_deadline_closes_running_and_queued_jobs_durably(tmp_path: Path) -> None
         (2, "interrupted"),
     }
     assert all(job.closed_sequence is not None for job in view.jobs)
+
+
+def test_no_tool_progress_cancels_lane_and_routes_changed_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "_NO_PROGRESS_SECONDS", 0.02)
+    config = replace(_config(tmp_path), episodes_per_challenge=2)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=HangingBoundaryRuntime("unused"),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert [(item.failure_kind, item.disposition) for item in view.route_decisions] == [
+        ("tool", "dispatch"),
+        ("tool", "contain"),
+    ]
+    with sqlite3.connect(config.state_path) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT failure_class FROM attempts WHERE run_id=?", (report.run_id,)
+            )
+        } == {"no_progress"}
 
 
 def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:

@@ -84,11 +84,11 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_LEAD_LANES` | `1` | Primary-model Lead lanes in every initial challenge wave. |
 | `RAPIDO_PEER_PROFILE` | `mixed_v1` | Mixed direct-peer scheduler. `uniform_v1` exists for frozen historical replay. |
 | `RAPIDO_CONCURRENCY` | `20` | Lane admission bound; accepted range 2–32. |
-| `RAPIDO_ACTIVE_CHALLENGES` | `5` | Configured active-set partition; accepted range 1–8. |
-| `RAPIDO_EPISODES_PER_CHALLENGE` | `2` | Configured episode bound; accepted range 1–4. |
+| `RAPIDO_ACTIVE_CHALLENGES` | `5` | Active challenge engagements; auxiliary Recovery/Verifier agents do not consume these slots. |
+| `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, recovery or shared-instance, then bounded verification; accepted range 1–4. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: one Lead plus three Specialists by default; accepted range 2–8. |
-| `RAPIDO_ATTEMPT_SECONDS` | `1800` | Initial per-lane interrupt deadline. |
+| `RAPIDO_ATTEMPT_SECONDS` | `800` | Initial per-lane interrupt deadline. |
 | `RAPIDO_BOARD_TIMEOUT_SECONDS` | `15` | One bounded Board request. |
 | `RAPIDO_INSTANCE_READY_SECONDS` | `120` | Dynamic-instance readiness budget. |
 | `RAPIDO_INSTANCE_CLEANUP_SECONDS` | `45` | Dynamic cleanup budget; must cover three Board requests. |
@@ -99,16 +99,17 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
 | `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
-| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Serial exact-agreement submissions; explicit false is developer-only. |
-| `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Wrong/indeterminate submission-risk ceiling. |
-| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Managed receipt-bound dynamic instance lifecycle. |
+| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Immediate durable submission for the first qualified candidate on an unlimited challenge; limited or post-wrong candidates require an independent Verifier. |
+| `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Local-first analysis plus one receipt-bound shared-instance lease at a time. |
 
 ## Evaluation and persistent Board state
 
 Every live run starts with fresh solver state and a run-local 0/15, but the authenticated Board
 account persists. Board-solved challenges are still analyzed, and freshly derived qualified
 candidates are still submitted. A generic `already_solved` response proves only account history;
-it does not validate that run's candidate.
+it does not validate that run's candidate. Board-unsolved challenges are queued first. A fresh
+`already_solved` candidate enters independent verification, then closes without being reported as
+a new HTTP `correct`.
 
 For repeated calibration runs, report current-run and cumulative results separately. Count a
 cumulative challenge once only from the source run that received `correct`, or from independent
@@ -129,8 +130,10 @@ authorities, paths, credentials, and candidate fingerprints are never carried in
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
-Initial work defaults to Daybreak/xhigh plus Luna max/xhigh/max for each challenge. A routed
-Verifier or Recovery wave uses the primary exact model and remains inside the original run deadline.
+Initial and Recovery work defaults to Daybreak/xhigh plus Luna max/xhigh/max for each challenge;
+a Verifier is one fresh Daybreak/xhigh lane. Dynamic challenges analyze locally first, then queue
+for the measured single Board instance slot. All four peers share that challenge's one live
+instance, which is removed before the lease passes to another challenge.
 
 ## Stop, restart, and cleanup
 

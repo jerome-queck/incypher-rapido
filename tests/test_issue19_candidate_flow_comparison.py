@@ -19,7 +19,7 @@ sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
 RECORDED_RESULT = (
     Path(__file__).resolve().parents[1]
-    / "notes/research/issue-19-candidate-flow-comparison-v2.json"
+    / "notes/research/issue-19-candidate-flow-comparison-v3.json"
 )
 
 
@@ -100,10 +100,10 @@ def test_cases_exercise_retention_verification_and_adversarial_rejection(
     disagreement = _row(observations, "private_verification", "source_disagreement")
     assert disagreement["correct_admission_count"] == disagreement["submission_count"] == 1
     assert disagreement["false_admission_count"] == 0
-    assert disagreement["proposal_count"] == 4
+    assert disagreement["proposal_count"] == 3
     assert disagreement["verified_candidate_count"] == 1
     assert disagreement["pending_candidate_count"] == 1
-    assert disagreement["verifier_job_count"] == disagreement["verifier_prompt_count"] == 2
+    assert disagreement["verifier_job_count"] == disagreement["verifier_prompt_count"] == 1
     for case in ("description_decoy", "verifier_mismatch", "model_reflection"):
         assert _row(observations, "private_verification", case)["qualified_count"] == 0
 
