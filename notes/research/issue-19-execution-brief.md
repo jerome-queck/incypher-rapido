@@ -647,7 +647,7 @@ comparison green while independent review is pending.
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; diagnostic produced two new correct solves and cumulative at least five, but began only 13 challenges |
 | New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; diagnostic trace places changed shared-instance Recovery routing on both solve paths, with typed memory participating but no counterfactual causality claim |
 | No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | pending |
-| Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | pending |
+| Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | complete for corrected calibration; final run pending |
 | #19 closed honestly | GitHub closeout linked to merged evidence | pending |
 
 ### Mixed-peer live calibration result

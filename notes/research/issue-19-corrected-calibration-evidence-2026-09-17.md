@@ -115,7 +115,8 @@ lifecycle/security gates.
   an empty run root and zero-byte supervisor lease: no nested file, byte, symlink, or process leak.
 - Supervisor authentication remained present and separate.
 
-Independent Daybreak/xhigh lifecycle and result/contribution reviews were required before deleting
-the exact stopped container and state volume. After this evidence is merged, delete only those exact
-run objects, preserve authentication, and verify absence. The 19,800-second run remains unauthorized
-pending the owner's post-calibration decision and the focused fixes above.
+Independent Daybreak/xhigh lifecycle and result/contribution reviews were clean. After PR #39 merged
+as `ec1a55bb3e21ac29f4c01dde061f838a5b4dc71c`, the exact stopped container and state volume were
+removed. Subsequent exact-name inspection proved both absent while preserving the supervisor auth
+volume `rapido-auth-v4` and registered image. The 19,800-second run remains unauthorized pending the
+owner's post-calibration decision and the focused fixes above.
