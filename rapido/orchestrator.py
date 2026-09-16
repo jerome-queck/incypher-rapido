@@ -629,7 +629,12 @@ class Orchestrator:
         raise BoardError("dynamic instance ownership receipt could not be recovered")
 
     async def _start_instance(
-        self, run_id: str, challenge: Challenge, deadline: float
+        self,
+        run_id: str,
+        challenge: Challenge,
+        deadline: float,
+        *,
+        on_create_attempt: Callable[[], None] | None = None,
     ) -> tuple[tuple[TargetEndpoint, ...], str]:
         """Persist intent, create once, poll boundedly, and parse Board-issued endpoints."""
         existing = await self._board_read(deadline, self.board.instance, "GET", challenge.id)
@@ -644,6 +649,8 @@ class Orchestrator:
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
         if deadline - time.monotonic() <= transport_timeout:
             raise RunDeadlineReached
+        if on_create_attempt is not None:
+            on_create_attempt()
         create_task = asyncio.create_task(
             asyncio.to_thread(self.board.instance, "POST", challenge.id)
         )
@@ -2156,6 +2163,7 @@ class Orchestrator:
             target_endpoints: tuple[TargetEndpoint, ...] = ()
             receipt: str | None = None
             lease_acquired = False
+            create_attempted = False
             outcome: str | None = None
             active.add(challenge.id)
             peak_active = max(peak_active, len(active))
@@ -2166,7 +2174,7 @@ class Orchestrator:
             )
 
             async def acquire_instance() -> None:
-                nonlocal lease_acquired, receipt, target_endpoints
+                nonlocal create_attempted, lease_acquired, receipt, target_endpoints
                 self.state.event(
                     run_id,
                     "instance_lease_waiting",
@@ -2205,7 +2213,17 @@ class Orchestrator:
                     "instance_lease_granted",
                     {"challenge_id": challenge.id, "episode": episode},
                 )
-                target_endpoints, receipt = await self._start_instance(run_id, challenge, deadline)
+
+                def note_create_attempt() -> None:
+                    nonlocal create_attempted
+                    create_attempted = True
+
+                target_endpoints, receipt = await self._start_instance(
+                    run_id,
+                    challenge,
+                    deadline,
+                    on_create_attempt=note_create_attempt,
+                )
 
             async def release_instance() -> bool:
                 nonlocal lease_acquired, receipt, target_endpoints
@@ -2213,7 +2231,6 @@ class Orchestrator:
                     return True
 
                 cancelled: asyncio.CancelledError | None = None
-                created = receipt is not None
 
                 async def drain_cleanup(cleanup: asyncio.Task[bool]) -> bool:
                     nonlocal cancelled
@@ -2272,7 +2289,7 @@ class Orchestrator:
                     target_endpoints = ()
                     async with instance_condition:
                         instance_holders.discard(challenge.id)
-                        if created:
+                        if create_attempted:
                             instance_completed.add(challenge.id)
                         instance_condition.notify_all()
                 if not clean:
@@ -2317,11 +2334,19 @@ class Orchestrator:
                         self._adaptive_control
                         and challenge.type == "dynamic_iac"
                         and not lease_acquired
+                        and not create_attempted
+                        and route.tactic != "instance_enabled_follow_on"
                         and terminal in {"candidate", "unsolved", "error"}
                         and has_successor_budget
                     )
                     should_retry = (
-                        terminal in {"unsolved", "error", "candidate"} and has_successor_budget
+                        terminal in {"unsolved", "error", "candidate"}
+                        and has_successor_budget
+                        and not (
+                            challenge.type == "dynamic_iac"
+                            and create_attempted
+                            and not lease_acquired
+                        )
                     )
                     if dynamic_local_follow_on:
                         successor = instance_follow_on_route(route)

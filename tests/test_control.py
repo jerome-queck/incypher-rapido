@@ -112,6 +112,21 @@ class ManagedInstanceBoundaryBoard(BoundaryBoard):
         return {"success": False, "status": 404, "connection_info": "", "until": None}
 
 
+class FailedCreateBoundaryBoard(ManagedInstanceBoundaryBoard):
+    def __init__(self, challenges: list[Challenge], *, invalid_connection: bool) -> None:
+        super().__init__(challenges)
+        self.invalid_connection = invalid_connection
+
+    def instance(self, method: str, challenge_id: int) -> dict[str, object]:
+        if method == "POST" and not self.invalid_connection:
+            self.instance_calls.append((method, challenge_id))
+            return {"success": False, "status": 429, "connection_info": "", "until": None}
+        result = super().instance(method, challenge_id)
+        if challenge_id in self.active and self.invalid_connection:
+            result["connection_info"] = "invalid connection"
+        return result
+
+
 class WrongThenCorrectBoundaryBoard(BoundaryBoard):
     def __init__(self, challenges: list[Challenge], correct: str) -> None:
         super().__init__(challenges)
@@ -514,6 +529,25 @@ class DynamicPhaseRuntime(UnsolvedBoundaryRuntime):
                         "host_observation": observation,
                     }
                 ],
+            },
+        )()
+
+
+class DynamicLocalFailureRuntime(DynamicPhaseRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        if kwargs.get("tool_registry") is not None:
+            return await super().solve(workspace, prompt, **kwargs)
+        del workspace
+        document = json.loads(prompt)
+        self.prompts.append((document, False))
+        return type(
+            "DynamicLocalFailureTurn",
+            (),
+            {
+                "status": "failed",
+                "failure_class": "sandbox_error",
+                "text": "",
+                "tool_calls": [],
             },
         )()
 
@@ -1023,6 +1057,49 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     assert all(has_target for _, has_target in live)
     assert all(document["same_run_memory"] for document, _ in live)
     assert {job.role for job in view.jobs if job.episode == 1} == {"recovery"}
+
+
+@pytest.mark.parametrize("invalid_connection", (False, True))
+def test_dynamic_create_failure_is_not_retried_unchanged(
+    tmp_path: Path, invalid_connection: bool
+) -> None:
+    dynamic = _challenge(1, challenge_type="dynamic_iac")
+    board = FailedCreateBoundaryBoard([dynamic], invalid_connection=invalid_connection)
+    config = replace(
+        _config(tmp_path),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=3,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=board, runtime=DynamicPhaseRuntime())
+    )
+
+    assert report.status == "completed"
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert board.active == set()
+
+
+def test_dynamic_local_failure_enters_shared_phase_without_wasting_episode(
+    tmp_path: Path,
+) -> None:
+    dynamic = _challenge(1, challenge_type="dynamic_iac")
+    board = ManagedInstanceBoundaryBoard([dynamic])
+    runtime = DynamicLocalFailureRuntime()
+    config = replace(
+        _config(tmp_path),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=3,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    assert report.status == "completed"
+    phases = [(document["execution_phase"], document["episode"]) for document, _ in runtime.prompts]
+    assert phases[:2] == [("local_analysis", 0), ("local_analysis", 0)]
+    assert ("shared_instance", 1) in phases
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert board.active == set()
 
 
 def test_limited_dynamic_candidate_uses_same_instance_for_verifier(tmp_path: Path) -> None:
