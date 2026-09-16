@@ -247,6 +247,37 @@ single-SQLite, file/index, and volatile candidate-retention designs. Their origi
 had no durable source/config/result artifact and remain unaccepted. E3 routing stays pending until
 its own reproducible harness exists.
 
+E3 measurement is prospectively frozen by
+[`issue-19-routing-comparison-protocol-v1.json`](issue-19-routing-comparison-protocol-v1.json),
+SHA-256 `bc7a219c92e893b188584c4567bbb04b97d9be4ffaeaee90aa12d749ce5b5ef6`,
+based on merged commit `ae3da51aa675b6fdcfb1cbfe50a33cf5fbc4c954`. No measurement or result
+artifact exists at registration. It compares `fifo_unchanged`, `closed_rule_table`,
+`graph_reducer`, and `scored_policy` over the same 27 deterministic cases, 20 repetitions, three
+episodes, two lanes, exact fixture payloads, complete route templates and budgets, and an
+effect-free fixture boundary. Exact policy rules, graph transitions, scoring weights, and canonical
+section digests are registered. Policies may select only frozen recipe IDs; common code validates
+typed facts, materializes the route, and owns admission. Every failure kind has positive and
+negative facts, while mixed, malformed, conflicting, exhausted, duplicate, and persistent inputs
+must contain. Policy/runtime inputs exclude the case identity, expected disposition/recipe,
+evaluator outcome, arm, and repetition.
+
+Selection is recomputed only from 2,160 strict-schema per-arm/case/repetition raw rows; aggregate
+result storage is forbidden. An arm is ineligible for any unsafe,
+unchanged, duplicate, divergent, incomplete, leaking, or lifecycle-unclean observation. Among
+eligible arms, the unique winner must strictly improve total conversion over FIFO with no
+per-kind regression; fixed tie-breaks then prefer minimum tool, context, durable-event,
+policy-operation, and canonical policy-config cost. FIFO is a non-selectable comparator whose sole
+exemption is the changed/unused-route check; every other authority, privacy, durability, budget,
+and lifecycle gate remains. The frozen sensitivity schedule gives FIFO a nonzero 5-of-20
+qualification baseline and a correct changed recipe 15-of-20; it tests the selection machinery and
+is explicitly not a live-conversion estimate. Ties select nothing. Timing is descriptive only. Label permutation,
+synthetic winners for each policy arm, tie/all-ineligible, row/config/digest mutation, and
+changed-policy replay are mandatory tamper gates. E1 policy and E6 Board recipes remain
+live-locked; fixture facts can never grant live authority. The protocol itself must pass
+independent Daybreak/xhigh review and green CI before a comparison result is generated. Result
+provenance must bind the clean merged commit, harness and imported fixture hashes, full production
+tree digest, exact command/result format, environment, timestamps, and zero disabled-surface calls.
+
 The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
 two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
 material route fingerprint. Policy, provenance, timeout, quota, and Board failures remain
@@ -440,7 +471,7 @@ comparison green while independent review is pending.
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
-| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router merged; corrected E2 storage and behavior comparisons select private single-SQLite verification with clean review, pending final-image replay; E3 pending |
+| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router merged; corrected E2 storage and behavior comparisons select private single-SQLite verification with clean review, pending final-image replay; prospective four-arm E3 protocol frozen before measurement and clean review, CI and result pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and no-unchanged dispatch implemented; validated gated routes pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; full four-role/recovery proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
@@ -491,6 +522,11 @@ comparison green while independent review is pending.
 | Candidate-flow independent review | `gpt-daybreak-blue-latest` / `xhigh` | rejected with five P1 and two P2 findings: incomplete host evidence, schedule-dependent verification, public digest leakage, uncontrolled comparison, non-source reobservation, incomplete provenance, and crash overclaim; no fallback |
 | Candidate-flow fixes and corrected E2 comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; all findings covered test-first; 240 external-effect-free raw observations select private verification; clean re-review pending, no fallback |
 | Candidate-flow clean release re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; v2 replay/source hashes and reversed-order fencing verified, no P0-P3 findings, no fallback |
+| E3 routing protocol architecture | `gpt-daybreak-blue-latest` / `xhigh` | complete; four equal-budget arms, common authority boundary, raw-derived selection, and tamper gates frozen before measurement, no fallback |
+| E3 narrow test-design lane | requested `gpt-5.6-luna` / `xhigh` | rejected; worker could not attest the required model, output is not model-valid evidence and was not accepted, no fallback |
+| Initial E3 protocol independent review | `gpt-daybreak-blue-latest` / `xhigh` | held release: unfrozen fixture/policy/route values, aggregate circular evidence, FIFO gate contradiction, and declarative-only safety tests; all findings addressed before measurement, re-review pending, no fallback |
+| E3 protocol second independent review | `gpt-daybreak-blue-latest` / `xhigh` | held release: FIFO was definitionally unable to convert, gate-negative fixtures were not isolated, comparator recipe was incomplete, and result-source provenance was missing; all findings addressed before measurement, clean re-review pending, no fallback |
+| E3 protocol clean release re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; all frozen digests, comparator/gate semantics, E1/E6 locks, provenance contract, and protocol/brief SHA verified with no P0-P3 findings, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
