@@ -332,10 +332,16 @@ write_env RAPIDO_WORK_ROOT "/state/work"
 write_env RAPIDO_CODEX_BINARY "codex"
 write_env RAPIDO_MODEL "gpt-daybreak-blue-latest"
 write_env RAPIDO_REASONING_EFFORT "xhigh"
-write_env RAPIDO_CONCURRENCY "4"
-write_env RAPIDO_ACTIVE_CHALLENGES "2"
-write_env RAPIDO_ATTEMPTS_PER_CHALLENGE "2"
+write_env RAPIDO_SPECIALIST_MODEL "gpt-5.6-luna"
+write_env RAPIDO_SPECIALIST_REASONING_EFFORTS "max,xhigh,max"
+write_env RAPIDO_LEAD_LANES "1"
+write_env RAPIDO_PEER_PROFILE "mixed_v1"
+write_env RAPIDO_MEMORY_ARM "typed_challenge_v1"
+write_env RAPIDO_CONCURRENCY "20"
+write_env RAPIDO_ACTIVE_CHALLENGES "5"
+write_env RAPIDO_ATTEMPTS_PER_CHALLENGE "4"
 write_env RAPIDO_EPISODES_PER_CHALLENGE "2"
+write_env RAPIDO_ATTEMPT_SECONDS "1800"
 write_env RAPIDO_DYNAMIC_CONCURRENCY "1"
 write_env RAPIDO_SUBMIT_CANDIDATES "true"
 write_env RAPIDO_MANAGE_DYNAMIC_INSTANCES "true"
@@ -350,7 +356,18 @@ docker run --rm --platform "$RAPIDO_PLATFORM" --user 0 \
   --entrypoint sh "$RAPIDO_IMAGE" -c \
   'install -d -o 10001 -g 10001 -m 0700 /state/work && chown 10001:10001 /state /auth/codex /auth/codex/auth.json && chmod 700 /state /auth/codex && chmod 600 /auth/codex/auth.json'
 docker run --rm --platform "$RAPIDO_PLATFORM" --entrypoint codex "$RAPIDO_IMAGE" --version
-docker run --rm --platform "$RAPIDO_PLATFORM" --entrypoint rapido "$RAPIDO_IMAGE" config
+docker run --rm --platform "$RAPIDO_PLATFORM" --env-file "$ENV_FILE" \
+  --entrypoint rapido "$RAPIDO_IMAGE" config | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["active_challenges"] == 5
+assert value["attempts_per_challenge"] == 4
+assert value["concurrency"] == 20
+assert value["model"] == "gpt-daybreak-blue-latest"
+assert value["specialist_model"] == "gpt-5.6-luna"
+assert value["specialist_reasoning_efforts"] == ["max", "xhigh", "max"]
+assert value["memory_arm"] == "typed_challenge_v1"
+'
 note "image and architecture smoke tests passed"
 
 stage "Read-only Board preflight"

@@ -964,6 +964,48 @@ def test_wave_close_decision_and_successor_admission_roll_back_together(
         state.close()
 
 
+def test_quota_successor_preserves_the_exact_mixed_peer_roster(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    state = StateStore(path)
+    run_id = "2" * 32
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=300)
+    assignments = (
+        ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+        ("specialist", "gpt-5.6-luna", "max"),
+        ("specialist", "gpt-5.6-luna", "xhigh"),
+        ("specialist", "gpt-5.6-luna", "max"),
+    )
+    try:
+        state.start_run(run_id, {})
+        state.upsert_challenge(1, "fixture", "crypto", "standard", 100)
+        state.record_control_catalogue(run_id, [(1, 1, True)])
+        state.admit_control_wave(run_id, 1, 0, 1, 4, route, assignments)
+        state.start_control_wave(run_id, 1, 0)
+        for lane, (_, model, effort) in enumerate(assignments):
+            attempt_id = f"{run_id}:1:0:{lane}"
+            state.start_attempt(attempt_id, run_id, 1, 0, lane, model, effort)
+            state.finish_attempt(attempt_id, "failed", failure_class="rate_limit_exceeded")
+
+        decision = state.finish_and_decide_control_wave(
+            run_id=run_id,
+            challenge_id=1,
+            source_episode=0,
+            next_episode=1,
+            catalogue_rank=1,
+            lanes=4,
+            terminal="error",
+            attempts_remaining=True,
+            remaining_milliseconds=180_000,
+        )
+        assert decision is not None and decision.rule_id == "quota_bounded_wait_v1"
+        retry = [
+            job for job in DurableJobControl.inspect(path, run_id=run_id).jobs if job.episode == 1
+        ]
+        assert [(job.agent_role, job.model, job.effort) for job in retry] == list(assignments)
+    finally:
+        state.close()
+
+
 def test_inspect_supports_main_schema_without_route_decisions(tmp_path: Path) -> None:
     config = _config(tmp_path)
     report = asyncio.run(

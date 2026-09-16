@@ -422,11 +422,7 @@ class StateStore:
                 )
                 """
             )
-            agent_role = (
-                "jobs.agent_role"
-                if "agent_role" in old_columns
-                else "jobs.role"
-            )
+            agent_role = "jobs.agent_role" if "agent_role" in old_columns else "jobs.role"
             model = (
                 "jobs.model"
                 if "model" in old_columns
@@ -2054,6 +2050,21 @@ class StateStore:
         if decision.disposition == "dispatch":
             if decision.successor is None:
                 raise AssertionError("dispatch requires a successor route")
+            assignments = None
+            if decision.successor.role not in {"verifier", "recovery"}:
+                assignment_rows = connection.execute(
+                    "SELECT agent_role, model, effort FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
+                    (run_id, challenge_id, source_episode),
+                ).fetchall()
+                assignments = tuple(
+                    (
+                        str(row["agent_role"]),
+                        str(row["model"]),
+                        str(row["effort"]),
+                    )
+                    for row in assignment_rows
+                )
             self._admit_control_wave(
                 connection,
                 run_id,
@@ -2062,6 +2073,7 @@ class StateStore:
                 catalogue_rank,
                 lanes,
                 decision.successor,
+                assignments,
                 require_unused_route=True,
             )
         return decision
