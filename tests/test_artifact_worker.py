@@ -410,12 +410,20 @@ def test_native_resource_signal_maps_to_resource_limit(tmp_path, termination_sig
     source.write_bytes(b"x")
     descriptor = _open(source)
     try:
+        reset_signal = (
+            f"signal.signal({int(termination_signal)}, signal.SIG_DFL); "
+            if termination_signal != signal.SIGKILL
+            else ""
+        )
         with pytest.raises(artifact_worker_main.WorkerError) as error:
             artifact_worker_main._native(
                 [
                     os.path.abspath(sys.executable),
                     "-c",
-                    f"import os,signal; os.kill(os.getpid(), {int(termination_signal)})",
+                    (
+                        f"import os,signal; {reset_signal}os.kill(os.getpid(), "
+                        f"{int(termination_signal)})"
+                    ),
                 ],
                 descriptor,
             )
