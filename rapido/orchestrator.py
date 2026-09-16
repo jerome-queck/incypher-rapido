@@ -13,7 +13,7 @@ import time
 import urllib.parse
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -368,6 +368,55 @@ class Orchestrator:
         self._dynamic_slots = asyncio.Semaphore(config.dynamic_concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
+
+    def _initial_peer_assignments(self) -> tuple[tuple[str, str, str], ...]:
+        if self.config.peer_profile == "uniform_v1":
+            return tuple(
+                ("specialist", self.config.model, self.config.reasoning_effort)
+                for _ in range(self.config.attempts_per_challenge)
+            )
+        assignments: list[tuple[str, str, str]] = []
+        for lane in range(self.config.attempts_per_challenge):
+            if lane < self.config.lead_lanes:
+                assignments.append(("lead", self.config.model, self.config.reasoning_effort))
+                continue
+            effort_index = (lane - self.config.lead_lanes) % len(
+                self.config.specialist_reasoning_efforts
+            )
+            assignments.append(
+                (
+                    "specialist",
+                    self.config.specialist_model,
+                    self.config.specialist_reasoning_efforts[effort_index],
+                )
+            )
+        return tuple(assignments)
+
+    async def _validate_peer_models(self, run_id: str, deadline: float) -> None:
+        validator = getattr(self.runtime, "validate_model", None)
+        if not callable(validator):
+            return
+        selections = {(self.config.model, self.config.reasoning_effort)}
+        if self.config.peer_profile == "mixed_v1":
+            selections.update(
+                (self.config.specialist_model, effort)
+                for effort in self.config.specialist_reasoning_efforts
+            )
+        for model, effort in sorted(selections):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunDeadlineReached
+            await asyncio.wait_for(validator(model, effort), timeout=remaining)
+        self.state.event(
+            run_id,
+            "peer_models_validated",
+            {
+                "selections": [
+                    {"model": model, "effort": effort} for model, effort in sorted(selections)
+                ],
+                "fallback": False,
+            },
+        )
 
     async def _board_call(
         self, deadline: float, function: Any, /, *args: Any, **kwargs: Any
@@ -1119,14 +1168,24 @@ class Orchestrator:
                 route,
                 run_evidence,
             )
+            agent_role, model, effort = self.state.control_assignment(
+                run_id, challenge.id, episode, lane
+            )
+            execution_route = replace(route, model=model, effort=effort)
+        else:
+            agent_role = "specialist"
+            model = self.config.model
+            effort = self.config.reasoning_effort
+            execution_route = route
         self.state.start_attempt(
             attempt_id,
             run_id,
             challenge.id,
             episode,
             lane,
-            self.config.model,
-            self.config.reasoning_effort,
+            model,
+            effort,
+            require_control_assignment=self._adaptive_control,
         )
         started = time.monotonic()
         tool_call_count = 0
@@ -1204,8 +1263,13 @@ class Orchestrator:
                         before_episode=episode,
                     )
                 ),
-                control_route=route,
+                control_route=execution_route,
                 same_run_memory=same_run_memory,
+                agent_role=(
+                    agent_role
+                    if self._adaptive_control and self.config.peer_profile == "mixed_v1"
+                    else None
+                ),
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -1245,8 +1309,8 @@ class Orchestrator:
                     workspace,
                     turn_prompt,
                     developer_instructions=DEVELOPER_INSTRUCTIONS,
-                    model=self.config.model,
-                    reasoning_effort=self.config.reasoning_effort,
+                    model=model,
+                    reasoning_effort=effort,
                     output_schema=SOLVER_OUTPUT_SCHEMA,
                     timeout=timeout_seconds,
                     tool_registry=target_registry,
@@ -1597,7 +1661,8 @@ class Orchestrator:
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
         remaining = max(0.0, deadline - time.monotonic())
-        timeout = min(float(self.config.attempt_seconds), remaining)
+        attempt_seconds = self.config.attempt_seconds if route is None else route.attempt_seconds
+        timeout = min(float(attempt_seconds), remaining)
         if timeout <= 0:
             self.state.set_challenge_status(challenge.id, "unsolved")
             return "unsolved"
@@ -1847,6 +1912,7 @@ class Orchestrator:
                     catalogue_ranks[challenge.id],
                     self.config.attempts_per_challenge,
                     route,
+                    self._initial_peer_assignments() if episode == 0 else None,
                 )
             queue.put_nowait((challenge, episode, queued_at, route))
             self.state.event(
@@ -1876,6 +1942,21 @@ class Orchestrator:
                 raise RunDeadlineReached
             if challenge.id in active:
                 raise RuntimeError("challenge episode overlap violated")
+            if route.backoff_policy == "bounded_60_seconds":
+                if deadline - time.monotonic() <= 60:
+                    raise RunDeadlineReached
+                self.state.event(
+                    run_id,
+                    "challenge_episode_backoff",
+                    {
+                        "challenge_id": challenge.id,
+                        "episode": episode,
+                        "seconds": 60,
+                    },
+                )
+                await asyncio.sleep(60)
+            elif route.backoff_policy != "none":
+                raise ValueError("unsupported durable backoff policy")
             active.add(challenge.id)
             peak_active = max(peak_active, len(active))
             admitted_episodes += 1
@@ -2063,6 +2144,7 @@ class Orchestrator:
                 await asyncio.wait_for(self.runtime.start(), timeout=remaining)
             except TimeoutError as exc:
                 raise RunDeadlineReached from exc
+            await self._validate_peer_models(run_id, deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached

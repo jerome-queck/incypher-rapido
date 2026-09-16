@@ -121,13 +121,19 @@ class BoundaryRuntime:
         self._candidate = candidate
         self.started = False
         self.closed = False
+        self.calls: list[tuple[dict[str, object], dict[str, object]]] = []
+        self.validated: list[tuple[str, str]] = []
 
     async def start(self) -> None:
         self.started = True
 
+    async def validate_model(self, model: str, effort: str) -> None:
+        self.validated.append((model, effort))
+
     async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
-        del workspace, kwargs
+        del workspace
         document = json.loads(prompt)
+        self.calls.append((document, dict(kwargs)))
         candidate_digest = hashlib.sha256(self._candidate.encode()).hexdigest()
         await asyncio.sleep(0.01)
         observation = project_tool_observation(
@@ -418,6 +424,9 @@ def _config(tmp_path: Path) -> RuntimeConfig:
             "RAPIDO_CODEX_HOME": str(tmp_path / "auth"),
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
+            "RAPIDO_ACTIVE_CHALLENGES": "2",
+            "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
+            "RAPIDO_CONCURRENCY": "4",
         }
     )
     return replace(base, run_seconds=60, attempt_seconds=15, episodes_per_challenge=1)
@@ -491,6 +500,56 @@ def test_initial_queue_identity_and_order_survive_reopened_inspection(tmp_path: 
         job.started_sequence for job in first.jobs
     )
     assert all(job.started_sequence < job.closed_sequence for job in first.jobs)
+
+
+def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
+    tmp_path: Path,
+) -> None:
+    runtime = BoundaryRuntime("INCYPHER{mixed-peer-fixture}")
+    config = replace(
+        _config(tmp_path),
+        active_challenges=5,
+        attempts_per_challenge=4,
+        concurrency=20,
+        lead_lanes=1,
+        specialist_reasoning_efforts=("max", "xhigh", "max"),
+    )
+    challenges = [_challenge(challenge_id) for challenge_id in range(1, 16)]
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard(challenges), runtime=runtime)
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert view.catalogue_count == view.initial_coverage_count == 15
+    assert set(runtime.validated) == {
+        ("gpt-daybreak-blue-latest", "xhigh"),
+        ("gpt-5.6-luna", "xhigh"),
+        ("gpt-5.6-luna", "max"),
+    }
+    for challenge_id in range(1, 16):
+        jobs = [job for job in view.jobs if job.challenge_id == challenge_id]
+        assert [(job.agent_role, job.model, job.effort) for job in jobs] == [
+            ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+            ("specialist", "gpt-5.6-luna", "max"),
+            ("specialist", "gpt-5.6-luna", "xhigh"),
+            ("specialist", "gpt-5.6-luna", "max"),
+        ]
+        assert all(
+            job.started_sequence is not None and job.closed_sequence is not None for job in jobs
+        )
+    for document, kwargs in runtime.calls:
+        lane = int(document["lane"])
+        job = next(
+            item
+            for item in view.jobs
+            if item.challenge_id == int(document["challenge"]["id"]) and item.lane == lane
+        )
+        assert document["agent_role"] == job.agent_role
+        assert kwargs["model"] == job.model
+        assert kwargs["reasoning_effort"] == job.effort
+        assert document["control_route"]["model"] == job.model
+        assert document["control_route"]["effort"] == job.effort
 
 
 def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
@@ -610,7 +669,7 @@ def test_wave_failure_fact_is_available_to_each_lane_without_false_lane_attribut
     tmp_path: Path,
 ) -> None:
     runtime = ToolRetryMemoryRuntime()
-    config = replace(_config(tmp_path), episodes_per_challenge=2)
+    config = replace(_config(tmp_path), episodes_per_challenge=2, memory_arm="lane_local_v1")
     asyncio.run(
         DurableJobControl.drive(config, board=BoundaryBoard([_challenge(1)]), runtime=runtime)
     )
@@ -1147,8 +1206,9 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
             "RAPIDO_CODEX_HOME": os.environ["CRASH_AUTH"],
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
-            "RAPIDO_ACTIVE_CHALLENGES": "1",
-            "RAPIDO_CONCURRENCY": "2",
+                "RAPIDO_ACTIVE_CHALLENGES": "1",
+                "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
+                "RAPIDO_CONCURRENCY": "2",
         })
         asyncio.run(DurableJobControl.drive(config, board=Board(), runtime=Runtime()))
         """

@@ -53,6 +53,8 @@ def config(tmp_path: Path, **changes: object) -> RuntimeConfig:
             "RAPIDO_CONCURRENCY": "4",
             "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
             "RAPIDO_SUBMIT_CANDIDATES": "false",
+            "RAPIDO_PEER_PROFILE": "uniform_v1",
+            "RAPIDO_MEMORY_ARM": "lane_local_v1",
         }
     )
     overrides = {"run_seconds": 60, "attempt_seconds": 15, **changes}

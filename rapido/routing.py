@@ -300,6 +300,8 @@ def route_failure(request: RouteRequest) -> RouteDecision:
             tactic="independent_source_reobservation",
             context_profile="fresh_source_only_no_candidate_carry",
             verification_recipe="fresh_source_reobservation_v1",
+            attempt_seconds=min(7_200, max(300, request.current.attempt_seconds * 2)),
+            deadline_policy="evidence_earned_within_original_run_deadline",
         )
     if failure.kind == "timeout":
         return _terminal(
@@ -308,10 +310,17 @@ def route_failure(request: RouteRequest) -> RouteDecision:
             "no committed and restorable checkpoint fact exists",
         )
     if failure.kind == "quota":
-        return _terminal(
-            request,
-            "quota_reset_unobserved",
-            "no durable bounded waiter or validated provider reset fact exists",
+        if request.remaining_milliseconds < 61_000:
+            return _terminal(
+                request,
+                "quota_wait_exceeds_run_deadline",
+                "the bounded quota wait cannot fit inside the original run deadline",
+            )
+        rule_id = "quota_bounded_wait_v1"
+        successor = replace(
+            request.current,
+            tactic="resume_after_quota_backoff",
+            backoff_policy="bounded_60_seconds",
         )
     if failure.kind == "board":
         return _terminal(
@@ -353,7 +362,7 @@ def route_failure(request: RouteRequest) -> RouteDecision:
             context_profile="durable_facts_only",
             workspace_generation=1,
         )
-    elif failure.kind != "disagreement":  # pragma: no cover - closed above
+    elif failure.kind not in {"disagreement", "quota"}:  # pragma: no cover - closed above
         raise AssertionError("unreachable failure kind")
 
     assert successor is not None

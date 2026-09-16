@@ -14,15 +14,16 @@ replayable ordering, evidence-earned extensions, full catalogue coverage, measur
 8-CPU/24-GiB/256-PID/~500-GiB envelope, and crash-safe 5.5-hour recovery. An unchanged failed
 action is never retried.
 
-Completion requires one pre-registered, fresh-state, exact-final-image, unattended
-`gpt-daybreak-blue-latest`/`xhigh` run with a 19,800-second work-admission budget, autonomous
-qualified submissions, and managed instances enabled. It must analyze all 15 catalogue entries,
+Completion requires one pre-registered, fresh-state, exact-final-image, unattended mixed-model run
+with a 19,800-second work-admission budget, autonomous qualified submissions, and managed instances
+enabled. Every challenge must receive at least one exact `gpt-daybreak-blue-latest`/`xhigh` peer;
+additional exact OpenAI peers may use the pre-registered Luna xhigh/max plan. It must analyze all 15 catalogue entries,
 submit every freshly derived qualified candidate including candidates for Board-solved entries,
 receive at least one new HTTP-200 `correct` verdict, bring cumulative autonomous solves from three
 to at least four, and prove that a new routing, context, collaboration, recovery, or verification
 mechanism materially contributed. Generic `already_solved` is never candidate validation.
 
-The gate also requires exact model/effort with no fallback; no manual candidate relay or operator
+The gate also requires each assigned model/effort exactly with no fallback; no manual candidate relay or operator
 steering; no pending effect, indeterminate owned instance, process/workspace/state leak, or
 security/lifecycle regression. Sanitized evidence must merge before that exact run's container,
 state, and workspace are deleted. Authentication is preserved. Acceptance will not be lowered
@@ -203,13 +204,33 @@ review, merged source, exact image, and protocol are fixed.
 | E2 | Exact peer agreement vs private-retention plus independent deterministic verification | Qualified candidates, false admissions, provenance subreason, elapsed/tool count | New path admits only source-bound deterministic verification and never model assertion alone |
 | E3 | FIFO unchanged episode vs failure-specific Lead routing | Per-class conversion, repeated action fingerprints, coverage, elapsed, tool count | Selected route changes tactic/context/tool/role/budget after every failure and improves or preserves safe conversion |
 | M1 | Current lane-local carry vs typed challenge-wide earlier-episode memory | Useful context, duplicate tactics/observations, prompt bytes, source linkage, replay, scope/privacy violations | Select typed memory only if it exposes strictly more useful cross-lane context with zero safety regression; confirm conversion in E4 |
-| E4 | 2, 4, 6, then 8 inference lanes and scaled local-analysis workers | CPU, RSS, PIDs, model quota/latency, queue wait, Board/instance pressure, conversion | Stop increasing at first measured non-host bottleneck or safety boundary; keep full-wave admission |
+| E4 | Mixed P20 default, then measured lower/higher safe peer profiles | CPU, RSS, PIDs, RPM/quota/latency, queue wait, Board/instance pressure, conversion | Keep five-challenge full-wave admission unless a measured provider, host, or lifecycle boundary dominates |
 | E5 | Crash points before/after queue admission, evidence/vault commit, submission intent/response, instance create/delete | Replay order, lost/duplicated work/effects, cleanup, DB integrity, residue | One durable owner; no duplicate POST, lost closed work, stale lane, or leaked instance/workspace |
 | E6 | Read-only current Board inactive-instance observations with exact request contract | HTTP status, validated body shape, endpoint/timestamp presence, repeated coherence | Mutation allowed only after documented inactive semantics are positively established |
 
 Every experiment records exact source, fixture identity, model/effort when used, configuration,
 elapsed time, and a sanitized result. Native calibration is not a submission probe. Live solver
-runs always use Daybreak/xhigh; Luna is restricted to narrow non-live fixtures/tests.
+runs use the exact pre-registered OpenAI peer roster with no fallback.
+
+### Owner amendments before mixed-model live measurement
+
+On 2026-09-16, before any issue-19 native or Board solver result was observed, the owner clarified
+that live execution is model-agnostic within the configured OpenAI catalogue. Every challenge gets
+at least one Daybreak/xhigh peer; cheaper Luna xhigh/max peers may fan out around it, and routed hard,
+disputed, verification, or recovery work may earn more Daybreak peers. These are controller-managed
+peer threads, not nested agent trees. The initial production default is five active challenges and
+four peers per challenge: Daybreak/xhigh Lead plus Luna max, xhigh, and max Specialists, for a full
+20-lane wave. Provider RPM/quota is a measured routing input, never permission to fall back.
+
+The owner also requested light implementation-first engineering rather than TDD or framework
+expansion. Required security, lifecycle, memory, routing, recovery, review, and acceptance proofs
+remain unchanged. The initial lane deadline becomes 1,800 seconds; a longer successor must be earned
+by durable progress and cannot extend the original run deadline.
+
+Before any 19,800-second acceptance run, run one separately pre-registered 1,800-second live Board
+calibration and report back. It tests mixed peers, typed memory, tools, routing, qualified submissions,
+instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance, authorize closure,
+or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
 
 ### M1 typed-memory comparison registration
 
