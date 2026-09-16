@@ -136,5 +136,9 @@ full initial coverage. Policy refusals, provenance dead ends, persistent-Board e
 changed inactive-instance response require a separate measured follow-up: issue
 [#19](https://github.com/jerome-queck/incypher-rapido/issues/19).
 
-Delete the exact stopped container and state volume only after this report is merged and linked
-from GitHub. Preserve the dedicated authentication volume.
+After PR [#18](https://github.com/jerome-queck/incypher-rapido/pull/18) merged this report as
+`c330e4e` and the evidence was linked from GitHub, the exact stopped container and run-state volume
+were deleted. A post-deletion Docker inspection confirmed both absent while the dedicated
+authentication volume and exact final image remained. Issue
+[#11](https://github.com/jerome-queck/incypher-rapido/issues/11) was closed with the failed original
+gate, amended acceptance basis, follow-up, and cleanup stated explicitly.
