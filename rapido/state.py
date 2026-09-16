@@ -176,6 +176,37 @@ class StateStore:
                 team_id INTEGER NOT NULL,
                 bound_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS control_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                kind TEXT NOT NULL,
+                job_id TEXT,
+                data_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS control_catalogue (
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                catalogue_rank INTEGER NOT NULL,
+                executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
+                PRIMARY KEY(run_id, challenge_id),
+                UNIQUE(run_id, catalogue_rank)
+            );
+            CREATE TABLE IF NOT EXISTS control_jobs (
+                job_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL,
+                catalogue_rank INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                role TEXT NOT NULL,
+                lane INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                route_fingerprint TEXT NOT NULL,
+                admitted_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
+                started_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                closed_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                UNIQUE(run_id, challenge_id, episode, role, lane)
+            );
             """
         )
         self._migrate_attempts()
@@ -578,6 +609,188 @@ class StateStore:
             )
             return int(cursor.lastrowid)
 
+    @staticmethod
+    def _control_event(
+        connection: sqlite3.Connection,
+        run_id: str,
+        kind: str,
+        job_id: str,
+        data: dict[str, object],
+    ) -> int:
+        cursor = connection.execute(
+            "INSERT INTO control_events(run_id, kind, job_id, data_json) VALUES (?, ?, ?, ?)",
+            (run_id, kind, job_id, json.dumps(data, sort_keys=True, separators=(",", ":"))),
+        )
+        return int(cursor.lastrowid)
+
+    def admit_control_wave(
+        self,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        catalogue_rank: int,
+        lanes: int,
+        route: dict[str, object],
+    ) -> None:
+        phase = "initial" if episode == 0 else "retry"
+        route_json = json.dumps(route, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(route_json.encode()).hexdigest()
+        with self.transaction() as connection:
+            for lane in range(lanes):
+                job_id = f"{run_id}:{challenge_id}:{episode}:specialist:{lane}"
+                sequence = self._control_event(
+                    connection,
+                    run_id,
+                    "job_admitted",
+                    job_id,
+                    {
+                        "catalogue_rank": catalogue_rank,
+                        "challenge_id": challenge_id,
+                        "episode": episode,
+                        "lane": lane,
+                        "phase": phase,
+                        "role": "specialist",
+                    },
+                )
+                connection.execute(
+                    """
+                    INSERT INTO control_jobs(
+                      job_id, run_id, challenge_id, episode, catalogue_rank,
+                      phase, role, lane, state, route_fingerprint, admitted_sequence
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'specialist', ?, 'queued', ?, ?)
+                    """,
+                    (
+                        job_id,
+                        run_id,
+                        challenge_id,
+                        episode,
+                        catalogue_rank,
+                        phase,
+                        lane,
+                        fingerprint,
+                        sequence,
+                    ),
+                )
+
+    def record_control_catalogue(self, run_id: str, entries: list[tuple[int, int, bool]]) -> None:
+        with self.transaction() as connection:
+            connection.executemany(
+                """
+                INSERT INTO control_catalogue(run_id, challenge_id, catalogue_rank, executable)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (run_id, challenge_id, catalogue_rank, int(executable))
+                    for catalogue_rank, challenge_id, executable in entries
+                ],
+            )
+
+    def start_control_wave(self, run_id: str, challenge_id: int, episode: int) -> None:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT job_id, lane FROM control_jobs "
+                "WHERE run_id=? AND challenge_id=? AND episode=? AND state='queued' ORDER BY lane",
+                (run_id, challenge_id, episode),
+            ).fetchall()
+            if not rows:
+                raise ValueError("control wave is absent or not queued")
+            for row in rows:
+                sequence = self._control_event(
+                    connection,
+                    run_id,
+                    "job_started",
+                    str(row["job_id"]),
+                    {"challenge_id": challenge_id, "episode": episode, "lane": int(row["lane"])},
+                )
+                connection.execute(
+                    "UPDATE control_jobs SET state='running', started_sequence=? WHERE job_id=?",
+                    (sequence, row["job_id"]),
+                )
+
+    def finish_control_wave(
+        self, run_id: str, challenge_id: int, episode: int, terminal: str
+    ) -> None:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT job_id, lane FROM control_jobs "
+                "WHERE run_id=? AND challenge_id=? AND episode=? AND state='running' ORDER BY lane",
+                (run_id, challenge_id, episode),
+            ).fetchall()
+            if not rows:
+                raise ValueError("control wave is absent or not running")
+            for row in rows:
+                attempt = connection.execute(
+                    "SELECT status FROM attempts "
+                    "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=?",
+                    (run_id, challenge_id, episode, row["lane"]),
+                ).fetchone()
+                lane_state = (
+                    str(attempt["status"])
+                    if attempt is not None
+                    else ("failed" if terminal == "error" else "cancelled")
+                )
+                sequence = self._control_event(
+                    connection,
+                    run_id,
+                    "job_closed",
+                    str(row["job_id"]),
+                    {
+                        "challenge_id": challenge_id,
+                        "episode": episode,
+                        "lane": int(row["lane"]),
+                        "lane_state": lane_state,
+                        "terminal": terminal,
+                    },
+                )
+                connection.execute(
+                    "UPDATE control_jobs SET state=?, closed_sequence=? WHERE job_id=?",
+                    (lane_state, sequence, row["job_id"]),
+                )
+
+    @classmethod
+    def _interrupt_control_jobs(
+        cls, connection: sqlite3.Connection, run_id: str, reason: str
+    ) -> int:
+        rows = connection.execute(
+            "SELECT job_id, challenge_id, episode, lane FROM control_jobs "
+            "WHERE run_id=? AND state IN ('queued', 'running') ORDER BY admitted_sequence",
+            (run_id,),
+        ).fetchall()
+        for row in rows:
+            attempt = connection.execute(
+                "SELECT status FROM attempts "
+                "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=?",
+                (run_id, row["challenge_id"], row["episode"], row["lane"]),
+            ).fetchone()
+            attempt_state = None if attempt is None else str(attempt["status"])
+            job_state = (
+                attempt_state
+                if attempt_state is not None and attempt_state != "running"
+                else "interrupted"
+            )
+            sequence = cls._control_event(
+                connection,
+                run_id,
+                "job_closed" if job_state != "interrupted" else "job_interrupted",
+                str(row["job_id"]),
+                {
+                    "challenge_id": int(row["challenge_id"]),
+                    "episode": int(row["episode"]),
+                    "lane_state": job_state,
+                    "lane": int(row["lane"]),
+                    "reason": reason,
+                },
+            )
+            connection.execute(
+                "UPDATE control_jobs SET state=?, closed_sequence=? WHERE job_id=?",
+                (job_state, sequence, row["job_id"]),
+            )
+        return len(rows)
+
+    def interrupt_control_run(self, run_id: str, reason: str) -> int:
+        with self.transaction() as connection:
+            return self._interrupt_control_jobs(connection, run_id, reason)
+
     def active_attempts(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
@@ -867,6 +1080,14 @@ class StateStore:
             raise RuntimeError("state recovery requires the supervisor lease")
         with self.transaction() as connection:
             now = self._now()
+            interrupted_run_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM runs WHERE status='running' ORDER BY started_at, id"
+                ).fetchall()
+            ]
+            for interrupted_run_id in interrupted_run_ids:
+                self._interrupt_control_jobs(connection, interrupted_run_id, "supervisor_restart")
             rows = connection.execute(
                 "SELECT run_id, COUNT(*) AS count FROM attempts WHERE status='running' GROUP BY run_id"
             ).fetchall()
