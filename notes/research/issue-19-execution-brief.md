@@ -651,6 +651,27 @@ for solve quality. Typed memory projected safely but supplied no records in this
 Independent post-run Board and local audits were clean. Full sanitized evidence is in
 [`issue-19-calibration-evidence-2026-09-17.md`](issue-19-calibration-evidence-2026-09-17.md).
 
+### Production-path 800-second calibration result
+
+The diagnostic calibration used an 800-second outer ceiling and 1,800-second lanes, inverting the
+owner's intended 1,800-second outer run and 800-second agent budget. It failed its registered 3/5
+checkpoint with zero solves. Five
+dynamic-first challenge workers claimed active slots before the one-slot dynamic semaphore, so only
+one challenge and four model attempts actually executed. Three agents produced the same private,
+source-bound candidate after 166 committed tool observations. Whole-wave blocking and the absence of
+an immediate unverified-candidate branch made no submission before deadline. Typed memory again
+projected zero records because no follow-on episode started. Instance, container, Board, and
+workspace cleanup were clean; DB integrity was clean, but exact state deletion remains pending.
+
+This selects four focused changes before another performance run: measure rather than assume the
+Board's dynamic limit; add a unified manager so every challenge can do local work while one shared
+instance per dynamic challenge is leased only for its live phase; submit source-qualified candidates
+immediately when the Board exposes no attempt limit; and feed local results into instance-enabled and
+Recovery agents as nonzero typed peer memory. The implementation slice also needs truthful job state,
+a no-progress watchdog, role-specific successor lanes, sibling cancellation on `correct`, and early
+instance release. Full sanitized evidence is in
+[`issue-19-production-calibration-evidence-2026-09-17.md`](issue-19-production-calibration-evidence-2026-09-17.md).
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
