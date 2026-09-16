@@ -804,6 +804,8 @@ volume reopened the same run, retained one private candidate, dispatched one Ver
 both synthetic challenges, closed every durable job, and reported zero Board writes, pending
 submissions, and owned instances. This proves the merged recovery mechanism inside the production
 image; it is not a live solve or a substitute for the 19,800-second acceptance run.
+After this sanitized record was pushed, the exact rehearsal volume and container names were absent;
+the image was retained, and no authentication state existed to preserve or remove.
 
 ## Model/effort ledger
 
