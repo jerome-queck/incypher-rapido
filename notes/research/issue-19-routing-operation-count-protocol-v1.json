@@ -1,0 +1,231 @@
+{
+  "canonical_config_bytes": {
+    "expected_by_arm": {
+      "closed_rule_table": 1012,
+      "fifo_unchanged": 140,
+      "graph_reducer": 1427,
+      "scored_policy": 429
+    },
+    "json_pointer": "parent_protocol.policy_configs[arm]",
+    "serialization": "json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(comma, colon)).encode(UTF-8), no newline"
+  },
+  "common_work_excluded": [
+    "fixture projection and validation",
+    "fact scope and authority validation",
+    "recipe lookup and route materialization",
+    "route fingerprint and changed-axis validation",
+    "budget, effect, instance, model, effort, replay, privacy, and lifecycle gates",
+    "SQLite reads, writes, transactions, and durable event serialization",
+    "evaluator scoring and aggregate recomputation"
+  ],
+  "operation_units": {
+    "closed_rule_table": [
+      "add 1 for each ordered rule visit",
+      "add 1 for each visited rule failure-kind comparison",
+      "only when the kind matches, add 1 for each required-fact membership lookup",
+      "add 1 when an eligible recipe is selected",
+      "stop after the first selected recipe; otherwise visit every rule"
+    ],
+    "fifo_unchanged": [
+      "add exactly 1 for fixed comparator selection"
+    ],
+    "graph_reducer": [
+      "add 1 to initialize the observed_failure node",
+      "add 2 per canonically ordered fact: one fold visit and one set insertion",
+      "add 1 for each ordered edge visit",
+      "add 1 for each visited edge source-node comparison",
+      "add 1 for each visited edge failure-kind comparison",
+      "only when node and kind match, add 1 for each required-fact membership lookup",
+      "add 1 when an eligible transition reaches authorized_recipe",
+      "stop after the first authorized transition; otherwise visit every edge"
+    ],
+    "scored_policy": [
+      "visit recipes in recipe-id lexical order",
+      "add 1 for each recipe visit",
+      "add 1 for each recipe failure-kind comparison",
+      "only when the kind matches, add 1 for each required-fact membership lookup",
+      "for an eligible recipe add 2: failure-match weight and recipe weight",
+      "add 1 for each eligible score comparison against the current maximum",
+      "after all recipes add 1 for the unique-maximum or tie check"
+    ]
+  },
+  "policy_invocation_contract": {
+    "config_bytes_per_row": "record the canonical byte length for the row arm even when policy invocation is skipped",
+    "invoked_case_ids": [
+      "policy_authorized_context",
+      "policy_missing_context",
+      "provenance_fresh_derivation",
+      "provenance_model_supplied",
+      "provenance_missing_recipe",
+      "disagreement_one_candidate",
+      "disagreement_distinct_candidates",
+      "timeout_compatible_checkpoint",
+      "timeout_missing_checkpoint",
+      "tool_alternate_representation",
+      "tool_unsafe_native",
+      "quota_validated_reset",
+      "quota_missing_reset",
+      "board_validated_contract",
+      "board_undocumented_inactive",
+      "container_clean_recovery",
+      "container_unknown_origin",
+      "duplicate_route",
+      "persistent_failure_no_third_route"
+    ],
+    "operation_count_when_skipped": 0,
+    "input_derived_predicate": {
+      "authorizing_fact_types": "exact parent_protocol.fact_types",
+      "canonical_fact_order": "event_sequence ascending, then fact_id lexical; duplicate event_sequence plus fact_id is invalid",
+      "invoke": "invoke the arm policy if and only if no ordered precontain predicate matches",
+      "ordered_precontain_predicates": [
+        "failure_kind is null",
+        "failure_kind is not one of the exact parent eight",
+        "any projected fact shape, type, scope, sequence, id, or value is invalid",
+        "any fact scope is not same_run_challenge_episode",
+        "fact types include both private_candidate_proposal and unsafe_native_failure",
+        "any private_candidate_proposal value is multiple_verified_identities",
+        "failure_kind is board and fact types include indeterminate_board_observation",
+        "attempts_remaining is false",
+        "remaining_milliseconds is less than 1000",
+        "model, effort, or effect policy differs from the exact parent contract",
+        "effects_safe or instances_safe is false and failure_kind is not board"
+      ],
+      "recognized_non_authorizing_fact_types": [
+        "indeterminate_board_observation",
+        "model_supplied_input",
+        "unknown_container_origin",
+        "unsafe_native_failure",
+        "unvalidated_board_observation"
+      ]
+    },
+    "post_policy_gate_order": [
+      "selected recipe exists in the frozen catalogue and matches the failure kind",
+      "selected recipe required facts are present and valid",
+      "recipe-specific remaining-time budget is satisfied",
+      "materialized route preserves exact model, effort, and controller-only effect authority",
+      "materialized route changes a semantic axis and its fingerprint is unused, except the exact FIFO comparator exemption",
+      "pending effects and owned or indeterminate instances are zero unless the exact selected recipe is the frozen read-only Board recheck",
+      "decision, context, fact links, route, and successor admission commit atomically"
+    ],
+    "pre_policy_gate_order": [
+      "protocol, contract, policy input, current route, and canonical fact shapes are valid",
+      "fact run, challenge, episode, source sequence, origin, and protocol digest match",
+      "completed, mixed, unrecognized, malformed, conflicting, foreign-scope, or indeterminate-Board input contains",
+      "episode budget remains",
+      "at least 1000 milliseconds of the original run deadline remains",
+      "exact model is gpt-daybreak-blue-latest, effort is xhigh, and effect policy is controller_only",
+      "unsafe pending effects or instances contain before policy except an exact Board failure may proceed only to the frozen read-only recipe"
+    ],
+    "skipped_case_ids": [
+      "completed",
+      "disagreement_foreign_candidate",
+      "disagreement_multiple_verified",
+      "board_indeterminate",
+      "container_effect_fenced",
+      "mixed_failure_quarantine",
+      "deadline_exhausted",
+      "episode_budget_exhausted"
+    ]
+  },
+  "measurement_accounting": {
+    "comparison_host_binding": {
+      "fields": [
+        "run_id",
+        "challenge_id",
+        "episode",
+        "fact_sequence",
+        "origin",
+        "protocol_digest"
+      ],
+      "rule": "common SQLite authority validates exact comparison origin and protocol binding before policy projection; these fields never enter policy_input_projection, lane artifacts, policy_input_digest, or source_fact_public_metadata_digest"
+    },
+    "context_bytes": "sum the exact UTF-8 byte lengths of the two fresh lane artifacts; each artifact is canonical JSON of policy_input_projection with ensure_ascii=True, sort_keys=True, separators comma and colon, and no newline",
+    "durable_event_bytes": "for every control_events row owned by the exact comparison run, sum UTF-8 bytes of kind, one NUL byte, job_id or empty string, one NUL byte, and the stored canonical data_json; exclude SQLite page overhead and companion decision/fact/context tables",
+    "elapsed_seconds": "monotonic observation from immediately before fresh state creation through final residue inspection; finite and nonnegative; descriptive only",
+    "source_fact_public_metadata_digest": "SHA-256 of canonical JSON for facts in canonical_fact_order containing exactly fact_id, fact_type, scope, value, and event_sequence",
+    "policy_config_bytes": "record canonical_config_bytes.expected_by_arm[arm] on every row, including skipped rows",
+    "replay_digest": {
+      "algorithm": "SHA-256 of canonical JSON, lower-case hexadecimal",
+      "excluded": [
+        "run_id",
+        "case",
+        "repetition",
+        "SQLite sequence allocation",
+        "timestamps",
+        "elapsed_seconds"
+      ],
+      "fields": [
+        "arm",
+        "policy_config_digest",
+        "policy_input_digest",
+        "failure_kind",
+        "disposition",
+        "recipe_id",
+        "source_route_fingerprint",
+        "successor_route_fingerprint",
+        "changed_axes",
+        "policy_operation_count",
+        "source_fact_public_metadata_digest",
+        "terminal_outcome"
+      ]
+    },
+    "tool_call_count": "exactly 0 on every row; the harness imports no runtime, Board, model, tool, container, or network adapter"
+  },
+  "raw_row_semantics": {
+    "completed_case": {
+      "changed_axes": [],
+      "decision_sequence": null,
+      "disposition": "no_route",
+      "fact_event_sequences": [],
+      "failure_kind": null,
+      "policy_operation_count": 0,
+      "recipe_id": null,
+      "source_route_fingerprint": "sanitized baseline route fingerprint",
+      "successor_route_fingerprint": null,
+      "terminal_outcome": "completed_without_successor"
+    },
+    "duplicate_route": "1 only when a non-FIFO selected successor fingerprint is already in the pre-decision used set; otherwise 0",
+    "false_dispatch": "1 only when disposition is dispatch for an evaluator expected contain or no_route case, or a non-FIFO dispatch recipe differs from the exact evaluator recipe; otherwise 0",
+    "fifo_flags": "an invoked FIFO row records unchanged_dispatch=1, duplicate_route=0 under its exact exemption, and false_dispatch solely by the common false_dispatch definition",
+    "integer_flag_domain": "every boolean integer observation is exactly integer 0 or 1, never bool",
+    "unchanged_dispatch": "1 only when disposition is dispatch and successor route fingerprint equals source route fingerprint; otherwise 0"
+  },
+  "result_container_schema": {
+    "exact_top_level_fields": [
+      "schema_version",
+      "protocol",
+      "fixture",
+      "observations",
+      "gate",
+      "provenance",
+      "selection"
+    ],
+    "forbidden_stored_aggregates": "gate and selection are freshly recomputed views validated against observations on load; no independent aggregate input is accepted",
+    "protocol_fields": [
+      "parent_protocol_sha256",
+      "operation_protocol_sha256",
+      "parent_frozen_digests"
+    ],
+    "schema_version": 1
+  },
+  "expected_twenty_repetition_operation_totals": {
+    "closed_rule_table": 5120,
+    "fifo_unchanged": 380,
+    "graph_reducer": 8440,
+    "scored_policy": 7500
+  },
+  "parent_protocol_sha256": "bc7a219c92e893b188584c4567bbb04b97d9be4ffaeaee90aa12d749ce5b5ef6",
+  "protocol_id": "issue-19-routing-operation-count-v1",
+  "registered_before_implementation_measurement": true,
+  "result_generated": false,
+  "schema_version": 1,
+  "source_base_commit": "ecee4aec53e609fb2941548d9716171580eef2ea",
+  "tamper_requirements": [
+    "recompute every row operation count from its policy input and exact policy config",
+    "mutating an operation count, policy order, rule, edge, weight, fact order, or config byte count fails the gate",
+    "synthetic raw rows cannot override recomputed operation or config-byte costs",
+    "elapsed time remains descriptive and never substitutes for operation count",
+    "mutating gate order, invocation predicate or expectation, or a skipped-case zero operation count fails the gate",
+    "mutating accounting domain, replay field or exclusion, null/type semantic, FIFO flag, result schema, or expected full-protocol total fails the gate"
+  ]
+}
