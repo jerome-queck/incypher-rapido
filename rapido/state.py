@@ -15,41 +15,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .routing import (
+    FAILURE_ORIGINS,
+    KNOWN_FAILURE_CLASSES,
+    RouteDecision,
+    RouteRequest,
+    RouteSpec,
+    classify_failure,
+    route_failure,
+)
+
 MAX_EVENT_BYTES = 128 * 1024
 MAX_ATTEMPT_EVIDENCE_ITEMS = 20
 MAX_ATTEMPT_EVIDENCE_ITEM_CHARS = 1000
 
-_FAILURE_CLASSES = frozenset(
-    {
-        "active_turn_not_steerable",
-        "bad_request",
-        "candidate_provenance",
-        "cancelled",
-        "context_window_exceeded",
-        "cyber_policy",
-        "http_connection_failed",
-        "internal_server_error",
-        "interrupted",
-        "invalid_value",
-        "misalignment_policy_violation",
-        "native_runtime",
-        "operating_system",
-        "other",
-        "rate_limit_exceeded",
-        "response_stream_connection_failed",
-        "response_stream_disconnected",
-        "response_too_many_failed_attempts",
-        "sandbox_error",
-        "server_overloaded",
-        "session_budget_exceeded",
-        "solver_output",
-        "thread_rollback_failed",
-        "timeout",
-        "unauthorized",
-        "unknown",
-        "usage_limit_exceeded",
-    }
-)
+_FAILURE_CLASSES = KNOWN_FAILURE_CLASSES
 
 
 class StateStore:
@@ -191,6 +171,37 @@ class StateStore:
                 PRIMARY KEY(run_id, challenge_id),
                 UNIQUE(run_id, catalogue_rank)
             );
+            CREATE TABLE IF NOT EXISTS control_routes (
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                route_fingerprint TEXT NOT NULL,
+                first_episode INTEGER NOT NULL,
+                route_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, challenge_id, route_fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS control_route_decisions (
+                decision_sequence INTEGER PRIMARY KEY REFERENCES control_events(sequence),
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                source_episode INTEGER NOT NULL,
+                failure_kind TEXT NOT NULL,
+                failure_subreason TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                source_route_fingerprint TEXT NOT NULL,
+                successor_route_fingerprint TEXT,
+                changed_axes_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                UNIQUE(run_id, challenge_id, source_episode)
+            );
+            CREATE TABLE IF NOT EXISTS control_failure_origins (
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL,
+                origin TEXT NOT NULL CHECK(origin IN ('board', 'container')),
+                event_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
+                PRIMARY KEY(run_id, challenge_id, episode)
+            );
             CREATE TABLE IF NOT EXISTS control_jobs (
                 job_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES runs(id),
@@ -205,17 +216,100 @@ class StateStore:
                 admitted_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
                 started_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
                 closed_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
-                UNIQUE(run_id, challenge_id, episode, role, lane)
+                UNIQUE(run_id, challenge_id, episode, role, lane),
+                FOREIGN KEY(run_id, challenge_id, route_fingerprint)
+                  REFERENCES control_routes(run_id, challenge_id, route_fingerprint)
             );
             """
         )
         self._migrate_attempts()
+        self._migrate_control_jobs()
         instance_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(instances)").fetchall()
         }
         if "receipt_sha256" not in instance_columns:
             self._connection.execute("ALTER TABLE instances ADD COLUMN receipt_sha256 TEXT")
+
+    def _migrate_control_jobs(self) -> None:
+        """Atomically establish control_routes as the sole route JSON authority."""
+
+        def has_route_foreign_key() -> bool:
+            mappings = {
+                (str(row["from"]), str(row["to"]))
+                for row in self._connection.execute(
+                    "PRAGMA foreign_key_list(control_jobs)"
+                ).fetchall()
+                if str(row["table"]) == "control_routes"
+            }
+            return mappings == {
+                ("run_id", "run_id"),
+                ("challenge_id", "challenge_id"),
+                ("route_fingerprint", "route_fingerprint"),
+            }
+
+        if has_route_foreign_key():
+            return
+        migration_table = "control_jobs__route_authority_migration"
+        with self.transaction() as connection:
+            if has_route_foreign_key():
+                return
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (migration_table,),
+                ).fetchone()
+                is not None
+            ):
+                raise RuntimeError("stale control job migration table is present")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO control_routes(
+                  run_id, challenge_id, route_fingerprint, first_episode, route_json
+                )
+                SELECT run_id, challenge_id, route_fingerprint, MIN(episode),
+                       '{"legacy":"route-unavailable"}'
+                FROM control_jobs
+                GROUP BY run_id, challenge_id, route_fingerprint
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE TABLE {migration_table} (
+                    job_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id),
+                    challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                    episode INTEGER NOT NULL,
+                    catalogue_rank INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    lane INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    route_fingerprint TEXT NOT NULL,
+                    admitted_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
+                    started_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                    closed_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                    UNIQUE(run_id, challenge_id, episode, role, lane),
+                    FOREIGN KEY(run_id, challenge_id, route_fingerprint)
+                      REFERENCES control_routes(run_id, challenge_id, route_fingerprint)
+                )
+                """
+            )
+            connection.execute(
+                f"""
+                INSERT INTO {migration_table}(
+                  job_id, run_id, challenge_id, episode, catalogue_rank, phase,
+                  role, lane, state, route_fingerprint, admitted_sequence,
+                  started_sequence, closed_sequence
+                )
+                SELECT job_id, run_id, challenge_id, episode, catalogue_rank, phase,
+                       role, lane, state, route_fingerprint, admitted_sequence,
+                       started_sequence, closed_sequence
+                FROM control_jobs
+                """
+            )
+            connection.execute("DROP TABLE control_jobs")
+            connection.execute(f"ALTER TABLE {migration_table} RENAME TO control_jobs")
 
     def _migrate_attempts(self) -> None:
         """Atomically upgrade the pre-episode attempts table, retaining every row."""
@@ -614,7 +708,7 @@ class StateStore:
         connection: sqlite3.Connection,
         run_id: str,
         kind: str,
-        job_id: str,
+        job_id: str | None,
         data: dict[str, object],
     ) -> int:
         cursor = connection.execute(
@@ -623,6 +717,69 @@ class StateStore:
         )
         return int(cursor.lastrowid)
 
+    @classmethod
+    def _admit_control_wave(
+        cls,
+        connection: sqlite3.Connection,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        catalogue_rank: int,
+        lanes: int,
+        route: RouteSpec,
+        *,
+        require_unused_route: bool,
+    ) -> None:
+        phase = "initial" if episode == 0 else "retry"
+        route_json = json.dumps(route.as_dict(), sort_keys=True, separators=(",", ":"))
+        fingerprint = route.fingerprint
+        inserted = connection.execute(
+            """
+            INSERT OR IGNORE INTO control_routes(
+              run_id, challenge_id, route_fingerprint, first_episode, route_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, challenge_id, fingerprint, episode, route_json),
+        ).rowcount
+        if require_unused_route and inserted != 1:
+            raise ValueError("control route was already admitted")
+        for lane in range(lanes):
+            job_id = f"{run_id}:{challenge_id}:{episode}:{route.role}:{lane}"
+            sequence = cls._control_event(
+                connection,
+                run_id,
+                "job_admitted",
+                job_id,
+                {
+                    "catalogue_rank": catalogue_rank,
+                    "challenge_id": challenge_id,
+                    "episode": episode,
+                    "lane": lane,
+                    "phase": phase,
+                    "role": route.role,
+                },
+            )
+            connection.execute(
+                """
+                INSERT INTO control_jobs(
+                  job_id, run_id, challenge_id, episode, catalogue_rank,
+                  phase, role, lane, state, route_fingerprint, admitted_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    job_id,
+                    run_id,
+                    challenge_id,
+                    episode,
+                    catalogue_rank,
+                    phase,
+                    route.role,
+                    lane,
+                    fingerprint,
+                    sequence,
+                ),
+            )
+
     def admit_control_wave(
         self,
         run_id: str,
@@ -630,47 +787,19 @@ class StateStore:
         episode: int,
         catalogue_rank: int,
         lanes: int,
-        route: dict[str, object],
+        route: RouteSpec,
     ) -> None:
-        phase = "initial" if episode == 0 else "retry"
-        route_json = json.dumps(route, sort_keys=True, separators=(",", ":"))
-        fingerprint = hashlib.sha256(route_json.encode()).hexdigest()
         with self.transaction() as connection:
-            for lane in range(lanes):
-                job_id = f"{run_id}:{challenge_id}:{episode}:specialist:{lane}"
-                sequence = self._control_event(
-                    connection,
-                    run_id,
-                    "job_admitted",
-                    job_id,
-                    {
-                        "catalogue_rank": catalogue_rank,
-                        "challenge_id": challenge_id,
-                        "episode": episode,
-                        "lane": lane,
-                        "phase": phase,
-                        "role": "specialist",
-                    },
-                )
-                connection.execute(
-                    """
-                    INSERT INTO control_jobs(
-                      job_id, run_id, challenge_id, episode, catalogue_rank,
-                      phase, role, lane, state, route_fingerprint, admitted_sequence
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'specialist', ?, 'queued', ?, ?)
-                    """,
-                    (
-                        job_id,
-                        run_id,
-                        challenge_id,
-                        episode,
-                        catalogue_rank,
-                        phase,
-                        lane,
-                        fingerprint,
-                        sequence,
-                    ),
-                )
+            self._admit_control_wave(
+                connection,
+                run_id,
+                challenge_id,
+                episode,
+                catalogue_rank,
+                lanes,
+                route,
+                require_unused_route=False,
+            )
 
     def record_control_catalogue(self, run_id: str, entries: list[tuple[int, int, bool]]) -> None:
         with self.transaction() as connection:
@@ -707,45 +836,292 @@ class StateStore:
                     (sequence, row["job_id"]),
                 )
 
+    @classmethod
+    def _finish_control_wave(
+        cls,
+        connection: sqlite3.Connection,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        terminal: str,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT job_id, lane FROM control_jobs "
+            "WHERE run_id=? AND challenge_id=? AND episode=? AND state='running' ORDER BY lane",
+            (run_id, challenge_id, episode),
+        ).fetchall()
+        if not rows:
+            raise ValueError("control wave is absent or not running")
+        for row in rows:
+            attempt = connection.execute(
+                "SELECT status FROM attempts "
+                "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=?",
+                (run_id, challenge_id, episode, row["lane"]),
+            ).fetchone()
+            lane_state = (
+                str(attempt["status"])
+                if attempt is not None
+                else ("failed" if terminal == "error" else "cancelled")
+            )
+            sequence = cls._control_event(
+                connection,
+                run_id,
+                "job_closed",
+                str(row["job_id"]),
+                {
+                    "challenge_id": challenge_id,
+                    "episode": episode,
+                    "lane": int(row["lane"]),
+                    "lane_state": lane_state,
+                    "terminal": terminal,
+                },
+            )
+            connection.execute(
+                "UPDATE control_jobs SET state=?, closed_sequence=? WHERE job_id=?",
+                (lane_state, sequence, row["job_id"]),
+            )
+
     def finish_control_wave(
         self, run_id: str, challenge_id: int, episode: int, terminal: str
     ) -> None:
         with self.transaction() as connection:
-            rows = connection.execute(
-                "SELECT job_id, lane FROM control_jobs "
-                "WHERE run_id=? AND challenge_id=? AND episode=? AND state='running' ORDER BY lane",
+            self._finish_control_wave(connection, run_id, challenge_id, episode, terminal)
+
+    def record_control_failure_origin(
+        self,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        origin: str,
+    ) -> None:
+        if origin not in FAILURE_ORIGINS:
+            raise ValueError("control failure origin is invalid")
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT origin FROM control_failure_origins "
+                "WHERE run_id=? AND challenge_id=? AND episode=?",
                 (run_id, challenge_id, episode),
-            ).fetchall()
-            if not rows:
-                raise ValueError("control wave is absent or not running")
-            for row in rows:
-                attempt = connection.execute(
-                    "SELECT status FROM attempts "
-                    "WHERE run_id=? AND challenge_id=? AND episode=? AND lane=?",
-                    (run_id, challenge_id, episode, row["lane"]),
-                ).fetchone()
-                lane_state = (
-                    str(attempt["status"])
-                    if attempt is not None
-                    else ("failed" if terminal == "error" else "cancelled")
-                )
+            ).fetchone()
+            if existing is not None:
+                current = str(existing["origin"])
+                if current == origin or current == "board":
+                    return
+                if current != "container" or origin != "board":
+                    raise ValueError("control failure origin transition is invalid")
                 sequence = self._control_event(
                     connection,
                     run_id,
-                    "job_closed",
-                    str(row["job_id"]),
+                    "failure_origin_escalated",
+                    None,
                     {
                         "challenge_id": challenge_id,
                         "episode": episode,
-                        "lane": int(row["lane"]),
-                        "lane_state": lane_state,
-                        "terminal": terminal,
+                        "from": current,
+                        "to": origin,
                     },
                 )
                 connection.execute(
-                    "UPDATE control_jobs SET state=?, closed_sequence=? WHERE job_id=?",
-                    (lane_state, sequence, row["job_id"]),
+                    "UPDATE control_failure_origins SET origin=?, event_sequence=? "
+                    "WHERE run_id=? AND challenge_id=? AND episode=?",
+                    (origin, sequence, run_id, challenge_id, episode),
                 )
+                return
+            sequence = self._control_event(
+                connection,
+                run_id,
+                "failure_origin_recorded",
+                None,
+                {
+                    "challenge_id": challenge_id,
+                    "episode": episode,
+                    "origin": origin,
+                },
+            )
+            connection.execute(
+                "INSERT INTO control_failure_origins("
+                "run_id, challenge_id, episode, origin, event_sequence) VALUES (?, ?, ?, ?, ?)",
+                (run_id, challenge_id, episode, origin, sequence),
+            )
+
+    def _decide_control_successor(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        challenge_id: int,
+        source_episode: int,
+        next_episode: int,
+        catalogue_rank: int,
+        lanes: int,
+        terminal: str,
+        attempts_remaining: bool,
+        remaining_milliseconds: int,
+    ) -> RouteDecision | None:
+        route_rows = connection.execute(
+            """
+            SELECT DISTINCT routes.route_json
+            FROM control_jobs AS jobs
+            JOIN control_routes AS routes
+              ON routes.run_id=jobs.run_id
+             AND routes.challenge_id=jobs.challenge_id
+             AND routes.route_fingerprint=jobs.route_fingerprint
+            WHERE jobs.run_id=? AND jobs.challenge_id=? AND jobs.episode=?
+            """,
+            (run_id, challenge_id, source_episode),
+        ).fetchall()
+        if len(route_rows) != 1:
+            raise ValueError("source control wave has no unique durable route")
+        try:
+            current = RouteSpec.from_dict(json.loads(str(route_rows[0]["route_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("source control route is invalid") from exc
+        attempts = connection.execute(
+            "SELECT failure_class, candidate FROM attempts "
+            "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
+            (run_id, challenge_id, source_episode),
+        ).fetchall()
+        failure_classes = frozenset(
+            str(row["failure_class"]) for row in attempts if row["failure_class"] is not None
+        )
+        candidate_identity_count = len(
+            {str(row["candidate"]) for row in attempts if row["candidate"] is not None}
+        )
+        origin_row = connection.execute(
+            "SELECT origin FROM control_failure_origins "
+            "WHERE run_id=? AND challenge_id=? AND episode=?",
+            (run_id, challenge_id, source_episode),
+        ).fetchone()
+        signal = classify_failure(
+            terminal=terminal,
+            failure_origin=None if origin_row is None else str(origin_row["origin"]),
+            failure_classes=failure_classes,
+            candidate_identity_count=candidate_identity_count,
+            attempt_count=len(attempts),
+        )
+        if signal is None:
+            return None
+        used_fingerprints = frozenset(
+            str(row["route_fingerprint"])
+            for row in connection.execute(
+                "SELECT route_fingerprint FROM control_routes WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchall()
+        )
+        effects_safe = (
+            int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM submission_intents WHERE status='pending'"
+                ).fetchone()[0]
+            )
+            == 0
+        )
+        instances_safe = (
+            int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM instances "
+                    "WHERE status IN ('creating', 'owned', 'cleanup_pending')"
+                ).fetchone()[0]
+            )
+            == 0
+        )
+        decision = route_failure(
+            RouteRequest(
+                failure=signal,
+                current=current,
+                used_fingerprints=used_fingerprints,
+                attempts_remaining=attempts_remaining,
+                remaining_milliseconds=remaining_milliseconds,
+                effects_safe=effects_safe,
+                instances_safe=instances_safe,
+            )
+        )
+        successor_fingerprint = (
+            None if decision.successor is None else decision.successor.fingerprint
+        )
+        decision_sequence = self._control_event(
+            connection,
+            run_id,
+            "failure_route_decision",
+            None,
+            {
+                "challenge_id": challenge_id,
+                "changed_axes": list(decision.changed_axes),
+                "disposition": decision.disposition,
+                "failure_kind": signal.kind,
+                "failure_subreason": signal.subreason,
+                "rule_id": decision.rule_id,
+                "source_episode": source_episode,
+                "source_route_fingerprint": decision.source_fingerprint,
+                "successor_route_fingerprint": successor_fingerprint,
+            },
+        )
+        connection.execute(
+            """
+            INSERT INTO control_route_decisions(
+              decision_sequence, run_id, challenge_id, source_episode,
+              failure_kind, failure_subreason, disposition, rule_id,
+              source_route_fingerprint, successor_route_fingerprint,
+              changed_axes_json, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_sequence,
+                run_id,
+                challenge_id,
+                source_episode,
+                signal.kind,
+                signal.subreason,
+                decision.disposition,
+                decision.rule_id,
+                decision.source_fingerprint,
+                successor_fingerprint,
+                json.dumps(list(decision.changed_axes), separators=(",", ":")),
+                decision.reason,
+            ),
+        )
+        if decision.disposition == "dispatch":
+            if decision.successor is None:
+                raise AssertionError("dispatch requires a successor route")
+            self._admit_control_wave(
+                connection,
+                run_id,
+                challenge_id,
+                next_episode,
+                catalogue_rank,
+                lanes,
+                decision.successor,
+                require_unused_route=True,
+            )
+        return decision
+
+    def finish_and_decide_control_wave(
+        self,
+        *,
+        run_id: str,
+        challenge_id: int,
+        source_episode: int,
+        next_episode: int,
+        catalogue_rank: int,
+        lanes: int,
+        terminal: str,
+        attempts_remaining: bool,
+        remaining_milliseconds: int,
+    ) -> RouteDecision | None:
+        """Close a wave, decide, record, and admit its successor in one transaction."""
+        with self.transaction() as connection:
+            self._finish_control_wave(connection, run_id, challenge_id, source_episode, terminal)
+            return self._decide_control_successor(
+                connection,
+                run_id=run_id,
+                challenge_id=challenge_id,
+                source_episode=source_episode,
+                next_episode=next_episode,
+                catalogue_rank=catalogue_rank,
+                lanes=lanes,
+                terminal=terminal,
+                attempts_remaining=attempts_remaining,
+                remaining_milliseconds=remaining_milliseconds,
+            )
 
     @classmethod
     def _interrupt_control_jobs(

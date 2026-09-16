@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -12,10 +13,14 @@ import threading
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import pytest
+
 from rapido.board import BoardError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.control import DurableJobControl
 from rapido.evidence import project_tool_observation
+from rapido.routing import baseline_route
+from rapido.state import StateStore
 
 
 class BoundaryBoard:
@@ -74,6 +79,39 @@ class IndeterminateCleanupBoundaryBoard(BoundaryBoard):
         if self.get_calls >= 3:
             return {"success": False, "status": 429, "connection_info": "", "until": None}
         return {"success": True, "status": 200, **self.active[challenge_id]}
+
+
+class WorkspaceAndCleanupFailureBoard(BoundaryBoard):
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.get_calls = 0
+        self.post_calls = 0
+        self.download_calls = 0
+
+    def download(self, file_ref: str, destination: Path, *, byte_limit: int) -> dict[str, object]:
+        del file_ref, destination, byte_limit
+        self.download_calls += 1
+        raise OSError("local workspace write failed")
+
+    def instance(self, method: str, challenge_id: int) -> dict[str, object]:
+        del challenge_id
+        current = {
+            "success": True,
+            "status": 200,
+            "connection_info": "http://127.0.0.1:8135/",
+            "until": 100,
+        }
+        if method == "POST":
+            self.post_calls += 1
+            return current
+        if method == "GET":
+            self.get_calls += 1
+            if self.get_calls == 1:
+                return {"success": False, "status": 404, "connection_info": "", "until": None}
+            if self.get_calls == 2:
+                return current
+            return {"success": False, "status": 429, "connection_info": "", "until": None}
+        raise AssertionError("indeterminate cleanup must not attempt deletion")
 
 
 class BoundaryRuntime:
@@ -216,6 +254,11 @@ def _challenge(challenge_id: int, *, challenge_type: str = "standard") -> Challe
     )
 
 
+def _file_challenge(challenge_id: int, *, challenge_type: str) -> Challenge:
+    value = _challenge(challenge_id, challenge_type=challenge_type)
+    return replace(value, files=("fixture-file",))
+
+
 def test_drive_inspect_round_trip_exposes_only_sanitized_run_contract(tmp_path: Path) -> None:
     candidate = "INCYPHER{control-view-must-not-leak}"
     board = BoundaryBoard([_challenge(1)])
@@ -335,7 +378,9 @@ def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path
     assert {(job.challenge_id, job.catalogue_rank) for job in view.jobs} == {(1, 1)}
 
 
-def test_route_fingerprint_changes_only_with_material_route_configuration(tmp_path: Path) -> None:
+def test_unclassified_analysis_is_contained_and_config_changes_change_routes(
+    tmp_path: Path,
+) -> None:
     board = BoundaryBoard([_challenge(1)])
     base = replace(_config(tmp_path), episodes_per_challenge=2)
 
@@ -344,9 +389,9 @@ def test_route_fingerprint_changes_only_with_material_route_configuration(tmp_pa
     )
     first = DurableJobControl.inspect(base.state_path, run_id=first_report.run_id)
     initial_routes = {job.route_fingerprint for job in first.jobs if job.phase == "initial"}
-    retry_routes = {job.route_fingerprint for job in first.jobs if job.phase == "retry"}
-    assert len(initial_routes) == len(retry_routes) == 1
-    assert initial_routes == retry_routes
+    assert len(initial_routes) == 1
+    assert not [job for job in first.jobs if job.phase == "retry"]
+    assert first.route_decisions == ()
 
     changed = replace(base, episodes_per_challenge=1, attempt_seconds=14)
     second_report = asyncio.run(
@@ -354,6 +399,182 @@ def test_route_fingerprint_changes_only_with_material_route_configuration(tmp_pa
     )
     second = DurableJobControl.inspect(changed.state_path, run_id=second_report.run_id)
     assert {job.route_fingerprint for job in second.jobs}.isdisjoint(initial_routes)
+
+
+def test_wave_close_decision_and_successor_admission_roll_back_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    state = StateStore(path)
+    run_id = "1" * 32
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    try:
+        state.start_run(run_id, {})
+        state.upsert_challenge(1, "fixture", "crypto", "standard", 100)
+        state.record_control_catalogue(run_id, [(1, 1, True)])
+        state.admit_control_wave(run_id, 1, 0, 1, 2, route)
+        state.start_control_wave(run_id, 1, 0)
+        for lane in range(2):
+            attempt_id = f"{run_id}:1:0:{lane}"
+            state.start_attempt(attempt_id, run_id, 1, 0, lane, "gpt-daybreak-blue-latest", "xhigh")
+            state.finish_attempt(attempt_id, "failed", failure_class="solver_output")
+
+        def fail_admission(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("crash before successor admission")
+
+        monkeypatch.setattr(StateStore, "_admit_control_wave", fail_admission)
+        with pytest.raises(RuntimeError, match="crash before successor"):
+            state.finish_and_decide_control_wave(
+                run_id=run_id,
+                challenge_id=1,
+                source_episode=0,
+                next_episode=1,
+                catalogue_rank=1,
+                lanes=2,
+                terminal="error",
+                attempts_remaining=True,
+                remaining_milliseconds=10_000,
+            )
+        view = DurableJobControl.inspect(path, run_id=run_id)
+        assert {job.state for job in view.jobs} == {"running"}
+        assert view.route_decisions == ()
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM control_routes").fetchone()[0] == 1
+    finally:
+        state.close()
+
+
+def test_inspect_supports_main_schema_without_route_decisions(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    with sqlite3.connect(config.state_path) as connection:
+        connection.execute("DROP TABLE control_route_decisions")
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+    assert view.route_decisions == ()
+
+
+def test_jobs_reference_the_single_route_authority(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    with sqlite3.connect(config.state_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(control_jobs)")}
+        foreign_keys = list(connection.execute("PRAGMA foreign_key_list(control_jobs)"))
+    assert "route_json" not in columns
+    assert sum(row[2] == "control_routes" for row in foreign_keys) == 3
+
+
+def test_concurrent_openers_recheck_route_authority_migration(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    StateStore(path).close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE control_jobs")
+        connection.execute(
+            """
+            CREATE TABLE control_jobs (
+                job_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL,
+                catalogue_rank INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                role TEXT NOT NULL,
+                lane INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                route_fingerprint TEXT NOT NULL,
+                admitted_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
+                started_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                closed_sequence INTEGER UNIQUE REFERENCES control_events(sequence),
+                UNIQUE(run_id, challenge_id, episode, role, lane)
+            )
+            """
+        )
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def open_state() -> None:
+        barrier.wait()
+        try:
+            StateStore(path).close()
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_state) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    with sqlite3.connect(path) as connection:
+        assert (
+            sum(
+                row[2] == "control_routes"
+                for row in connection.execute("PRAGMA foreign_key_list(control_jobs)")
+            )
+            == 3
+        )
+
+
+def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    state = StateStore(path)
+    run_id = "2" * 32
+    try:
+        state.start_run(run_id, {})
+        state.upsert_challenge(1, "fixture", "crypto", "dynamic_iac", 100)
+        state.record_control_failure_origin(run_id, 1, 0, "container")
+        state.record_control_failure_origin(run_id, 1, 0, "board")
+        state.record_control_failure_origin(run_id, 1, 0, "container")
+        with sqlite3.connect(path) as connection:
+            origin = connection.execute(
+                "SELECT origin FROM control_failure_origins "
+                "WHERE run_id=? AND challenge_id=1 AND episode=0",
+                (run_id,),
+            ).fetchone()[0]
+            kinds = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT kind FROM control_events WHERE run_id=? ORDER BY sequence", (run_id,)
+                )
+            ]
+        assert origin == "board"
+        assert kinds == ["failure_origin_recorded", "failure_origin_escalated"]
+    finally:
+        state.close()
+
+
+def test_dynamic_workspace_then_cleanup_failure_escalates_and_contains(tmp_path: Path) -> None:
+    board = WorkspaceAndCleanupFailureBoard([_file_challenge(1, challenge_type="dynamic_iac")])
+    config = replace(_config(tmp_path), manage_dynamic_instances=True, episodes_per_challenge=2)
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+    assert report.status == "completed"
+    assert [(item.failure_kind, item.disposition) for item in view.route_decisions] == [
+        ("board", "contain")
+    ]
+    assert {job.episode for job in view.jobs} == {0}
+    assert board.post_calls == board.download_calls == 1
+    assert board.get_calls >= 3
+    assert view.owned_instance_count == 1
 
 
 def test_inspect_is_consistent_while_one_wave_runs_and_another_is_queued(tmp_path: Path) -> None:
