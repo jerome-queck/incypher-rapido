@@ -231,15 +231,26 @@ Before any 19,800-second acceptance run, run one separately pre-registered 1,800
 calibration and report back. It tests mixed peers, typed memory, tools, routing, qualified submissions,
 instance lifecycle, and cleanup. It does not resolve issue #19, lower acceptance, authorize closure,
 or replace the 19,800-second run; the owner will decide whether to authorize that run afterward.
-The calibration keeps P20 but uses exact overrides of 90 seconds per initial lane, 4 seconds per
-Board request, 20 seconds for instance readiness, and 20 seconds for cleanup. At the current proven
-single-instance bound, the known nine dynamic initial waves consume at most 1,242 seconds, including
-one preflight GET and one create POST per wave, and the
-other six consume at most two P5 waves, or 180 seconds. Initial catalogue entries are durably queued
-before any successor, leaving 378 seconds for catalogue qualification, downloads, native startup,
-and evidence-earned routes. Do not start if a fresh preflight changes the 15-challenge or
-nine-dynamic catalogue assumption, or measured Board latency does not fit the four-second request
-budget. Production and final-acceptance defaults remain 1,800/15/120/45 seconds respectively.
+The calibration keeps P20 but uses exact overrides of 60 seconds per initial lane, 10 seconds per
+Board request, 30 seconds for instance readiness, and 30 seconds for cleanup. At the current proven
+single-instance bound, the known nine dynamic initial waves consume at most 1,260 seconds, including
+one preflight GET and one create POST per wave; the other six consume at most two P5 waves, or 120
+seconds. Initial catalogue entries are durably queued before any successor, leaving 420 seconds for
+catalogue qualification, downloads, native startup, and evidence-earned routes. A four-second
+request budget was rejected before mutation after one read-only TLS handshake exceeded it. Do not
+start if a fresh preflight changes the 15-challenge or nine-dynamic catalogue assumption. Production
+and final-acceptance defaults remain 1,800/15/120/45 seconds respectively.
+
+### E6 current Board inactive semantics
+
+On 2026-09-16, the exact branch-built candidate container performed two authenticated GET-only rounds
+over all nine freshly qualified `dynamic_iac` IDs with a ten-second per-request bound. Both rounds
+returned coherent HTTP 404, `success=false`, no connection information, and no `until` or `since`
+value for every ID; elapsed time was 18.106 seconds and writes were zero. A separate complete
+read-only qualification confirmed 15 challenges (nine dynamic, six standard) in 27.5 seconds. This
+was independently repeated by Daybreak/xhigh in two more coherent rounds totaling 13.263 seconds,
+again with zero writes and the same sanitized shape. This re-establishes the implementation's
+fail-closed inactive contract before any instance mutation.
 
 ### M1 typed-memory comparison registration
 
@@ -619,7 +630,7 @@ comparison green while independent review is pending.
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
-| Board inactive semantics established | E6 independent evidence | pending |
+| Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | pending |
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending |
 | New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending |
