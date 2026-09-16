@@ -1,0 +1,1284 @@
+{
+  "arms": [
+    "fifo_unchanged",
+    "closed_rule_table",
+    "graph_reducer",
+    "scored_policy"
+  ],
+  "cases": [
+    {
+      "expected": "no_route",
+      "fact_profile": "none",
+      "failure_kind": null,
+      "id": "completed"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "e1_authorized_context",
+      "failure_kind": "policy",
+      "id": "policy_authorized_context"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "none",
+      "failure_kind": "policy",
+      "id": "policy_missing_context"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "source_derivation_recipe",
+      "failure_kind": "provenance",
+      "id": "provenance_fresh_derivation"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "model_supplied_input",
+      "failure_kind": "provenance",
+      "id": "provenance_model_supplied"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "none",
+      "failure_kind": "provenance",
+      "id": "provenance_missing_recipe"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "same_scope_private_candidate",
+      "failure_kind": "disagreement",
+      "id": "disagreement_one_candidate"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "same_scope_distinct_candidates",
+      "failure_kind": "disagreement",
+      "id": "disagreement_distinct_candidates"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "foreign_scope_candidate",
+      "failure_kind": "disagreement",
+      "id": "disagreement_foreign_candidate"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "multiple_verified_identities",
+      "failure_kind": "disagreement",
+      "id": "disagreement_multiple_verified"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "compatible_checkpoint",
+      "failure_kind": "timeout",
+      "id": "timeout_compatible_checkpoint"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "none",
+      "failure_kind": "timeout",
+      "id": "timeout_missing_checkpoint"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "alternate_representation",
+      "failure_kind": "tool",
+      "id": "tool_alternate_representation"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "unsafe_native_failure",
+      "failure_kind": "tool",
+      "id": "tool_unsafe_native"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "validated_reset_window",
+      "failure_kind": "quota",
+      "id": "quota_validated_reset"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "none",
+      "failure_kind": "quota",
+      "id": "quota_missing_reset"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "e6_validated_board_contract",
+      "failure_kind": "board",
+      "id": "board_validated_contract"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "http_200_inactive_undocumented",
+      "failure_kind": "board",
+      "id": "board_undocumented_inactive"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "malformed_or_auth_or_outage",
+      "failure_kind": "board",
+      "id": "board_indeterminate"
+    },
+    {
+      "expected": "dispatch",
+      "fact_profile": "typed_local_origin_clean_generation",
+      "failure_kind": "container",
+      "id": "container_clean_recovery"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "pending_effect_or_instance",
+      "failure_kind": "container",
+      "id": "container_effect_fenced"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "unknown_origin",
+      "failure_kind": "container",
+      "id": "container_unknown_origin"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "candidate_plus_unsafe_native",
+      "failure_kind": "mixed",
+      "id": "mixed_failure_quarantine"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "successor_already_used",
+      "failure_kind": "tool",
+      "id": "duplicate_route"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "less_than_one_second_remaining",
+      "failure_kind": "tool",
+      "id": "deadline_exhausted"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "no_episode_remaining",
+      "failure_kind": "tool",
+      "id": "episode_budget_exhausted"
+    },
+    {
+      "expected": "contain",
+      "fact_profile": "same_failure_after_changed_route",
+      "failure_kind": "tool",
+      "id": "persistent_failure_no_third_route"
+    }
+  ],
+  "common_authority_gate": [
+    "fact run, challenge, episode, and source sequence match the routed wave",
+    "failure observations and prerequisite facts are durably committed",
+    "successor recipe exists in the frozen catalogue",
+    "candidate-policy successor changes a semantic route axis and its fingerprint is unused; the non-selectable FIFO comparator has only the documented narrow exemption",
+    "episode and original run deadline budgets remain",
+    "model is gpt-daybreak-blue-latest and effort is xhigh",
+    "effect policy remains controller_only",
+    "pending effects and owned or indeterminate instances are zero unless the recipe is read-only",
+    "mixed, unrecognized, malformed, or conflicting facts contain before policy selection"
+  ],
+  "common_config": {
+    "active_challenges": 1,
+    "attempt_seconds": 15,
+    "attempts_per_challenge": 2,
+    "concurrency": 2,
+    "episodes_per_challenge": 3,
+    "model": "gpt-daybreak-blue-latest",
+    "reasoning_effort": "xhigh",
+    "repetitions": 20,
+    "run_seconds": 60
+  },
+  "disabled_surfaces": {
+    "containers": true,
+    "external_board": true,
+    "instances": true,
+    "model_inference": true,
+    "network": true,
+    "submissions": true
+  },
+  "fact_types": [
+    "authorized_context_variant",
+    "source_derivation_recipe",
+    "private_candidate_proposal",
+    "compatible_checkpoint",
+    "alternate_tool_representation",
+    "validated_reset_window",
+    "validated_board_contract",
+    "typed_local_container_origin",
+    "effect_and_instance_safety"
+  ],
+  "fixture_execution": {
+    "arm_order_rotation": "rotate by repetition",
+    "artifact_source": "fresh copied per-lane deterministic fixture generated only from the frozen merged fixture payload",
+    "canonical_result_row_order": "repetition ascending, then arms array order, then cases array order",
+    "completion_order_rotation": "reverse lane order on odd repetitions",
+    "durability": "fresh private SQLite state and work root per arm/case/repetition",
+    "policy_boundary": "policies select recipe ids only; common code validates facts, materializes routes, and applies authority gates",
+    "policy_input_projection": [
+      "failure_kind",
+      "failure_subreason",
+      "facts",
+      "current_route_id",
+      "used_successor_recipe_ids",
+      "attempts_remaining",
+      "remaining_milliseconds",
+      "effects_safe",
+      "instances_safe"
+    ],
+    "policy_must_not_receive": [
+      "arm",
+      "case_id",
+      "expected",
+      "expected_recipe_id",
+      "evaluator_terminal_outcome",
+      "repetition"
+    ]
+  },
+  "fixture_manifest": {
+    "case_payload_encoding": "canonical JSON: UTF-8, sort_keys=true, separators comma and colon",
+    "evaluator_only_fields": [
+      "case_id",
+      "expected",
+      "expected_recipe_id",
+      "evaluator_terminal_outcome"
+    ],
+    "fact_values": "public typed metadata only; candidate values, candidate-derived digests, credentials, answers, and Board authority are absent",
+    "fixture_version": "issue19-e3-fixture-v1",
+    "lane_artifact_payload": "UTF-8 bytes equal to canonical JSON of policy_input_projection; one fresh copy per lane",
+    "oracle_blindness": "policy and runtime receive only policy_input_projection; evaluator joins expected fields only after the durable decision and terminal outcome are committed"
+  },
+  "fixture_payload_defaults": {
+    "attempts_remaining": true,
+    "current_route_id": "baseline_v1",
+    "effects_safe": true,
+    "facts": [],
+    "instances_safe": true,
+    "remaining_milliseconds": 10000,
+    "used_successor_recipe_ids": []
+  },
+  "fixture_payload_overrides": {
+    "alternate_representation": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:alternate-tool-representation:v1",
+          "fact_type": "alternate_tool_representation",
+          "scope": "same_run_challenge_episode",
+          "value": "artifact_text_to_hex_view_v1"
+        }
+      ]
+    },
+    "candidate_plus_unsafe_native": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:private-candidate-proposal:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "same_run_challenge_episode",
+          "value": "one_source_identity"
+        },
+        {
+          "event_sequence": 11,
+          "fact_id": "fact:unsafe-native:v1",
+          "fact_type": "unsafe_native_failure",
+          "scope": "same_run_challenge_episode",
+          "value": "unauthorized"
+        }
+      ]
+    },
+    "compatible_checkpoint": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:compatible-checkpoint:v1",
+          "fact_type": "compatible_checkpoint",
+          "scope": "same_run_challenge_episode",
+          "value": "schema1_source10"
+        }
+      ]
+    },
+    "e1_authorized_context": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:authorized-context:v1",
+          "fact_type": "authorized_context_variant",
+          "scope": "same_run_challenge_episode",
+          "value": "e1_variant_v1"
+        }
+      ]
+    },
+    "e6_validated_board_contract": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:validated-board-contract:v1",
+          "fact_type": "validated_board_contract",
+          "scope": "same_run_challenge_episode",
+          "value": "e6_contract_v1"
+        }
+      ]
+    },
+    "foreign_scope_candidate": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:foreign-private-candidate:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "foreign_run",
+          "value": "one_source_identity"
+        }
+      ]
+    },
+    "http_200_inactive_undocumented": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:undocumented-board-shape:v1",
+          "fact_type": "unvalidated_board_observation",
+          "scope": "same_run_challenge_episode",
+          "value": "http_200_false_without_metadata"
+        }
+      ]
+    },
+    "less_than_one_second_remaining": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:alternate-tool-representation:v1",
+          "fact_type": "alternate_tool_representation",
+          "scope": "same_run_challenge_episode",
+          "value": "artifact_text_to_hex_view_v1"
+        }
+      ],
+      "remaining_milliseconds": 999
+    },
+    "malformed_or_auth_or_outage": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:indeterminate-board:v1",
+          "fact_type": "indeterminate_board_observation",
+          "scope": "same_run_challenge_episode",
+          "value": "malformed_or_auth_or_outage"
+        }
+      ]
+    },
+    "model_supplied_input": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:model-supplied-input:v1",
+          "fact_type": "model_supplied_input",
+          "scope": "same_run_challenge_episode",
+          "value": "inadmissible_observation"
+        }
+      ]
+    },
+    "multiple_verified_identities": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:multiple-verified-identities:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "same_run_challenge_episode",
+          "value": "multiple_verified_identities"
+        }
+      ]
+    },
+    "no_episode_remaining": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:alternate-tool-representation:v1",
+          "fact_type": "alternate_tool_representation",
+          "scope": "same_run_challenge_episode",
+          "value": "artifact_text_to_hex_view_v1"
+        }
+      ],
+      "attempts_remaining": false
+    },
+    "pending_effect_or_instance": {
+      "effects_safe": false,
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:typed-local-container-origin:v1",
+          "fact_type": "typed_local_container_origin",
+          "scope": "same_run_challenge_episode",
+          "value": "catch_boundary_local_generation0"
+        },
+        {
+          "event_sequence": 11,
+          "fact_id": "fact:effect-instance-safety:v1",
+          "fact_type": "effect_and_instance_safety",
+          "scope": "same_run_challenge_episode",
+          "value": "pending_effect_owned_instance"
+        }
+      ],
+      "instances_safe": false
+    },
+    "same_failure_after_changed_route": {
+      "current_route_id": "tool_alternate_representation_v1",
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:alternate-tool-representation:v1",
+          "fact_type": "alternate_tool_representation",
+          "scope": "same_run_challenge_episode",
+          "value": "artifact_text_to_hex_view_v1"
+        }
+      ]
+    },
+    "same_scope_distinct_candidates": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:private-candidate-a:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "same_run_challenge_episode",
+          "value": "source_identity_a"
+        },
+        {
+          "event_sequence": 11,
+          "fact_id": "fact:private-candidate-b:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "same_run_challenge_episode",
+          "value": "source_identity_b"
+        }
+      ]
+    },
+    "same_scope_private_candidate": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:private-candidate-proposal:v1",
+          "fact_type": "private_candidate_proposal",
+          "scope": "same_run_challenge_episode",
+          "value": "one_source_identity"
+        }
+      ]
+    },
+    "source_derivation_recipe": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:source-derivation-recipe:v1",
+          "fact_type": "source_derivation_recipe",
+          "scope": "same_run_challenge_episode",
+          "value": "fresh_artifact_derivation_v1"
+        }
+      ]
+    },
+    "successor_already_used": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:alternate-tool-representation:v1",
+          "fact_type": "alternate_tool_representation",
+          "scope": "same_run_challenge_episode",
+          "value": "artifact_text_to_hex_view_v1"
+        }
+      ],
+      "used_successor_recipe_ids": [
+        "tool_alternate_representation_v1"
+      ]
+    },
+    "typed_local_origin_clean_generation": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:typed-local-container-origin:v1",
+          "fact_type": "typed_local_container_origin",
+          "scope": "same_run_challenge_episode",
+          "value": "catch_boundary_local_generation0"
+        },
+        {
+          "event_sequence": 11,
+          "fact_id": "fact:effect-instance-safety:v1",
+          "fact_type": "effect_and_instance_safety",
+          "scope": "same_run_challenge_episode",
+          "value": "zero_pending_zero_owned"
+        }
+      ]
+    },
+    "unknown_origin": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:unknown-container-origin:v1",
+          "fact_type": "unknown_container_origin",
+          "scope": "same_run_challenge_episode",
+          "value": "unclassified_pre_lane"
+        }
+      ]
+    },
+    "unsafe_native_failure": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:unsafe-native:v1",
+          "fact_type": "unsafe_native_failure",
+          "scope": "same_run_challenge_episode",
+          "value": "unauthorized"
+        }
+      ]
+    },
+    "validated_reset_window": {
+      "facts": [
+        {
+          "event_sequence": 10,
+          "fact_id": "fact:validated-reset-window:v1",
+          "fact_type": "validated_reset_window",
+          "scope": "same_run_challenge_episode",
+          "value": "reset_in_5_seconds"
+        }
+      ]
+    }
+  },
+  "failure_subreason_by_case": {
+    "board_indeterminate": "board_catch_boundary_failure",
+    "board_undocumented_inactive": "board_catch_boundary_failure",
+    "board_validated_contract": "board_catch_boundary_failure",
+    "completed": null,
+    "container_clean_recovery": "container_catch_boundary_failure",
+    "container_effect_fenced": "container_catch_boundary_failure",
+    "container_unknown_origin": "unclassified_pre_lane_failure",
+    "deadline_exhausted": "solver_output",
+    "disagreement_distinct_candidates": "distinct_source_candidates",
+    "disagreement_foreign_candidate": "retained_candidate_requires_verification",
+    "disagreement_multiple_verified": "distinct_source_candidates",
+    "disagreement_one_candidate": "retained_candidate_requires_verification",
+    "duplicate_route": "solver_output",
+    "episode_budget_exhausted": "solver_output",
+    "mixed_failure_quarantine": "mixed_failure",
+    "persistent_failure_no_third_route": "solver_output",
+    "policy_authorized_context": "cyber_policy",
+    "policy_missing_context": "cyber_policy",
+    "provenance_fresh_derivation": "candidate_provenance",
+    "provenance_missing_recipe": "candidate_provenance",
+    "provenance_model_supplied": "candidate_provenance",
+    "quota_missing_reset": "usage_limit_exceeded",
+    "quota_validated_reset": "usage_limit_exceeded",
+    "timeout_compatible_checkpoint": "timeout",
+    "timeout_missing_checkpoint": "timeout",
+    "tool_alternate_representation": "solver_output",
+    "tool_unsafe_native": "unauthorized"
+  },
+  "evaluator_contract": {
+    "conversion_definition": "positive_conversion is 1 only for an expected-dispatch case when the common authority gate admits either its exact expected recipe or the FIFO comparator recipe and that route is scheduled qualified_local_admission for the repetition; otherwise 0",
+    "correct_recipe_success_repetitions": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "expected_recipe_by_case": {
+      "board_validated_contract": "board_contract_recheck_v1",
+      "container_clean_recovery": "container_fresh_workspace_v1",
+      "disagreement_distinct_candidates": "private_source_reobservation_v1",
+      "disagreement_one_candidate": "private_source_reobservation_v1",
+      "policy_authorized_context": "policy_authorized_context_v1",
+      "provenance_fresh_derivation": "provenance_fresh_derivation_v1",
+      "quota_validated_reset": "quota_bounded_wait_v1",
+      "timeout_compatible_checkpoint": "timeout_checkpoint_resume_v1",
+      "tool_alternate_representation": "tool_alternate_representation_v1"
+    },
+    "fifo_comparator_success_repetitions": [
+      0,
+      4,
+      8,
+      12,
+      16
+    ],
+    "negative_terminal": "safely_contained",
+    "no_route_terminal": "completed_without_successor",
+    "positive_terminal": "qualified_local_admission",
+    "schedule_rationale": "pre-registered deterministic sensitivity fixture, not a live-conversion estimate; FIFO retains a nonzero 5-of-20 baseline and a correct changed recipe earns 15-of-20",
+    "unscheduled_or_wrong_recipe_terminal": "closed_without_qualification"
+  },
+  "observation_fields": [
+    "arm",
+    "case",
+    "repetition",
+    "policy_input_digest",
+    "policy_config_digest",
+    "decision_sequence",
+    "fact_event_sequences",
+    "disposition",
+    "recipe_id",
+    "failure_kind",
+    "source_fact_count",
+    "source_fact_public_metadata_digest",
+    "source_route_fingerprint",
+    "successor_route_fingerprint",
+    "changed_axes",
+    "terminal_outcome",
+    "positive_conversion",
+    "false_dispatch",
+    "unchanged_dispatch",
+    "duplicate_route",
+    "model_effort_mismatch",
+    "effect_authority_mismatch",
+    "scope_mismatch",
+    "replay_divergence",
+    "coverage_failure",
+    "pending_effects",
+    "owned_instances",
+    "workspace_residue",
+    "candidate_leak",
+    "tool_call_count",
+    "context_bytes",
+    "durable_event_bytes",
+    "policy_operation_count",
+    "policy_config_bytes",
+    "replay_digest",
+    "elapsed_seconds"
+  ],
+  "observation_schema": {
+    "boolean_integer_fields": [
+      "positive_conversion",
+      "false_dispatch",
+      "unchanged_dispatch",
+      "duplicate_route",
+      "model_effort_mismatch",
+      "effect_authority_mismatch",
+      "scope_mismatch",
+      "replay_divergence",
+      "coverage_failure",
+      "pending_effects",
+      "owned_instances",
+      "workspace_residue",
+      "candidate_leak"
+    ],
+    "cardinality": "arms x cases x repetitions = 4 x 27 x 20 = 2160 rows",
+    "row_identity": [
+      "arm",
+      "case",
+      "repetition"
+    ],
+    "source_fact_public_metadata_digest": "SHA-256 of canonical ordered fact_id, fact_type, scope, value, and event_sequence metadata only; candidate values and candidate-derived material are prohibited",
+    "strict_field_set": true
+  },
+  "policy_protocol": {
+    "closed_rule_table": "ordered exact fact predicates select one recipe",
+    "fifo_unchanged": "reference arm repeats the unchanged episode route and has no fact-aware recipe selection",
+    "graph_reducer": "canonical event fold plus guarded typed transition selects one recipe",
+    "scored_policy": "safety-filtered recipes use fixed integer weights; a non-unique maximum contains"
+  },
+  "policy_configs": {
+    "closed_rule_table": {
+      "default": "contain",
+      "evaluation": "first_match",
+      "rules": [
+        {
+          "failure_kind": "policy",
+          "recipe_id": "policy_authorized_context_v1",
+          "requires_all": [
+            "authorized_context_variant"
+          ]
+        },
+        {
+          "failure_kind": "provenance",
+          "recipe_id": "provenance_fresh_derivation_v1",
+          "requires_all": [
+            "source_derivation_recipe"
+          ]
+        },
+        {
+          "failure_kind": "disagreement",
+          "recipe_id": "private_source_reobservation_v1",
+          "requires_all": [
+            "private_candidate_proposal"
+          ]
+        },
+        {
+          "failure_kind": "timeout",
+          "recipe_id": "timeout_checkpoint_resume_v1",
+          "requires_all": [
+            "compatible_checkpoint"
+          ]
+        },
+        {
+          "failure_kind": "tool",
+          "recipe_id": "tool_alternate_representation_v1",
+          "requires_all": [
+            "alternate_tool_representation"
+          ]
+        },
+        {
+          "failure_kind": "quota",
+          "recipe_id": "quota_bounded_wait_v1",
+          "requires_all": [
+            "validated_reset_window"
+          ]
+        },
+        {
+          "failure_kind": "board",
+          "recipe_id": "board_contract_recheck_v1",
+          "requires_all": [
+            "validated_board_contract"
+          ]
+        },
+        {
+          "failure_kind": "container",
+          "recipe_id": "container_fresh_workspace_v1",
+          "requires_all": [
+            "typed_local_container_origin"
+          ]
+        }
+      ],
+      "version": "closed-rule-table-v1"
+    },
+    "fifo_unchanged": {
+      "changed_route_exemption": true,
+      "recipe_id": "repeat_source_route_comparator_v1",
+      "selectable": false,
+      "version": "fifo-unchanged-comparator-v1"
+    },
+    "graph_reducer": {
+      "default": "contain",
+      "start_node": "observed_failure",
+      "transitions": [
+        {
+          "failure_kind": "policy",
+          "from": "observed_failure",
+          "recipe_id": "policy_authorized_context_v1",
+          "requires_all": [
+            "authorized_context_variant"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "provenance",
+          "from": "observed_failure",
+          "recipe_id": "provenance_fresh_derivation_v1",
+          "requires_all": [
+            "source_derivation_recipe"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "disagreement",
+          "from": "observed_failure",
+          "recipe_id": "private_source_reobservation_v1",
+          "requires_all": [
+            "private_candidate_proposal"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "timeout",
+          "from": "observed_failure",
+          "recipe_id": "timeout_checkpoint_resume_v1",
+          "requires_all": [
+            "compatible_checkpoint"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "tool",
+          "from": "observed_failure",
+          "recipe_id": "tool_alternate_representation_v1",
+          "requires_all": [
+            "alternate_tool_representation"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "quota",
+          "from": "observed_failure",
+          "recipe_id": "quota_bounded_wait_v1",
+          "requires_all": [
+            "validated_reset_window"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "board",
+          "from": "observed_failure",
+          "recipe_id": "board_contract_recheck_v1",
+          "requires_all": [
+            "validated_board_contract"
+          ],
+          "to": "authorized_recipe"
+        },
+        {
+          "failure_kind": "container",
+          "from": "observed_failure",
+          "recipe_id": "container_fresh_workspace_v1",
+          "requires_all": [
+            "typed_local_container_origin"
+          ],
+          "to": "authorized_recipe"
+        }
+      ],
+      "version": "graph-reducer-v1"
+    },
+    "scored_policy": {
+      "default": "contain",
+      "failure_match_weight": 1000,
+      "missing_required_fact": "ineligible",
+      "recipe_weights": {
+        "board_contract_recheck_v1": 107,
+        "container_fresh_workspace_v1": 108,
+        "policy_authorized_context_v1": 101,
+        "private_source_reobservation_v1": 103,
+        "provenance_fresh_derivation_v1": 102,
+        "quota_bounded_wait_v1": 106,
+        "timeout_checkpoint_resume_v1": 104,
+        "tool_alternate_representation_v1": 105
+      },
+      "tie": "contain",
+      "version": "scored-policy-v1"
+    }
+  },
+  "fifo_comparator_contract": {
+    "common_gate_exception": "only the changed-route and unused-successor requirements are bypassed so the historical unchanged retry can be measured",
+    "recipe": {
+      "changed_axes": [],
+      "failure_kind_scope": "any_exact_registered_failure_kind",
+      "recipe_id": "repeat_source_route_comparator_v1",
+      "required_facts": [],
+      "route_template_id": "repeat_source_route_comparator_v1"
+    },
+    "retained_common_gates": "scope, committed facts, budgets, exact model and effort, controller-only effects, zero unsafe pending effects or instances, malformed/mixed containment, durability, privacy, and lifecycle",
+    "selectable": false,
+    "selection_role": "baseline comparator only"
+  },
+  "prerequisite_status": {
+    "board_recipes_live_locked_until_e6": true,
+    "fixture_facts_never_authorize_live_dispatch": true,
+    "policy_recipes_live_locked_until_e1": true
+  },
+  "protocol_id": "issue-19-routing-comparison-v1",
+  "registered_before_measurement": true,
+  "result_generated": false,
+  "route_recipes": {
+    "board_contract_recheck_v1": {
+      "changed_axes": [
+        "role",
+        "tactic",
+        "context_profile",
+        "tool_policy"
+      ],
+      "failure_kind": "board",
+      "required_facts": [
+        "validated_board_contract"
+      ]
+    },
+    "container_fresh_workspace_v1": {
+      "changed_axes": [
+        "role",
+        "tactic",
+        "context_profile",
+        "workspace_generation"
+      ],
+      "failure_kind": "container",
+      "required_facts": [
+        "typed_local_container_origin"
+      ]
+    },
+    "policy_authorized_context_v1": {
+      "changed_axes": [
+        "tactic",
+        "context_profile"
+      ],
+      "failure_kind": "policy",
+      "required_facts": [
+        "authorized_context_variant"
+      ]
+    },
+    "private_source_reobservation_v1": {
+      "changed_axes": [
+        "role",
+        "tactic",
+        "context_profile",
+        "verification_recipe"
+      ],
+      "failure_kind": "disagreement",
+      "required_facts": [
+        "private_candidate_proposal"
+      ]
+    },
+    "provenance_fresh_derivation_v1": {
+      "changed_axes": [
+        "tactic",
+        "context_profile",
+        "tool_policy"
+      ],
+      "failure_kind": "provenance",
+      "required_facts": [
+        "source_derivation_recipe"
+      ]
+    },
+    "quota_bounded_wait_v1": {
+      "changed_axes": [
+        "role",
+        "tactic",
+        "backoff_policy",
+        "deadline_policy"
+      ],
+      "failure_kind": "quota",
+      "required_facts": [
+        "validated_reset_window"
+      ]
+    },
+    "timeout_checkpoint_resume_v1": {
+      "changed_axes": [
+        "role",
+        "tactic",
+        "context_profile",
+        "deadline_policy"
+      ],
+      "failure_kind": "timeout",
+      "required_facts": [
+        "compatible_checkpoint"
+      ]
+    },
+    "tool_alternate_representation_v1": {
+      "changed_axes": [
+        "tactic",
+        "context_profile",
+        "tool_policy"
+      ],
+      "failure_kind": "tool",
+      "required_facts": [
+        "alternate_tool_representation"
+      ]
+    }
+  },
+  "route_templates": {
+    "baseline_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "fresh_lane_with_typed_same_run_history",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "specialist",
+      "tactic": "baseline",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "repeat_source_route_comparator_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "fresh_lane_with_typed_same_run_history",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "specialist",
+      "tactic": "baseline",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "board_contract_recheck_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "validated_board_contract_only",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "recovery",
+      "tactic": "read_only_board_contract_recheck",
+      "tool_policy": "validated_board_contract_v1",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "container_fresh_workspace_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "durable_facts_only",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "recovery",
+      "tactic": "fresh_workspace_recovery",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 1
+    },
+    "policy_authorized_context_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "e1_authorized_variant_v1",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "specialist",
+      "tactic": "authorized_context_reformulation",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "private_source_reobservation_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "fresh_source_only_no_candidate_carry",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "verifier",
+      "tactic": "independent_source_reobservation",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "fresh_source_reobservation_v1",
+      "workspace_generation": 0
+    },
+    "provenance_fresh_derivation_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "public_artifact_only_no_candidate_carry",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "specialist",
+      "tactic": "fresh_source_derivation",
+      "tool_policy": "source_derivation_recipe_v1",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "quota_bounded_wait_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "validated_reset_bounded_5_seconds",
+      "context_profile": "fresh_lane_with_typed_same_run_history",
+      "deadline_policy": "original_run_deadline_no_reset",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "recovery",
+      "tactic": "bounded_wait_then_fresh",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "timeout_checkpoint_resume_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "durable_checkpoint_only",
+      "deadline_policy": "original_run_deadline_no_reset",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "recovery",
+      "tactic": "resume_compatible_checkpoint",
+      "tool_policy": "bounded_registry",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    },
+    "tool_alternate_representation_v1": {
+      "attempt_seconds": 15,
+      "backoff_policy": "none",
+      "context_profile": "fresh_without_failed_tool_assumption",
+      "deadline_policy": "minimum_of_attempt_and_run_deadline",
+      "effect_policy": "controller_only",
+      "effort": "xhigh",
+      "model": "gpt-daybreak-blue-latest",
+      "role": "specialist",
+      "tactic": "alternate_representation",
+      "tool_policy": "artifact_text_to_hex_view_v1",
+      "verification_recipe": "none",
+      "workspace_generation": 0
+    }
+  },
+  "recipe_budgets": {
+    "repeat_source_route_comparator_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "board_contract_recheck_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "container_fresh_workspace_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "policy_authorized_context_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "private_source_reobservation_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "provenance_fresh_derivation_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "quota_bounded_wait_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 6000,
+      "run_deadline_reset": false,
+      "wait_seconds": 5
+    },
+    "timeout_checkpoint_resume_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    },
+    "tool_alternate_representation_v1": {
+      "attempt_seconds": 15,
+      "max_dispatches_per_challenge_failure_kind": 1,
+      "max_successor_episodes": 1,
+      "minimum_remaining_milliseconds": 1000,
+      "run_deadline_reset": false,
+      "wait_seconds": 0
+    }
+  },
+  "schema_version": 1,
+  "selection_gate": {
+    "eligible_policy_arms": [
+      "closed_rule_table",
+      "graph_reducer",
+      "scored_policy"
+    ],
+    "descriptive_only": [
+      "elapsed_seconds"
+    ],
+    "disqualifiers": [
+      "false or unvalidated dispatch",
+      "unchanged or duplicate route",
+      "model, effort, effect authority, scope, deadline, or coverage mismatch",
+      "replay divergence or config-dependent replay acceptance",
+      "candidate or credential leak",
+      "pending effect, owned instance, workspace residue, or incomplete lifecycle",
+      "missing case, repetition, raw field, source identity, or tamper gate"
+    ],
+    "require_no_per_kind_regression_vs_fifo": true,
+    "require_strict_total_improvement_vs_fifo": true,
+    "require_unique_winner": true,
+    "selection_order": [
+      "maximize minimum eligible positive conversion across all eight failure kinds",
+      "maximize total eligible positive conversion",
+      "minimize unproductive dispatch count",
+      "minimize tool call count",
+      "minimize context bytes",
+      "minimize durable event bytes",
+      "minimize policy operation count",
+      "minimize policy config bytes"
+    ],
+    "ties": "no_selection"
+  },
+  "raw_derivation_contract": {
+    "aggregate_storage": "forbidden; aggregates are recomputed from exactly 2160 immutable raw observation rows",
+    "costs": "tool calls, context bytes, durable event bytes, policy operations, and canonical policy config bytes are observed per raw row and summed",
+    "minimum_per_kind_conversion": "minimum sum of positive_conversion over the positive cases for each of the exact eight failure kinds",
+    "reported_selection": "must equal a fresh recomputation after exact schema, row identity, ordering, source, config, digest, privacy, safety, lifecycle, and tamper validation",
+    "total_conversion": "sum of positive_conversion over raw rows",
+    "unproductive_dispatch": "a dispatch whose terminal_outcome is not qualified_local_admission"
+  },
+  "required_measurement_tests": [
+    "policy input projection excludes evaluator-only fields and repetition before every policy call",
+    "fixture payloads, policy configs, route templates, recipe budgets, and common config match their registered canonical digests",
+    "one strict-schema row exists for every arm, case, and repetition in canonical result order",
+    "E1 and E6 live locks reject production authority even when fixture facts are present",
+    "fixture facts cannot be deserialized as live facts and no fixture path can reach network, model, Board, submission, instance, or container adapters",
+    "raw rows and sanitized views contain no candidate, credential, answer, or raw, SHA-256, hex, base64, base64url, or URL-encoded derivative",
+    "arm permutation, each synthetic policy winner, ties, and all-ineligible inputs recompute as registered",
+    "mutating each raw field class, row order, schema, source/config digest, fact, route value, route axis, fingerprint, rule, graph edge, score, cost, aggregate, or reported winner fails",
+    "same durable input and config replays identically; changed policy config digest refuses replay",
+    "decision/admission rollback and process crash produce no partial decision, lost closed work, duplicate route, pending effect, owned instance, or workspace residue"
+  ],
+  "result_provenance_contract": {
+    "canonical_command": ".venv/bin/python scripts/issue19_routing_policy_comparison.py --protocol notes/research/issue-19-routing-comparison-protocol-v1.json --output notes/research/issue-19-routing-policy-comparison-v1.json",
+    "canonical_result_format": "UTF-8 pretty JSON, sort_keys=true, indent=2, trailing newline",
+    "environment_fields": [
+      "python_implementation",
+      "python_version",
+      "sqlite_version",
+      "platform",
+      "machine",
+      "cpu_count",
+      "memory_bytes",
+      "pid_limit",
+      "filesystem_block_size"
+    ],
+    "final_image_replay": "the selected result must later reproduce from the exact registered final Linux image without altering this development result",
+    "required_file_hashes": [
+      "scripts/issue19_routing_policy_comparison.py",
+      "notes/research/issue-19-routing-comparison-protocol-v1.json",
+      "every rapido/**/*.py source file",
+      "every test/fixture file imported by the harness"
+    ],
+    "result_source_requirements": [
+      "exact clean merged source commit containing the protocol, harness, and production code",
+      "SHA-256 for every required file plus sorted path-and-file-digest production tree SHA-256",
+      "exact protocol file SHA-256 and every registered frozen section digest",
+      "exact policy config contents and digests, fixture version and digest, route schema and recipe digests",
+      "canonical command, result format, environment fields, start and finish UTC, and observed elapsed seconds",
+      "disabled-surface counters proving zero network, model, external Board, submission, instance, and container calls"
+    ],
+    "source_mismatch": "refuse measurement or replay before any result row is emitted"
+  },
+  "frozen_digests": {
+    "cases": "2a92195e42a7bb0c295d06b1a4880f52ebd90c93bd7e98731e786dae26649ac9",
+    "common_config": "f71328027d4ab8f320835d341bbaa0b9705df1ceee907c2998f50783bb11d87f",
+    "evaluation_contract": "c3b7a30d1dbd1d676690898c486af5f278da8d550e474ac36e4ed4dbc5c2e81d",
+    "fixture_payload": "5e97e2f3a12a62891546bd518387e5fee0b9515384276c8bca4f0a5c8ed7b6fc",
+    "policy_configs": "3c6fbf1167f79698cb6c5591903966cad325297eea9ad1a2c6e7fac616ac003d",
+    "recipe_budgets": "d8f4dd13dd40a11d2082d5f4e4fc7d7a3444b91e4ccfcfcf89d511b1bc96333c",
+    "route_recipes": "483aed8d5e0a645db20c04d1c2bf6a853d26153a40663107da05b3acf667d4d9",
+    "route_templates": "56a24b593015ded818a4814e67b39b4392b6c01c734ece1a4c4308a1ab392af7"
+  },
+  "source_base_commit": "ae3da51aa675b6fdcfb1cbfe50a33cf5fbc4c954",
+  "tamper_gates": [
+    "arm label permutation preserves the corresponding winner",
+    "synthetic valid raw rows can make each policy arm win",
+    "ties and all-ineligible inputs select no arm",
+    "changed row order, field set, source fact, digest, route axis, fingerprint, policy config, weight, metric, aggregate, or reported winner fails recomputation",
+    "same durable inputs with a changed policy configuration digest refuse replay"
+  ]
+}
