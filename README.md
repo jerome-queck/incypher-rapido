@@ -90,6 +90,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source-byte ceiling. |
 | `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Run-wide ceiling; active challenges partition it. |
 | `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
+| `RAPIDO_MEMORY_ARM` | `lane_local_v1` | Registered memory arm. `typed_challenge_v1` shares only sanitized typed earlier-episode host/controller facts; Verifier `same_run_memory` remains empty. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
 | `RAPIDO_SUBMIT_CANDIDATES` | `true` | Serial exact-agreement submissions; explicit false is developer-only. |
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Wrong/indeterminate submission-risk ceiling. |
@@ -112,10 +113,12 @@ and follow-up issue [#19](https://github.com/jerome-queck/incypher-rapido/issues
 
 The effective non-secret configuration is printed by `config`. Never publish state/work folders:
 attempt rows can contain candidate values, while submission records retain fingerprints and
-verdicts. Each later episode receives only bounded, immutable, same-run/same-challenge/same-lane
-host observations from earlier attempts, including safe structural facts from a candidate
-disagreement. Raw tool payloads, payload-derived digests from candidate observations, authorities,
-paths, credentials, and candidate fingerprints are not carried into that prompt.
+verdicts. The default `lane_local_v1` memory arm carries bounded, immutable, sanitized typed
+analysis plus host/controller facts from earlier episodes in the same lane. The experimental
+`typed_challenge_v1` arm also shares sanitized host/controller facts across lanes, but never
+cross-lane model prose. Every verifier `same_run_memory` projection is empty; private controller
+state still retains candidates for verification. Raw tool payloads, payload-derived digests,
+authorities, paths, credentials, and candidate fingerprints are never carried into public memory.
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 

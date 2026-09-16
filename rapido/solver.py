@@ -11,6 +11,7 @@ from typing import Any
 
 from .board import FLAG_RE, Challenge
 from .evidence import EvidenceBundle, EvidenceItem, EvidenceManifest
+from .memory import MemoryProjection
 from .routing import RouteSpec
 
 MAX_AGENT_MESSAGE_BYTES = 128 * 1024
@@ -478,10 +479,12 @@ def build_turn_prompt(
     artifact_paths: list[str],
     lane: int,
     *,
+    run_id: str | None = None,
     episode: int = 0,
     prior_attempts: tuple[AttemptCarry | Mapping[str, Any], ...] = (),
     prior_observations: EvidenceBundle | None = None,
     control_route: RouteSpec | None = None,
+    same_run_memory: MemoryProjection | None = None,
 ) -> str:
     """Serialize challenge data plus bounded, explicitly untrusted successor context."""
     if type(lane) is not int or lane < 0:
@@ -510,6 +513,23 @@ def build_turn_prompt(
         if not isinstance(control_route, RouteSpec):
             raise TypeError("control_route must be a RouteSpec")
         route_document = control_route.as_dict()
+    if same_run_memory is not None and not isinstance(same_run_memory, MemoryProjection):
+        raise TypeError("same_run_memory must be a MemoryProjection")
+    if same_run_memory is not None:
+        memory_target = same_run_memory.target
+        if (
+            route_document is None
+            or not isinstance(run_id, str)
+            or not run_id
+            or memory_target.run_id != run_id
+            or memory_target.challenge_id != challenge.id
+            or memory_target.episode != episode
+            or memory_target.lane != lane
+            or memory_target.role != route_document["role"]
+        ):
+            raise ValueError("same-run memory does not match the prompt target")
+        if route_document["role"] == "verifier" and same_run_memory.records:
+            raise ValueError("verifier routes cannot receive same-run memory")
     seen_episodes = {episode}
     normalized_attempts: list[AttemptCarry] = []
     for raw_attempt in attempts:
@@ -536,6 +556,7 @@ def build_turn_prompt(
         "prior_observations": None,
         "prior_attempts": [],
         "prior_attempts_omitted_for_budget": len(normalized_attempts),
+        "same_run_memory": (None if same_run_memory is None else same_run_memory.as_public()),
         "carry_guidance": _CARRY_GUIDANCE,
         "observation_guidance": _OBSERVATION_GUIDANCE,
         "task": (
