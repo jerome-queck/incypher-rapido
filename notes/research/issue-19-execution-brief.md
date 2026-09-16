@@ -627,16 +627,29 @@ comparison green while independent review is pending.
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and clean-source E3 result merged/generated; live-controller promotion pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: merged typed same-run projection exposes 48 useful records versus 20 lane-local with no duplicate regression; deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; native M1 and full four-role/recovery proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
-| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
-| Productive bounded resource scaling | E4 measurements and selected profile | pending |
+| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: calibration covered 15/15 before its Verifier retry and exercised an evidence-earned extension; final 19,800-second coverage pending |
+| Productive bounded resource scaling | E4 measurements and selected profile | in progress: P20-configured Board calibration observed P16 peak, 298.2 MiB, and 84 PIDs; short lanes and serialized dynamic lifecycle constrained the run, with no observed RAM/quota failure |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
-| Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | pending |
+| Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | complete for the 1,800-second calibration only; final 19,800-second registration pending |
 | Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending |
 | New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending |
 | No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | pending |
 | Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | pending |
 | #19 closed honestly | GitHub closeout linked to merged evidence | pending |
+
+### Mixed-peer live calibration result
+
+The separately registered Board calibration completed on 2026-09-17. It covered all 15 challenges,
+enforced the exact Daybreak-plus-Luna roster under a P20 cap (observed P16 peak), committed 1,093
+tool observations, retained a
+private candidate after partial peer success, dispatched four fresh Daybreak Verifiers, retried no
+unchanged route, and cleaned ten dynamic cycles. It produced zero verified candidates and zero
+submissions: the producer identity and independently agreed Verifier identity differed. Fifty-eight
+of 60 initial lanes timed out under the calibration-only 60-second deadline, falsifying that setting
+for solve quality. Typed memory projected safely but supplied no records in this episode shape.
+Independent post-run Board and local audits were clean. Full sanitized evidence is in
+[`issue-19-calibration-evidence-2026-09-17.md`](issue-19-calibration-evidence-2026-09-17.md).
 
 ## Model/effort ledger
 
