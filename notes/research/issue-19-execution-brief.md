@@ -278,6 +278,20 @@ independent Daybreak/xhigh review and green CI before a comparison result is gen
 provenance must bind the clean merged commit, harness and imported fixture hashes, full production
 tree digest, exact command/result format, environment, timestamps, and zero disabled-surface calls.
 
+The parent protocol names operation and canonical-config costs but does not define their primitive
+units. Before policy implementation or measurement, the exact units are separately frozen in
+[`issue-19-routing-operation-count-protocol-v1.json`](issue-19-routing-operation-count-protocol-v1.json),
+SHA-256 `c7e5147fbe9d4367b9f4bc40850faf3011c50d0d586ee22a69f3d792726e75bf`,
+bound to the parent protocol SHA and merged base `ecee4aec53e609fb2941548d9716171580eef2ea`.
+It excludes common validation/materialization/SQLite/evaluator work and fixes every table rule
+visit, graph fold/edge visit, scored-recipe visit, fact lookup, score action, and comparator action.
+It also freezes pre-policy and post-policy gate order: 19 exact cases invoke a policy, while eight
+early-contained cases record zero policy operations; canonical config bytes remain recorded for
+every row. The harness must import and provenance-hash this addendum; raw costs are recomputed and
+tamper-gated. Exact per-arm config byte constants, context/event accounting, replay fields and
+exclusions, null/type and FIFO-flag semantics, result-container schema, input-derived invocation
+predicate, and full-protocol operation totals are also fixed.
+
 The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
 two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
 material route fingerprint. Policy, provenance, timeout, quota, and Board failures remain
@@ -527,6 +541,8 @@ comparison green while independent review is pending.
 | Initial E3 protocol independent review | `gpt-daybreak-blue-latest` / `xhigh` | held release: unfrozen fixture/policy/route values, aggregate circular evidence, FIFO gate contradiction, and declarative-only safety tests; all findings addressed before measurement, re-review pending, no fallback |
 | E3 protocol second independent review | `gpt-daybreak-blue-latest` / `xhigh` | held release: FIFO was definitionally unable to convert, gate-negative fixtures were not isolated, comparator recipe was incomplete, and result-source provenance was missing; all findings addressed before measurement, clean re-review pending, no fallback |
 | E3 protocol clean release re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; all frozen digests, comparator/gate semantics, E1/E6 locks, provenance contract, and protocol/brief SHA verified with no P0-P3 findings, no fallback |
+| E3 implementation design | `gpt-daybreak-blue-latest` / `xhigh` | complete; comparison-only typed facts/policies and SQLite decision context selected without changing live route behavior; identified operation-unit registration gap before measurement, no fallback |
+| E3 operation-count addendum review | `gpt-daybreak-blue-latest` / `xhigh` | complete after successive holds fixed config-byte, invocation, accounting, replay, and parent-schema ambiguities; final review found no P0-P3 findings, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
