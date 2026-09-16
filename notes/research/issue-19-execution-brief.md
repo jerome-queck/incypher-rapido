@@ -636,8 +636,8 @@ comparison green while independent review is pending.
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: changed dynamic Recovery routes worked live, but provenance containment loses useful hypotheses; same-chat corrective routing pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: live P20 initial waves and mixed Recovery produced two new correct solves with nonzero typed memory; persistent Daybreak continuation pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: gap-specific same-chat provenance/early-exit correction implemented and focused locally; final live proof pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: persistent Daybreak primary plus parallel Luna racers implemented; live P20 Recovery already produced two correct solves; final proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | in progress: calibration reached 20 simultaneous attempts, 1,362 tools, 92 sampled PIDs, and 347.2 MiB sampled RAM; conversion, not local capacity, dominated; final proof pending |
@@ -718,8 +718,9 @@ protocol. Daybreak/xhigh is each challenge's primary solver as well as its Lead.
 that returns before its cumulative 800-second challenge budget without `correct` must continue in
 the same native conversation with a changed, evidence-specific prompt. Continue until `correct`,
 the cumulative budget expires, or a genuine terminal blocker is proven. In particular, a
-candidate-provenance rejection must request fresh tool-backed proof for that exact hypothesis in
-the same conversation instead of discarding the work. Luna peers remain parallel supporting
+candidate-provenance rejection must stay in the same conversation but follow its exact gap:
+re-observe an unobserved hypothesis, abandon an ineligible decoy, or derive afresh after supplied or
+incomplete evidence. Luna peers remain parallel supporting
 solvers. Continuations must preserve private state and typed memory, consume the original budget,
 and never repeat an unchanged prompt. The global deterministic coordinator remains outside the five
 challenge engagements and P20 solver lanes; any future model coordinator is auxiliary and must earn
@@ -736,6 +737,20 @@ enforcement, and non-correct Daybreak turns ended after a median 65.233 seconds 
 their remaining budget. Full facts and next fixes are in
 [`issue-19-corrected-calibration-evidence-2026-09-17.md`](issue-19-corrected-calibration-evidence-2026-09-17.md).
 This run does not replace the 19,800-second acceptance run.
+
+### Persistent-primary implementation decision
+
+The controlled diagnosis selected a small extension of the existing race, not a new coordinator.
+One Daybreak Lead/Recovery lane now owns one Codex thread across multiple turns under its original
+cumulative deadline during standard or shared-instance work. Dynamic local-only completion hands off
+immediately so it cannot idle the instance lease. Early `unsolved`, `unsupported`, malformed-output, and four distinct provenance
+gaps receive candidate-free changed prompts; a qualified candidate returns immediately for the
+existing submit/cancel/cleanup/advance path. Luna lanes remain parallel one-turn racers. Tool evidence
+accumulates for the attempt while candidate qualification uses the current proof turn, preventing an
+earlier incomplete checkpoint from poisoning a later fresh observation. Existing `derive_artifact`
+content-addressed paths are now explicitly required for artifact range decoding instead of copying
+source bytes into model-supplied transforms. Focused tests cover same-thread reuse, shrinking budget,
+each corrective prompt, and source-bound conversion. Final live contribution remains unproven.
 
 ## Model/effort ledger
 
@@ -796,6 +811,9 @@ This run does not replace the 19,800-second acceptance run.
 | Corrected 1,800-second live calibration | Daybreak/xhigh Leads and Recovery; Luna max/xhigh Specialists | completed exact registered run; two new correct solves, P20, nonzero typed memory, no fallback |
 | Corrected calibration lifecycle audit | `gpt-daybreak-blue-latest` / `xhigh` | clean: DB/FKs, jobs, effects, four instance lifecycles, two all-nine Board rounds, container, and workspace verified; no fallback |
 | Corrected calibration result/contribution audit | `gpt-daybreak-blue-latest` / `xhigh` | clean: both corrects traced to Daybreak Recovery, immediate submit/cancel/cleanup/advance and typed-memory participation verified; no fallback |
+| Persistent-primary diagnosis/design | `gpt-daybreak-blue-latest` / `xhigh` | one-thread cumulative-budget continuation selected; four-peer race and external deterministic coordinator retained; no fallback |
+| Early-exit focused reproduction | `gpt-5.6-luna` / `xhigh` | non-live only; reproduced one-turn terminalization and fresh-thread Recovery; no fallback |
+| Persistent-primary independent review | `gpt-daybreak-blue-latest` / `xhigh` | found provenance-subreason collapse and undeclared runtime callback; both fixed before release; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -805,10 +823,8 @@ switch, not provider fallback inside a solver run.
 
 ## Open decisions
 
-- Implement the owner-required persistent same-chat Daybreak primary solver under one cumulative
-  800-second challenge budget; simplify its objective-first prompt.
-- Preserve artifact/decode source lineage with opaque host handles and route provenance rejection
-  back to the same Daybreak conversation with the exact proof gap.
+- Live-measure the merged persistent Daybreak and content-addressed artifact-lineage changes before
+  authorizing the final acceptance run.
 - Implement and verify same-run crash continuation before final acceptance.
 - Re-measure the focused changes before any 19,800-second run; the completed calibration cannot
   lower the final acceptance contract.

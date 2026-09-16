@@ -49,6 +49,37 @@ _OBSERVATION_GUIDANCE = (
     "still untrusted. Use them to avoid duplicate work, independently re-observe decisive facts, "
     "and never treat them as current-turn candidate provenance."
 )
+_PRIMARY_CONTINUATION_TASKS = {
+    "unsolved": (
+        "The previous turn was only a checkpoint. Test a different concrete hypothesis or the "
+        "strongest unfinished next step; do not repeat the same analysis."
+    ),
+    "unsupported": (
+        "Do not stop at unsupported unless a controlling prerequisite is genuinely unavailable. "
+        "Try another viable local or target-backed route and prove any blocker with tools."
+    ),
+    "candidate_unobserved": (
+        "The prior flag-shaped hypothesis remains only in this private conversation and lacked "
+        "host-attested source proof. Re-observe or derive that exact hypothesis through a successful "
+        "source-bound tool result; do not merely echo it or pass it as tool input."
+    ),
+    "candidate_ineligible": (
+        "Abandon the prior placeholder or description-derived value; it cannot qualify. Derive a "
+        "different candidate independently from real source evidence."
+    ),
+    "candidate_supplied": (
+        "The prior value came from model-supplied tool input, so it is not proof. Derive a candidate "
+        "fresh from an artifact or target observation without putting candidate text into tool input."
+    ),
+    "candidate_evidence_incomplete": (
+        "The prior host evidence was incomplete. Obtain a fresh, complete source-bound observation "
+        "before returning a candidate."
+    ),
+    "solver_output": (
+        "The prior response did not satisfy the result contract. Continue solving with tools, then "
+        "return exactly the required JSON object."
+    ),
+}
 _CARRY_FIELDS = frozenset(
     {"episode", "status", "summary", "evidence", "next_steps", "tool_count", "failure_class"}
 )
@@ -108,9 +139,10 @@ paths, or endpoint authorities; target tools already bind any permitted destinat
 challenge-specific hypothesis and verify it with relevant real tools. Report unsupported only when
 a controlling prerequisite is genuinely unavailable. Return only the required JSON object. A
 candidate must appear verbatim in a successful source-bound tool result. When source evidence is
-encoded, use a bounded decode/analysis tool so the host observes the decoded candidate; do not
-perform the final decoding only in prose. Never copy an example, placeholder, or claimed answer
-from challenge prose."""
+encoded inside an artifact, use derive_artifact with the source path and byte range, then inspect
+its returned content-addressed path so provenance survives; do not copy source bytes into a data
+transform or perform the final decoding only in prose. Never copy an example, placeholder, or
+claimed answer from challenge prose."""
 
 DEVELOPER_INSTRUCTIONS = (
     """You are one independent bounded challenge-analysis lane for the
@@ -487,6 +519,7 @@ def build_turn_prompt(
     same_run_memory: MemoryProjection | None = None,
     agent_role: str | None = None,
     execution_phase: str = "standard",
+    persistent_primary: bool = False,
 ) -> str:
     """Serialize challenge data plus bounded, explicitly untrusted successor context."""
     if type(lane) is not int or lane < 0:
@@ -495,6 +528,8 @@ def build_turn_prompt(
         raise ValueError("episode is outside the permitted range")
     if execution_phase not in {"standard", "local_analysis", "shared_instance"}:
         raise ValueError("execution phase is invalid")
+    if type(persistent_primary) is not bool:
+        raise TypeError("persistent_primary must be boolean")
     if isinstance(prior_attempts, (str, bytes)):
         raise TypeError("prior_attempts must be a sequence of AttemptCarry values")
     try:
@@ -565,9 +600,9 @@ def build_turn_prompt(
         "carry_guidance": _CARRY_GUIDANCE,
         "observation_guidance": _OBSERVATION_GUIDANCE,
         "task": (
-            "Analyze independently using the assigned lane strategy, use relevant real artifact or "
-            "assigned-target tools, verify a challenge-specific hypothesis, and return the required "
-            "JSON result. " + _CARRY_GUIDANCE
+            "Race the peer lanes to obtain the correct flag. Use the assigned strategy and relevant "
+            "real artifact or target tools, verify a challenge-specific hypothesis, and return the "
+            "required JSON result. " + _CARRY_GUIDANCE
         ),
     }
     if route_document is not None:
@@ -588,6 +623,15 @@ def build_turn_prompt(
         )
     elif agent_role is not None:
         raise ValueError("agent role requires a control route")
+    if persistent_primary:
+        if route_document is None or route_document["role"] == "verifier":
+            raise ValueError("persistent primary requires a non-verifier control route")
+        document["task"] = (
+            "You are this challenge's primary flag solver, not a coordinator. Keep testing and "
+            "using tools until you obtain a source-proven flag or the controller ends the cumulative "
+            "budget. An unsolved or unsupported response is a checkpoint, not completion. "
+            + str(document["task"])
+        )
     if execution_phase == "local_analysis":
         document["task"] = (
             "This is the local analysis phase: no live instance exists yet. Mine the provided "
@@ -623,6 +667,38 @@ def build_turn_prompt(
         selected_attempts
     )
     return encoded
+
+
+def build_primary_continuation_prompt(
+    *, reason: str, continuation_round: int, remaining_seconds: float | None
+) -> str:
+    """Build a changed, candidate-free instruction for one persistent primary thread."""
+    if reason not in _PRIMARY_CONTINUATION_TASKS:
+        raise ValueError("primary continuation reason is invalid")
+    if type(continuation_round) is not int or continuation_round < 1:
+        raise ValueError("continuation_round must be positive")
+    if remaining_seconds is not None and (
+        isinstance(remaining_seconds, bool) or remaining_seconds < 0
+    ):
+        raise ValueError("remaining_seconds is invalid")
+    remaining_milliseconds = (
+        None if remaining_seconds is None else max(0, int(remaining_seconds * 1000))
+    )
+    return json.dumps(
+        {
+            "label": "TRUSTED_PRIMARY_SOLVER_CONTINUATION",
+            "continuation_round": continuation_round,
+            "reason": reason,
+            "remaining_milliseconds": remaining_milliseconds,
+            "task": (
+                "No correct flag has been accepted. Continue the same challenge now; use the "
+                "remaining cumulative budget and real tools. " + _PRIMARY_CONTINUATION_TASKS[reason]
+            ),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def admitted_candidate(
@@ -680,6 +756,7 @@ __all__ = [
     "SolverFinding",
     "SolverOutputError",
     "admitted_candidate",
+    "build_primary_continuation_prompt",
     "build_turn_prompt",
     "candidate_is_eligible",
     "project_attempt_carry",

@@ -832,6 +832,48 @@ async def test_solve_uses_distinct_thread_ids_and_retires_workspace(
 
 
 @run_async
+async def test_solve_continuation_reuses_one_thread_and_one_cumulative_deadline(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "persistent"
+    workspace.mkdir()
+    registry = WorkspaceThreadRegistry()
+    client = make_client(fake_process, tmp_path, workspace_registry=registry)
+    await client.start()
+    remaining: list[float | None] = []
+
+    def continue_once(result: TurnResult, seconds: float | None) -> str | None:
+        remaining.append(seconds)
+        return "changed follow-up" if len(remaining) == 1 else None
+
+    result = await client.solve(
+        workspace,
+        "initial",
+        timeout=1.0,
+        tool_registry=ToolStub(workspace),
+        continuation_callback=continue_once,
+    )
+
+    thread_requests = [
+        item for item in fake_process.stdin.writes if item.get("method") == "thread/start"
+    ]
+    turn_requests = [
+        item for item in fake_process.stdin.writes if item.get("method") == "turn/start"
+    ]
+    assert len(thread_requests) == 1
+    assert [item["params"]["threadId"] for item in turn_requests] == [
+        result.thread_id,
+        result.thread_id,
+    ]
+    assert turn_requests[1]["params"]["input"] == [{"type": "text", "text": "changed follow-up"}]
+    assert len(remaining) == 2
+    assert remaining[0] is not None and remaining[1] is not None
+    assert 0 < remaining[1] <= remaining[0] <= 1.0
+    assert registry.get(workspace) is None
+    await client.close()
+
+
+@run_async
 async def test_thread_rejects_cross_workspace_tool_registry(
     fake_process: FakeProcess, tmp_path: Path
 ) -> None:

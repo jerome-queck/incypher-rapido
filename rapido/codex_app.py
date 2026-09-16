@@ -259,6 +259,7 @@ class TurnResult:
     interrupt_sent: bool = False
     process_fenced: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    current_turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -1902,8 +1903,9 @@ class CodexAppClient:
         workspace_registry: WorkspaceThreadRegistry | MutableMapping[str, str] | None = None,
         raise_on_timeout: bool = True,
         progress_callback: Callable[[], None] | None = None,
+        continuation_callback: Callable[[TurnResult, float | None], str | None] | None = None,
     ) -> TurnResult:
-        """Start the app-server/thread as needed and execute one structured turn."""
+        """Start one thread and execute one or more cumulatively bounded structured turns."""
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 
@@ -1965,16 +1967,42 @@ class CodexAppClient:
             await self.close()
             raise TimeoutError("native setup consumed the turn deadline")
         try:
-            return await self.run_turn(
-                prompt,
-                thread_id=thread_id,
-                timeout=turn_timeout,
-                output_schema=output_schema,
-                model=selected_model,
-                reasoning_effort=selected_effort,
-                raise_on_timeout=raise_on_timeout,
-                progress_callback=progress_callback,
-            )
+            current_prompt = prompt
+            session_tool_calls: list[dict[str, Any]] = []
+            while True:
+                try:
+                    result = await self.run_turn(
+                        current_prompt,
+                        thread_id=thread_id,
+                        timeout=turn_timeout,
+                        output_schema=output_schema,
+                        model=selected_model,
+                        reasoning_effort=selected_effort,
+                        raise_on_timeout=raise_on_timeout,
+                        progress_callback=progress_callback,
+                    )
+                except TurnTimeoutError as exc:
+                    exc.result.tool_calls = [*session_tool_calls, *exc.result.tool_calls]
+                    raise
+                except asyncio.CancelledError as exc:
+                    evidence = getattr(exc, "result", None)
+                    current_calls = getattr(evidence, "tool_calls", None)
+                    if isinstance(current_calls, list):
+                        current_calls[:0] = session_tool_calls
+                    raise
+                session_tool_calls.extend(result.tool_calls)
+                result.tool_calls = list(session_tool_calls)
+                if continuation_callback is None:
+                    return result
+                next_prompt = continuation_callback(result, remaining())
+                if next_prompt is None:
+                    return result
+                if not isinstance(next_prompt, str) or not next_prompt:
+                    raise ValueError("continuation callback must return non-empty text or None")
+                current_prompt = next_prompt
+                turn_timeout = remaining()
+                if turn_timeout is not None and turn_timeout <= 0:
+                    raise TurnTimeoutError(result)
         finally:
             self._retire_thread(str(workspace), thread_id)
 
@@ -2048,6 +2076,7 @@ class CodexAppClient:
             interrupt_sent=interrupt_sent,
             process_fenced=process_fenced,
             tool_calls=[dict(call) for call in state.tool_calls],
+            current_turn_tool_calls=[dict(call) for call in state.tool_calls],
         )
 
     def _state_for(self, thread_id: str | None, turn_id: str | None) -> _TurnState | None:

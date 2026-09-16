@@ -50,6 +50,7 @@ from .solver import (
     SolverFinding,
     SolverOutputError,
     admitted_candidate,
+    build_primary_continuation_prompt,
     build_turn_prompt,
     candidate_is_eligible,
     project_attempt_carry,
@@ -80,6 +81,7 @@ class NativeRuntime(Protocol):
         timeout: float,
         tool_registry: Any | None = None,
         progress_callback: Callable[[], None] | None = None,
+        continuation_callback: (Callable[[NativeTurn, float | None], str | None] | None) = None,
     ) -> NativeTurn: ...
 
     async def close(self) -> None: ...
@@ -1289,6 +1291,14 @@ class Orchestrator:
                         continue
                     prior_attempts.append(projected)
                     compacted_records += int(compacted)
+            persistent_primary = (
+                self._adaptive_control
+                and self.config.peer_profile == "mixed_v1"
+                and model == self.config.model
+                and route is not None
+                and route.role != "verifier"
+                and (challenge.type != "dynamic_iac" or bool(target_endpoints))
+            )
             turn_prompt = build_turn_prompt(
                 challenge,
                 artifact_paths,
@@ -1319,6 +1329,7 @@ class Orchestrator:
                     if challenge.type == "dynamic_iac"
                     else "standard"
                 ),
+                persistent_primary=persistent_primary,
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -1366,6 +1377,74 @@ class Orchestrator:
                 nonlocal progress_at
                 progress_at = time.monotonic()
 
+            continuation_round = 0
+
+            def validate_candidate(
+                finding: SolverFinding,
+                calls: tuple[ToolCallEvidence, ...],
+                complete: bool,
+            ) -> None:
+                if finding.candidate is None:
+                    return
+                if self._adaptive_control and not complete:
+                    raise CandidateProvenanceError("candidate_evidence_incomplete")
+                if not candidate_is_eligible(finding.candidate, challenge.description):
+                    raise CandidateProvenanceError("candidate_ineligible")
+                candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
+                candidate_observed = False
+                candidate_supplied = False
+                for call in calls:
+                    candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
+                    if call.success is True and call.source_bound:
+                        candidate_observed |= candidate_fingerprint in call.candidate_sha256s
+                if candidate_supplied:
+                    raise CandidateProvenanceError("candidate_supplied")
+                if not candidate_observed:
+                    raise CandidateProvenanceError("candidate_unobserved")
+
+            def continue_primary(turn: NativeTurn, remaining_seconds: float | None) -> str | None:
+                nonlocal continuation_round
+                if not persistent_primary or turn.status != "completed":
+                    return None
+                try:
+                    checkpoint = SolverFinding.from_message(turn.text)
+                    _, checkpoint_calls, checkpoint_complete = _normalize_tool_calls(
+                        getattr(turn, "current_turn_tool_calls", turn.tool_calls)
+                    )
+                    validate_candidate(checkpoint, checkpoint_calls, checkpoint_complete)
+                except CandidateProvenanceError as exc:
+                    reason = str(exc)
+                except SolverOutputError:
+                    reason = "solver_output"
+                else:
+                    if checkpoint.candidate is not None:
+                        return None
+                    reason = checkpoint.status
+                if remaining_seconds is not None and remaining_seconds <= 1:
+                    return None
+                continuation_round += 1
+                self.state.event(
+                    run_id,
+                    "primary_solver_continued",
+                    {
+                        "challenge_id": challenge.id,
+                        "episode": episode,
+                        "lane": lane,
+                        "continuation_round": continuation_round,
+                        "reason": reason,
+                        "remaining_milliseconds": (
+                            None
+                            if remaining_seconds is None
+                            else max(0, int(remaining_seconds * 1000))
+                        ),
+                    },
+                )
+                return build_primary_continuation_prompt(
+                    reason=reason,
+                    continuation_round=continuation_round,
+                    remaining_seconds=remaining_seconds,
+                )
+
             async with asyncio.timeout(timeout_seconds + 5):
                 solve_call = self.runtime.solve(
                     workspace,
@@ -1377,6 +1456,7 @@ class Orchestrator:
                     timeout=timeout_seconds,
                     tool_registry=target_registry,
                     progress_callback=note_progress,
+                    continuation_callback=continue_primary if persistent_primary else None,
                 )
                 if timeout_seconds <= _NO_PROGRESS_SECONDS:
                     turn = await solve_call
@@ -1420,30 +1500,10 @@ class Orchestrator:
                     getattr(turn, "failure_class", None),
                 )
             finding = SolverFinding.from_message(turn.text)
-            if finding.candidate is not None:
-                if self._adaptive_control and not tool_evidence_complete:
-                    raise CandidateProvenanceError(
-                        "candidate tool evidence is incomplete or host-unattested"
-                    )
-                if not candidate_is_eligible(finding.candidate, challenge.description):
-                    raise CandidateProvenanceError(
-                        "candidate is a placeholder or challenge-description decoy"
-                    )
-                candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
-                candidate_observed = False
-                candidate_supplied = False
-                for call in tool_calls:
-                    candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
-                    if call.success is True and call.source_bound:
-                        candidate_observed |= candidate_fingerprint in call.candidate_sha256s
-                if not candidate_observed:
-                    raise CandidateProvenanceError(
-                        "candidate was not observed in a successful source-bound tool result"
-                    )
-                if candidate_supplied:
-                    raise CandidateProvenanceError(
-                        "candidate originated in model-supplied tool input"
-                    )
+            _, candidate_calls, candidate_evidence_complete = _normalize_tool_calls(
+                getattr(turn, "current_turn_tool_calls", turn.tool_calls)
+            )
+            validate_candidate(finding, candidate_calls, candidate_evidence_complete)
             terminal = "candidate" if finding.status == "candidate" else finding.status
             private_candidate = self._adaptive_control and finding.candidate is not None
             finish_attempt(
