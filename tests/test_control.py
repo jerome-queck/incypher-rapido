@@ -370,6 +370,45 @@ class HangingBoundaryRuntime(BoundaryRuntime):
         raise AssertionError("deadline must cancel the hanging turn")
 
 
+class ToolRetryMemoryRuntime(UnsolvedBoundaryRuntime):
+    def __init__(self) -> None:
+        super().__init__("unused")
+        self.prompts: list[dict[str, object]] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        self.prompts.append(document)
+        if document["episode"] != 0:
+            return await super().solve(workspace, prompt, **kwargs)
+        lane = document["lane"]
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": f"lane{lane}", "size": lane + 1},
+        )
+        return type(
+            "ToolRetryMemoryTurn",
+            (),
+            {
+                "status": "failed",
+                "failure_class": "sandbox_error",
+                "text": "",
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": False,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+
+
 def _config(tmp_path: Path) -> RuntimeConfig:
     (tmp_path / "auth").mkdir(exist_ok=True)
     base = RuntimeConfig.from_env(
@@ -535,9 +574,53 @@ def test_verifier_reobserves_without_candidate_in_prompt(tmp_path: Path) -> None
         encoded = json.dumps(document, sort_keys=True)
         assert document["prior_attempts"] == []
         assert document["prior_observations"] is None
+        assert document["same_run_memory"] == []
         assert all(value not in encoded for value in forbidden)
         assert kwargs["model"] == "gpt-daybreak-blue-latest"
         assert kwargs["reasoning_effort"] == "xhigh"
+
+
+def test_typed_memory_reuses_verified_cross_lane_host_facts_after_changed_route(
+    tmp_path: Path,
+) -> None:
+    runtime = ToolRetryMemoryRuntime()
+    config = replace(
+        _config(tmp_path),
+        episodes_per_challenge=2,
+        memory_arm="typed_challenge_v1",
+    )
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard([_challenge(1)]), runtime=runtime)
+    )
+
+    assert report.status == "completed"
+    successor_prompts = [prompt for prompt in runtime.prompts if prompt["episode"] == 1]
+    assert len(successor_prompts) == 2
+    for prompt in successor_prompts:
+        host_records = [
+            record for record in prompt["same_run_memory"] if record["kind"] == "host_observation"
+        ]
+        assert {record["source_lane"] for record in host_records} == {0, 1}
+        assert {record["facts"]["size"] for record in host_records} == {1, 2}
+        assert prompt["prior_attempts"] == []
+        assert prompt["prior_observations"] is None
+
+
+def test_wave_failure_fact_is_available_to_each_lane_without_false_lane_attribution(
+    tmp_path: Path,
+) -> None:
+    runtime = ToolRetryMemoryRuntime()
+    config = replace(_config(tmp_path), episodes_per_challenge=2)
+    asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard([_challenge(1)]), runtime=runtime)
+    )
+
+    successor_prompts = [prompt for prompt in runtime.prompts if prompt["episode"] == 1]
+    assert len(successor_prompts) == 2
+    for prompt in successor_prompts:
+        failures = [record for record in prompt["same_run_memory"] if record["kind"] == "failure"]
+        assert len(failures) == 1
+        assert failures[0]["source_lane"] == prompt["lane"]
 
 
 def test_incomplete_host_evidence_cannot_enter_private_vault(tmp_path: Path) -> None:

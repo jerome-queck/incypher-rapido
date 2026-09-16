@@ -49,6 +49,7 @@ _MANIFEST_DOCUMENT_KEYS = frozenset(
     }
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_DIGEST_VALUE = re.compile(r"[0-9a-fA-F]{32,128}")
 _TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,96}")
 _TOOL = re.compile(r"[a-z0-9_]{1,96}")
 _MAX_HOST_RESULT_BYTES = 128 * 1024
@@ -327,6 +328,38 @@ def _freeze_json(value: Any, *, depth: int = 0) -> Any:
     raise ValueError("host observation is not strict JSON data")
 
 
+_OMIT_MEMORY_VALUE = object()
+
+
+def _digest_free_memory_value(value: Any, *, depth: int = 0) -> Any:
+    """Remove digest-bearing fields and values from the public memory seam."""
+    if depth > 32:
+        raise ValueError("memory observation exceeds the nesting limit")
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for key, child in value.items():
+            lowered = key.lower()
+            if re.search(
+                r"(?:^|_)(?:sha(?:1|224|256|384|512)|hash(?:es)?|digest|checksum)(?:_|$)",
+                lowered,
+            ):
+                continue
+            projected = _digest_free_memory_value(child, depth=depth + 1)
+            if projected is not _OMIT_MEMORY_VALUE:
+                cleaned[key] = projected
+        return cleaned
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        cleaned_items = []
+        for child in value:
+            projected = _digest_free_memory_value(child, depth=depth + 1)
+            if projected is not _OMIT_MEMORY_VALUE:
+                cleaned_items.append(projected)
+        return cleaned_items
+    if isinstance(value, str) and _DIGEST_VALUE.fullmatch(value):
+        return _OMIT_MEMORY_VALUE
+    return value
+
+
 def _canonical_value(value: Any) -> Any:
     if value is None or type(value) in {bool, int, str}:
         return value
@@ -472,6 +505,33 @@ class EvidenceItem:
         if not self.carry_redact_digests:
             public["digest"] = self.digest
         return public
+
+
+@dataclass(frozen=True)
+class MemoryEvidenceObservation:
+    """Digest-free typed host observation for the memory projector."""
+
+    ordinal: int
+    tool: str
+    success: bool | None
+    source_bound: bool
+    facts: Mapping[str, CanonicalValue]
+
+
+@dataclass(frozen=True)
+class MemoryEvidenceSource:
+    """Narrow verified evidence view; candidate identity stays a private boolean join."""
+
+    run_id: str
+    attempt_id: str
+    challenge_id: int
+    episode: int
+    lane: int
+    complete: bool
+    gap: str | None
+    observations: tuple[MemoryEvidenceObservation, ...]
+    candidate_observed: bool
+    candidate_supplied: bool
 
 
 @dataclass(frozen=True)
@@ -1754,6 +1814,53 @@ class RunEvidence:
             candidate_sensitive=document["candidate_sensitive"],
         )
 
+    def memory_source(
+        self,
+        attempt_id: str,
+        *,
+        candidate_sha256: str | None = None,
+    ) -> MemoryEvidenceSource:
+        """Load a verified digest-free view for typed same-run memory."""
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("attempt_id must be nonempty")
+        if candidate_sha256 is not None and _SHA256.fullmatch(candidate_sha256) is None:
+            raise ValueError("candidate_sha256 must be lowercase SHA-256")
+        self._verify_run()
+        manifest = self._load_manifest(attempt_id)
+        observations: list[MemoryEvidenceObservation] = []
+        candidate_observed = False
+        candidate_supplied = False
+        for item in manifest.items:
+            payload = json.loads(item.payload_json)
+            if candidate_sha256 is not None:
+                candidate_supplied |= candidate_sha256 in payload["supplied_candidate_sha256s"]
+                candidate_observed |= (
+                    payload["success"] is True
+                    and payload["source_bound"] is True
+                    and candidate_sha256 in payload["candidate_sha256s"]
+                )
+            observations.append(
+                MemoryEvidenceObservation(
+                    ordinal=item.ordinal,
+                    tool=item.tool,
+                    success=payload["success"],
+                    source_bound=payload["source_bound"],
+                    facts=_freeze_json(_digest_free_memory_value(payload["facts"])),
+                )
+            )
+        return MemoryEvidenceSource(
+            run_id=self.run_id,
+            attempt_id=manifest.attempt_id,
+            challenge_id=manifest.challenge_id,
+            episode=manifest.episode,
+            lane=manifest.lane,
+            complete=manifest.complete,
+            gap=manifest.gap,
+            observations=tuple(observations),
+            candidate_observed=candidate_observed,
+            candidate_supplied=candidate_supplied,
+        )
+
     @staticmethod
     def _bundle_size(bundle: EvidenceBundle) -> tuple[EvidenceBundle, int]:
         current = bundle
@@ -1864,6 +1971,8 @@ __all__ = [
     "EvidenceManifest",
     "EvidenceTamperError",
     "HostObservation",
+    "MemoryEvidenceObservation",
+    "MemoryEvidenceSource",
     "RunEvidence",
     "ensure_evidence_schema",
     "project_tool_observation",

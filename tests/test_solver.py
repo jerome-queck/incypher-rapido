@@ -1,9 +1,13 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from rapido.board import Challenge
 from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
+from rapido.memory import HostObservation as MemoryHostObservation
+from rapido.memory import MemoryTarget, project_memory
+from rapido.routing import baseline_route
 from rapido.solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_AGENT_MESSAGE_BYTES,
@@ -217,6 +221,7 @@ def test_turn_prompt_carries_verified_host_observations_without_candidate_proven
             challenge,
             [],
             0,
+            run_id="run-a",
             episode=1,
             prior_observations=evidence.carry(7, 0, 1),
         )
@@ -408,6 +413,71 @@ def test_turn_prompt_omits_old_carry_that_exceeds_aggregate_byte_budget() -> Non
     assert len(encoded.encode("utf-8")) <= MAX_AGENT_MESSAGE_BYTES
     assert 0 < prompt["prior_attempts_omitted_for_budget"] < MAX_PRIOR_ATTEMPTS
     assert len(prompt["prior_attempts"]) + prompt["prior_attempts_omitted_for_budget"] == 4
+
+
+def test_turn_prompt_accepts_typed_memory_but_fences_verifier_memory() -> None:
+    challenge = Challenge(
+        7, "Name", "crypto", "standard", "Do thing", 100, (), False, 0, 0, None, None
+    )
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=60)
+    record = MemoryHostObservation(
+        record_id="host-0",
+        run_id="run-a",
+        challenge_id=7,
+        source_episode=0,
+        source_lane=1,
+        source_attempt_id="attempt-0",
+        complete=True,
+        gap=None,
+        tool="inspect_file",
+        success=True,
+        source_bound=True,
+        facts={"format": "text", "size": 7},
+    )
+    projection = project_memory(
+        (record,),
+        MemoryTarget("run-a", 7, 1, 0, "specialist"),
+    )
+    prompt = json.loads(
+        build_turn_prompt(
+            challenge,
+            [],
+            0,
+            run_id="run-a",
+            episode=1,
+            control_route=route,
+            same_run_memory=projection,
+        )
+    )
+    assert [item["record_id"] for item in prompt["same_run_memory"]] == ["host-0"]
+
+    with pytest.raises(ValueError, match="prompt target"):
+        build_turn_prompt(
+            challenge,
+            [],
+            0,
+            run_id="run-b",
+            episode=1,
+            control_route=route,
+            same_run_memory=projection,
+        )
+
+    verifier = replace(
+        route,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    with pytest.raises(ValueError, match="prompt target"):
+        build_turn_prompt(
+            challenge,
+            [],
+            0,
+            episode=1,
+            control_route=verifier,
+            same_run_memory=projection,
+        )
 
 
 def test_developer_instructions_truthfully_bound_authorized_ctf_scope() -> None:

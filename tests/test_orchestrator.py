@@ -11,8 +11,9 @@ import pytest
 
 from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
-from rapido.evidence import HostObservation
+from rapido.evidence import EvidenceError, HostObservation
 from rapido.orchestrator import Orchestrator
+from rapido.routing import baseline_route
 from rapido.state import StateStore
 
 
@@ -956,6 +957,32 @@ def test_oversized_prior_attempt_is_compacted_before_successor(tmp_path: Path) -
         "SELECT data_json FROM events WHERE kind='attempt_carry_sanitized'"
     ).fetchone()
     assert json.loads(event["data_json"])["compacted_records"] == 1
+    store.close()
+
+
+def test_adaptive_memory_is_verified_before_attempt_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    store.start_run("run-1", cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+    orchestrator = AdaptiveOrchestrator(cfg, FakeBoard([challenge(1)]), store, FakeRuntime({}))
+
+    def reject_memory(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise EvidenceError("prior memory failed verification")
+
+    monkeypatch.setattr(orchestrator, "_typed_same_run_memory", reject_memory)
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    with pytest.raises(EvidenceError, match="prior memory failed verification"):
+        asyncio.run(orchestrator._lane("run-1", challenge(1), 1, 0, workspace, [], 10, route=route))
+    assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
     store.close()
 
 

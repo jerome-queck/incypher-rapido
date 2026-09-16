@@ -14,6 +14,7 @@ def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     assert config.active_challenges == 2
     assert config.episodes_per_challenge == 2
     assert config.dynamic_concurrency == 1
+    assert config.memory_arm == "lane_local_v1"
     assert config.attempts_per_challenge == 2
     assert config.run_seconds == 19_800
     assert config.max_artifact_bytes == 64 * 1024 * 1024
@@ -28,6 +29,7 @@ def test_defaults_are_a_real_two_lane_practice_profile() -> None:
     assert public["active_challenges"] == 2
     assert public["episodes_per_challenge"] == 2
     assert public["dynamic_concurrency"] == 1
+    assert public["memory_arm"] == "lane_local_v1"
     assert public["max_challenge_workspace_bytes"] == config.max_challenge_workspace_bytes
     assert public["max_lane_workspace_bytes"] == config.max_lane_workspace_bytes
 
@@ -38,6 +40,12 @@ def test_secrets_are_never_in_public_record() -> None:
     assert "token-value" not in encoded
     assert "team-value" not in encoded
     assert config.public_record()["board_token_present"] is True
+
+
+def test_registered_typed_memory_arm_is_explicit_and_public() -> None:
+    config = RuntimeConfig.from_env({"RAPIDO_MEMORY_ARM": "typed_challenge_v1"})
+    assert config.memory_arm == "typed_challenge_v1"
+    assert config.public_record()["memory_arm"] == "typed_challenge_v1"
 
 
 @pytest.mark.parametrize(
@@ -56,6 +64,7 @@ def test_secrets_are_never_in_public_record() -> None:
         ("RAPIDO_DYNAMIC_CONCURRENCY", "0"),
         ("RAPIDO_DYNAMIC_CONCURRENCY", "2"),
         ("RAPIDO_REASONING_EFFORT", "extreme"),
+        ("RAPIDO_MEMORY_ARM", "shared_prose"),
         ("RAPIDO_SUBMIT_CANDIDATES", "yes"),
         ("RAPIDO_STATE_PATH", "state.sqlite3"),
         ("RAPIDO_MAX_CHALLENGE_BYTES", "1024"),

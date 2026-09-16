@@ -216,10 +216,10 @@ runs always use Daybreak/xhigh; Luna is restricted to narrow non-live fixtures/t
 M1 is frozen before implementation or result generation in
 [`issue-19-memory-comparison-protocol-v1.json`](issue-19-memory-comparison-protocol-v1.json), SHA-256
 `4605399b8ff84acef4ecbcd30bd1856a86b8e3792d94f03fd525db4d70cd8a6e`. It compares exactly two
-production projections: `lane_local_v1`, the current maximum-four same-lane attempt carry plus
-same-lane evidence, and `typed_challenge_v1`, bounded eligible earlier episodes from the same run
-and challenge across lanes. The latter composes existing SQLite records; it does not add a database,
-RAM cache, retained workspace, agent mesh, or candidate-derived prompt field.
+production projections: `lane_local_v1`, typed earlier-episode analysis and host/controller facts
+restricted to the target lane, and `typed_challenge_v1`, bounded eligible earlier episodes from the
+same run and challenge across lanes. The latter composes existing SQLite records; it does not add a
+database, RAM cache, retained workspace, agent mesh, or candidate-derived prompt field.
 
 The typed projection has six closed record kinds: untrusted analysis claim, host observation,
 controller tactic outcome, typed failure, private candidate context, and verification. Arbitrary
@@ -236,6 +236,13 @@ a 64-KiB projection budget, and the existing 128-KiB total prompt cap. The resul
 clean merged source using the exact registered command. No Board, native model, network, container,
 submission, instance, or target effect is permitted.
 
+Before any accepted result, command-only addendum
+[`issue-19-memory-comparison-command-addendum-v1.json`](issue-19-memory-comparison-command-addendum-v1.json),
+SHA-256 `756b1e5f0d0b29e1db88db516b9787e6cf70b85d96c99f8bac01786e919da740`, replaced
+the unavailable bare `python` executable with `.venv/bin/python`. It changes no fixture, metric,
+selector, safety gate, or acceptance rule. The harness requires the exact protocol path, result
+path, interpreter, addendum hash, and command.
+
 `typed_challenge_v1` is eligible only with exact replay after reopen; deterministic source ordering;
 100% proposal-to-complete-source-context linkage; strictly more useful other-lane records than
 `lane_local_v1`; no increase in repeated tactic/observation count; and zero stale, cross-run,
@@ -244,6 +251,17 @@ violation. A tie keeps `lane_local_v1`. Selection remains provisional until Dayb
 calibration compares only the memory arm at fixed P4 capacity and preserves oracle correctness while
 improving either conversion or duplicate/source-bound work. Only then does E4 vary P2/P4/P6/P8.
 M1 cannot lower E4 or final acceptance.
+
+The local M1 implementation now connects the durable attempt/evidence/vault rows to that exact
+projection and the production prompt builder behind explicit `RAPIDO_MEMORY_ARM` selection. SQL
+removes cross-lane model prose before projection; evidence exposes a digest-free typed memory view;
+private proposal/verification rows are bounded by the target episode; and candidate completeness
+requires a successful source-bound, non-reflected observation. The Verifier projection is empty even
+while the controller retains private verification state. A changed-route integration fixture proves
+both earlier lanes' distinct host facts reach each successor Specialist under
+`typed_challenge_v1`. Post-implementation local validation is 749 passed, one host skip. This is
+implementation evidence only: the registered deterministic comparison, independent release review,
+merge/CI, and fixed-P4 Daybreak native confirmation remain pending.
 
 ### E0 red-baseline result
 
@@ -544,7 +562,7 @@ comparison green while independent review is pending.
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and clean-source E3 result merged/generated; live-controller promotion pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; full four-role/recovery proof pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: typed same-run projection and changed-route cross-lane reuse implemented locally; deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; M1 comparison/review and full four-role/recovery proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | pending |
@@ -604,6 +622,10 @@ comparison green while independent review is pending.
 | E3 implementation independent review | `gpt-daybreak-blue-latest` / `xhigh` | complete after holds for fact-link replay, raw-row/crash evidence, and native/thread/process monitor bypasses; final review found no P0-P3 blockers, no fallback |
 | E3 CI memory-lifecycle fix review | `gpt-daybreak-blue-latest` / `xhigh` | complete; cached socket/process aliases blocked, global/profile restoration proven, and 8-process A/B showed old global hook worsened a separate pre-existing heap-threshold flake from 3/8 to 7/8 failures; rerun CI green, no fallback |
 | E3 clean-source result review | `gpt-daybreak-blue-latest` / `xhigh` | complete; 2,160 rows, source/protocol hashes, operation totals, raw selector, replay, privacy, and zero-effect/leak gates independently verified; no blockers, no fallback |
+| Initial M1 memory-core lane | requested `gpt-daybreak-blue-latest` / `xhigh`; worker reported `gpt-6-astra` / `xhigh` | rejected model-selection failure; draft treated as untrusted and sent through a fresh exact Daybreak implementation lane, no fallback |
+| M1 memory-core implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; frozen fixture, privacy, private-context, dual-Python import, and static checks green, no fallback |
+| M1 state/evidence independent review | `gpt-daybreak-blue-latest` / `xhigh` | release held for future-episode verification influence, raw manifest digest access, cross-lane prose access, and broad private rows; all corrected before integration, clean re-review pending, no fallback |
+| M1 narrow test lane | requested `gpt-5.6-luna` / `xhigh` | rejected as model-valid delegated evidence because effective selection was unavailable; tests retained only after main-agent inspection and full-suite execution, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were

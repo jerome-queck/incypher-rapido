@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .routing import (
+    FAILURE_KINDS,
     FAILURE_ORIGINS,
     KNOWN_FAILURE_CLASSES,
     RouteDecision,
@@ -2109,6 +2110,262 @@ class StateStore:
             }
             for row in rows
         ]
+
+    def same_run_memory_sources(
+        self,
+        run_id: str,
+        challenge_id: int,
+        *,
+        target_lane: int,
+        before_episode: int,
+    ) -> list[dict[str, Any]]:
+        """Return terminal typed-memory inputs with cross-lane model prose removed."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be nonempty")
+        if type(challenge_id) is not int or challenge_id <= 0:
+            raise ValueError("challenge_id must be positive")
+        if type(target_lane) is not int or target_lane < 0:
+            raise ValueError("target_lane must be nonnegative")
+        if type(before_episode) is not int or before_episode < 0:
+            raise ValueError("before_episode must be nonnegative")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT attempt.id AS source_attempt_id, attempt.episode AS source_episode,
+                       attempt.lane AS source_lane, attempt.status,
+                       CASE WHEN attempt.lane=? THEN attempt.summary ELSE NULL END AS summary,
+                       CASE WHEN attempt.lane=? THEN attempt.evidence_json ELSE NULL END
+                         AS evidence_json,
+                       CASE WHEN attempt.lane=? THEN attempt.next_steps_json ELSE NULL END
+                         AS next_steps_json,
+                       attempt.tool_count, job.role, job.route_fingerprint,
+                       route.route_json
+                FROM attempts AS attempt
+                LEFT JOIN control_jobs AS job
+                  ON job.run_id=attempt.run_id
+                 AND job.challenge_id=attempt.challenge_id
+                 AND job.episode=attempt.episode
+                 AND job.lane=attempt.lane
+                LEFT JOIN control_routes AS route
+                  ON route.run_id=job.run_id
+                 AND route.challenge_id=job.challenge_id
+                 AND route.route_fingerprint=job.route_fingerprint
+                WHERE attempt.run_id=? AND attempt.challenge_id=?
+                  AND attempt.episode<? AND attempt.status!='running'
+                ORDER BY attempt.episode DESC, attempt.lane, attempt.id, job.role
+                """,
+                (target_lane, target_lane, target_lane, run_id, challenge_id, before_episode),
+            ).fetchall()
+        identities = [str(row["source_attempt_id"]) for row in rows]
+        if len(identities) != len(set(identities)):
+            raise ValueError("terminal attempt maps to multiple control jobs")
+        sources: list[dict[str, Any]] = []
+        for row in rows:
+            route_spec = None
+            if row["route_json"] is not None:
+                try:
+                    route_spec = RouteSpec.from_dict(json.loads(str(row["route_json"])))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("terminal attempt route is invalid") from exc
+                if row["role"] is None or route_spec.role != str(row["role"]):
+                    raise ValueError("terminal attempt route role changed")
+                if route_spec.fingerprint != str(row["route_fingerprint"]):
+                    raise ValueError("terminal attempt route fingerprint changed")
+            sources.append(
+                {
+                    "source_attempt_id": str(row["source_attempt_id"]),
+                    "source_episode": int(row["source_episode"]),
+                    "source_lane": int(row["source_lane"]),
+                    "status": str(row["status"]),
+                    "summary": None if row["summary"] is None else str(row["summary"]),
+                    "evidence": self._decode_attempt_evidence(row["evidence_json"]),
+                    "next_steps": self._decode_attempt_evidence(row["next_steps_json"]),
+                    "tool_count": int(row["tool_count"]),
+                    "role": None if row["role"] is None else str(row["role"]),
+                    "tactic": None if route_spec is None else route_spec.tactic,
+                    "tool_profile": None if route_spec is None else route_spec.tool_policy,
+                }
+            )
+        return sources
+
+    def private_candidate_context_sources(
+        self,
+        run_id: str,
+        challenge_id: int,
+        *,
+        before_episode: int,
+    ) -> list[dict[str, Any]]:
+        """Return private proposal linkage inputs; never use these rows in a prompt or view."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be nonempty")
+        if type(challenge_id) is not int or challenge_id <= 0:
+            raise ValueError("challenge_id must be positive")
+        if type(before_episode) is not int or before_episode < 0:
+            raise ValueError("before_episode must be nonnegative")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT proposal.source_attempt_id, proposal.episode, proposal.lane,
+                       proposal.role, proposal.recipe_kind, proposal.candidate,
+                       route.route_json, job.route_fingerprint,
+                       verifier.source_attempt_id AS verifier_attempt_id,
+                       verifier.episode AS verifier_episode,
+                       verifier.lane AS verifier_lane,
+                       verifier.candidate AS verifier_candidate,
+                       verifier_route.route_json AS verifier_route_json,
+                       verifier_job.route_fingerprint AS verifier_route_fingerprint,
+                       verification.recipe_kind AS verification_recipe_kind
+                FROM candidate_proposals AS proposal
+                LEFT JOIN control_jobs AS job
+                  ON job.run_id=proposal.run_id
+                 AND job.challenge_id=proposal.challenge_id
+                 AND job.episode=proposal.episode
+                 AND job.lane=proposal.lane
+                 AND job.role=proposal.role
+                LEFT JOIN control_routes AS route
+                  ON route.run_id=job.run_id
+                 AND route.challenge_id=job.challenge_id
+                 AND route.route_fingerprint=job.route_fingerprint
+                LEFT JOIN candidate_verifications AS verification
+                  ON verification.run_id=proposal.run_id
+                 AND verification.challenge_id=proposal.challenge_id
+                 AND verification.producer_attempt_id=proposal.source_attempt_id
+                LEFT JOIN candidate_proposals AS verifier
+                  ON verifier.source_attempt_id=verification.verifier_attempt_id
+                 AND verifier.run_id=proposal.run_id
+                 AND verifier.challenge_id=proposal.challenge_id
+                 AND verifier.episode<?
+                LEFT JOIN control_jobs AS verifier_job
+                  ON verifier_job.run_id=verifier.run_id
+                 AND verifier_job.challenge_id=verifier.challenge_id
+                 AND verifier_job.episode=verifier.episode
+                 AND verifier_job.lane=verifier.lane
+                 AND verifier_job.role=verifier.role
+                LEFT JOIN control_routes AS verifier_route
+                  ON verifier_route.run_id=verifier_job.run_id
+                 AND verifier_route.challenge_id=verifier_job.challenge_id
+                 AND verifier_route.route_fingerprint=verifier_job.route_fingerprint
+                WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND proposal.role IN ('specialist', 'recovery')
+                  AND proposal.episode<?
+                ORDER BY proposal.episode, proposal.lane, proposal.source_attempt_id
+                """,
+                (before_episode, run_id, challenge_id, before_episode),
+            ).fetchall()
+        sources: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                route_spec = RouteSpec.from_dict(json.loads(str(row["route_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("private candidate route is invalid") from exc
+            if route_spec.role != str(row["role"]):
+                raise ValueError("private candidate route role changed")
+            if route_spec.fingerprint != str(row["route_fingerprint"]):
+                raise ValueError("private candidate route fingerprint changed")
+            verifier_route_spec = None
+            if row["verifier_attempt_id"] is not None:
+                try:
+                    verifier_route_spec = RouteSpec.from_dict(
+                        json.loads(str(row["verifier_route_json"]))
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("private verifier route is invalid") from exc
+                if verifier_route_spec.role != "verifier":
+                    raise ValueError("private verifier route role changed")
+                if verifier_route_spec.fingerprint != str(row["verifier_route_fingerprint"]):
+                    raise ValueError("private verifier route fingerprint changed")
+            sources.append(
+                {
+                    "source_attempt_id": str(row["source_attempt_id"]),
+                    "episode": int(row["episode"]),
+                    "lane": int(row["lane"]),
+                    "role": str(row["role"]),
+                    "recipe_kind": str(row["recipe_kind"]),
+                    "candidate": bytes(row["candidate"]),
+                    "route_role": route_spec.role,
+                    "route_verification_recipe": route_spec.verification_recipe,
+                    "verifier_attempt_id": (
+                        None
+                        if row["verifier_attempt_id"] is None
+                        else str(row["verifier_attempt_id"])
+                    ),
+                    "verifier_episode": (
+                        None if row["verifier_episode"] is None else int(row["verifier_episode"])
+                    ),
+                    "verifier_lane": (
+                        None if row["verifier_lane"] is None else int(row["verifier_lane"])
+                    ),
+                    "verifier_candidate": (
+                        None
+                        if row["verifier_candidate"] is None
+                        else bytes(row["verifier_candidate"])
+                    ),
+                    "verification_recipe_kind": (
+                        None
+                        if row["verification_recipe_kind"] is None
+                        else str(row["verification_recipe_kind"])
+                    ),
+                    "verifier_route_role": (
+                        None if verifier_route_spec is None else verifier_route_spec.role
+                    ),
+                    "verifier_route_verification_recipe": (
+                        None
+                        if verifier_route_spec is None
+                        else verifier_route_spec.verification_recipe
+                    ),
+                }
+            )
+        return sources
+
+    def same_run_memory_failures(
+        self,
+        run_id: str,
+        challenge_id: int,
+        *,
+        before_episode: int,
+    ) -> list[dict[str, Any]]:
+        """Return replay-stable controller-classified failures from earlier episodes."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be nonempty")
+        if type(challenge_id) is not int or challenge_id <= 0:
+            raise ValueError("challenge_id must be positive")
+        if type(before_episode) is not int or before_episode < 0:
+            raise ValueError("before_episode must be nonnegative")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT decision.decision_sequence, decision.source_episode,
+                       decision.failure_kind, decision.failure_subreason,
+                       job.lane AS source_lane, job.job_id AS source_attempt_id
+                FROM control_route_decisions AS decision
+                JOIN control_jobs AS job
+                  ON job.run_id=decision.run_id
+                 AND job.challenge_id=decision.challenge_id
+                 AND job.episode=decision.source_episode
+                WHERE decision.run_id=? AND decision.challenge_id=?
+                  AND decision.source_episode<?
+                ORDER BY decision.source_episode DESC, job.lane, decision.decision_sequence
+                """,
+                (run_id, challenge_id, before_episode),
+            ).fetchall()
+        failures: list[dict[str, Any]] = []
+        for row in rows:
+            kind = str(row["failure_kind"])
+            if kind not in FAILURE_KINDS:
+                raise ValueError("durable memory failure kind is invalid")
+            source_episode = int(row["source_episode"])
+            source_lane = int(row["source_lane"])
+            failures.append(
+                {
+                    "record_id": f"failure:{int(row['decision_sequence'])}:lane:{source_lane}",
+                    "source_episode": source_episode,
+                    "source_lane": source_lane,
+                    "source_attempt_id": str(row["source_attempt_id"]),
+                    "failure_kind": kind,
+                    "subreason": str(row["failure_subreason"]),
+                }
+            )
+        return failures
 
     @staticmethod
     def _candidate_fingerprint(candidate: str) -> str:

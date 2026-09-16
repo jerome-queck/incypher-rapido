@@ -145,6 +145,7 @@ class RuntimeConfig:
     codex_home: Path
     codex_binary: str
     profile: str
+    memory_arm: str
     challenge_ids: tuple[int, ...]
     wrong_submission_ceiling: int
     submit_candidates: bool
@@ -175,6 +176,10 @@ class RuntimeConfig:
         profile = _text(values, "RAPIDO_PROFILE", "practice")
         if profile not in {"economy", "practice", "competition"}:
             raise ConfigError("RAPIDO_PROFILE must be economy, practice, or competition")
+
+        memory_arm = _text(values, "RAPIDO_MEMORY_ARM", "lane_local_v1")
+        if memory_arm not in {"lane_local_v1", "typed_challenge_v1"}:
+            raise ConfigError("RAPIDO_MEMORY_ARM must be lane_local_v1 or typed_challenge_v1")
 
         active_challenges = _integer(values, "RAPIDO_ACTIVE_CHALLENGES", 2, minimum=1, maximum=4)
         episodes_per_challenge = _integer(
@@ -249,6 +254,7 @@ class RuntimeConfig:
             codex_home=_path(values, "RAPIDO_CODEX_HOME", "/auth/codex"),
             codex_binary=_text(values, "RAPIDO_CODEX_BINARY", "codex"),
             profile=profile,
+            memory_arm=memory_arm,
             challenge_ids=_challenge_ids(values),
             wrong_submission_ceiling=_integer(
                 values, "RAPIDO_WRONG_SUBMISSION_CEILING", 2, minimum=0, maximum=10
@@ -279,6 +285,7 @@ class RuntimeConfig:
             "work_root": str(self.work_root),
             "codex_home": str(self.codex_home),
             "profile": self.profile,
+            "memory_arm": self.memory_arm,
             "challenge_ids": list(self.challenge_ids),
             "wrong_submission_ceiling": self.wrong_submission_ceiling,
             "submit_candidates": self.submit_candidates,

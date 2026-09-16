@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "protocol_sha256": "4605399b8ff84acef4ecbcd30bd1856a86b8e3792d94f03fd525db4d70cd8a6e",
+  "scope": "registered_command_only",
+  "reason": "The frozen command's bare python executable is unavailable in the measurement shell; the repository virtual-environment interpreter is explicit and available.",
+  "acceptance_changes": false,
+  "supersedes_registered_command": "python scripts/issue19_memory_comparison.py --protocol notes/research/issue-19-memory-comparison-protocol-v1.json --output notes/research/issue-19-memory-comparison-v1.json",
+  "registered_command": ".venv/bin/python scripts/issue19_memory_comparison.py --protocol notes/research/issue-19-memory-comparison-protocol-v1.json --output notes/research/issue-19-memory-comparison-v1.json"
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 from pathlib import Path
@@ -113,6 +114,51 @@ def test_canonical_objects_dedupe_and_survive_workspace_deletion(tmp_path: Path)
     assert first.digest in rendered
     assert str(workspace) not in rendered
     reopened_state.close()
+
+
+def test_memory_source_is_verified_narrow_and_candidate_digest_free(tmp_path: Path) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    _attempt(state, "a0")
+    candidate_digest = hashlib.sha256(b"INCYPHER{private_memory}").hexdigest()
+    evidence = RunEvidence.open(state, "run-a")
+    evidence.commit(
+        "a0",
+        EvidenceBatch(
+            (
+                HostObservation(
+                    tool="inspect_file",
+                    success=True,
+                    source_bound=True,
+                    facts={"format": "text", "size": 7},
+                    candidate_sha256s=(candidate_digest,),
+                ),
+                project_tool_observation(
+                    "http_request",
+                    success=True,
+                    source_bound=True,
+                    result={
+                        "body": "INCYPHER{private_memory}",
+                        "nested": {"source_sha256": candidate_digest},
+                        "status": 200,
+                    },
+                    candidate_sha256s=(candidate_digest,),
+                    candidate_sensitive=True,
+                ),
+            )
+        ),
+    )
+
+    source = evidence.memory_source("a0", candidate_sha256=candidate_digest)
+    assert source.candidate_observed is True
+    assert source.candidate_supplied is False
+    assert source.complete is True
+    assert source.observations[0].facts == {"format": "text", "size": 7}
+    rendered = repr(source)
+    assert "digest" not in rendered.lower()
+    assert re.search(r"[0-9a-fA-F]{64}", rendered) is None
+    assert source.observations[1].facts["payload_shape"] == {"kind": "text"}
+    assert candidate_digest not in repr(source)
+    state.close()
 
 
 def test_rows_are_immutable_and_verified_before_carry(tmp_path: Path) -> None:

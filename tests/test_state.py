@@ -1,9 +1,11 @@
+import json
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -592,6 +594,103 @@ def test_prior_attempts_are_same_run_challenge_and_lane_local(tmp_path: Path) ->
             "failure_class": None,
         }
     ]
+    store.close()
+
+
+def test_typed_memory_sources_remove_cross_lane_model_prose(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "memory-run"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 2, route)
+    store.start_control_wave(run_id, 1, 0)
+    for lane in (0, 1):
+        attempt_id = f"attempt-{lane}"
+        store.start_attempt(attempt_id, run_id, 1, 0, lane, route.model, route.effort)
+        store.finish_attempt(
+            attempt_id,
+            "unsolved",
+            summary=f"private-prose-{lane}",
+            evidence=(f"evidence-{lane}",),
+            next_steps=(f"next-{lane}",),
+        )
+
+    rows = store.same_run_memory_sources(
+        run_id,
+        1,
+        target_lane=0,
+        before_episode=1,
+    )
+    assert rows[0]["summary"] == "private-prose-0"
+    assert rows[0]["evidence"] == ["evidence-0"]
+    assert rows[1]["summary"] is None
+    assert rows[1]["evidence"] == []
+    assert rows[1]["next_steps"] == []
+    assert rows[1]["tactic"] == "baseline"
+
+    tampered = replace(route, tactic="tampered_tactic")
+    store._connection.execute(
+        "UPDATE control_routes SET route_json=? WHERE run_id=? AND challenge_id=?",
+        (json.dumps(tampered.as_dict(), sort_keys=True, separators=(",", ":")), run_id, 1),
+    )
+    with pytest.raises(ValueError, match="route fingerprint changed"):
+        store.same_run_memory_sources(run_id, 1, target_lane=0, before_episode=1)
+    store.close()
+
+
+def test_private_memory_verification_is_visible_only_after_its_episode(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "private-memory-run"
+    candidate = "INCYPHER{typed_memory_private}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+
+    before_verifier = store.private_candidate_context_sources(run_id, 1, before_episode=1)
+    after_verifier = store.private_candidate_context_sources(run_id, 1, before_episode=2)
+    assert len(before_verifier) == len(after_verifier) == 1
+    assert before_verifier[0]["verifier_attempt_id"] is None
+    assert after_verifier[0]["verifier_attempt_id"] == "verifier"
+    assert after_verifier[0]["verifier_route_role"] == "verifier"
+    assert after_verifier[0]["verifier_route_verification_recipe"] == (
+        "fresh_source_reobservation_v1"
+    )
+
+    tampered_verifier = replace(verifier, tactic="tampered_verifier_tactic")
+    store._connection.execute(
+        "UPDATE control_routes SET route_json=? WHERE run_id=? AND challenge_id=? "
+        "AND route_fingerprint=?",
+        (
+            json.dumps(tampered_verifier.as_dict(), sort_keys=True, separators=(",", ":")),
+            run_id,
+            1,
+            verifier.fingerprint,
+        ),
+    )
+    with pytest.raises(ValueError, match="verifier route fingerprint changed"):
+        store.private_candidate_context_sources(run_id, 1, before_episode=2)
     store.close()
 
 

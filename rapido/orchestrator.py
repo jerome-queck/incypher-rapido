@@ -27,6 +27,19 @@ from .evidence import (
     project_tool_observation,
     seal_unavailable_attempt_evidence,
 )
+from .memory import (
+    AnalysisClaim,
+    CandidateContext,
+    CandidateEvidence,
+    CandidateMemoryAggregate,
+    CandidateVerification,
+    FailureRecord,
+    MemoryProjection,
+    MemoryTarget,
+    TacticOutcome,
+    project_memory,
+)
+from .memory import HostObservation as MemoryHostObservation
 from .routing import RouteSpec, baseline_route
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
@@ -878,6 +891,204 @@ class Orchestrator:
         ):
             raise OSError("work root must be runtime/root owned, private, and writable")
 
+    def _typed_same_run_memory(
+        self,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        lane: int,
+        route: RouteSpec,
+        run_evidence: RunEvidence,
+    ) -> tuple[MemoryProjection, CandidateMemoryAggregate]:
+        """Project verified earlier-episode facts; keep candidate identity controller-private."""
+        target = MemoryTarget(run_id, challenge_id, episode, lane, route.role)
+        contexts: list[CandidateContext] = []
+        for source in self.state.private_candidate_context_sources(
+            run_id,
+            challenge_id,
+            before_episode=episode,
+        ):
+            try:
+                candidate = source["candidate"].decode("utf-8")
+            except (AttributeError, UnicodeDecodeError) as exc:
+                raise EvidenceError("private candidate encoding changed") from exc
+            if (
+                source["route_role"] != source["role"]
+                or source["recipe_kind"] != "source_bound_tool_observation_v1"
+            ):
+                raise EvidenceError("private producer route or recipe changed")
+            candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+            producer_source = run_evidence.memory_source(
+                source["source_attempt_id"],
+                candidate_sha256=candidate_sha256,
+            )
+            producer_evidence = CandidateEvidence(
+                run_id=producer_source.run_id,
+                challenge_id=producer_source.challenge_id,
+                source_episode=producer_source.episode,
+                source_lane=producer_source.lane,
+                source_attempt_id=producer_source.attempt_id,
+                role=source["route_role"],
+                recipe_kind=source["recipe_kind"],
+                manifest_complete=producer_source.complete,
+                manifest_gap=producer_source.gap,
+                candidate_observed=producer_source.candidate_observed,
+                candidate_supplied=producer_source.candidate_supplied,
+            )
+            verification = None
+            verifier_attempt_id = source["verifier_attempt_id"]
+            if verifier_attempt_id is not None:
+                try:
+                    verifier_candidate = source["verifier_candidate"].decode("utf-8")
+                except (AttributeError, UnicodeDecodeError) as exc:
+                    raise EvidenceError("private verifier candidate encoding changed") from exc
+                if (
+                    verifier_candidate != candidate
+                    or source["verifier_route_role"] != "verifier"
+                    or source["verification_recipe_kind"] != "fresh_source_reobservation_v1"
+                    or source["verifier_route_verification_recipe"]
+                    != "fresh_source_reobservation_v1"
+                ):
+                    raise EvidenceError("private verifier linkage changed")
+                verifier_source = run_evidence.memory_source(
+                    verifier_attempt_id,
+                    candidate_sha256=candidate_sha256,
+                )
+                verifier_evidence = CandidateEvidence(
+                    run_id=verifier_source.run_id,
+                    challenge_id=verifier_source.challenge_id,
+                    source_episode=verifier_source.episode,
+                    source_lane=verifier_source.lane,
+                    source_attempt_id=verifier_source.attempt_id,
+                    role="verifier",
+                    recipe_kind=source["verification_recipe_kind"],
+                    manifest_complete=verifier_source.complete,
+                    manifest_gap=verifier_source.gap,
+                    candidate_observed=verifier_source.candidate_observed,
+                    candidate_supplied=verifier_source.candidate_supplied,
+                )
+                verification = CandidateVerification(
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    producer_attempt_id=source["source_attempt_id"],
+                    verifier_attempt_id=verifier_attempt_id,
+                    recipe_kind=source["verification_recipe_kind"],
+                    candidate=candidate,
+                    evidence=verifier_evidence,
+                )
+            contexts.append(
+                CandidateContext(
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    source_episode=source["episode"],
+                    source_lane=source["lane"],
+                    source_attempt_id=source["source_attempt_id"],
+                    role=source["role"],
+                    recipe_kind=source["recipe_kind"],
+                    candidate=candidate,
+                    evidence=producer_evidence,
+                    verification=verification,
+                )
+            )
+        candidate_memory = CandidateMemoryAggregate.from_contexts(contexts)
+        if route.role == "verifier":
+            return (
+                project_memory(
+                    (),
+                    target,
+                    arm=self.config.memory_arm,
+                    candidate_memory=candidate_memory,
+                ),
+                candidate_memory,
+            )
+
+        records = []
+        for source in self.state.same_run_memory_sources(
+            run_id,
+            challenge_id,
+            target_lane=lane,
+            before_episode=episode,
+        ):
+            evidence_source = run_evidence.memory_source(source["source_attempt_id"])
+            if source["summary"] is not None:
+                records.append(
+                    AnalysisClaim(
+                        record_id=f"{source['source_attempt_id']}:analysis",
+                        run_id=run_id,
+                        challenge_id=challenge_id,
+                        source_episode=source["source_episode"],
+                        source_lane=source["source_lane"],
+                        source_attempt_id=source["source_attempt_id"],
+                        status=source["status"],
+                        summary=source["summary"],
+                        evidence=tuple(source["evidence"]),
+                        next_steps=tuple(source["next_steps"]),
+                        tool_count=source["tool_count"],
+                    )
+                )
+            if (
+                source["role"] is not None
+                and source["tactic"] is not None
+                and source["tool_profile"] is not None
+            ):
+                records.append(
+                    TacticOutcome(
+                        record_id=f"{source['source_attempt_id']}:tactic",
+                        run_id=run_id,
+                        challenge_id=challenge_id,
+                        source_episode=source["source_episode"],
+                        source_lane=source["source_lane"],
+                        source_attempt_id=source["source_attempt_id"],
+                        role=source["role"],
+                        tactic=source["tactic"],
+                        tool_profile=source["tool_profile"],
+                        status=source["status"],
+                    )
+                )
+            for observation in evidence_source.observations:
+                records.append(
+                    MemoryHostObservation(
+                        record_id=f"{source['source_attempt_id']}:host:{observation.ordinal}",
+                        run_id=run_id,
+                        challenge_id=challenge_id,
+                        source_episode=source["source_episode"],
+                        source_lane=source["source_lane"],
+                        source_attempt_id=source["source_attempt_id"],
+                        complete=evidence_source.complete,
+                        gap=evidence_source.gap,
+                        tool=observation.tool,
+                        success=observation.success,
+                        source_bound=observation.source_bound,
+                        facts=observation.facts,
+                    )
+                )
+        for failure in self.state.same_run_memory_failures(
+            run_id,
+            challenge_id,
+            before_episode=episode,
+        ):
+            records.append(
+                FailureRecord(
+                    record_id=failure["record_id"],
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    source_episode=failure["source_episode"],
+                    source_lane=failure["source_lane"],
+                    source_attempt_id=failure["source_attempt_id"],
+                    failure_kind=failure["failure_kind"],
+                    subreason=failure["subreason"],
+                )
+            )
+        return (
+            project_memory(
+                records,
+                target,
+                arm=self.config.memory_arm,
+                candidate_memory=candidate_memory,
+            ),
+            candidate_memory,
+        )
+
     async def _lane(
         self,
         run_id: str,
@@ -894,6 +1105,20 @@ class Orchestrator:
         run_evidence = self._run_evidence
         if run_evidence is None or run_evidence.run_id != run_id:
             run_evidence = RunEvidence.open(self.state, run_id)
+        verifier_route = route is not None and route.role == "verifier"
+        same_run_memory = None
+        candidate_memory = CandidateMemoryAggregate()
+        if self._adaptive_control:
+            if route is None:
+                raise ValueError("adaptive lane requires a typed route")
+            same_run_memory, candidate_memory = self._typed_same_run_memory(
+                run_id,
+                challenge.id,
+                episode,
+                lane,
+                route,
+                run_evidence,
+            )
         self.state.start_attempt(
             attempt_id,
             run_id,
@@ -945,11 +1170,10 @@ class Orchestrator:
                     team_key=self.config.team_key,
                     max_workspace_bytes=self.config.max_lane_workspace_bytes,
                 )
-            verifier_route = route is not None and route.role == "verifier"
             prior_attempts = []
             compacted_records = 0
             rejected_records = 0
-            if not verifier_route:
+            if not self._adaptive_control and not verifier_route:
                 for record in self.state.prior_attempts_for_lane(
                     run_id,
                     challenge.id,
@@ -968,11 +1192,12 @@ class Orchestrator:
                 challenge,
                 artifact_paths,
                 lane,
+                run_id=run_id if self._adaptive_control else None,
                 episode=episode,
                 prior_attempts=tuple(prior_attempts),
                 prior_observations=(
                     None
-                    if verifier_route
+                    if verifier_route or self._adaptive_control
                     else run_evidence.carry(
                         challenge.id,
                         lane,
@@ -980,6 +1205,7 @@ class Orchestrator:
                     )
                 ),
                 control_route=route,
+                same_run_memory=same_run_memory,
             )
             omitted_for_budget = len(prior_attempts) - len(
                 json.loads(turn_prompt)["prior_attempts"]
@@ -995,6 +1221,23 @@ class Orchestrator:
                         "compacted_records": compacted_records,
                         "rejected_records": rejected_records,
                         "omitted_for_prompt_budget": omitted_for_budget,
+                    },
+                )
+            if same_run_memory is not None:
+                self.state.event(
+                    run_id,
+                    "same_run_memory_projected",
+                    {
+                        "challenge_id": challenge.id,
+                        "episode": episode,
+                        "lane": lane,
+                        "role": route.role if route is not None else "specialist",
+                        "arm": self.config.memory_arm,
+                        "record_count": len(same_run_memory.records),
+                        "deduplicated_record_count": (same_run_memory.deduplicated_record_count),
+                        "omitted_record_count": same_run_memory.omitted_record_count,
+                        "encoded_bytes": same_run_memory.encoded_bytes,
+                        **candidate_memory.public_counts(),
                     },
                 )
             async with asyncio.timeout(timeout_seconds + 5):
