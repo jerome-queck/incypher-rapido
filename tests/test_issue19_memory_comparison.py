@@ -82,7 +82,7 @@ def test_output_writer_never_overwrites(tmp_path: Path) -> None:
         HARNESS._write_new(output, payload)
 
 
-def test_output_writer_removes_a_link_after_installation_failure(
+def test_output_writer_preserves_verified_link_after_directory_fsync_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "result.json"
@@ -94,7 +94,7 @@ def test_output_writer_removes_a_link_after_installation_failure(
     monkeypatch.setattr(HARNESS, "_fsync_directory", fail_fsync)
     with pytest.raises(OSError, match="injected directory fsync failure"):
         HARNESS._write_new(output, b"{}\n")
-    assert not output.exists()
+    assert output.read_bytes() == b"{}\n"
 
 
 def test_cli_rejects_nonregistered_paths(tmp_path: Path) -> None:
@@ -107,6 +107,55 @@ def test_cli_rejects_nonregistered_paths(tmp_path: Path) -> None:
                 str(tmp_path / "other.json"),
             ]
         )
+
+
+def test_cli_preserves_a_preexisting_registered_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "registered-result.json"
+    output.write_bytes(b"durable accepted evidence\n")
+    monkeypatch.setattr(HARNESS, "DEFAULT_RESULT_PATH", output)
+    monkeypatch.setattr(HARNESS.sys, "executable", str(HARNESS.ROOT / ".venv/bin/python"))
+    with pytest.raises(FileExistsError, match="already exists"):
+        HARNESS.main(
+            [
+                "--protocol",
+                str(HARNESS.DEFAULT_PROTOCOL_PATH),
+                "--output",
+                str(output),
+            ]
+        )
+    assert output.read_bytes() == b"durable accepted evidence\n"
+
+
+def test_cli_validates_before_installing_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "registered-result.json"
+    monkeypatch.setattr(HARNESS, "DEFAULT_RESULT_PATH", output)
+    monkeypatch.setattr(HARNESS.sys, "executable", str(HARNESS.ROOT / ".venv/bin/python"))
+    monkeypatch.setattr(
+        HARNESS,
+        "run_comparison",
+        lambda *args, **kwargs: {"source": {}, "result": "not installed yet"},
+    )
+    monkeypatch.setattr(HARNESS, "load_protocol", lambda path: {})
+
+    def reject(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise ValueError("injected pre-install validation failure")
+
+    monkeypatch.setattr(HARNESS, "validate_result", reject)
+    with pytest.raises(ValueError, match="pre-install validation failure"):
+        HARNESS.main(
+            [
+                "--protocol",
+                str(HARNESS.DEFAULT_PROTOCOL_PATH),
+                "--output",
+                str(output),
+            ]
+        )
+    assert not output.exists()
 
 
 def test_run_and_validation_recomputations_remain_inside_effect_fence(

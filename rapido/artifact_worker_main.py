@@ -66,7 +66,21 @@ def _set_limit(kind: int, soft: int, hard: int | None = None) -> None:
     resource.setrlimit(kind, (min(bounded(old_soft, soft), new_hard), new_hard))
 
 
+def _unblock_resource_signals() -> None:
+    """Ensure inherited masks cannot suppress the worker's resource-limit signals."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return
+    signals = {
+        value
+        for name in ("SIGXCPU", "SIGXFSZ")
+        if isinstance((value := getattr(signal, name, None)), signal.Signals)
+    }
+    if signals:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
+
+
 def _apply_limits() -> None:
+    _unblock_resource_signals()
     _set_limit(resource.RLIMIT_CORE, 0)
     _set_limit(resource.RLIMIT_FSIZE, SCRATCH_FILE_LIMIT_BYTES)
     _set_limit(resource.RLIMIT_NOFILE, 64)

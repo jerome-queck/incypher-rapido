@@ -1565,22 +1565,15 @@ def _write_new(path: Path, payload: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     if temporary.exists() or temporary.is_symlink():
         raise FileExistsError("M1 temporary output already exists")
-    linked = False
     try:
         with temporary.open("xb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if temporary.read_bytes() != payload:
+            raise OSError("M1 temporary output verification failed")
         os.link(temporary, path)
-        linked = True
-        if path.read_bytes() != payload:
-            raise OSError("M1 output verification failed")
         _fsync_directory(path.parent)
-    except BaseException:
-        if linked and path.exists():
-            path.unlink()
-            _fsync_directory(path.parent)
-        raise
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -1605,25 +1598,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--output must be the frozen M1 result path")
     if Path(sys.executable).absolute() != (ROOT / ".venv/bin/python").absolute():
         parser.error("M1 must run with the preregistered .venv/bin/python interpreter")
+    if arguments.output.exists() or arguments.output.is_symlink():
+        raise FileExistsError("M1 output already exists")
     result = run_comparison(arguments.protocol, require_clean_source=True)
     payload = canonical_result_bytes(result)
-    try:
-        _write_new(arguments.output, payload)
-        stored = json.loads(arguments.output.read_bytes())
-        validate_result(
-            stored,
-            load_protocol(arguments.protocol),
-            protocol_path=arguments.protocol.resolve(),
-            require_clean_source=True,
-            expected_source=result["source"],
-        )
-        if canonical_result_bytes(stored) != payload:
-            raise ValueError("M1 stored result is not canonical")
-    except BaseException:
-        if arguments.output.exists():
-            arguments.output.unlink()
-            _fsync_directory(arguments.output.parent)
-        raise
+    stored = json.loads(payload)
+    validate_result(
+        stored,
+        load_protocol(arguments.protocol),
+        protocol_path=arguments.protocol.resolve(),
+        require_clean_source=True,
+        expected_source=result["source"],
+    )
+    if canonical_result_bytes(stored) != payload:
+        raise ValueError("M1 result is not canonical")
+    _write_new(arguments.output, payload)
     return 0
 
 

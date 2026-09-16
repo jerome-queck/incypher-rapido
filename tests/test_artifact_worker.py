@@ -405,11 +405,18 @@ def test_parent_removes_private_scratch_for_every_worker_exit(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("termination_signal", [signal.SIGKILL, signal.SIGXCPU])
-def test_native_resource_signal_maps_to_resource_limit(tmp_path, termination_signal):
+def test_native_resource_signal_maps_to_resource_limit(tmp_path, termination_signal, monkeypatch):
     source = tmp_path / "source"
     source.write_bytes(b"x")
     descriptor = _open(source)
+    prior_mask = None
     try:
+        if termination_signal != signal.SIGKILL and hasattr(signal, "pthread_sigmask"):
+            prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {termination_signal})
+            monkeypatch.setattr(artifact_worker_main, "_set_limit", lambda *args: None)
+            artifact_worker_main._apply_limits()
+            current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            assert termination_signal not in current_mask
         reset_signal = (
             f"signal.signal({int(termination_signal)}, signal.SIG_DFL); "
             if termination_signal != signal.SIGKILL
@@ -428,8 +435,25 @@ def test_native_resource_signal_maps_to_resource_limit(tmp_path, termination_sig
                 descriptor,
             )
     finally:
+        if prior_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         os.close(descriptor)
     assert error.value.code == "resource_limit"
+
+
+@pytest.mark.parametrize("signal_name", ["SIGXCPU", "SIGXFSZ"])
+def test_apply_limits_unblocks_every_resource_signal(monkeypatch, signal_name):
+    if not hasattr(signal, "pthread_sigmask") or not hasattr(signal, signal_name):
+        pytest.skip(f"{signal_name} masking unavailable")
+    resource_signal = getattr(signal, signal_name)
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {resource_signal})
+    monkeypatch.setattr(artifact_worker_main, "_set_limit", lambda *args: None)
+    try:
+        artifact_worker_main._apply_limits()
+        current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert resource_signal not in current_mask
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
 
 
 def test_native_stdin_uses_bound_descriptor_from_start_after_prior_parser_reads(tmp_path):

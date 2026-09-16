@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-SPEC = importlib.util.spec_from_file_location(
-    "sustainability_acceptance",
-    Path(__file__).resolve().parents[1] / "scripts" / "sustainability_acceptance.py",
-)
+ROOT = Path(__file__).resolve().parents[1]
+HARNESS_PATH = ROOT / "scripts" / "sustainability_acceptance.py"
+SPEC = importlib.util.spec_from_file_location("sustainability_acceptance", HARNESS_PATH)
 assert SPEC is not None and SPEC.loader is not None
 HARNESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HARNESS)
@@ -123,10 +125,18 @@ def test_cancelled_cycle_drains_workers_and_releases_state(tmp_path):
 
 
 def test_short_real_measurement_reports_scope_and_samples():
-    report = asyncio.run(run(cycles=12))
+    completed = subprocess.run(
+        [sys.executable, str(HARNESS_PATH), "--cycles", "48"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(completed.stdout)
+    assert completed.returncode == 0, report.get("failures")
     assert report["status"] == "passed", report["failures"]
-    assert report["outcomes"]["recovered"] == 12
-    assert len(report["samples"]) == 13
+    assert report["outcomes"]["recovered"] == 48
+    assert len(report["samples"]) == 49
     assert report["peak_active"] <= report["workers"]
     assert report["peak_queue"] <= report["workers"]
     assert "synthetic" in report["scope"]
