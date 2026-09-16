@@ -81,9 +81,7 @@ class NativeRuntime(Protocol):
         timeout: float,
         tool_registry: Any | None = None,
         progress_callback: Callable[[], None] | None = None,
-        continuation_callback: (
-            Callable[[NativeTurn, float | None], str | None] | None
-        ) = None,
+        continuation_callback: (Callable[[NativeTurn, float | None], str | None] | None) = None,
     ) -> NativeTurn: ...
 
     async def close(self) -> None: ...

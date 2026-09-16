@@ -865,9 +865,7 @@ async def test_solve_continuation_reuses_one_thread_and_one_cumulative_deadline(
         result.thread_id,
         result.thread_id,
     ]
-    assert turn_requests[1]["params"]["input"] == [
-        {"type": "text", "text": "changed follow-up"}
-    ]
+    assert turn_requests[1]["params"]["input"] == [{"type": "text", "text": "changed follow-up"}]
     assert len(remaining) == 2
     assert remaining[0] is not None and remaining[1] is not None
     assert 0 < remaining[1] <= remaining[0] <= 1.0
