@@ -95,6 +95,21 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_WRONG_SUBMISSION_CEILING` | `2` | Wrong/indeterminate submission-risk ceiling. |
 | `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Managed receipt-bound dynamic instance lifecycle. |
 
+## Evaluation and persistent Board state
+
+Every live run starts with fresh solver state and a run-local 0/15, but the authenticated Board
+account persists. Board-solved challenges are still analyzed, and freshly derived qualified
+candidates are still submitted. A generic `already_solved` response proves only account history;
+it does not validate that run's candidate.
+
+For repeated calibration runs, report current-run and cumulative results separately. Count a
+cumulative challenge once only from the source run that received `correct`, or from independent
+deterministic verification. Never convert `already_solved` into a new or current-run solve. Issue
+#11's final evidence records one current-run verified solve and three cumulative autonomous Board
+solves under a later owner amendment; it does not claim the original 3/15 run-local gate passed.
+See [`notes/research/issue-11-completion-evidence-2026-09-16.md`](notes/research/issue-11-completion-evidence-2026-09-16.md)
+and follow-up issue [#19](https://github.com/jerome-queck/incypher-rapido/issues/19).
+
 The effective non-secret configuration is printed by `config`. Never publish state/work folders:
 attempt rows can contain candidate values, while submission records retain fingerprints and
 verdicts. Each later episode receives only bounded, immutable, same-run/same-challenge/same-lane
@@ -110,7 +125,7 @@ Use the 180-second grace period so bounded target drains, native shutdown, and i
 finish:
 
 ```sh
-docker stop --time 180 rapido
+docker stop --timeout 180 rapido
 ```
 
 With `--rm`, rerun the same `docker run` command against the same state/auth mounts after a crash;
@@ -152,6 +167,10 @@ evidence first, then remove only the run's containers, volumes, and workspaces a
   app-server owners.
 - `preflight` errors: check the official HTTPS origin, token, authenticated identity, and stable
   challenge catalogue. It intentionally fails on incoherence.
+- Dynamic preflight accepts HTTP 404 as the established inactive-instance shape. HTTP 200 with
+  `success=false` and no endpoint metadata is indeterminate and intentionally fails closed. That
+  changed shape was observed after the issue #11 run and is tracked in issue #19; do not create an
+  instance until current Board behavior is established.
 - `pending` output means a submission effect is unresolved. Reconcile explicitly; do not rerun it.
 - Keep env files, auth, state, logs, and Docker daemon access private. Docker env metadata is
   visible to the daemon administrator. `.dockerignore` is defense in depth, not a substitute for

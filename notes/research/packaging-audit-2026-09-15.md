@@ -1,7 +1,9 @@
 # Packaging audit — 2026-09-15
 
 > Historical source-only baseline. Its gap list is retained as an audit trail and is superseded where
-> explicitly closed by the post-audit acceptance result below.
+> explicitly closed by the post-audit acceptance result below. The later exact image and issue-11
+> disposition are in
+> [the 2026-09-16 completion evidence](issue-11-completion-evidence-2026-09-16.md).
 
 ## Post-audit packaging acceptance result
 

@@ -64,6 +64,15 @@ Do not reuse a host-local env file whose paths point outside the container. Boar
 of the Codex child, whose environment is an explicit allowlist. Trusted fixed-argv supervisor
 helpers may inherit the supervisor environment.
 
+## Network boundary
+
+The live solver cannot use `--network none`: native inference, the fixed official Board origin,
+fresh same-origin downloads, and Board-issued challenge targets require networking. The template
+uses ordinary container networking and does not provide a Docker-level egress firewall. Rapido
+instead constrains Board calls to the configured origin and challenge tools to immutable
+authorities parsed from Board connection information; the model cannot select arbitrary hosts or
+ports. Optional artifact-parser workers deny networking entirely.
+
 ## Resources and shutdown
 
 The competition launch profile assigns 8 CPUs, 24 GiB RAM, and 256 PIDs. The default
@@ -122,3 +131,10 @@ The image has no organizer-provided healthcheck, network policy, persistent-stor
 competition launch contract here; do not infer those from this template. Board receipt-less creates
 require explicit reconciliation, and receipt-bound generation deletion still has a narrow
 server-side replacement race documented in the repository research.
+
+Dynamic preflight currently accepts HTTP 404 as inactive. A post-issue-11 check instead observed
+HTTP 200, `success=false`, no connection information, and no instance timestamps. This exposes no
+endpoint but does not satisfy the established absence contract; future mutation fails closed until
+the Board shape is verified. See
+[`issue-11-completion-evidence-2026-09-16.md`](../notes/research/issue-11-completion-evidence-2026-09-16.md)
+and issue [#19](https://github.com/jerome-queck/incypher-rapido/issues/19).

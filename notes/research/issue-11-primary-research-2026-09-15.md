@@ -1,5 +1,9 @@
 # Issue 11 — primary research and minimal audit Interface
 
+> Incremental dated research. Early "current" source claims are superseded by later sections in
+> this file; final live-run coverage, scoring, failures, and disposition are recorded in
+> [the 2026-09-16 completion evidence](issue-11-completion-evidence-2026-09-16.md).
+
 Date: 2026-09-15. Source revision: `2f97c9641f01f68c3b478a08fb2bb034a4e5bfa9`.
 Research worker: `/root/minimal_research`; selected model `gpt-6-astra`, effort `xhigh`.
 Evidence: lead confirmed successful dispatch of that exact pair, without fallback. Worker-side

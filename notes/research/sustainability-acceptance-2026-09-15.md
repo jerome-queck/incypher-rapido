@@ -1,5 +1,9 @@
 # Accelerated sustainability evidence — 2026-09-15
 
+> Historical exact-image evidence. Later issue-11 coverage, scoring, and Board behavior are recorded
+> in [the 2026-09-16 completion evidence](issue-11-completion-evidence-2026-09-16.md). Measurements
+> below remain facts about the 2026-09-15 run.
+
 Status: strong accelerated evidence. This is **not** a 5.5-hour rehearsal and does not claim one.
 
 ## Exact-final-image useful work

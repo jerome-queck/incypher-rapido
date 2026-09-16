@@ -2,7 +2,8 @@
 
 > Historical baseline at commit `15b5813`. Its present-tense gap conclusions are superseded by the
 > post-audit implementation and acceptance result below; the original text is retained as an audit
-> trail.
+> trail. The later issue-11 disposition is in
+> [the 2026-09-16 completion evidence](issue-11-completion-evidence-2026-09-16.md).
 
 ## Post-audit implementation and acceptance result
 

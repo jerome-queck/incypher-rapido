@@ -2,7 +2,9 @@
 
 ## Read on trigger
 
-- Solver capability, scheduling, context, tools, model routing, or competition evaluation: read GitHub issue #11 and the current acceptance notes under `notes/research/`.
+- Solver capability, scheduling, context, tools, model routing, or competition evaluation: read
+  GitHub issue #19 and `notes/research/issue-11-completion-evidence-2026-09-16.md` first. Issue #11
+  and older dated notes are historical evidence.
 - Container, Board, credential, submission, or cleanup changes: read `README.md`, `deploy/CONTAINER.md`, and `notes/research/dynamic-acceptance-2026-09-15.md` first.
 - Treat `/Volumes/Working/001 Projects/incypher-ctf` as read-only design research. Reuse measured principles, not its code or scale.
 
@@ -29,5 +31,14 @@
 
 ## Completion
 
-- Pre-register a numeric run-local solve-improvement threshold against the prior 1/15 autonomous baseline before the final run.
-- Finish only after an unattended Daybreak/xhigh final-image run attempts all 15 challenges from fresh solver state, meets that threshold, and shows no manual answer relay, stuck work, leaked process/instance, or lifecycle regression.
+- Issue #11 is a dated exception: its pre-registered 3/15 run-local threshold and uninterrupted-run
+  gate failed. The owner later accepted three cumulative autonomous Board solves across fresh runs
+  and authorized closure after full initial coverage. Report that post-observation amendment and
+  the 1/15 current-run result separately; never claim the original gate passed.
+- Before future live evaluation, pre-register numeric current-run and cumulative targets plus the
+  exact protocol. A cumulative solve counts once only from its source-run `correct` verdict or an
+  independent deterministic verification. A later generic `already_solved` response never
+  validates the current candidate or creates another solve.
+- Issue #19 owns the next capability gate. Finish it only after its accepted evidence is durable
+  and no manual answer relay, stuck work, pending effect, active or indeterminate instance,
+  process/workspace leak, or lifecycle/security regression remains.

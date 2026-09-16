@@ -133,7 +133,8 @@ solve loss.
 Issue #11's original final-run threshold and uninterrupted-run requirement failed. At the owner's
 explicit direction, issue completion instead uses the transparent cumulative-three result after
 full initial coverage. Policy refusals, provenance dead ends, persistent-Board evaluation, and the
-changed inactive-instance response require a separate measured follow-up issue.
+changed inactive-instance response require a separate measured follow-up: issue
+[#19](https://github.com/jerome-queck/incypher-rapido/issues/19).
 
 Delete the exact stopped container and state volume only after this report is merged and linked
 from GitHub. Preserve the dedicated authentication volume.
