@@ -37,6 +37,7 @@ LANES = 2
 MODEL = "gpt-daybreak-blue-latest"
 REASONING_EFFORT = "xhigh"
 BOARD_CASE_ID = 7
+UNFINISHED_RUN_ID = "19".rjust(32, "0")
 _SYNTHETIC_PROVENANCE_VALUE = "INCYPHER{offline_replay_provenance_only}"
 _SYNTHETIC_DISAGREEMENT_VALUES = (
     "INCYPHER{offline_replay_peer_a_only}",
@@ -354,11 +355,11 @@ def _seed_unfinished_row(path: Path, config: RuntimeConfig) -> None:
             config.codex_home / ".rapido-supervisor.lock",
             config.work_root / ".rapido-work.lock",
         )
-        state.start_run("issue19-unfinished-row", {"fixture": "unfinished-row-only"})
+        state.start_run(UNFINISHED_RUN_ID, config.public_record())
         state.upsert_challenge(1000, "Unfinished row fixture", "misc", "standard", 0)
         state.start_attempt(
-            "issue19-unfinished-row:1000:0:0",
-            "issue19-unfinished-row",
+            f"{UNFINISHED_RUN_ID}:1000:0:0",
+            UNFINISHED_RUN_ID,
             1000,
             0,
             0,
@@ -837,14 +838,14 @@ async def _run_fixture_async() -> dict[str, Any]:
             )
             unfinished_attempt = state._connection.execute(
                 "SELECT status, summary FROM attempts WHERE id=?",
-                ("issue19-unfinished-row:1000:0:0",),
+                (f"{UNFINISHED_RUN_ID}:1000:0:0",),
             ).fetchone()
             unfinished_run = state._connection.execute(
-                "SELECT status FROM runs WHERE id='issue19-unfinished-row'"
+                "SELECT status FROM runs WHERE id=?", (UNFINISHED_RUN_ID,)
             ).fetchone()
             recovery_events = state._connection.execute(
-                "SELECT COUNT(*) FROM events "
-                "WHERE run_id='issue19-unfinished-row' AND kind='recovery'"
+                "SELECT COUNT(*) FROM events WHERE run_id=? AND kind='recovery'",
+                (UNFINISHED_RUN_ID,),
             ).fetchone()[0]
             state.acquire_supervisor(
                 config.codex_home / ".rapido-supervisor.lock",
@@ -940,14 +941,14 @@ async def _run_fixture_async() -> dict[str, Any]:
             "cases": cases,
             "gap_event_sequences": global_gap_event_sequences,
             "recovery": {
-                "scope": "unfinished durable rows only",
+                "scope": "same-run unfinished durable row",
                 "unfinished_attempts_recovered": int(unfinished_attempt["status"] == "interrupted"),
                 "unfinished_attempt_status": str(unfinished_attempt["status"]),
                 "unfinished_attempt_summary": str(unfinished_attempt["summary"]),
                 "unfinished_run_status": str(unfinished_run["status"]),
                 "recovery_events": int(recovery_events),
                 "second_recovery": second_recovery,
-                "same_run_resumed": False,
+                "same_run_resumed": run.run_id == UNFINISHED_RUN_ID,
                 "abrupt_process_crash_exercised": False,
                 "container_restart_exercised": False,
             },
@@ -1229,7 +1230,7 @@ def _expected_red_gate(report: dict[str, Any]) -> dict[str, Any]:
         or run["runtime_model_selections"] != [[MODEL, REASONING_EFFORT]]
         or run["runtime_solve_calls"] <= 0
         or run["runtime_solve_calls"] != observed_solve_calls
-        or run["evidence_manifests"] != run["runtime_solve_calls"]
+        or run["evidence_manifests"] != run["runtime_solve_calls"] + 1
         or run["board_submission_calls"] != 0
         or run["board_instance_mutations"] != 0
         or run["board_instance_reads"] != 2
@@ -1240,14 +1241,14 @@ def _expected_red_gate(report: dict[str, Any]) -> dict[str, Any]:
 
     recovery = report["recovery"]
     if recovery != {
-        "scope": "unfinished durable rows only",
+        "scope": "same-run unfinished durable row",
         "unfinished_attempts_recovered": 1,
         "unfinished_attempt_status": "interrupted",
         "unfinished_attempt_summary": "process ended before restart",
-        "unfinished_run_status": "interrupted",
+        "unfinished_run_status": "completed",
         "recovery_events": 1,
         "second_recovery": 0,
-        "same_run_resumed": False,
+        "same_run_resumed": True,
         "abrupt_process_crash_exercised": False,
         "container_restart_exercised": False,
     }:

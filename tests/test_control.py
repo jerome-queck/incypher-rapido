@@ -13,6 +13,7 @@ import textwrap
 import threading
 import urllib.parse
 from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -895,6 +896,14 @@ def test_daybreak_primary_continues_changed_same_session_until_source_bound_cand
     assert follow_up["remaining_milliseconds"] == 14_000
     initial = runtime.calls[0][0]
     assert "primary flag solver, not a coordinator" in initial["task"]
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='primary_candidate_checkpointed'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
@@ -1392,15 +1401,18 @@ def test_pending_effect_count_is_global_when_inspecting_prior_or_current_run(
     board = AmbiguousBoundaryBoard([_challenge(1)])
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
-    first_report = asyncio.run(
-        DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
-    )
-    second_report = asyncio.run(
-        DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
-    )
-
-    first = DurableJobControl.inspect(config.state_path, run_id=first_report.run_id)
-    second = DurableJobControl.inspect(config.state_path, run_id=second_report.run_id)
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="explicit reconciliation"):
+        asyncio.run(
+            DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+        )
+    first = DurableJobControl.inspect(config.state_path)
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="explicit reconciliation"):
+        asyncio.run(
+            DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+        )
+    second = DurableJobControl.inspect(config.state_path)
+    assert first.run_id == second.run_id
+    assert first.status == second.status == "running"
     assert first.pending_submission_count == second.pending_submission_count == 1
     assert board.submissions == [(1, candidate)]
 
@@ -1799,11 +1811,15 @@ def test_no_tool_progress_cancels_lane_and_routes_changed_recovery(
         } == {"no_progress"}
 
 
-def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+@pytest.mark.parametrize("candidate_checkpoint", [False, True])
+def test_restart_closes_jobs_left_open_by_process_loss(
+    tmp_path: Path, candidate_checkpoint: bool
+) -> None:
+    config = replace(_config(tmp_path), active_challenges=1, concurrency=2)
     code = textwrap.dedent(
         """
         import asyncio
+        import hashlib
         import json
         import os
         from dataclasses import replace
@@ -1812,6 +1828,7 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
         from rapido.board import Challenge, Verdict
         from rapido.config import RuntimeConfig
         from rapido.control import DurableJobControl
+        from rapido.evidence import project_tool_observation
 
         class Board:
             timeout = 0.01
@@ -1829,7 +1846,7 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
         class Runtime:
             async def start(self): pass
             async def solve(self, workspace, prompt, **kwargs):
-                if json.loads(prompt)["lane"] == 0:
+                if json.loads(prompt)["lane"] == 1:
                     return type("Turn", (), {
                         "status": "completed",
                         "text": json.dumps({
@@ -1838,6 +1855,33 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
                         }),
                         "tool_calls": [],
                     })()
+                candidate_checkpoint = os.environ["CRASH_CANDIDATE"] == "1"
+                candidate = "INCYPHER{candidate_survives_process_loss}"
+                candidate_digest = hashlib.sha256(candidate.encode()).hexdigest()
+                checkpoint = type("Turn", (), {
+                    "status": "completed",
+                    "text": json.dumps({
+                        "status": "candidate" if candidate_checkpoint else "unsolved",
+                        "candidate": candidate if candidate_checkpoint else None,
+                        "confidence": 0.9 if candidate_checkpoint else 0.2,
+                        "summary": "primary checkpoint survived", "evidence": ["local branch"],
+                        "next_steps": ["test the other branch"]
+                    }),
+                    "tool_calls": [{
+                        "name": "inspect_file", "success": True, "source_bound": True,
+                        "candidate_sensitive": candidate_checkpoint,
+                        "candidate_sha256s": [candidate_digest] if candidate_checkpoint else [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": project_tool_observation(
+                            "inspect_file", success=True, source_bound=True,
+                            candidate_sensitive=candidate_checkpoint,
+                            candidate_sha256s=(candidate_digest,) if candidate_checkpoint else (),
+                            result={"format": "text", "size": 7}
+                        ),
+                    }],
+                })()
+                follow_up = kwargs["continuation_callback"](checkpoint, 14.0)
+                assert (follow_up is None) is candidate_checkpoint
                 await asyncio.sleep(0.2)
                 os._exit(23)
             async def close(self): pass
@@ -1848,9 +1892,12 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
             "RAPIDO_CODEX_HOME": os.environ["CRASH_AUTH"],
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
-                "RAPIDO_ACTIVE_CHALLENGES": "1",
-                "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
-                "RAPIDO_CONCURRENCY": "2",
+            "RAPIDO_ACTIVE_CHALLENGES": "1",
+            "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
+            "RAPIDO_CONCURRENCY": "2",
+            "RAPIDO_EPISODES_PER_CHALLENGE": "1",
+            "RAPIDO_ATTEMPT_SECONDS": "15",
+            "RAPIDO_RUN_SECONDS": "60",
         })
         asyncio.run(DurableJobControl.drive(config, board=Board(), runtime=Runtime()))
         """
@@ -1861,6 +1908,7 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
             "CRASH_STATE": str(config.state_path),
             "CRASH_WORK": str(config.work_root),
             "CRASH_AUTH": str(config.codex_home),
+            "CRASH_CANDIDATE": "1" if candidate_checkpoint else "0",
             "PYTHONPATH": str(Path(__file__).parents[1]),
         }
     )
@@ -1876,20 +1924,479 @@ def test_restart_closes_jobs_left_open_by_process_loss(tmp_path: Path) -> None:
     assert crashed.status == "running"
     assert {job.state for job in crashed.jobs} == {"queued", "running"}
     assert all(job.closed_sequence is None for job in crashed.jobs)
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == int(
+            candidate_checkpoint
+        )
 
-    asyncio.run(
+    class RecoveryRuntime(UnsolvedBoundaryRuntime):
+        def __init__(self) -> None:
+            super().__init__("unused")
+            self.documents: list[dict[str, object]] = []
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            self.documents.append(json.loads(prompt))
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = RecoveryRuntime()
+    resumed_challenges = [
+        replace(_challenge(challenge_id), name=f"Crash {challenge_id}", description="derive")
+        for challenge_id in (1, 2)
+    ]
+    changed_runtime = BoundaryRuntime("unused")
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="material changed"):
+        asyncio.run(
+            DurableJobControl.drive(
+                config,
+                board=BoundaryBoard(
+                    [
+                        replace(challenge, description=f"{challenge.description} changed")
+                        for challenge in resumed_challenges
+                    ]
+                ),
+                runtime=changed_runtime,
+            )
+        )
+    assert not changed_runtime.started
+    assert changed_runtime.closed
+
+    report = asyncio.run(
         DurableJobControl.drive(
             config,
-            board=BoundaryBoard([_challenge(1)]),
-            runtime=UnsolvedBoundaryRuntime("unused"),
+            board=BoundaryBoard(resumed_challenges),
+            runtime=runtime,
         )
     )
     recovered = DurableJobControl.inspect(config.state_path, run_id=crashed.run_id)
-    assert recovered.status == "interrupted"
-    assert {(job.challenge_id, job.lane): job.state for job in recovered.jobs} == {
-        (1, 0): "unsolved",
-        (1, 1): "interrupted",
-        (2, 0): "interrupted",
-        (2, 1): "interrupted",
-    }
+    assert report.run_id == crashed.run_id
+    assert recovered.status == "completed"
+    expected_jobs = [
+        (1, 0, 0, "interrupted"),
+        (1, 0, 1, "unsolved"),
+        (2, 0, 0, "unsolved"),
+        (2, 0, 1, "unsolved"),
+    ]
+    expected_jobs.extend(
+        [(1, 1, 0, "unsolved")]
+        if candidate_checkpoint
+        else [(1, 1, 0, "unsolved"), (1, 1, 1, "unsolved")]
+    )
+    assert [
+        (job.challenge_id, job.episode, job.lane, job.state) for job in recovered.jobs
+    ] == expected_jobs
     assert all(job.closed_sequence is not None for job in recovered.jobs)
+    recovery_documents = [
+        document
+        for document in runtime.documents
+        if document["challenge"]["id"] == 1 and document["episode"] == 1
+    ]
+    assert len(recovery_documents) == (1 if candidate_checkpoint else 2)
+    expected_role = "verifier" if candidate_checkpoint else "recovery"
+    assert all(document["agent_role"] == expected_role for document in recovery_documents)
+    if not candidate_checkpoint:
+        assert all(document["same_run_memory"] for document in recovery_documents)
+        primary_recovery = next(
+            document for document in recovery_documents if document["lane"] == 0
+        )
+        assert any(
+            record.get("summary") == "primary checkpoint survived"
+            for record in primary_recovery["same_run_memory"]
+        )
+        assert any(
+            record.get("kind") == "host_observation"
+            and record.get("tool") == "inspect_file"
+            and record.get("facts", {}).get("format") == "text"
+            for record in primary_recovery["same_run_memory"]
+        )
+    engagement_order: list[tuple[int, int]] = []
+    for document in runtime.documents:
+        key = (int(document["challenge"]["id"]), int(document["episode"]))
+        if not engagement_order or engagement_order[-1] != key:
+            engagement_order.append(key)
+    assert engagement_order == [(2, 0), (1, 1)]
+
+
+def test_restart_keeps_original_wall_deadline_and_starts_no_solver(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), active_challenges=1, concurrency=2)
+    store = StateStore(config.state_path)
+    store.start_run("deadline-run", config.public_record())
+    fixture = _challenge(1)
+    store.upsert_challenge(1, fixture.name, fixture.category, fixture.type, fixture.value)
+    store.record_control_catalogue("deadline-run", [(0, 1, True)])
+    store.admit_control_wave(
+        "deadline-run",
+        1,
+        0,
+        0,
+        config.attempts_per_challenge,
+        baseline_route(
+            model=config.model,
+            effort=config.reasoning_effort,
+            attempt_seconds=config.attempt_seconds,
+        ),
+        (("lead", config.model, config.reasoning_effort),) * 2,
+    )
+    expired = (datetime.now(UTC) - timedelta(seconds=config.run_seconds + 1)).isoformat()
+    with store.transaction() as connection:
+        connection.execute("UPDATE runs SET started_at=? WHERE id='deadline-run'", (expired,))
+    store.close()
+
+    runtime = BoundaryRuntime("unused")
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=runtime,
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id="deadline-run")
+
+    assert report.run_id == "deadline-run"
+    assert report.status == view.status == "deadline"
+    assert not runtime.started
+    assert runtime.closed
+    assert {job.state for job in view.jobs} == {"interrupted"}
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_restart_finalizes_fully_closed_run_without_starting_runtime(
+    tmp_path: Path, expired: bool
+) -> None:
+    config = replace(_config(tmp_path), active_challenges=1, concurrency=2)
+    challenge = _challenge(1)
+    store = StateStore(config.state_path)
+    store.start_run("closed-run", config.public_record())
+    store.upsert_challenge(
+        challenge.id,
+        challenge.name,
+        challenge.category,
+        challenge.type,
+        challenge.value,
+    )
+    route = baseline_route(
+        model=config.model,
+        effort=config.reasoning_effort,
+        attempt_seconds=config.attempt_seconds,
+    )
+    assignments = (("lead", config.model, config.reasoning_effort),) * 2
+    store.record_control_catalogue("closed-run", [(0, 1, True)])
+    store.admit_control_wave("closed-run", 1, 0, 0, 2, route, assignments)
+    store.start_control_wave("closed-run", 1, 0)
+    for lane in range(2):
+        attempt_id = f"closed-run:1:0:{lane}"
+        store.start_attempt(
+            attempt_id,
+            "closed-run",
+            1,
+            0,
+            lane,
+            config.model,
+            config.reasoning_effort,
+            require_control_assignment=True,
+        )
+        store.finish_attempt(attempt_id, "unsolved", summary="closed")
+    store.finish_control_wave("closed-run", 1, 0, "unsolved")
+    store.set_challenge_status(1, "unsolved")
+    if expired:
+        started_at = (datetime.now(UTC) - timedelta(seconds=config.run_seconds + 1)).isoformat()
+        with store.transaction() as connection:
+            connection.execute("UPDATE runs SET started_at=? WHERE id='closed-run'", (started_at,))
+    store.close()
+
+    class CatalogueUnavailableBoard(BoundaryBoard):
+        def list_challenges(self) -> list[dict[str, int]]:
+            raise BoardError("durable closed work must not refetch catalogue")
+
+    runtime = BoundaryRuntime("unused")
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config, board=CatalogueUnavailableBoard([challenge]), runtime=runtime
+        )
+    )
+
+    assert report.run_id == "closed-run"
+    assert report.status == "completed"
+    assert report.unsolved == 1
+    assert not runtime.started
+    assert runtime.closed
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_restart_fences_ambiguous_submission_until_explicit_reconciliation(
+    tmp_path: Path, expired: bool
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        concurrency=2,
+        submit_candidates=True,
+    )
+    candidate = "INCYPHER{effect-may-have-landed}"
+    store = StateStore(config.state_path)
+    store.start_run("effect-run", config.public_record())
+    store.bind_board_identity(1, 2)
+    fixture = _challenge(1)
+    store.upsert_challenge(1, fixture.name, fixture.category, fixture.type, fixture.value)
+    store.record_control_catalogue("effect-run", [(0, 1, True)])
+    store.admit_control_wave(
+        "effect-run",
+        1,
+        0,
+        0,
+        config.attempts_per_challenge,
+        baseline_route(
+            model=config.model,
+            effort=config.reasoning_effort,
+            attempt_seconds=config.attempt_seconds,
+        ),
+        (("lead", config.model, config.reasoning_effort),) * 2,
+    )
+    assert store.reserve_submission("effect-run", 1, candidate)
+    if expired:
+        started_at = (datetime.now(UTC) - timedelta(seconds=config.run_seconds + 1)).isoformat()
+        with store.transaction() as connection:
+            connection.execute("UPDATE runs SET started_at=? WHERE id='effect-run'", (started_at,))
+    store.close()
+
+    board = BoundaryBoard([_challenge(1)])
+    blocked_runtime = BoundaryRuntime("unused")
+    with pytest.raises(
+        orchestrator_module.RecoveryBlocked,
+        match="explicit reconciliation",
+    ):
+        asyncio.run(DurableJobControl.drive(config, board=board, runtime=blocked_runtime))
+    blocked = DurableJobControl.inspect(config.state_path, run_id="effect-run")
+    assert blocked.status == "running"
+    assert not blocked_runtime.started
+    assert blocked_runtime.closed
+    assert board.submissions == []
+    assert blocked.pending_submission_count == 1
+
+    store = StateStore(config.state_path)
+    store.reconcile_submission_intent(
+        1,
+        hashlib.sha256(candidate.encode()).hexdigest(),
+        "not_delivered",
+    )
+    store.close()
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    assert report.run_id == "effect-run"
+    assert report.status == ("deadline" if expired else "completed")
+    assert board.submissions == []
+
+
+def test_pending_submission_does_not_block_unaffected_challenge_recovery(
+    tmp_path: Path,
+) -> None:
+    config = replace(_config(tmp_path), active_challenges=1, concurrency=2, submit_candidates=True)
+    candidate = "INCYPHER{effect-may-have-landed}"
+    challenges = [_challenge(1), _challenge(2)]
+    store = StateStore(config.state_path)
+    store.start_run("effect-run", config.public_record())
+    store.bind_board_identity(1, 2)
+    route = baseline_route(
+        model=config.model,
+        effort=config.reasoning_effort,
+        attempt_seconds=config.attempt_seconds,
+    )
+    assignments = (("lead", config.model, config.reasoning_effort),) * 2
+    for challenge in challenges:
+        store.upsert_challenge(
+            challenge.id,
+            challenge.name,
+            challenge.category,
+            challenge.type,
+            challenge.value,
+        )
+    store.record_control_catalogue("effect-run", [(0, 1, True), (1, 2, True)])
+    for rank, challenge in enumerate(challenges):
+        store.admit_control_wave("effect-run", challenge.id, 0, rank, 2, route, assignments)
+    store.start_control_wave("effect-run", 1, 0)
+    assert store.reserve_submission("effect-run", 1, candidate)
+    store.close()
+
+    class RecordingRuntime(UnsolvedBoundaryRuntime):
+        def __init__(self) -> None:
+            super().__init__("unused")
+            self.work: list[tuple[int, int]] = []
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            self.work.append((int(document["challenge"]["id"]), int(document["episode"])))
+            return await super().solve(workspace, prompt, **kwargs)
+
+    board = BoundaryBoard(challenges)
+    first_runtime = RecordingRuntime()
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="explicit reconciliation"):
+        asyncio.run(DurableJobControl.drive(config, board=board, runtime=first_runtime))
+    assert {challenge_id for challenge_id, _ in first_runtime.work} == {2}
+    assert board.submissions == []
+
+    store = StateStore(config.state_path)
+    store.reconcile_submission_intent(
+        1,
+        hashlib.sha256(candidate.encode()).hexdigest(),
+        "not_delivered",
+    )
+    store.close()
+    second_runtime = RecordingRuntime()
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=second_runtime))
+    assert report.run_id == "effect-run"
+    assert report.status == "completed"
+    assert {challenge_id for challenge_id, _ in second_runtime.work} == {1}
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_restart_removes_receipt_bound_instance_before_starting_solver(
+    tmp_path: Path, expired: bool
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        concurrency=2,
+        manage_dynamic_instances=True,
+    )
+    challenge = _challenge(1, challenge_type="dynamic_iac")
+    board = ManagedInstanceBoundaryBoard([challenge])
+    board.active.add(1)
+    receipt = hashlib.sha256(
+        json.dumps(
+            {
+                "connection_info": "http://127.0.0.1:8135/",
+                "since": None,
+                "until": 100,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    store = StateStore(config.state_path)
+    store.start_run("instance-run", config.public_record())
+    store.bind_board_identity(1, 2)
+    store.upsert_challenge(
+        1,
+        challenge.name,
+        challenge.category,
+        challenge.type,
+        challenge.value,
+    )
+    store.record_control_catalogue("instance-run", [(0, 1, True)])
+    store.admit_control_wave(
+        "instance-run",
+        1,
+        0,
+        0,
+        config.attempts_per_challenge,
+        baseline_route(
+            model=config.model,
+            effort=config.reasoning_effort,
+            attempt_seconds=config.attempt_seconds,
+        ),
+        (("lead", config.model, config.reasoning_effort),) * 2,
+    )
+    store.mark_instance("instance-run", 1, "owned", receipt_sha256=receipt)
+    if expired:
+        started_at = (datetime.now(UTC) - timedelta(seconds=config.run_seconds + 1)).isoformat()
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET started_at=? WHERE id='instance-run'", (started_at,)
+            )
+    store.close()
+
+    class OrderedRuntime(UnsolvedBoundaryRuntime):
+        async def start(self) -> None:
+            assert not board.active
+            assert ("DELETE", 1) in board.instance_calls
+            await super().start()
+
+    runtime = OrderedRuntime("unused")
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    assert report.run_id == "instance-run"
+    assert report.status == ("deadline" if expired else "completed")
+    assert runtime.started is (not expired)
+    assert runtime.closed
+    assert not board.active
+    assert ("POST", 1) not in board.instance_calls
+    assert DurableJobControl.inspect(config.state_path).owned_instance_count == 0
+
+
+def test_restart_fences_mismatched_instance_generation_before_solver(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        concurrency=2,
+        manage_dynamic_instances=True,
+    )
+    challenge = _challenge(1, challenge_type="dynamic_iac")
+    board = ManagedInstanceBoundaryBoard([challenge])
+    board.active.add(1)
+    store = StateStore(config.state_path)
+    store.start_run("instance-run", config.public_record())
+    store.bind_board_identity(1, 2)
+    store.upsert_challenge(1, challenge.name, challenge.category, challenge.type, challenge.value)
+    store.record_control_catalogue("instance-run", [(0, 1, True)])
+    store.admit_control_wave(
+        "instance-run",
+        1,
+        0,
+        0,
+        config.attempts_per_challenge,
+        baseline_route(
+            model=config.model,
+            effort=config.reasoning_effort,
+            attempt_seconds=config.attempt_seconds,
+        ),
+        (("lead", config.model, config.reasoning_effort),) * 2,
+    )
+    store.mark_instance("instance-run", 1, "owned", receipt_sha256="a" * 64)
+    store.close()
+
+    runtime = BoundaryRuntime("unused")
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="indeterminate"):
+        asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    view = DurableJobControl.inspect(config.state_path, run_id="instance-run")
+    assert view.status == "running"
+    assert view.owned_instance_count == 1
+    assert not runtime.started
+    assert runtime.closed
+    assert board.active == {1}
+    assert ("DELETE", 1) not in board.instance_calls
+
+
+def test_restart_fences_receiptless_current_instance_before_solver(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        concurrency=2,
+        manage_dynamic_instances=True,
+    )
+    challenge = _challenge(1, challenge_type="dynamic_iac")
+    board = ManagedInstanceBoundaryBoard([challenge])
+    board.active.add(1)
+    store = StateStore(config.state_path)
+    store.start_run("instance-run", config.public_record())
+    store.bind_board_identity(1, 2)
+    store.upsert_challenge(1, challenge.name, challenge.category, challenge.type, challenge.value)
+    store.record_control_catalogue("instance-run", [(0, 1, True)])
+    store.mark_instance("instance-run", 1, "creating")
+    store.close()
+
+    runtime = BoundaryRuntime("unused")
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="indeterminate"):
+        asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    view = DurableJobControl.inspect(config.state_path, run_id="instance-run")
+    assert view.status == "running"
+    assert view.owned_instance_count == 1
+    assert not runtime.started
+    assert runtime.closed
+    assert board.active == {1}
+    assert board.instance_calls == [("GET", 1)]

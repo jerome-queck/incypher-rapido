@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -62,6 +63,121 @@ def test_records_run_attempt_and_restart_recovery(tmp_path: Path) -> None:
     assert row["status"] == "interrupted"
     assert event["kind"] == "recovery"
     assert event["data_json"] == '{"interrupted_attempts":1}'
+    store.close()
+
+
+def test_same_run_recovery_is_idempotent_and_rejects_config_change(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    config = {"run_seconds": 19_800, "model": "gpt-daybreak-blue-latest"}
+    store.start_run("run-1", config)
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("run-1", [(0, 1, True)])
+    route = baseline_route(
+        model="gpt-daybreak-blue-latest",
+        effort="xhigh",
+        attempt_seconds=800,
+    )
+    store.admit_control_wave(
+        "run-1",
+        1,
+        0,
+        0,
+        2,
+        route,
+        (
+            ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+            ("specialist", "gpt-5.6-luna", "max"),
+        ),
+    )
+    store.start_control_wave("run-1", 1, 0)
+    store.start_attempt(
+        "attempt-1",
+        "run-1",
+        1,
+        0,
+        0,
+        "gpt-daybreak-blue-latest",
+        "xhigh",
+        require_control_assignment=True,
+    )
+    store.acquire_supervisor()
+
+    first = store.start_or_resume_run("unused", config)
+    second = store.start_or_resume_run("unused-again", config)
+    assert first.run_id == second.run_id == "run-1"
+    assert first.resumed and second.resumed
+    assert store.resume_control_waves("run-1", 10_000) == 1
+    assert store.resume_control_waves("run-1", 10_000) == 0
+    waves = store.queued_control_waves("run-1")
+    assert [(wave.challenge_id, wave.episode, wave.route.role) for wave in waves] == [
+        (1, 1, "recovery")
+    ]
+    assert store.attempts_for_challenge("run-1", 1)[0]["status"] == "interrupted"
+    assert store.recovery_dispatch_count("run-1", 1) == 1
+    with pytest.raises(RuntimeError, match="configuration differs"):
+        store.start_or_resume_run("unused", {**config, "run_seconds": 60})
+    assert len(store.queued_control_waves("run-1")) == 1
+    store.close()
+
+
+def test_repeated_restart_before_attempt_keeps_changing_recovery_route(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    config = {"run_seconds": 19_800}
+    store.start_run("run-1", config)
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("run-1", [(0, 1, True)])
+    route = baseline_route(model="model", effort="xhigh", attempt_seconds=800)
+    assignments = (("lead", "model", "xhigh"), ("specialist", "model", "xhigh"))
+    store.admit_control_wave("run-1", 1, 0, 0, 2, route, assignments)
+    store.start_control_wave("run-1", 1, 0)
+    store.acquire_supervisor()
+
+    store.start_or_resume_run("unused", config)
+    assert store.resume_control_waves("run-1", 10_000) == 1
+    first = store.queued_control_waves("run-1")[0]
+    assert first.episode == first.route.workspace_generation == 1
+
+    store.start_control_wave("run-1", 1, 1)
+    store.start_or_resume_run("unused-again", config)
+    assert store.resume_control_waves("run-1", 10_000) == 1
+    second = store.queued_control_waves("run-1")[0]
+    assert second.episode == second.route.workspace_generation == 2
+    assert store.recovery_dispatch_count("run-1", 1) == 2
+    store.close()
+
+
+def test_reconciled_correct_closes_interrupted_challenge_without_retry(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    config = {"run_seconds": 19_800}
+    store.start_run("run-1", config)
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("run-1", [(0, 1, True)])
+    route = baseline_route(model="model", effort="xhigh", attempt_seconds=800)
+    store.admit_control_wave(
+        "run-1",
+        1,
+        0,
+        0,
+        2,
+        route,
+        (("lead", "model", "xhigh"), ("specialist", "model", "xhigh")),
+    )
+    store.start_control_wave("run-1", 1, 0)
+    candidate = "INCYPHER{delivered-before-process-loss}"
+    assert store.reserve_submission("run-1", 1, candidate)
+    store.reconcile_submission_intent(
+        1,
+        hashlib.sha256(candidate.encode()).hexdigest(),
+        "correct",
+    )
+    store.acquire_supervisor()
+
+    store.start_or_resume_run("unused", config)
+    assert store.resume_control_waves("run-1", 10_000) == 0
+    assert store.queued_control_waves("run-1") == ()
+    assert store.challenge_has_correct_submission("run-1", 1)
+    assert store.run_terminal_outcomes("run-1") == {1: "solved"}
+    assert store._connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
     store.close()
 
 

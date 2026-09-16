@@ -38,7 +38,7 @@ _QUOTA_FAILURES = frozenset(
         "usage_limit_exceeded",
     }
 )
-_CONTAINER_FAILURES = frozenset({"native_runtime", "operating_system"})
+_CONTAINER_FAILURES = frozenset({"native_runtime", "operating_system", "process_restart"})
 _ROUTABLE_TOOL_FAILURES = frozenset(
     {
         "active_turn_not_steerable",
@@ -395,7 +395,11 @@ def route_failure(request: RouteRequest) -> RouteDecision:
             role="recovery",
             tactic="fresh_workspace_recovery",
             context_profile="durable_facts_only",
-            workspace_generation=1,
+            workspace_generation=(
+                request.current.workspace_generation + 1
+                if failure.subreason == "process_restart"
+                else 1
+            ),
         )
     elif failure.kind not in {"disagreement", "quota"}:  # pragma: no cover - closed above
         raise AssertionError("unreachable failure kind")

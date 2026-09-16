@@ -55,6 +55,21 @@ class ComparisonRouteTrace:
     decision_digest: str
 
 
+@dataclass(frozen=True)
+class RunSession:
+    run_id: str
+    started_at: str
+    resumed: bool
+
+
+@dataclass(frozen=True)
+class QueuedControlWave:
+    challenge_id: int
+    catalogue_rank: int
+    episode: int
+    route: RouteSpec
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -137,6 +152,7 @@ class StateStore:
                 confidence REAL,
                 evidence_json TEXT NOT NULL DEFAULT '[]',
                 next_steps_json TEXT NOT NULL DEFAULT '[]',
+                checkpoint_observations_json TEXT NOT NULL DEFAULT '[]',
                 tool_count INTEGER NOT NULL DEFAULT 0,
                 failure_class TEXT,
                 UNIQUE(run_id, challenge_id, episode, lane)
@@ -191,6 +207,7 @@ class StateStore:
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
                 catalogue_rank INTEGER NOT NULL,
                 executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
+                context_sha256 TEXT,
                 PRIMARY KEY(run_id, challenge_id),
                 UNIQUE(run_id, catalogue_rank)
             );
@@ -271,6 +288,7 @@ class StateStore:
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
                 episode INTEGER NOT NULL,
                 origin TEXT NOT NULL CHECK(origin IN ('board', 'container')),
+                reason TEXT NOT NULL DEFAULT '',
                 event_sequence INTEGER NOT NULL UNIQUE REFERENCES control_events(sequence),
                 PRIMARY KEY(run_id, challenge_id, episode)
             );
@@ -336,6 +354,15 @@ class StateStore:
             """
         )
         self._migrate_attempts()
+        attempt_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(attempts)").fetchall()
+        }
+        if "checkpoint_observations_json" not in attempt_columns:
+            self._connection.execute(
+                "ALTER TABLE attempts ADD COLUMN checkpoint_observations_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
         self._connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
             "ON attempts(id, run_id, challenge_id, episode, lane)"
@@ -347,6 +374,22 @@ class StateStore:
         }
         if "receipt_sha256" not in instance_columns:
             self._connection.execute("ALTER TABLE instances ADD COLUMN receipt_sha256 TEXT")
+        catalogue_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(control_catalogue)").fetchall()
+        }
+        if "context_sha256" not in catalogue_columns:
+            self._connection.execute("ALTER TABLE control_catalogue ADD COLUMN context_sha256 TEXT")
+        origin_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(control_failure_origins)"
+            ).fetchall()
+        }
+        if "reason" not in origin_columns:
+            self._connection.execute(
+                "ALTER TABLE control_failure_origins ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
+            )
 
     def _migrate_control_jobs(self) -> None:
         """Atomically establish control_routes as the sole route JSON authority."""
@@ -638,6 +681,127 @@ class StateStore:
                 (run_id, self._now(), json.dumps(config, sort_keys=True, separators=(",", ":"))),
             )
 
+    def start_or_resume_run(self, run_id: str, config: dict[str, object]) -> RunSession:
+        """Create a run or atomically seal process-lost work for same-run continuation."""
+        if not self._lease_files:
+            raise RuntimeError("run ownership requires the supervisor lease")
+        encoded_config = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        with self.transaction() as connection:
+            active = connection.execute(
+                "SELECT id, started_at, config_json FROM runs WHERE status='running' "
+                "ORDER BY started_at, id"
+            ).fetchall()
+            if len(active) > 1:
+                raise RuntimeError("state contains multiple running runs")
+            if not active:
+                started_at = self._now()
+                connection.execute(
+                    "INSERT INTO runs(id, started_at, status, config_json) "
+                    "VALUES (?, ?, 'running', ?)",
+                    (run_id, started_at, encoded_config),
+                )
+                return RunSession(run_id=run_id, started_at=started_at, resumed=False)
+
+            row = active[0]
+            active_run_id = str(row["id"])
+            if str(row["config_json"]) != encoded_config:
+                raise RuntimeError("running run configuration differs from requested configuration")
+
+            now = self._now()
+            active_waves = connection.execute(
+                "SELECT DISTINCT challenge_id, episode FROM control_jobs "
+                "WHERE run_id=? AND state='running' ORDER BY challenge_id, episode",
+                (active_run_id,),
+            ).fetchall()
+            attempt_counts = connection.execute(
+                "SELECT run_id, COUNT(*) AS count FROM attempts "
+                "WHERE run_id=? AND status='running' GROUP BY run_id",
+                (active_run_id,),
+            ).fetchall()
+            interrupted = connection.execute(
+                "UPDATE attempts SET finished_at=?, status='interrupted', "
+                "summary=CASE WHEN summary='' THEN 'process ended before restart' ELSE summary END, "
+                "failure_class='process_restart' "
+                "WHERE run_id=? AND status='running'",
+                (now, active_run_id),
+            ).rowcount
+            for wave in active_waves:
+                challenge_id = int(wave["challenge_id"])
+                episode = int(wave["episode"])
+                self._finish_control_wave(connection, active_run_id, challenge_id, episode, "error")
+                existing_origin = connection.execute(
+                    "SELECT origin FROM control_failure_origins "
+                    "WHERE run_id=? AND challenge_id=? AND episode=?",
+                    (active_run_id, challenge_id, episode),
+                ).fetchone()
+                sequence = self._control_event(
+                    connection,
+                    active_run_id,
+                    (
+                        "process_restart_recorded"
+                        if existing_origin is not None
+                        else "failure_origin_recorded"
+                    ),
+                    None,
+                    {
+                        "challenge_id": challenge_id,
+                        "episode": episode,
+                        "origin": "container",
+                        "reason": "process_restart",
+                    },
+                )
+                if existing_origin is None:
+                    connection.execute(
+                        "INSERT INTO control_failure_origins("
+                        "run_id, challenge_id, episode, origin, reason, event_sequence) "
+                        "VALUES (?, ?, ?, 'container', 'process_restart', ?)",
+                        (active_run_id, challenge_id, episode, sequence),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE control_failure_origins "
+                        "SET origin='container', reason='process_restart', event_sequence=? "
+                        "WHERE run_id=? AND challenge_id=? AND episode=?",
+                        (sequence, active_run_id, challenge_id, episode),
+                    )
+            for attempt_count in attempt_counts:
+                connection.execute(
+                    "INSERT INTO events(run_id, at, kind, data_json) VALUES (?, ?, 'recovery', ?)",
+                    (
+                        active_run_id,
+                        now,
+                        json.dumps(
+                            {"interrupted_attempts": int(attempt_count["count"])},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            connection.execute(
+                "UPDATE challenges SET status='queued', updated_at=? WHERE status='running'",
+                (now,),
+            )
+            connection.execute(
+                "INSERT INTO events(run_id, at, kind, data_json) VALUES (?, ?, 'run_resumed', ?)",
+                (
+                    active_run_id,
+                    now,
+                    json.dumps(
+                        {
+                            "interrupted_attempts": int(interrupted),
+                            "interrupted_waves": len(active_waves),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return RunSession(
+                run_id=active_run_id,
+                started_at=str(row["started_at"]),
+                resumed=True,
+            )
+
     def bind_board_identity(self, user_id: int, team_id: int) -> None:
         """Bind durable ownership and submission accounting to one Board identity."""
         if type(user_id) is not int or user_id <= 0 or type(team_id) is not int or team_id <= 0:
@@ -802,6 +966,20 @@ class StateStore:
             return []
         return decoded
 
+    @staticmethod
+    def _decode_checkpoint_observations(value: object) -> list[dict[str, Any]]:
+        try:
+            decoded = json.loads(value) if isinstance(value, str) else None
+        except (TypeError, ValueError, RecursionError):
+            return []
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) > 100
+            or any(not isinstance(observation, dict) for observation in decoded)
+        ):
+            return []
+        return decoded
+
     def finish_attempt(
         self,
         attempt_id: str,
@@ -854,7 +1032,8 @@ class StateStore:
                 """
                 UPDATE attempts
                 SET finished_at=?, status=?, summary=?, candidate=?, confidence=?,
-                    evidence_json=?, next_steps_json=?, tool_count=?, failure_class=?
+                    evidence_json=?, next_steps_json=?, checkpoint_observations_json='[]',
+                    tool_count=?, failure_class=?
                 WHERE id=? AND status='running'
                 """,
                 (
@@ -874,6 +1053,67 @@ class StateStore:
                 raise ValueError("attempt is absent or not running")
             if retain_private_candidate:
                 assert candidate is not None
+                self._retain_candidate(
+                    connection,
+                    attempt_id=attempt_id,
+                    run_id=str(attempt["run_id"]),
+                    challenge_id=int(attempt["challenge_id"]),
+                    episode=int(attempt["episode"]),
+                    lane=int(attempt["lane"]),
+                    candidate=candidate,
+                )
+
+    def checkpoint_attempt(
+        self,
+        attempt_id: str,
+        *,
+        summary: str,
+        candidate: str | None = None,
+        evidence: list[str] | tuple[str, ...] = (),
+        next_steps: list[str] | tuple[str, ...] = (),
+        observations: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        tool_count: int = 0,
+    ) -> None:
+        """Durably retain the latest primary checkpoint while it keeps running."""
+        if candidate is not None and not isinstance(candidate, str):
+            raise TypeError("checkpoint candidate must be text or null")
+        evidence_json = self._encode_attempt_evidence("evidence", evidence)
+        next_steps_json = self._encode_attempt_evidence("next_steps", next_steps)
+        if (
+            not isinstance(observations, (list, tuple))
+            or len(observations) > 100
+            or any(not isinstance(observation, dict) for observation in observations)
+        ):
+            raise ValueError("checkpoint observations are invalid or unbounded")
+        observations_json = json.dumps(
+            list(observations), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(observations_json.encode("utf-8")) > MAX_EVENT_BYTES:
+            raise ValueError("checkpoint observations exceed the durable audit limit")
+        if type(tool_count) is not int or not 0 <= tool_count <= 100:
+            raise ValueError("tool_count must be an integer in [0, 100]")
+        with self.transaction() as connection:
+            changed = connection.execute(
+                "UPDATE attempts SET summary=?, evidence_json=?, next_steps_json=?, "
+                "checkpoint_observations_json=?, tool_count=? "
+                "WHERE id=? AND status='running'",
+                (
+                    summary[:4000],
+                    evidence_json,
+                    next_steps_json,
+                    observations_json,
+                    tool_count,
+                    attempt_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("attempt is absent or not running")
+            if candidate is not None:
+                attempt = connection.execute(
+                    "SELECT run_id, challenge_id, episode, lane FROM attempts WHERE id=?",
+                    (attempt_id,),
+                ).fetchone()
+                assert attempt is not None
                 self._retain_candidate(
                     connection,
                     attempt_id=attempt_id,
@@ -929,26 +1169,45 @@ class StateStore:
         else:
             raise ValueError("private candidate role is invalid")
         candidate_key = hashlib.sha256(encoded).digest()
-        connection.execute(
+        existing = connection.execute(
             """
-            INSERT INTO candidate_proposals(
-              source_attempt_id, run_id, challenge_id, episode, lane, role,
-              recipe_kind, candidate_key, candidate, retained_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT run_id, challenge_id, episode, lane, role, recipe_kind,
+                   candidate_key, candidate
+            FROM candidate_proposals WHERE source_attempt_id=?
             """,
-            (
-                attempt_id,
-                run_id,
-                challenge_id,
-                episode,
-                lane,
-                role,
-                recipe,
-                candidate_key,
-                encoded,
-                self._now(),
-            ),
+            (attempt_id,),
+        ).fetchone()
+        expected = (
+            run_id,
+            challenge_id,
+            episode,
+            lane,
+            role,
+            recipe,
+            candidate_key,
+            encoded,
         )
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO candidate_proposals(
+                  source_attempt_id, run_id, challenge_id, episode, lane, role,
+                  recipe_kind, candidate_key, candidate, retained_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (attempt_id, *expected, self._now()),
+            )
+        elif (
+            str(existing["run_id"]),
+            int(existing["challenge_id"]),
+            int(existing["episode"]),
+            int(existing["lane"]),
+            str(existing["role"]),
+            str(existing["recipe_kind"]),
+            bytes(existing["candidate_key"]),
+            bytes(existing["candidate"]),
+        ) != expected:
+            raise ValueError("checkpoint candidate changed before attempt completion")
         if role != "verifier":
             return
         producer = connection.execute(
@@ -1217,6 +1476,289 @@ class StateStore:
                     for catalogue_rank, challenge_id, executable in entries
                 ],
             )
+
+    def initialize_control_catalogue(
+        self,
+        run_id: str,
+        entries: list[tuple[int, int, bool]],
+        lanes: int,
+        route: RouteSpec,
+        assignments: Sequence[tuple[str, str, str]],
+        context_sha256s: dict[int, str] | None = None,
+    ) -> None:
+        """Atomically freeze the catalogue and admit every executable initial wave."""
+        contexts = context_sha256s or {}
+        if contexts and set(contexts) != {challenge_id for _, challenge_id, _ in entries}:
+            raise ValueError("catalogue context identities are incomplete")
+        if any(
+            len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+            for digest in contexts.values()
+        ):
+            raise ValueError("catalogue context identity is invalid")
+        with self.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO control_catalogue("
+                "run_id, challenge_id, catalogue_rank, executable, context_sha256) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        run_id,
+                        challenge_id,
+                        catalogue_rank,
+                        int(executable),
+                        contexts.get(challenge_id),
+                    )
+                    for catalogue_rank, challenge_id, executable in entries
+                ],
+            )
+            for catalogue_rank, challenge_id, executable in entries:
+                if executable:
+                    self._admit_control_wave(
+                        connection,
+                        run_id,
+                        challenge_id,
+                        0,
+                        catalogue_rank,
+                        lanes,
+                        route,
+                        assignments,
+                        require_unused_route=False,
+                    )
+
+    def control_catalogue_entries(self, run_id: str) -> list[tuple[int, int, bool]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT catalogue_rank, challenge_id, executable FROM control_catalogue "
+                "WHERE run_id=? ORDER BY catalogue_rank",
+                (run_id,),
+            ).fetchall()
+        return [
+            (int(row["catalogue_rank"]), int(row["challenge_id"]), bool(row["executable"]))
+            for row in rows
+        ]
+
+    def control_catalogue_signature(
+        self, run_id: str
+    ) -> dict[int, tuple[str, str, str, int, bool]]:
+        """Stable Board fields for safe same-run identity validation."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT catalogue.challenge_id, challenge.name, challenge.category,
+                       challenge.challenge_type, challenge.value, catalogue.executable
+                FROM control_catalogue AS catalogue
+                JOIN challenges AS challenge ON challenge.id=catalogue.challenge_id
+                WHERE catalogue.run_id=?
+                """,
+                (run_id,),
+            ).fetchall()
+        return {
+            int(row["challenge_id"]): (
+                str(row["name"]),
+                str(row["category"]),
+                str(row["challenge_type"]),
+                int(row["value"]),
+                bool(row["executable"]),
+            )
+            for row in rows
+        }
+
+    def control_catalogue_contexts(self, run_id: str) -> dict[int, str]:
+        """Return material challenge identities when the run was created with them."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT challenge_id, context_sha256 FROM control_catalogue "
+                "WHERE run_id=? ORDER BY catalogue_rank",
+                (run_id,),
+            ).fetchall()
+        if not rows or all(row["context_sha256"] is None for row in rows):
+            return {}
+        if any(row["context_sha256"] is None for row in rows):
+            raise ValueError("durable catalogue context identities are incomplete")
+        contexts = {int(row["challenge_id"]): str(row["context_sha256"]) for row in rows}
+        if any(
+            len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+            for digest in contexts.values()
+        ):
+            raise ValueError("durable catalogue context identity is invalid")
+        return contexts
+
+    def queued_control_waves(
+        self, run_id: str, *, exclude_pending_submissions: bool = False
+    ) -> tuple[QueuedControlWave, ...]:
+        """Rebuild the unfinished queue from already-admitted durable jobs."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT jobs.challenge_id, jobs.catalogue_rank, jobs.episode,
+                       MIN(jobs.admitted_sequence) AS first_sequence,
+                       COUNT(DISTINCT jobs.route_fingerprint) AS route_count,
+                       MIN(routes.route_json) AS route_json
+                FROM control_jobs AS jobs
+                JOIN control_routes AS routes
+                  ON routes.run_id=jobs.run_id
+                 AND routes.challenge_id=jobs.challenge_id
+                 AND routes.route_fingerprint=jobs.route_fingerprint
+                WHERE jobs.run_id=? AND jobs.state='queued'
+                  AND (?=0 OR NOT EXISTS (
+                    SELECT 1 FROM submission_intents AS pending
+                    WHERE pending.challenge_id=jobs.challenge_id
+                      AND pending.status='pending'
+                  ))
+                GROUP BY jobs.challenge_id, jobs.catalogue_rank, jobs.episode
+                ORDER BY jobs.catalogue_rank, first_sequence
+                """,
+                (run_id, int(exclude_pending_submissions)),
+            ).fetchall()
+        seen: set[int] = set()
+        waves: list[QueuedControlWave] = []
+        for row in rows:
+            challenge_id = int(row["challenge_id"])
+            if challenge_id in seen or int(row["route_count"]) != 1:
+                raise ValueError("durable queue has overlapping or mixed-route waves")
+            seen.add(challenge_id)
+            try:
+                route = RouteSpec.from_dict(json.loads(str(row["route_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("durable queued route is invalid") from exc
+            waves.append(
+                QueuedControlWave(
+                    challenge_id=challenge_id,
+                    catalogue_rank=int(row["catalogue_rank"]),
+                    episode=int(row["episode"]),
+                    route=route,
+                )
+            )
+        return tuple(waves)
+
+    def resume_control_waves(self, run_id: str, remaining_milliseconds: int) -> int:
+        """Route every process-interrupted wave once; repeated recovery is idempotent."""
+        if type(remaining_milliseconds) is not int or remaining_milliseconds < 0:
+            raise ValueError("remaining_milliseconds is invalid")
+        dispatched = 0
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT origin.challenge_id, origin.episode,
+                       MIN(jobs.catalogue_rank) AS catalogue_rank,
+                       COUNT(*) AS lanes,
+                       EXISTS(
+                         SELECT 1 FROM submission_intents AS pending
+                         WHERE pending.challenge_id=origin.challenge_id
+                           AND pending.status='pending'
+                       ) AS submission_pending
+                FROM control_failure_origins AS origin
+                JOIN control_jobs AS jobs
+                  ON jobs.run_id=origin.run_id
+                 AND jobs.challenge_id=origin.challenge_id
+                 AND jobs.episode=origin.episode
+                WHERE origin.run_id=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM control_route_decisions AS decision
+                    WHERE decision.run_id=origin.run_id
+                      AND decision.challenge_id=origin.challenge_id
+                      AND decision.source_episode=origin.episode
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM submissions AS submission
+                    WHERE submission.run_id=origin.run_id
+                      AND submission.challenge_id=origin.challenge_id
+                      AND submission.outcome='correct'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM submission_intents AS intent
+                    WHERE intent.first_run_id=origin.run_id
+                      AND intent.challenge_id=origin.challenge_id
+                      AND intent.status='correct'
+                  )
+                GROUP BY origin.challenge_id, origin.episode
+                ORDER BY MIN(jobs.admitted_sequence)
+                """,
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                challenge_id = int(row["challenge_id"])
+                source_episode = int(row["episode"])
+                if bool(row["submission_pending"]):
+                    connection.execute(
+                        "UPDATE challenges SET status='candidate', updated_at=? WHERE id=?",
+                        (self._now(), challenge_id),
+                    )
+                    continue
+                next_episode = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(episode), -1) + 1 FROM control_jobs "
+                        "WHERE run_id=? AND challenge_id=?",
+                        (run_id, challenge_id),
+                    ).fetchone()[0]
+                )
+                decision = self._decide_control_successor(
+                    connection,
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    source_episode=source_episode,
+                    next_episode=next_episode,
+                    catalogue_rank=int(row["catalogue_rank"]),
+                    lanes=int(row["lanes"]),
+                    terminal="error",
+                    attempts_remaining=remaining_milliseconds >= 1_000,
+                    remaining_milliseconds=remaining_milliseconds,
+                )
+                if decision is not None and decision.disposition == "dispatch":
+                    dispatched += 1
+                else:
+                    connection.execute(
+                        "UPDATE challenges SET status='error', updated_at=? WHERE id=?",
+                        (self._now(), challenge_id),
+                    )
+        return dispatched
+
+    def recovery_dispatch_count(self, run_id: str, challenge_id: int) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM control_route_decisions "
+                "WHERE run_id=? AND challenge_id=? AND failure_kind='container' "
+                "AND failure_subreason='process_restart' AND disposition='dispatch'",
+                (run_id, challenge_id),
+            ).fetchone()
+        return int(row["count"])
+
+    def run_terminal_outcomes(self, run_id: str) -> dict[int, str]:
+        """Return durable terminal statuses, excluding every challenge still queued."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT catalogue.challenge_id, challenge.status,
+                       EXISTS(
+                         SELECT 1 FROM submissions AS submission
+                         WHERE submission.run_id=catalogue.run_id
+                           AND submission.challenge_id=catalogue.challenge_id
+                           AND submission.outcome='correct'
+                       ) OR EXISTS(
+                         SELECT 1 FROM submission_intents AS intent
+                         WHERE intent.first_run_id=catalogue.run_id
+                           AND intent.challenge_id=catalogue.challenge_id
+                           AND intent.status='correct'
+                       ) AS correct
+                FROM control_catalogue AS catalogue
+                JOIN challenges AS challenge ON challenge.id=catalogue.challenge_id
+                WHERE catalogue.run_id=? AND NOT EXISTS (
+                  SELECT 1 FROM control_jobs AS jobs
+                  WHERE jobs.run_id=catalogue.run_id
+                    AND jobs.challenge_id=catalogue.challenge_id
+                    AND jobs.state IN ('queued', 'running')
+                )
+                ORDER BY catalogue.catalogue_rank
+                """,
+                (run_id,),
+            ).fetchall()
+        allowed = {"solved", "candidate", "unsolved", "unsupported", "error"}
+        outcomes: dict[int, str] = {}
+        for row in rows:
+            terminal = "solved" if bool(row["correct"]) else str(row["status"])
+            if terminal in allowed:
+                outcomes[int(row["challenge_id"])] = terminal
+        return outcomes
 
     def start_control_wave(self, run_id: str, challenge_id: int, episode: int) -> int:
         with self.transaction() as connection:
@@ -2018,13 +2560,17 @@ class StateStore:
             ).fetchone()[0]
         )
         origin_row = connection.execute(
-            "SELECT origin FROM control_failure_origins "
+            "SELECT origin, reason FROM control_failure_origins "
             "WHERE run_id=? AND challenge_id=? AND episode=?",
             (run_id, challenge_id, source_episode),
         ).fetchone()
+        failure_origin = None if origin_row is None else str(origin_row["origin"])
+        if origin_row is not None and str(origin_row["reason"]) == "process_restart":
+            failure_classes = frozenset({"process_restart"})
+            failure_origin = None
         signal = classify_failure(
             terminal=terminal,
-            failure_origin=None if origin_row is None else str(origin_row["origin"]),
+            failure_origin=failure_origin,
             failure_classes=failure_classes,
             candidate_identity_count=candidate_identity_count,
             attempt_count=len(attempts),
@@ -2050,7 +2596,9 @@ class StateStore:
         effects_safe = (
             int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM submission_intents WHERE status='pending'"
+                    "SELECT COUNT(*) FROM submission_intents "
+                    "WHERE challenge_id=? AND status='pending'",
+                    (challenge_id,),
                 ).fetchone()[0]
             )
             == 0
@@ -2327,6 +2875,7 @@ class StateStore:
                          AS evidence_json,
                        CASE WHEN attempt.lane=? THEN attempt.next_steps_json ELSE NULL END
                          AS next_steps_json,
+                       attempt.checkpoint_observations_json,
                        attempt.tool_count, job.role, job.route_fingerprint,
                        route.route_json
                 FROM attempts AS attempt
@@ -2369,6 +2918,9 @@ class StateStore:
                     "summary": None if row["summary"] is None else str(row["summary"]),
                     "evidence": self._decode_attempt_evidence(row["evidence_json"]),
                     "next_steps": self._decode_attempt_evidence(row["next_steps_json"]),
+                    "checkpoint_observations": self._decode_checkpoint_observations(
+                        row["checkpoint_observations_json"]
+                    ),
                     "tool_count": int(row["tool_count"]),
                     "role": None if row["role"] is None else str(row["role"]),
                     "tactic": None if route_spec is None else route_spec.tactic,
@@ -2628,6 +3180,11 @@ class StateStore:
                 """,
                 (outcome, self._now(), challenge_id, candidate_sha256),
             )
+            if outcome == "correct":
+                connection.execute(
+                    "UPDATE challenges SET status='solved', updated_at=? WHERE id=?",
+                    (self._now(), challenge_id),
+                )
             connection.execute(
                 "INSERT INTO events(run_id, at, kind, data_json) VALUES (?, ?, ?, ?)",
                 (
@@ -2736,9 +3293,11 @@ class StateStore:
     def challenge_has_correct_submission(self, run_id: str, challenge_id: int) -> bool:
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) AS count FROM submissions "
-                "WHERE run_id=? AND challenge_id=? AND outcome='correct'",
-                (run_id, challenge_id),
+                "SELECT (SELECT COUNT(*) FROM submissions "
+                "WHERE run_id=? AND challenge_id=? AND outcome='correct') + "
+                "(SELECT COUNT(*) FROM submission_intents "
+                "WHERE first_run_id=? AND challenge_id=? AND status='correct') AS count",
+                (run_id, challenge_id, run_id, challenge_id),
             ).fetchone()
         return int(row["count"]) > 0
 

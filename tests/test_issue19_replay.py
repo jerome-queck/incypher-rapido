@@ -82,7 +82,8 @@ def test_expected_red_is_empirical_all_15_and_truthful() -> None:
     assert run["runtime_model_selections"] == [["gpt-daybreak-blue-latest", "xhigh"]]
     assert run["runtime_started"] is True
     assert run["runtime_closed"] is True
-    assert run["runtime_solve_calls"] == run["evidence_manifests"] == 56
+    assert run["runtime_solve_calls"] == 56
+    assert run["evidence_manifests"] == 57
     assert run["board_instance_reads"] == 2
     assert run["board_instance_mutations"] == 0
     assert run["board_submission_calls"] == 0
@@ -168,14 +169,14 @@ def test_expected_red_is_empirical_all_15_and_truthful() -> None:
     }
 
     assert result["recovery"] == {
-        "scope": "unfinished durable rows only",
+        "scope": "same-run unfinished durable row",
         "unfinished_attempts_recovered": 1,
         "unfinished_attempt_status": "interrupted",
         "unfinished_attempt_summary": "process ended before restart",
-        "unfinished_run_status": "interrupted",
+        "unfinished_run_status": "completed",
         "recovery_events": 1,
         "second_recovery": 0,
-        "same_run_resumed": False,
+        "same_run_resumed": True,
         "abrupt_process_crash_exercised": False,
         "container_restart_exercised": False,
     }
@@ -360,9 +361,9 @@ def test_expected_red_gate_rejects_runtime_board_recovery_and_lifecycle_tamperin
     fallback = copy.deepcopy(baseline)
     fallback["fixture"]["fallback_used"] = True
     mutations.append(fallback)
-    recovery_overclaim = copy.deepcopy(baseline)
-    recovery_overclaim["recovery"]["same_run_resumed"] = True
-    mutations.append(recovery_overclaim)
+    recovery_tamper = copy.deepcopy(baseline)
+    recovery_tamper["recovery"]["same_run_resumed"] = False
+    mutations.append(recovery_tamper)
     bad_integrity = copy.deepcopy(baseline)
     bad_integrity["lifecycle"]["sqlite_integrity"] = "corrupt"
     mutations.append(bad_integrity)
