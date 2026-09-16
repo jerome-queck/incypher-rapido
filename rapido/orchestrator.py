@@ -37,6 +37,7 @@ from .solver import (
     SolverOutputError,
     admitted_candidate,
     build_turn_prompt,
+    candidate_is_eligible,
     project_attempt_carry,
 )
 from .state import StateStore
@@ -191,6 +192,8 @@ _DURABLE_TOOL_NAMES = frozenset(
         "wav_analyze",
     }
 )
+
+
 _CATEGORY_ORDER = {
     name: index
     for index, name in enumerate(("misc", "crypto", "forensics", "rev", "pwn", "network", "web"))
@@ -923,7 +926,12 @@ class Orchestrator:
                 ),
             )
             try:
-                self.state.finish_attempt(attempt_id, status, **fields)
+                self.state.finish_attempt(
+                    attempt_id,
+                    status,
+                    retain_private_candidate=self._adaptive_control and status == "candidate",
+                    **fields,
+                )
             except ValueError as exc:
                 raise EvidenceError(
                     "sealed attempt could not transition to terminal state"
@@ -937,33 +945,39 @@ class Orchestrator:
                     team_key=self.config.team_key,
                     max_workspace_bytes=self.config.max_lane_workspace_bytes,
                 )
+            verifier_route = route is not None and route.role == "verifier"
             prior_attempts = []
             compacted_records = 0
             rejected_records = 0
-            for record in self.state.prior_attempts_for_lane(
-                run_id,
-                challenge.id,
-                lane,
-                before_episode=episode,
-                limit=MAX_PRIOR_ATTEMPTS,
-            ):
-                try:
-                    projected, compacted = project_attempt_carry(record)
-                except (TypeError, ValueError):
-                    rejected_records += 1
-                    continue
-                prior_attempts.append(projected)
-                compacted_records += int(compacted)
+            if not verifier_route:
+                for record in self.state.prior_attempts_for_lane(
+                    run_id,
+                    challenge.id,
+                    lane,
+                    before_episode=episode,
+                    limit=MAX_PRIOR_ATTEMPTS,
+                ):
+                    try:
+                        projected, compacted = project_attempt_carry(record)
+                    except (TypeError, ValueError):
+                        rejected_records += 1
+                        continue
+                    prior_attempts.append(projected)
+                    compacted_records += int(compacted)
             turn_prompt = build_turn_prompt(
                 challenge,
                 artifact_paths,
                 lane,
                 episode=episode,
                 prior_attempts=tuple(prior_attempts),
-                prior_observations=run_evidence.carry(
-                    challenge.id,
-                    lane,
-                    before_episode=episode,
+                prior_observations=(
+                    None
+                    if verifier_route
+                    else run_evidence.carry(
+                        challenge.id,
+                        lane,
+                        before_episode=episode,
+                    )
                 ),
                 control_route=route,
             )
@@ -1004,6 +1018,14 @@ class Orchestrator:
                 )
             finding = SolverFinding.from_message(turn.text)
             if finding.candidate is not None:
+                if self._adaptive_control and not tool_evidence_complete:
+                    raise CandidateProvenanceError(
+                        "candidate tool evidence is incomplete or host-unattested"
+                    )
+                if not candidate_is_eligible(finding.candidate, challenge.description):
+                    raise CandidateProvenanceError(
+                        "candidate is a placeholder or challenge-description decoy"
+                    )
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
                 candidate_observed = False
                 candidate_supplied = False
@@ -1020,13 +1042,14 @@ class Orchestrator:
                         "candidate originated in model-supplied tool input"
                     )
             terminal = "candidate" if finding.status == "candidate" else finding.status
+            private_candidate = self._adaptive_control and finding.candidate is not None
             finish_attempt(
                 terminal,
-                summary=finding.summary,
+                summary="candidate retained privately" if private_candidate else finding.summary,
                 candidate=finding.candidate,
-                confidence=finding.confidence,
-                evidence=finding.evidence,
-                next_steps=finding.next_steps,
+                confidence=None if private_candidate else finding.confidence,
+                evidence=() if private_candidate else finding.evidence,
+                next_steps=() if private_candidate else finding.next_steps,
                 tool_count=tool_call_count,
             )
         except TimeoutError as exc:
@@ -1216,7 +1239,7 @@ class Orchestrator:
             "candidate_withheld",
             {
                 "challenge_id": challenge_id,
-                "candidate_sha256": candidate_sha256,
+                **({} if self._adaptive_control else {"candidate_sha256": candidate_sha256}),
                 "reason": reason,
             },
         )
@@ -1233,6 +1256,12 @@ class Orchestrator:
         """Serialize eligibility, reservation, Board effect, and finalization."""
         fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
         async with self._submission_lock:
+            if self._adaptive_control and not self.state.candidate_is_verified(
+                run_id, challenge.id, candidate
+            ):
+                return self._withhold_candidate(
+                    run_id, challenge.id, fingerprint, "candidate_unverified"
+                )
             transport_timeout = float(getattr(self.board, "timeout", 15.0))
             if deadline - time.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
@@ -1358,7 +1387,11 @@ class Orchestrator:
                 current_findings = [
                     result.finding for result in results if result.finding is not None
                 ]
-                if admitted_candidate(current_findings, challenge.description) is not None:
+                legacy_agreement = (
+                    not self._adaptive_control
+                    and admitted_candidate(current_findings, challenge.description) is not None
+                )
+                if legacy_agreement:
                     winner_found = True
                     for task in pending:
                         task.cancel()
@@ -1398,11 +1431,19 @@ class Orchestrator:
                                 "success": call.success,
                                 "source_bound": call.source_bound,
                                 "candidate_sensitive": call.candidate_sensitive,
-                                "candidate_sha256s": list(
-                                    call.candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
-                                ),
-                                "supplied_candidate_sha256s": list(
-                                    call.supplied_candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
+                                **(
+                                    {}
+                                    if self._adaptive_control
+                                    else {
+                                        "candidate_sha256s": list(
+                                            call.candidate_sha256s[:_MAX_DURABLE_TOOL_HASHES]
+                                        ),
+                                        "supplied_candidate_sha256s": list(
+                                            call.supplied_candidate_sha256s[
+                                                :_MAX_DURABLE_TOOL_HASHES
+                                            ]
+                                        ),
+                                    }
                                 ),
                             }
                             for call in item.tool_calls[:_MAX_DURABLE_TOOL_CALLS]
@@ -1412,11 +1453,25 @@ class Orchestrator:
                 ],
             },
         )
-        if parallel < 2:
+        verified_candidate = (
+            self.state.verified_candidate(run_id, challenge.id) if self._adaptive_control else None
+        )
+        if parallel < 2 and verified_candidate is None:
             self.state.set_challenge_status(challenge.id, "error")
             return "error"
         findings = [result.finding for result in results if result.finding is not None]
-        candidate = admitted_candidate(findings, challenge.description)
+        candidate = (
+            verified_candidate
+            if self._adaptive_control
+            else admitted_candidate(findings, challenge.description)
+        )
+        if (
+            self._adaptive_control
+            and candidate is None
+            and self.state.pending_candidate_count(run_id, challenge.id) > 0
+        ):
+            self.state.set_challenge_status(challenge.id, "candidate")
+            return "candidate"
         if candidate is None:
             terminals = {result.terminal_status for result in results}
             status = "unsupported" if terminals == {"unsupported"} else "unsolved"
@@ -1646,7 +1701,11 @@ class Orchestrator:
                     terminal = await execute_episode(challenge, episode, queued_at, route)
                     cleanup_pending = bool(self.state.owned_instances())
                     should_retry = (
-                        terminal in {"unsolved", "error"}
+                        (
+                            terminal in {"unsolved", "error"}
+                            or self._adaptive_control
+                            and terminal == "candidate"
+                        )
                         and episode + 1 < self.config.episodes_per_challenge
                         and time.monotonic() < deadline
                         and not (challenge.type == "dynamic_iac" and cleanup_pending)

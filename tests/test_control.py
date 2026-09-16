@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import urllib.parse
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -199,6 +201,151 @@ class MixedBoundaryRuntime(BoundaryRuntime):
         return await UnsolvedBoundaryRuntime.solve(self, workspace, prompt, **kwargs)
 
 
+class CandidateVerifierRuntime(BoundaryRuntime):
+    def __init__(self, candidate: str, verifier_candidate: str | None) -> None:
+        super().__init__(candidate)
+        self.verifier_candidate = verifier_candidate
+        self.prompts: list[tuple[dict[str, object], dict[str, object]]] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        self.prompts.append((document, dict(kwargs)))
+        role = document["control_route"]["role"]
+        selected = self._candidate if role == "specialist" else self.verifier_candidate
+        if document["lane"] != 0 or selected is None:
+            return await UnsolvedBoundaryRuntime.solve(self, workspace, prompt, **kwargs)
+        candidate_digest = hashlib.sha256(selected.encode()).hexdigest()
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            candidate_sensitive=True,
+            candidate_sha256s=(candidate_digest,),
+        )
+        return type(
+            "CandidateVerifierTurn",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "candidate",
+                        "candidate": selected,
+                        "confidence": 0.9,
+                        "summary": f"{role} independently derived {selected}",
+                        "evidence": [
+                            selected,
+                            hashlib.sha256(selected.encode()).hexdigest(),
+                            base64.b64encode(selected.encode()).decode(),
+                        ],
+                        "next_steps": [],
+                    }
+                ),
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": True,
+                        "candidate_sha256s": [candidate_digest],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+
+
+class ReflectedCandidateRuntime(BoundaryRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        turn = await super().solve(workspace, prompt, **kwargs)
+        digest = hashlib.sha256(self._candidate.encode()).hexdigest()
+        turn.tool_calls[0]["supplied_candidate_sha256s"] = [digest]
+        turn.tool_calls[0]["host_observation"] = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            candidate_sensitive=True,
+            candidate_sha256s=(digest,),
+            supplied_candidate_sha256s=(digest,),
+        )
+        return turn
+
+
+class IncompleteHostEvidenceRuntime(CandidateVerifierRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        turn = await super().solve(workspace, prompt, **kwargs)
+        if turn.tool_calls:
+            turn.tool_calls[0].pop("host_observation", None)
+        return turn
+
+
+class VerifierDisagreementRuntime(CandidateVerifierRuntime):
+    def __init__(self, candidates: tuple[str, str], delayed_lane: int) -> None:
+        super().__init__(candidates[0], None)
+        self.candidates = candidates
+        self.delayed_lane = delayed_lane
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        lane = document["lane"]
+        role = document["control_route"]["role"]
+        if lane == self.delayed_lane:
+            await asyncio.sleep(0.02)
+        selected = self.candidates[lane]
+        candidate_digest = hashlib.sha256(selected.encode()).hexdigest()
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            candidate_sensitive=True,
+            candidate_sha256s=(candidate_digest,),
+        )
+        self.prompts.append((document, dict(kwargs)))
+        return type(
+            "VerifierDisagreementTurn",
+            (),
+            {
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "status": "candidate",
+                        "candidate": selected,
+                        "confidence": 0.9,
+                        "summary": f"{role} source-derived candidate",
+                        "evidence": ["source bytes independently re-observed"],
+                        "next_steps": [],
+                    }
+                ),
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": True,
+                        "candidate_sha256s": [candidate_digest],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ],
+            },
+        )()
+
+
+class CrossChallengeVerifierRuntime(CandidateVerifierRuntime):
+    def __init__(self, candidates: dict[int, str]) -> None:
+        super().__init__("unused", None)
+        self.candidates = candidates
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        challenge_id = document["challenge"]["id"]
+        role = document["control_route"]["role"]
+        self._candidate = self.candidates[challenge_id]
+        self.verifier_candidate = self.candidates[3 - challenge_id] if role == "verifier" else None
+        return await super().solve(workspace, prompt, **kwargs)
+
+
 class BlockingBoundaryRuntime(UnsolvedBoundaryRuntime):
     def __init__(self) -> None:
         super().__init__("unused")
@@ -321,12 +468,242 @@ def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
     assert {job.lane: job.state for job in view.jobs} == {0: "candidate", 1: "unsolved"}
 
 
+def test_failed_peer_cannot_discard_private_candidate(tmp_path: Path) -> None:
+    candidate = "INCYPHER{retained_after_peer_failure}"
+    board = BoundaryBoard([_challenge(1)])
+    runtime = CandidateVerifierRuntime(candidate, None)
+    config = replace(_config(tmp_path), episodes_per_challenge=2)
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.candidates == 1
+    assert view.pending_candidate_count == 1
+    assert view.verified_candidate_count == 0
+    assert {job.role for job in view.jobs} == {"specialist", "verifier"}
+    assert board.submissions == []
+    with sqlite3.connect(config.state_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM attempts WHERE candidate IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
+
+
+def test_verifier_reobserves_without_candidate_in_prompt(tmp_path: Path) -> None:
+    candidate = "INCYPHER{fresh_verifier_reobservation}"
+    runtime = CandidateVerifierRuntime(candidate, candidate)
+    config = replace(_config(tmp_path), episodes_per_challenge=2)
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard([_challenge(1)]), runtime=runtime)
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert view.pending_candidate_count == 0
+    assert view.verified_candidate_count == 1
+    assert [(decision.failure_kind, decision.disposition) for decision in view.route_decisions] == [
+        ("disagreement", "dispatch")
+    ]
+    verifier_calls = [
+        call for call in runtime.prompts if call[0]["control_route"]["role"] == "verifier"
+    ]
+    assert verifier_calls
+    forbidden = (
+        candidate,
+        hashlib.sha256(candidate.encode()).hexdigest(),
+        candidate.encode().hex(),
+        base64.b64encode(candidate.encode()).decode(),
+        base64.urlsafe_b64encode(candidate.encode()).decode().rstrip("="),
+        urllib.parse.quote(candidate, safe=""),
+    )
+    assert all(value not in json.dumps(asdict(view), sort_keys=True) for value in forbidden)
+    with sqlite3.connect(config.state_path) as connection:
+        durable_attempts = json.dumps(
+            connection.execute(
+                "SELECT summary, evidence_json, next_steps_json, candidate FROM attempts"
+            ).fetchall()
+        )
+        durable_events = json.dumps(
+            connection.execute("SELECT kind, data_json FROM events").fetchall()
+        )
+    assert all(value not in durable_attempts for value in forbidden)
+    assert all(value not in durable_events for value in forbidden)
+    for document, kwargs in verifier_calls:
+        encoded = json.dumps(document, sort_keys=True)
+        assert document["prior_attempts"] == []
+        assert document["prior_observations"] is None
+        assert all(value not in encoded for value in forbidden)
+        assert kwargs["model"] == "gpt-daybreak-blue-latest"
+        assert kwargs["reasoning_effort"] == "xhigh"
+
+
+def test_incomplete_host_evidence_cannot_enter_private_vault(tmp_path: Path) -> None:
+    candidate = "INCYPHER{unattested_candidate}"
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=IncompleteHostEvidenceRuntime(candidate, candidate),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert view.pending_candidate_count == view.verified_candidate_count == 0
+    assert {job.role for job in view.jobs} == {"specialist"}
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("delayed_lane", (0, 1))
+def test_distinct_verified_candidates_are_fenced_independent_of_completion_order(
+    tmp_path: Path, delayed_lane: int
+) -> None:
+    candidates = (
+        "INCYPHER{verified_identity_a}",
+        "INCYPHER{verified_identity_b}",
+    )
+    board = BoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=VerifierDisagreementRuntime(candidates, delayed_lane),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert board.submissions == []
+    assert view.verified_candidate_count == 2
+    assert view.pending_candidate_count == 0
+    assert sum(job.role == "verifier" and job.state == "candidate" for job in view.jobs) == 2
+    store = StateStore(config.state_path)
+    assert store.verified_candidate(report.run_id, 1) is None
+    assert all(
+        not store.candidate_is_verified(report.run_id, 1, candidate) for candidate in candidates
+    )
+    store.close()
+
+
+@pytest.mark.parametrize("matches", (True, False))
+def test_submission_requires_same_run_private_verification(tmp_path: Path, matches: bool) -> None:
+    candidate = "INCYPHER{verification_gates_submission}"
+    verifier = candidate if matches else "INCYPHER{independent_mismatch}"
+    board = BoundaryBoard([_challenge(1)])
+    runtime = CandidateVerifierRuntime(candidate, verifier)
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert board.submissions == ([(1, candidate)] if matches else [])
+    assert view.verified_candidate_count == int(matches)
+    assert view.pending_candidate_count == int(not matches)
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(
+    ("candidate", "description"),
+    (
+        ("INCYPHER{answer}", "derive the value"),
+        ("INCYPHER{description_decoy}", "ignore INCYPHER{description_decoy}"),
+    ),
+)
+def test_placeholder_and_description_decoys_never_enter_vault(
+    tmp_path: Path, candidate: str, description: str
+) -> None:
+    challenge = replace(_challenge(1), description=description)
+    runtime = CandidateVerifierRuntime(candidate, candidate)
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard([challenge]), runtime=runtime)
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert view.pending_candidate_count == view.verified_candidate_count == 0
+    assert {job.role for job in view.jobs} == {"specialist"}
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 0
+
+
+def test_model_supplied_reflection_never_enters_vault(tmp_path: Path) -> None:
+    candidate = "INCYPHER{reflected_model_input}"
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=ReflectedCandidateRuntime(candidate),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert view.pending_candidate_count == view.verified_candidate_count == 0
+    assert {job.role for job in view.jobs} == {"specialist"}
+    with sqlite3.connect(config.state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 0
+
+
+def test_cross_challenge_verifier_values_cannot_qualify(tmp_path: Path) -> None:
+    candidates = {
+        1: "INCYPHER{challenge_one_private}",
+        2: "INCYPHER{challenge_two_private}",
+    }
+    board = BoundaryBoard([_challenge(1), _challenge(2)])
+    runtime = CrossChallengeVerifierRuntime(candidates)
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert board.submissions == []
+    assert view.pending_candidate_count == 2
+    assert view.verified_candidate_count == 0
+
+
+def test_prior_run_candidate_cannot_qualify_current_run(tmp_path: Path) -> None:
+    prior = "INCYPHER{prior_run_private_value}"
+    current = "INCYPHER{current_run_private_value}"
+    board = BoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    first_report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=CandidateVerifierRuntime(prior, None),
+        )
+    )
+    second_report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=CandidateVerifierRuntime(current, prior),
+        )
+    )
+
+    first = DurableJobControl.inspect(config.state_path, run_id=first_report.run_id)
+    second = DurableJobControl.inspect(config.state_path, run_id=second_report.run_id)
+    assert first.pending_candidate_count == second.pending_candidate_count == 1
+    assert first.verified_candidate_count == second.verified_candidate_count == 0
+    assert board.submissions == []
+
+
 def test_pending_effect_count_is_global_when_inspecting_prior_or_current_run(
     tmp_path: Path,
 ) -> None:
     candidate = "INCYPHER{ambiguous-control-effect}"
     board = AmbiguousBoundaryBoard([_challenge(1)])
-    config = replace(_config(tmp_path), submit_candidates=True)
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
 
     first_report = asyncio.run(
         DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))

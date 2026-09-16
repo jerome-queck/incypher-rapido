@@ -249,11 +249,12 @@ its own reproducible harness exists.
 
 The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
 two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
-material route fingerprint. Policy, provenance, disagreement, timeout, quota, and Board failures
-remain contained until later slices add validated authorization, verifier, checkpoint, reset, or
-Board-contract facts. Tool and safely identified local-container failures may dispatch one changed
-route; persistent failures cannot turn episode, timestamp, or retry ordinal into a change. This is
-a tracer under test, not the final E3 selection.
+material route fingerprint. Policy, provenance, timeout, quota, and Board failures remain
+contained. Only two database-derived disagreement subreasons—one retained source candidate needing
+verification or multiple distinct retained source candidates—may dispatch the exact Verifier
+route; all other disagreement remains contained. Tool and safely identified local-container
+failures may dispatch one changed route; persistent failures cannot turn episode, timestamp, or
+retry ordinal into a change. This is a tracer under test, not the final E3 selection.
 
 E2 now has a reproducible, effect-free storage-subdecision candidate at
 `scripts/issue19_vault_comparison.py`, with the exact sanitized result in
@@ -278,6 +279,65 @@ provisionally selects the single SQLite transaction domain. Timing is deliberate
 metric. Independent Daybreak re-review is clean. A prospective Linux final-image replay remains
 required before treating this storage subdecision as accepted; full E2 still must compare admission
 behavior, not only persistence.
+
+The first E2 behavior artifact was rejected by independent Daybreak review and removed: it gave the
+arms unequal episode budgets, inferred legacy admission through raw SQL, used an in-memory answer
+oracle rather than an artifact, hard-coded the selected arm, and identified only the pre-change
+base. No result from that run is accepted.
+
+The replacement is reproducible at `scripts/issue19_candidate_flow_comparison.py`; its exact
+20-repetition sanitized result is
+`notes/research/issue-19-candidate-flow-comparison-v2.json` (SHA-256
+`301b3f9cbf963bb466f9b5d0d41ab2c334078f8e046c85089db901e1a027d42d`). It drives the
+production orchestrator and durable controller through equal two-episode/two-lane budgets over
+peer agreement, one useful lane plus one failed peer, challenge-description decoy, distinct source
+candidates, verifier mismatch, and model-input reflection. Each lane gets a fresh copied JSON
+artifact; the fake runtime has no Board-answer reference and derives its output only from that lane
+artifact or, for the decoy negative, the public challenge description. Admission is measured for
+both arms only through the production submission path against a local deterministic Board fake.
+No network, external Board, container, or model effect is enabled.
+
+All 240 raw rows include exact arm/case/repetition identity, observed per-run elapsed time and tool
+cost, actual local admission, report outcomes, provenance failures, private aggregate counts,
+route/Verifier activity, prompt leakage, and exact configured model/effort. Raw schema, order,
+safety relations, and negative-case invariants are checked before arm summaries are derived.
+Selection is the unique eligible arm with the greatest positive-case conversion, plus a fixed gate
+requiring both failed-peer and source-disagreement conversion; tampered safety, timing, model,
+admission, order, schema, or a conversion tie fails. Provenance records exact per-arm configuration,
+base commit, script SHA-256, and every production source-file SHA-256 with aggregate source-tree
+SHA-256 `f1e2becc0d438a1b709483af54e78f1943cb1f1f018339e93f6ab0827742cc79`.
+
+The exact-agreement arm qualified only peer agreement. The private-verification arm also converted
+the failed-peer and source-disagreement cases after fresh deterministic re-observation, while the
+decoy, reflected input, and verifier mismatch remained unqualified. Across every row it had zero
+false admissions, candidate prompt leaks, or model/effort mismatches. The 20 repetitions produced
+20 versus 60 correct local admissions, 440 versus 400 observed tool calls, and 2.385544 versus
+2.302042 aggregate observed seconds for exact agreement and private verification respectively;
+timing is recorded but not selected on. The candidate
+value and common raw, digest, hex, base64, base64url, and URL encodings are absent from the artifact.
+The corrected registered criterion therefore selects private verification with the single-SQLite
+vault and `fresh_source_reobservation_v1` recipe. Independent Daybreak/xhigh re-review reproduced
+the 20-repetition v2 artifact/source hashes and found no P0-P3 defects. Linux final-image replay
+remains a release gate; this result makes no live-conversion claim.
+
+The implementation keeps durable candidate bytes and keys only in run/challenge-scoped private
+SQLite records. Specialist or Recovery proposals bind by database foreign keys to the immutable source attempt and a
+source-observation recipe. Verifier proposals bind by composite foreign keys to the exact same-run,
+same-challenge producer scope and use a fresh source-only prompt with no peer prose or candidate
+carry. Incomplete or malformed host evidence rejects the candidate before retention. Candidate
+attempt prose is replaced structurally, and public wave/withholding events omit candidate-derived
+identifiers. Attempt closure plus retention/verification is one transaction. Real producer and
+Verifier pre-commit/post-commit process exits, injected rollback, replay conflict, cross-challenge
+swap, prior-run reuse, failed-peer retention, verifier mismatch, description decoy, and
+reflected-input tests cover the fail-closed boundary. Every Verifier wave completes; multiple
+verified identities are contained independent of completion order. Only the effect-owning
+controller can retrieve one unambiguous verified value for admission; public control views expose
+aggregate counts only.
+
+Candidate-flow local validation after review fixes: Ruff/format/`git diff --check` clean; 669 passed
+and 1 skipped on dependency-complete Python 3.11 and 3.12 environments. A first Python
+3.12 environment lacked installed parser dependencies, and a second had those dependencies but no
+isolated-mode Rapido install; neither result is counted as a product failure or green validation.
 
 Exactly-once Board POST remains impossible without remote idempotency; the current enforceable
 boundary is durable at-most-once reservation plus fenced ambiguity. The comparison claims interface
@@ -333,9 +393,9 @@ metadata; retained solver candidates and their digests are deliberately absent. 
 effects and owned instances are intentionally state-wide safety counts, even while inspecting a
 prior run.
 
-The tracer establishes a measured substrate, not the final scheduler: the existing orchestrator
-still owns execution order, and private vault, independent verification, durable queue authority,
-and same-run recovery remain subsequent red/green tracers. Public boundary tests
+The tracer established a measured substrate, not the final scheduler: the existing orchestrator
+still owns execution order, while private retention and independent verification were subsequently
+added in E2; durable queue authority and same-run recovery remain later red/green tracers. Public boundary tests
 prove sanitized round-trip inspection; stable order across reopened inspection; unchanged-route
 identity across episodes; material-route separation; live queued/running projection; graceful
 deadline closure; and process-loss recovery after a real `os._exit`. This recovery preserves a
@@ -371,18 +431,19 @@ review rejected a false-positive combined-failure fixture before accepting its c
 All are covered by focused regression tests; final Daybreak/xhigh review found no P0-P3 defects.
 
 Local validation after repairs: Ruff/format/`git diff --check` clean; 633 passed and 1 skipped on
-Python 3.11 and 3.12. Full E2 admission and E3 outcome comparisons remain separate pending gates;
-the E2 storage subcomparison passed independent review but still awaits final-image replay.
+Python 3.11 and 3.12. E3 outcome comparison remains a separate pending gate; E2 storage passed
+independent review but awaits final-image replay, and E2 admission is implemented with local
+comparison green while independent review is pending.
 
 ## Acceptance ledger
 
 | Requirement | Evidence required | Status |
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
-| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router merged; E2 storage subcomparison durable but provisional after post-observation tie-break; full E2/E3 comparisons pending |
+| Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; router merged; corrected E2 storage and behavior comparisons select private single-SQLite verification with clean review, pending final-image replay; E3 pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: exact eight-class tracer and no-unchanged dispatch implemented; validated gated routes pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | pending |
-| Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: deterministic Lead, Specialist, and fresh-context Verifier implemented; Recovery route exists; full four-role/recovery proof pending |
+| Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: initial job order durable/replayable; queue authority, extensions, and acceptance coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: process-loss jobs durably closed on restart; same-run continuation pending |
@@ -425,6 +486,11 @@ the E2 storage subcomparison passed independent review but still awaits final-im
 | Candidate-vault comparison review | `gpt-daybreak-blue-latest` / `xhigh` | rejected; raw gate, E2/E3 identity, pre-registration, provenance, and ledger defects found; fixes applied, re-review pending, no fallback |
 | Candidate-vault comparison fix re-review | `gpt-daybreak-blue-latest` / `xhigh` | rejected; volatile crash stages were collapsed and rollback acknowledgements ungated; fixes applied, clean re-review pending, no fallback |
 | Candidate-vault comparison clean review | `gpt-daybreak-blue-latest` / `xhigh` | complete; no P0-P3 findings, focused and full dual-version suites clean, no fallback |
+| Private candidate-flow implementation and tests | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; transactional private retention, fresh-context verification, adversarial and producer/Verifier real-crash tests, no fallback |
+| Initial E2 candidate-flow behavior comparison | `gpt-daybreak-blue-latest` / `xhigh` | rejected; unequal budgets, SQL-vs-production admission, answer oracle, hard-coded selection, and incomplete source identity; artifact removed, no fallback |
+| Candidate-flow independent review | `gpt-daybreak-blue-latest` / `xhigh` | rejected with five P1 and two P2 findings: incomplete host evidence, schedule-dependent verification, public digest leakage, uncontrolled comparison, non-source reobservation, incomplete provenance, and crash overclaim; no fallback |
+| Candidate-flow fixes and corrected E2 comparison | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; all findings covered test-first; 240 external-effect-free raw observations select private verification; clean re-review pending, no fallback |
+| Candidate-flow clean release re-review | `gpt-daybreak-blue-latest` / `xhigh` | complete; v2 replay/source hashes and reversed-order fencing verified, no P0-P3 findings, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -435,7 +501,8 @@ switch, not provider fallback inside a solver run.
 ## Open decisions
 
 - Exact policy-compatible context variant selected by E1.
-- Candidate-verification recipe and vault selected by the full reproducible E2 comparison.
+- E2-selected single-SQLite vault and `fresh_source_reobservation_v1` recipe require independent
+  review and final-image replay before acceptance.
 - E1-approved policy route, exact per-route budgets, and router selected by a reproducible E3 comparison.
 - Parallel lane/local-worker profile selected by E4.
 - Current Board inactive-instance contract established by E6.

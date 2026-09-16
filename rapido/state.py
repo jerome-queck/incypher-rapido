@@ -220,9 +220,51 @@ class StateStore:
                 FOREIGN KEY(run_id, challenge_id, route_fingerprint)
                   REFERENCES control_routes(run_id, challenge_id, route_fingerprint)
             );
+            CREATE TABLE IF NOT EXISTS candidate_proposals (
+                source_attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                episode INTEGER NOT NULL,
+                lane INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('specialist', 'verifier', 'recovery')),
+                recipe_kind TEXT NOT NULL,
+                candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
+                candidate BLOB NOT NULL,
+                retained_at TEXT NOT NULL,
+                UNIQUE(source_attempt_id, run_id, challenge_id, role, candidate_key),
+                FOREIGN KEY(source_attempt_id, run_id, challenge_id, episode, lane)
+                  REFERENCES attempts(id, run_id, challenge_id, episode, lane)
+            );
+            CREATE INDEX IF NOT EXISTS candidate_proposals_scope
+              ON candidate_proposals(run_id, challenge_id, role, candidate_key);
+            CREATE TABLE IF NOT EXISTS candidate_verifications (
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
+                producer_attempt_id TEXT NOT NULL REFERENCES candidate_proposals(source_attempt_id),
+                producer_role TEXT NOT NULL CHECK(producer_role IN ('specialist', 'recovery')),
+                verifier_attempt_id TEXT NOT NULL UNIQUE
+                  REFERENCES candidate_proposals(source_attempt_id),
+                verifier_role TEXT NOT NULL CHECK(verifier_role = 'verifier'),
+                recipe_kind TEXT NOT NULL,
+                verified_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, challenge_id, candidate_key),
+                FOREIGN KEY(producer_attempt_id, run_id, challenge_id, producer_role, candidate_key)
+                  REFERENCES candidate_proposals(
+                    source_attempt_id, run_id, challenge_id, role, candidate_key
+                  ),
+                FOREIGN KEY(verifier_attempt_id, run_id, challenge_id, verifier_role, candidate_key)
+                  REFERENCES candidate_proposals(
+                    source_attempt_id, run_id, challenge_id, role, candidate_key
+                  )
+            );
             """
         )
         self._migrate_attempts()
+        self._connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
+            "ON attempts(id, run_id, challenge_id, episode, lane)"
+        )
         self._migrate_control_jobs()
         instance_columns = {
             str(row["name"])
@@ -644,6 +686,7 @@ class StateStore:
         next_steps: list[str] | tuple[str, ...] = (),
         tool_count: int = 0,
         failure_class: str | None = None,
+        retain_private_candidate: bool = False,
     ) -> None:
         allowed = {
             "candidate",
@@ -666,7 +709,19 @@ class StateStore:
             not isinstance(failure_class, str) or failure_class not in _FAILURE_CLASSES
         ):
             raise ValueError("failure_class is not a recognized closed class")
+        if type(retain_private_candidate) is not bool:
+            raise TypeError("retain_private_candidate must be boolean")
+        if retain_private_candidate and (status != "candidate" or candidate is None):
+            raise ValueError("private candidate retention requires a candidate attempt")
+        stored_candidate = None if retain_private_candidate else candidate
         with self.transaction() as connection:
+            attempt = connection.execute(
+                "SELECT run_id, challenge_id, episode, lane FROM attempts "
+                "WHERE id=? AND status='running'",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("attempt is absent or not running")
             changed = connection.execute(
                 """
                 UPDATE attempts
@@ -678,7 +733,7 @@ class StateStore:
                     self._now(),
                     status,
                     summary[:4000],
-                    candidate,
+                    stored_candidate,
                     confidence,
                     evidence_json,
                     next_steps_json,
@@ -689,6 +744,208 @@ class StateStore:
             ).rowcount
             if changed != 1:
                 raise ValueError("attempt is absent or not running")
+            if retain_private_candidate:
+                assert candidate is not None
+                self._retain_candidate(
+                    connection,
+                    attempt_id=attempt_id,
+                    run_id=str(attempt["run_id"]),
+                    challenge_id=int(attempt["challenge_id"]),
+                    episode=int(attempt["episode"]),
+                    lane=int(attempt["lane"]),
+                    candidate=candidate,
+                )
+
+    def _retain_candidate(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        run_id: str,
+        challenge_id: int,
+        episode: int,
+        lane: int,
+        candidate: str,
+    ) -> None:
+        encoded = candidate.encode("utf-8")
+        if not encoded or len(candidate) > 600:
+            raise ValueError("invalid private candidate")
+        route = connection.execute(
+            """
+            SELECT jobs.role, routes.route_json
+            FROM control_jobs AS jobs
+            JOIN control_routes AS routes
+              ON routes.run_id=jobs.run_id
+             AND routes.challenge_id=jobs.challenge_id
+             AND routes.route_fingerprint=jobs.route_fingerprint
+            WHERE jobs.run_id=? AND jobs.challenge_id=? AND jobs.episode=? AND jobs.lane=?
+              AND jobs.state='running'
+            """,
+            (run_id, challenge_id, episode, lane),
+        ).fetchone()
+        if route is None:
+            raise ValueError("private candidate has no running control job")
+        role = str(route["role"])
+        try:
+            route_spec = RouteSpec.from_dict(json.loads(str(route["route_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("private candidate route is invalid") from exc
+        if route_spec.role != role:
+            raise ValueError("private candidate route role changed")
+        if role == "verifier":
+            recipe = route_spec.verification_recipe
+            if recipe != "fresh_source_reobservation_v1":
+                raise ValueError("verifier candidate lacks the approved recipe")
+        elif role in {"specialist", "recovery"}:
+            recipe = "source_bound_tool_observation_v1"
+        else:
+            raise ValueError("private candidate role is invalid")
+        candidate_key = hashlib.sha256(encoded).digest()
+        connection.execute(
+            """
+            INSERT INTO candidate_proposals(
+              source_attempt_id, run_id, challenge_id, episode, lane, role,
+              recipe_kind, candidate_key, candidate, retained_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id,
+                run_id,
+                challenge_id,
+                episode,
+                lane,
+                role,
+                recipe,
+                candidate_key,
+                encoded,
+                self._now(),
+            ),
+        )
+        if role != "verifier":
+            return
+        producer = connection.execute(
+            """
+            SELECT source_attempt_id, role
+            FROM candidate_proposals
+            WHERE run_id=? AND challenge_id=? AND role IN ('specialist', 'recovery')
+              AND candidate_key=? AND candidate=?
+            ORDER BY episode, source_attempt_id
+            LIMIT 1
+            """,
+            (run_id, challenge_id, candidate_key, encoded),
+        ).fetchone()
+        if producer is not None:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO candidate_verifications(
+                  run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
+                  verifier_attempt_id, verifier_role, recipe_kind, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'verifier', ?, ?)
+                """,
+                (
+                    run_id,
+                    challenge_id,
+                    candidate_key,
+                    producer["source_attempt_id"],
+                    producer["role"],
+                    attempt_id,
+                    recipe,
+                    self._now(),
+                ),
+            )
+
+    def candidate_counts(self, run_id: str) -> tuple[int, int]:
+        """Return aggregate pending and verified producer identities for one run."""
+        with self._lock:
+            pending = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                      SELECT proposal.challenge_id, proposal.candidate_key
+                      FROM candidate_proposals AS proposal
+                      WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM candidate_verifications AS verification
+                          WHERE verification.run_id=proposal.run_id
+                            AND verification.challenge_id=proposal.challenge_id
+                            AND verification.candidate_key=proposal.candidate_key
+                        )
+                      GROUP BY proposal.challenge_id, proposal.candidate_key
+                    )
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            verified = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM candidate_verifications WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+            )
+        return pending, verified
+
+    def pending_candidate_count(self, run_id: str, challenge_id: int) -> int:
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(DISTINCT proposal.candidate_key)
+                    FROM candidate_proposals AS proposal
+                    WHERE proposal.run_id=? AND proposal.challenge_id=?
+                      AND proposal.role IN ('specialist', 'recovery')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM candidate_verifications AS verification
+                        WHERE verification.run_id=proposal.run_id
+                          AND verification.challenge_id=proposal.challenge_id
+                          AND verification.candidate_key=proposal.candidate_key
+                      )
+                    """,
+                    (run_id, challenge_id),
+                ).fetchone()[0]
+            )
+
+    def verified_candidate(self, run_id: str, challenge_id: int) -> str | None:
+        """Return one privately verified value to the effect-owning controller only."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT proposal.candidate
+                FROM candidate_verifications AS verification
+                JOIN candidate_proposals AS proposal
+                  ON proposal.source_attempt_id=verification.producer_attempt_id
+                WHERE verification.run_id=? AND verification.challenge_id=?
+                ORDER BY verification.verified_at, verification.candidate_key
+                """,
+                (run_id, challenge_id),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            return bytes(rows[0]["candidate"]).decode("utf-8")
+        except (TypeError, UnicodeDecodeError) as exc:
+            raise ValueError("verified private candidate is invalid") from exc
+
+    def candidate_is_verified(self, run_id: str, challenge_id: int, candidate: str) -> bool:
+        if not candidate or len(candidate) > 600:
+            raise ValueError("invalid private candidate")
+        try:
+            encoded = candidate.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid private candidate") from exc
+        candidate_key = hashlib.sha256(encoded).digest()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN verification.candidate_key=? AND producer.candidate=?
+                                THEN 1 ELSE 0 END) AS matching
+                FROM candidate_verifications AS verification
+                JOIN candidate_proposals AS producer
+                  ON producer.source_attempt_id=verification.producer_attempt_id
+                WHERE verification.run_id=? AND verification.challenge_id=?
+                """,
+                (candidate_key, encoded, run_id, challenge_id),
+            ).fetchone()
+        return row is not None and int(row["total"]) == 1 and int(row["matching"] or 0) == 1
 
     def event(self, run_id: str, kind: str, data: dict[str, Any]) -> int:
         if not kind or len(kind) > 100:
@@ -976,15 +1233,23 @@ class StateStore:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("source control route is invalid") from exc
         attempts = connection.execute(
-            "SELECT failure_class, candidate FROM attempts "
+            "SELECT failure_class FROM attempts "
             "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
             (run_id, challenge_id, source_episode),
         ).fetchall()
         failure_classes = frozenset(
             str(row["failure_class"]) for row in attempts if row["failure_class"] is not None
         )
-        candidate_identity_count = len(
-            {str(row["candidate"]) for row in attempts if row["candidate"] is not None}
+        candidate_identity_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(DISTINCT candidate_key)
+                FROM candidate_proposals
+                WHERE run_id=? AND challenge_id=? AND episode=?
+                  AND role IN ('specialist', 'recovery')
+                """,
+                (run_id, challenge_id, source_episode),
+            ).fetchone()[0]
         )
         origin_row = connection.execute(
             "SELECT origin FROM control_failure_origins "

@@ -62,6 +62,8 @@ class ControlView:
     initial_coverage_count: int
     pending_submission_count: int
     owned_instance_count: int
+    pending_candidate_count: int
+    verified_candidate_count: int
     jobs: tuple[JobView, ...]
     route_decisions: tuple[RouteDecisionView, ...]
 
@@ -153,6 +155,37 @@ class DurableJobControl:
                     "WHERE status IN ('creating', 'owned', 'cleanup_pending')"
                 ).fetchone()[0]
             )
+            has_candidate_vault = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_proposals'"
+            ).fetchone()
+            if has_candidate_vault is None:
+                pending_candidate_count = verified_candidate_count = 0
+            else:
+                pending_candidate_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM (
+                          SELECT proposal.challenge_id, proposal.candidate_key
+                          FROM candidate_proposals AS proposal
+                          WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
+                            AND NOT EXISTS (
+                              SELECT 1 FROM candidate_verifications AS verification
+                              WHERE verification.run_id=proposal.run_id
+                                AND verification.challenge_id=proposal.challenge_id
+                                AND verification.candidate_key=proposal.candidate_key
+                            )
+                          GROUP BY proposal.challenge_id, proposal.candidate_key
+                        )
+                        """,
+                        (selected_run_id,),
+                    ).fetchone()[0]
+                )
+                verified_candidate_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM candidate_verifications WHERE run_id=?",
+                        (selected_run_id,),
+                    ).fetchone()[0]
+                )
             job_rows = connection.execute(
                 """
                 SELECT job_id, challenge_id, catalogue_rank, episode, phase, role, lane, state,
@@ -193,6 +226,8 @@ class DurableJobControl:
                 initial_coverage_count=initial_coverage_count,
                 pending_submission_count=pending_submission_count,
                 owned_instance_count=owned_instance_count,
+                pending_candidate_count=pending_candidate_count,
+                verified_candidate_count=verified_candidate_count,
                 jobs=tuple(
                     JobView(
                         job_id=str(job["job_id"]),
