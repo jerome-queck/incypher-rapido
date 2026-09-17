@@ -1657,11 +1657,13 @@ class RunEvidence:
             )
         )
         facts = decoded.get("facts")
-        validated_facts = (
-            _facts_for_tool(decoded.get("tool"), facts)
-            if isinstance(decoded.get("tool"), str) and isinstance(facts, dict)
-            else None
-        )
+        validated_facts = None
+        if isinstance(decoded.get("tool"), str) and isinstance(facts, dict):
+            validated_facts = (
+                _recursive_facts(facts)
+                if decoded.get("success") is False
+                else _facts_for_tool(decoded["tool"], facts)
+            )
         if (
             set(decoded)
             != {

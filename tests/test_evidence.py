@@ -736,6 +736,42 @@ def test_projector_preserves_structure_but_not_raw_or_authority() -> None:
     assert unknown.tool == "unknown_tool" and not unknown.facts
 
 
+@pytest.mark.parametrize(
+    "tool",
+    ("http_request", "run_target_script", "target_info", "tcp_close", "tcp_exchange", "tcp_open"),
+)
+def test_failed_target_tool_evidence_round_trips(tmp_path: Path, tool: str) -> None:
+    database = tmp_path / "state.sqlite3"
+    state = _state(database, "run-a")
+    _attempt(state, "failed-target")
+    observation = project_tool_observation(
+        tool,
+        success=False,
+        source_bound=False,
+        result={
+            "duration_milliseconds": 3,
+            "error_code": "target_unavailable",
+            "retryable": True,
+        },
+    )
+
+    manifest = RunEvidence.open(state, "run-a").commit(
+        "failed-target", EvidenceBatch((observation,))
+    )
+    state.finish_attempt("failed-target", "unsolved")
+    state.close()
+
+    reopened = StateStore(database)
+    loaded = RunEvidence.open(reopened, "run-a").carry(7, 0, 1).manifests[0]
+    assert loaded == manifest
+    assert json.loads(loaded.items[0].payload_json)["facts"] == {
+        "duration_milliseconds": 3,
+        "error_code": "target_unavailable",
+        "retryable": True,
+    }
+    reopened.close()
+
+
 def test_floats_are_rejected_before_canonical_commit() -> None:
     with pytest.raises(TypeError, match="floats are not canonical"):
         HostObservation(
