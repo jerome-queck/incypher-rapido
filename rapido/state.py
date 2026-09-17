@@ -180,10 +180,13 @@ class StateStore:
                 candidate_sha256 TEXT NOT NULL,
                 first_run_id TEXT NOT NULL REFERENCES runs(id),
                 context_episode INTEGER NOT NULL DEFAULT 0,
+                context_sha256 TEXT,
                 reserved_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY(challenge_id, candidate_sha256)
+                PRIMARY KEY(
+                  challenge_id, candidate_sha256, first_run_id, context_episode
+                )
             );
             CREATE TABLE IF NOT EXISTS instances (
                 challenge_id INTEGER PRIMARY KEY REFERENCES challenges(id),
@@ -460,6 +463,29 @@ class StateStore:
                 "ALTER TABLE submission_intents "
                 "ADD COLUMN context_episode INTEGER NOT NULL DEFAULT 0"
             )
+        if "context_sha256" not in intent_columns:
+            self._connection.execute(
+                "ALTER TABLE submission_intents ADD COLUMN context_sha256 TEXT"
+            )
+            self._connection.execute(
+                """
+                UPDATE submission_intents AS intent
+                SET context_sha256=(
+                  SELECT catalogue.context_sha256 FROM control_catalogue AS catalogue
+                  WHERE catalogue.run_id=intent.first_run_id
+                    AND catalogue.challenge_id=intent.challenge_id
+                    AND catalogue.context_episode=intent.context_episode
+                )
+                WHERE EXISTS (
+                  SELECT 1 FROM control_catalogue AS catalogue
+                  WHERE catalogue.run_id=intent.first_run_id
+                    AND catalogue.challenge_id=intent.challenge_id
+                    AND catalogue.context_episode=intent.context_episode
+                    AND catalogue.context_sha256 IS NOT NULL
+                )
+                """
+            )
+        self._migrate_submission_intents()
         origin_columns = {
             str(row["name"])
             for row in self._connection.execute(
@@ -584,6 +610,61 @@ class StateStore:
             )
             connection.execute("DROP TABLE control_jobs")
             connection.execute(f"ALTER TABLE {migration_table} RENAME TO control_jobs")
+
+    def _migrate_submission_intents(self) -> None:
+        """Retain immutable effect rows while allowing a candidate on changed material."""
+
+        primary_key = tuple(
+            str(row["name"])
+            for row in sorted(
+                self._connection.execute("PRAGMA table_info(submission_intents)").fetchall(),
+                key=lambda item: int(item["pk"]),
+            )
+            if int(row["pk"]) > 0
+        )
+        expected = ("challenge_id", "candidate_sha256", "first_run_id", "context_episode")
+        if primary_key == expected:
+            return
+        migration_table = "submission_intents__material_identity_migration"
+        with self.transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (migration_table,),
+                ).fetchone()
+                is not None
+            ):
+                raise RuntimeError("stale submission intent migration table is present")
+            connection.execute(
+                f"""
+                CREATE TABLE {migration_table} (
+                    challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                    candidate_sha256 TEXT NOT NULL,
+                    first_run_id TEXT NOT NULL REFERENCES runs(id),
+                    context_episode INTEGER NOT NULL DEFAULT 0,
+                    context_sha256 TEXT,
+                    reserved_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(
+                      challenge_id, candidate_sha256, first_run_id, context_episode
+                    )
+                )
+                """
+            )
+            connection.execute(
+                f"""
+                INSERT INTO {migration_table}(
+                  challenge_id, candidate_sha256, first_run_id, context_episode,
+                  context_sha256, reserved_at, status, updated_at
+                )
+                SELECT challenge_id, candidate_sha256, first_run_id, context_episode,
+                       context_sha256, reserved_at, status, updated_at
+                FROM submission_intents
+                """
+            )
+            connection.execute("DROP TABLE submission_intents")
+            connection.execute(f"ALTER TABLE {migration_table} RENAME TO submission_intents")
 
     def _migrate_attempts(self) -> None:
         """Atomically upgrade the pre-episode attempts table, retaining every row."""
@@ -1126,7 +1207,7 @@ class StateStore:
                     """
                     UPDATE attempts
                     SET finished_at=?, status=?, candidate=NULL, confidence=?,
-                        tool_count=?, failure_class=?
+                        tool_count=MAX(tool_count, ?), failure_class=?
                     WHERE id=? AND status='running'
                     """,
                     (
@@ -1144,7 +1225,7 @@ class StateStore:
                     UPDATE attempts
                     SET finished_at=?, status=?, summary=?, candidate=?, confidence=?,
                         evidence_json=?, next_steps_json=?, checkpoint_observations_json='[]',
-                        tool_count=?, failure_class=?
+                        tool_count=MAX(tool_count, ?), failure_class=?
                     WHERE id=? AND status='running'
                     """,
                     (
@@ -1206,7 +1287,7 @@ class StateStore:
         with self.transaction() as connection:
             changed = connection.execute(
                 "UPDATE attempts SET summary=?, evidence_json=?, next_steps_json=?, "
-                "checkpoint_observations_json=?, tool_count=? "
+                "checkpoint_observations_json=?, tool_count=MAX(tool_count, ?) "
                 "WHERE id=? AND status='running'",
                 (
                     summary[:4000],
@@ -1415,7 +1496,22 @@ class StateStore:
                     SELECT COUNT(*) FROM (
                       SELECT proposal.challenge_id, proposal.candidate_key
                       FROM candidate_proposals AS proposal
+                      JOIN control_catalogue AS catalogue
+                        ON catalogue.run_id=proposal.run_id
+                       AND catalogue.challenge_id=proposal.challenge_id
                       WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
+                        AND proposal.episode>=catalogue.context_episode
+                        AND NOT EXISTS (
+                          SELECT 1 FROM submission_intents AS rejected
+                          WHERE rejected.challenge_id=proposal.challenge_id
+                            AND rejected.candidate_sha256=lower(hex(proposal.candidate_key))
+                            AND rejected.first_run_id=proposal.run_id
+                            AND ((catalogue.context_sha256 IS NOT NULL
+                              AND rejected.context_sha256=catalogue.context_sha256) OR
+                              (rejected.context_episode=catalogue.context_episode
+                               AND rejected.context_sha256 IS catalogue.context_sha256))
+                            AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                        )
                         AND NOT EXISTS (
                           SELECT 1 FROM candidate_verifications AS verification
                           JOIN candidate_evidence_proofs AS producer_proof
@@ -1473,6 +1569,17 @@ class StateStore:
                     WHERE proposal.run_id=? AND proposal.challenge_id=?
                       AND proposal.episode>=catalogue.context_episode
                       AND proposal.role IN ('specialist', 'recovery')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM submission_intents AS rejected
+                        WHERE rejected.challenge_id=proposal.challenge_id
+                          AND rejected.candidate_sha256=lower(hex(proposal.candidate_key))
+                          AND rejected.first_run_id=proposal.run_id
+                          AND ((catalogue.context_sha256 IS NOT NULL
+                            AND rejected.context_sha256=catalogue.context_sha256) OR
+                            (rejected.context_episode=catalogue.context_episode
+                             AND rejected.context_sha256 IS catalogue.context_sha256))
+                          AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                      )
                       AND NOT EXISTS (
                         SELECT 1 FROM candidate_verifications AS verification
                         JOIN candidate_evidence_proofs AS producer_proof
@@ -2112,6 +2219,7 @@ class StateStore:
                     WHERE intent.first_run_id=origin.run_id
                       AND intent.challenge_id=origin.challenge_id
                       AND intent.context_episode=catalogue.context_episode
+                      AND intent.context_sha256 IS catalogue.context_sha256
                       AND intent.status='correct'
                   )
                 GROUP BY origin.challenge_id, origin.episode
@@ -2189,6 +2297,7 @@ class StateStore:
                          WHERE intent.first_run_id=catalogue.run_id
                            AND intent.challenge_id=catalogue.challenge_id
                            AND intent.context_episode=catalogue.context_episode
+                           AND intent.context_sha256 IS catalogue.context_sha256
                            AND intent.status='correct'
                        ) AS correct
                 FROM control_catalogue AS catalogue
@@ -3007,6 +3116,17 @@ class StateStore:
                   AND proposal.episode>=catalogue.context_episode
                   AND proposal.role IN ('specialist', 'recovery')
                   AND NOT EXISTS (
+                    SELECT 1 FROM submission_intents AS rejected
+                    WHERE rejected.challenge_id=proposal.challenge_id
+                      AND rejected.candidate_sha256=lower(hex(proposal.candidate_key))
+                      AND rejected.first_run_id=proposal.run_id
+                      AND ((catalogue.context_sha256 IS NOT NULL
+                        AND rejected.context_sha256=catalogue.context_sha256) OR
+                        (rejected.context_episode=catalogue.context_episode
+                         AND rejected.context_sha256 IS catalogue.context_sha256))
+                      AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                  )
+                  AND NOT EXISTS (
                     SELECT 1 FROM candidate_verifications AS verification
                     JOIN candidate_evidence_proofs AS producer_proof
                       ON producer_proof.source_attempt_id=verification.producer_attempt_id
@@ -3058,6 +3178,7 @@ class StateStore:
                   AND proposal.role IN ('specialist', 'recovery')
                   AND intent.first_run_id=?
                   AND intent.context_episode=catalogue.context_episode
+                  AND intent.context_sha256 IS catalogue.context_sha256
                   AND intent.status='incorrect'
                 LIMIT 1
                 """,
@@ -3065,7 +3186,7 @@ class StateStore:
             ).fetchone()
             is not None
         )
-        if terminal == "candidate" and current_wave_wrong:
+        if terminal in {"candidate", "unsolved"} and current_wave_wrong:
             signal = FailureSignal("disagreement", "board_rejected_candidate")
         if signal is None:
             return None
@@ -3278,11 +3399,13 @@ class StateStore:
         remaining_milliseconds: int,
         unresolved_challenge_count: int = 1,
         parallel_challenge_count: int = 1,
+        continuation_route: RouteSpec | None = None,
+        continuation_assignments: Sequence[tuple[str, str, str]] | None = None,
     ) -> RouteDecision | None:
         """Close a wave, decide, record, and admit its successor in one transaction."""
         with self.transaction() as connection:
             self._finish_control_wave(connection, run_id, challenge_id, source_episode, terminal)
-            return self._decide_control_successor(
+            decision = self._decide_control_successor(
                 connection,
                 run_id=run_id,
                 challenge_id=challenge_id,
@@ -3296,6 +3419,38 @@ class StateStore:
                 unresolved_challenge_count=unresolved_challenge_count,
                 parallel_challenge_count=parallel_challenge_count,
             )
+            if continuation_route is not None and (
+                decision is None or decision.disposition != "dispatch"
+            ):
+                assignments = continuation_assignments or tuple(
+                    (continuation_route.role, continuation_route.model, continuation_route.effort)
+                    for _ in range(lanes)
+                )
+                self._control_event(
+                    connection,
+                    run_id,
+                    "phase_transition",
+                    None,
+                    {
+                        "challenge_id": challenge_id,
+                        "source_episode": source_episode,
+                        "next_episode": next_episode,
+                        "reason": "unresolved_requeued_with_orthogonal_strategy",
+                        "successor_route_fingerprint": continuation_route.fingerprint,
+                    },
+                )
+                self._admit_control_wave(
+                    connection,
+                    run_id,
+                    challenge_id,
+                    next_episode,
+                    catalogue_rank,
+                    len(assignments),
+                    continuation_route,
+                    assignments,
+                    require_unused_route=True,
+                )
+            return decision
 
     @classmethod
     def _interrupt_control_jobs(
@@ -3699,28 +3854,80 @@ class StateStore:
         with self.transaction() as connection:
             now = self._now()
             catalogue = connection.execute(
-                "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                "SELECT context_episode, context_sha256 FROM control_catalogue "
+                "WHERE run_id=? AND challenge_id=?",
                 (run_id, challenge_id),
             ).fetchone()
             context_episode = 0 if catalogue is None else int(catalogue["context_episode"])
+            context_sha256 = None if catalogue is None else catalogue["context_sha256"]
+            if (
+                connection.execute(
+                    "SELECT 1 FROM submission_intents WHERE first_run_id=? "
+                    "AND challenge_id=? AND candidate_sha256=? "
+                    "AND status IN ('correct', 'incorrect', 'already_solved') AND ("
+                    "(? IS NOT NULL AND context_sha256=?) OR "
+                    "(context_episode=? AND context_sha256 IS ?)) LIMIT 1",
+                    (
+                        run_id,
+                        challenge_id,
+                        fingerprint,
+                        context_sha256,
+                        context_sha256,
+                        context_episode,
+                        context_sha256,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            if (
+                connection.execute(
+                    "SELECT 1 FROM submission_intents WHERE challenge_id=? "
+                    "AND status IN ('pending', 'unread') LIMIT 1",
+                    (challenge_id,),
+                ).fetchone()
+                is not None
+            ):
+                return False
             changed = connection.execute(
                 """
                 INSERT OR IGNORE INTO submission_intents(
-                    challenge_id, candidate_sha256, first_run_id, context_episode,
+                    challenge_id, candidate_sha256, first_run_id, context_episode, context_sha256,
                     reserved_at, status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
-                (challenge_id, fingerprint, run_id, context_episode, now, now),
+                (
+                    challenge_id,
+                    fingerprint,
+                    run_id,
+                    context_episode,
+                    context_sha256,
+                    now,
+                    now,
+                ),
             ).rowcount
             if changed == 0:
                 changed = connection.execute(
                     """
                     UPDATE submission_intents
-                    SET first_run_id=?, context_episode=?, reserved_at=?,
+                    SET first_run_id=?, context_episode=?, context_sha256=?, reserved_at=?,
                         status='pending', updated_at=?
-                    WHERE challenge_id=? AND candidate_sha256=? AND status='not_delivered'
+                    WHERE challenge_id=? AND candidate_sha256=?
+                      AND first_run_id=? AND context_episode=?
+                      AND context_sha256 IS ? AND status='not_delivered'
                     """,
-                    (run_id, context_episode, now, now, challenge_id, fingerprint),
+                    (
+                        run_id,
+                        context_episode,
+                        context_sha256,
+                        now,
+                        now,
+                        challenge_id,
+                        fingerprint,
+                        run_id,
+                        context_episode,
+                        context_sha256,
+                    ),
                 ).rowcount
         return changed == 1
 
@@ -3810,15 +4017,18 @@ class StateStore:
         fingerprint = self._candidate_fingerprint(candidate)
         with self.transaction() as connection:
             catalogue = connection.execute(
-                "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                "SELECT context_episode, context_sha256 FROM control_catalogue "
+                "WHERE run_id=? AND challenge_id=?",
                 (run_id, challenge_id),
             ).fetchone()
             context_episode = 0 if catalogue is None else int(catalogue["context_episode"])
+            context_sha256 = None if catalogue is None else catalogue["context_sha256"]
             intent = connection.execute(
                 "SELECT context_episode FROM submission_intents "
                 "WHERE challenge_id=? AND candidate_sha256=? "
-                "AND first_run_id=? AND context_episode=? AND status='pending'",
-                (challenge_id, fingerprint, run_id, context_episode),
+                "AND first_run_id=? AND context_episode=? "
+                "AND context_sha256 IS ? AND status='pending'",
+                (challenge_id, fingerprint, run_id, context_episode, context_sha256),
             ).fetchone()
             if intent is None:
                 raise ValueError("submission intent is absent, settled, or owned by a prior effect")
@@ -3826,9 +4036,18 @@ class StateStore:
                 """
                 UPDATE submission_intents SET status=?, updated_at=?
                 WHERE challenge_id=? AND candidate_sha256=?
-                  AND first_run_id=? AND context_episode=? AND status='pending'
+                  AND first_run_id=? AND context_episode=?
+                  AND context_sha256 IS ? AND status='pending'
                 """,
-                (outcome, self._now(), challenge_id, fingerprint, run_id, context_episode),
+                (
+                    outcome,
+                    self._now(),
+                    challenge_id,
+                    fingerprint,
+                    run_id,
+                    context_episode,
+                    context_sha256,
+                ),
             ).rowcount
             if changed != 1:
                 raise ValueError("submission intent is absent, settled, or owned by a prior effect")
@@ -3881,12 +4100,22 @@ class StateStore:
             ).fetchone()
         return int(row["count"])
 
-    def challenge_incorrect_submission_count(self, challenge_id: int) -> int:
+    def challenge_incorrect_submission_count(self, run_id: str, challenge_id: int) -> int:
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) AS count FROM submission_intents "
-                "WHERE challenge_id=? AND status='incorrect'",
-                (challenge_id,),
+                "SELECT COUNT(*) AS count FROM submission_intents AS intent "
+                "LEFT JOIN control_catalogue AS catalogue "
+                "ON catalogue.run_id=intent.first_run_id "
+                "AND catalogue.challenge_id=intent.challenge_id "
+                "WHERE intent.first_run_id=? AND intent.challenge_id=? "
+                "AND ((catalogue.run_id IS NULL AND intent.context_episode=0 "
+                "AND intent.context_sha256 IS NULL) OR "
+                "(catalogue.context_sha256 IS NOT NULL "
+                "AND intent.context_sha256=catalogue.context_sha256) OR "
+                "(intent.context_episode=catalogue.context_episode "
+                "AND intent.context_sha256 IS catalogue.context_sha256)) "
+                "AND intent.status='incorrect'",
+                (run_id, challenge_id),
             ).fetchone()
         return int(row["count"])
 
@@ -3898,6 +4127,58 @@ class StateStore:
                 (challenge_id,),
             ).fetchone()
         return int(row["count"])
+
+    def candidate_submission_status(
+        self, run_id: str, challenge_id: int, candidate: str
+    ) -> tuple[str, str, int, str | None] | None:
+        """Return a same-run, same-material effect without exposing candidate material."""
+        fingerprint = self._candidate_fingerprint(candidate)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT intent.status, intent.first_run_id, intent.context_episode, "
+                "intent.context_sha256 "
+                "FROM submission_intents AS intent "
+                "LEFT JOIN control_catalogue AS current "
+                "ON current.run_id=? AND current.challenge_id=intent.challenge_id "
+                "WHERE intent.first_run_id=? AND intent.challenge_id=? "
+                "AND intent.candidate_sha256=? AND ("
+                "(current.run_id IS NULL AND intent.context_episode=0 "
+                "AND intent.context_sha256 IS NULL) OR "
+                "(current.context_sha256 IS NOT NULL "
+                "AND intent.context_sha256=current.context_sha256) OR "
+                "(intent.context_episode=current.context_episode "
+                "AND intent.context_sha256 IS current.context_sha256)) "
+                "ORDER BY (intent.context_episode=current.context_episode) DESC, "
+                "intent.reserved_at DESC LIMIT 1",
+                (run_id, run_id, challenge_id, fingerprint),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else (
+                str(row["status"]),
+                str(row["first_run_id"]),
+                int(row["context_episode"]),
+                None if row["context_sha256"] is None else str(row["context_sha256"]),
+            )
+        )
+
+    def control_catalogue_context_identity(
+        self, run_id: str, challenge_id: int
+    ) -> tuple[int, str | None]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT context_episode, context_sha256 FROM control_catalogue "
+                "WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError("durable catalogue context is absent")
+        episode = row["context_episode"]
+        if type(episode) is not int or episode < 0:
+            raise ValueError("durable catalogue context episode is invalid")
+        digest = None if row["context_sha256"] is None else str(row["context_sha256"])
+        return episode, digest
 
     def challenge_has_correct_submission(self, run_id: str, challenge_id: int) -> bool:
         with self._lock:
@@ -3915,6 +4196,7 @@ class StateStore:
                 "AND catalogue.challenge_id=intent.challenge_id "
                 "WHERE intent.first_run_id=? AND intent.challenge_id=? "
                 "AND intent.context_episode=catalogue.context_episode "
+                "AND intent.context_sha256 IS catalogue.context_sha256 "
                 "AND intent.status='correct') AS count",
                 (run_id, challenge_id, run_id, challenge_id),
             ).fetchone()

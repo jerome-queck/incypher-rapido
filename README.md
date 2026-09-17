@@ -85,7 +85,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_PEER_PROFILE` | `mixed_v1` | Mixed direct-peer scheduler. `uniform_v1` exists for frozen historical replay. |
 | `RAPIDO_CONCURRENCY` | `20` | Lane admission bound; accepted range 2–32. |
 | `RAPIDO_ACTIVE_CHALLENGES` | `5` | Active challenge engagements; auxiliary Recovery/Verifier agents do not consume these slots. |
-| `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, shared-instance or one evidence-earned changed Recovery, then bounded verification; accepted range 1–4. |
+| `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Synthetic/non-watching cap. Production watching runs requeue unresolved work with changed strategy until deadline. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: two Daybreak Leads plus two Luna Specialists by default; accepted range 2–8. |
 | `RAPIDO_ATTEMPT_SECONDS` | `800` | First-pass baseline; accepted range 600–7,200s. Automatic scaling reaches 1,800s when wall time allows; a larger configured baseline is preserved. |
@@ -102,7 +102,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_FOCUS_CHALLENGE_IDS` | empty | Ordered priority prefix without narrowing full-catalogue coverage. |
 | `RAPIDO_SUBMIT_CANDIDATES` | `true` | Unlimited challenges immediately submit distinct source-qualified candidates through the fifth wrong; later or Board-limited candidates require an independent Verifier. |
 | `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Local-first analysis plus one receipt-bound shared-instance lease at a time. |
-| `RAPIDO_WATCH_BOARD` | `true` | After the queue drains, remain alive until the original deadline and resume new or materially changed work. |
+| `RAPIDO_WATCH_BOARD` | `true` | Append new challenges during active work; after drain, stay alive until the original deadline and resume new or changed work. |
 | `RAPIDO_BOARD_WATCH_SECONDS` | `60` | Idle challenge-list polling interval. |
 | `RAPIDO_BOARD_FULL_REFRESH_SECONDS` | `900` | Periodic qualified metadata and bounded attachment-content refresh while idle. |
 
@@ -112,8 +112,8 @@ Every live run starts with fresh solver state and a run-local 0/15, but the auth
 account persists. Board-solved challenges are still analyzed, and freshly derived qualified
 candidates are still submitted. A generic `already_solved` response proves only account history;
 it does not validate that run's candidate. Board-unsolved challenges are queued first. A fresh
-`already_solved` candidate enters independent verification, then closes without being reported as
-a new HTTP `correct`.
+`already_solved` response closes immediately without wasting a Verifier and is not reported as a
+new HTTP `correct`.
 
 For repeated calibration runs, report current-run and cumulative results separately. Count a
 cumulative challenge once only from the source run that received `correct`, or from independent
@@ -129,26 +129,34 @@ verdicts. The `lane_local_v1` comparison arm carries bounded, immutable, sanitiz
 plus host/controller facts from earlier episodes in the same lane. The selected default
 `typed_challenge_v1` arm also shares sanitized host/controller facts across lanes, but never
 cross-lane model prose. Every verifier `same_run_memory` projection is empty; private controller
-state still retains candidates for verification. Raw tool payloads, payload-derived digests,
+state still retains candidates for verification. Selected same-run solver scripts and analysis
+files survive changed non-Verifier episodes only for identical challenge material; unsafe content,
+links, and raw endpoints are excluded. Raw tool payloads, payload-derived digests,
 authorities, paths, credentials, and candidate fingerprints are never carried into public memory.
+Agents may write and execute analysis scripts through the confined workspace shell. For assigned
+targets, `run_target_script` runs a saved Python program without direct networking and brokers its
+HTTP/TCP operations through the supervisor's allowlisted endpoint registry; one script may keep
+multiple sessions/connections and returns bounded target observations for candidate provenance.
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
 Initial and ordinary Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh. A productive
 timeout may earn one changed Recovery with three Daybreak/xhigh plus one Luna/max; repeated or
-zero-evidence timeouts stop. A Verifier is one fresh Daybreak/xhigh lane. The ordered queue puts
+zero-evidence timeout routing stops that route, while the unresolved challenge returns at the queue
+tail with a distinct orthogonal strategy. A Verifier is one fresh Daybreak/xhigh lane. The ordered queue puts
 `RAPIDO_FOCUS_CHALLENGE_IDS` first, then Board-unsolved work, while preserving deterministic
 category/value order. Normal work starts near 800s; higher-value or explicitly focused unsolved
 work can receive an automatic grant up to 1,800s, and productive timeout Recovery recomputes its
 grant from remaining time and unsolved work. An explicitly configured larger baseline is not
 reduced. No full live wave starts with less than 600s left.
 
-Dynamic challenges analyze locally, then park in a durable instance-ready queue without occupying
-one of the five productive challenge slots. The next waiter gets priority when the single lease
-and a productive slot are free. All peers for that challenge share one instance; receipt-bound
-cleanup completes before the lease moves. After all queued work closes, the Board watcher keeps
-the same original deadline, appends new challenges, and gives materially changed challenges a new
-workspace generation. Full refreshes compare bounded attachment bytes even when a URL is unchanged.
+Dynamic challenges analyze locally before requesting an instance. An instance-ready challenge
+blocked behind the occupied lease yields its residency while productive local work is queued; with
+free lease capacity, or when only instance-bound work remains, it stays resident. All peers for that challenge share one instance for one
+target wave; receipt-bound cleanup completes before the lease moves. The watcher appends newly
+published challenges during unresolved work. After work drains it keeps the original deadline and
+admits new or materially changed work in a new workspace generation. Full refreshes compare bounded
+attachment bytes even when a URL is unchanged.
 Earlier-generation observations, candidates, verification, routes, and Board effects remain private
 durable audit history, but cannot drive new-material prompts, routing, verification, or outcomes.
 

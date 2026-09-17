@@ -13,6 +13,7 @@ from rapido.routing import (
     adaptive_attempt_seconds,
     baseline_route,
     classify_failure,
+    continued_solve_route,
     route_failure,
 )
 
@@ -200,6 +201,20 @@ def test_adaptive_budget_uses_remaining_unsolved_waves_and_a_meaningful_floor() 
         ).rule_id
         == "timeout_recovery_below_meaningful_budget"
     )
+
+
+def test_persistent_retries_use_distinct_semantic_strategies_for_full_run_capacity() -> None:
+    current = baseline_route(
+        model="gpt-daybreak-blue-latest",
+        effort="xhigh",
+        attempt_seconds=800,
+    )
+    routes = {
+        continued_solve_route(current, episode=episode, attempt_seconds=800).tactic
+        for episode in range(1, 33)
+    }
+
+    assert len(routes) == 32
 
 
 @pytest.mark.parametrize(

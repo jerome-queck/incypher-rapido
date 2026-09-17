@@ -75,6 +75,7 @@ _INTEGER_KEYS = frozenset(
         "bytes",
         "channels",
         "count",
+        "duration_milliseconds",
         "entry_count",
         "frame_count",
         "height",
@@ -99,6 +100,7 @@ _BOOLEAN_KEYS = frozenset(
         "linked",
         "partial",
         "readable",
+        "retryable",
         "signed",
         "slow",
         "supported",
@@ -120,6 +122,7 @@ _TOKEN_KEYS = frozenset(
         "decoder",
         "endianness",
         "encoding",
+        "error_code",
         "format",
         "inspector",
         "kind",
@@ -239,7 +242,16 @@ _DERIVATION_TOOLS = frozenset(
         "read_text",
     }
 )
-_TARGET_TOOLS = frozenset({"http_request", "target_info", "tcp_close", "tcp_exchange", "tcp_open"})
+_TARGET_TOOLS = frozenset(
+    {
+        "http_request",
+        "run_target_script",
+        "target_info",
+        "tcp_close",
+        "tcp_exchange",
+        "tcp_open",
+    }
+)
 _EXECUTION_TOOLS = frozenset({"run_shell"})
 _KNOWN_TOOLS = _METADATA_TOOLS | _DERIVATION_TOOLS | _TARGET_TOOLS | _EXECUTION_TOOLS
 
@@ -953,7 +965,11 @@ def _facts_for_tool(tool: str, facts: Mapping[str, Any]) -> dict[str, Any]:
 
 def _validated_facts(observation: HostObservation) -> dict[str, Any]:
     canonical_tool = observation.tool if observation.tool in _KNOWN_TOOLS else "unknown_tool"
-    facts = _facts_for_tool(canonical_tool, observation.facts)
+    if observation.success is False:
+        projected = _recursive_facts(observation.facts)
+        facts = projected if isinstance(projected, dict) else {}
+    else:
+        facts = _facts_for_tool(canonical_tool, observation.facts)
     if _contains_candidate(facts):
         return {}
     return facts
@@ -980,7 +996,10 @@ def project_tool_observation(
         raise ValueError("tool result must be a mapping or null")
     canonical_tool = name if name in _KNOWN_TOOLS else "unknown_tool"
     facts: dict[str, Any] = {}
-    if success is True and source_bound and result is not None:
+    if success is False and result is not None:
+        projected = _recursive_facts(result)
+        facts = projected if isinstance(projected, dict) else {}
+    elif success is True and source_bound and result is not None:
         if canonical_tool in _TARGET_TOOLS:
             facts = _target_metadata(result)
         elif canonical_tool in _METADATA_TOOLS:
@@ -1015,7 +1034,7 @@ def _project_observation(observation: HostObservation) -> tuple[str, bytes]:
         "success": observation.success,
         "tool": canonical_tool,
     }
-    if observation.success is True and observation.source_bound:
+    if observation.success is False or observation.success is True and observation.source_bound:
         payload["facts"] = _validated_facts(observation)
     encoded = _canonical_bytes(payload)
     return canonical_tool, encoded

@@ -14,13 +14,21 @@ import math
 import re
 import unicodedata
 import urllib.parse
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, TypeAlias
 
 PROTOCOL_SHA256 = "4605399b8ff84acef4ecbcd30bd1856a86b8e3792d94f03fd525db4d70cd8a6e"
-PROJECTION_BYTES = 64 * 1024
+PROJECTION_BYTES = 24 * 1024
+
+_ANALYSIS_SUMMARY_BYTES = 1024
+_ANALYSIS_EVIDENCE_ITEMS = 3
+_ANALYSIS_EVIDENCE_BYTES = 256
+_ANALYSIS_NEXT_STEP_ITEMS = 3
+_ANALYSIS_NEXT_STEP_BYTES = 512
+_OBSERVATION_RECORD_BYTES = 4096
 
 MemoryArm = Literal["lane_local_v1", "typed_challenge_v1"]
 MemoryRole = Literal["recovery", "specialist", "verifier"]
@@ -834,6 +842,154 @@ def _in_scope(record: PublicMemoryRecord, target: MemoryTarget, arm: MemoryArm) 
     return arm == "typed_challenge_v1" and record.kind != "analysis_claim"
 
 
+def _utf8_prefix(value: str, maximum: int) -> str:
+    """Return a deterministic bounded prefix without splitting a code point."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value
+    suffix = b"..."
+    prefix = encoded[: maximum - len(suffix)]
+    while prefix:
+        try:
+            return prefix.decode("utf-8") + suffix.decode("ascii")
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+    return suffix.decode("ascii")
+
+
+def _compact_text_items(value: object, *, maximum_items: int, maximum_bytes: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_utf8_prefix(item, maximum_bytes) for item in value if isinstance(item, str)][
+        :maximum_items
+    ]
+
+
+def _compact_analysis(
+    public_record: dict[str, JSONValue],
+    sensitive_forms: frozenset[str],
+) -> dict[str, JSONValue] | None:
+    """Bound semantic prose before it competes with other lanes for prompt space."""
+    summary = public_record.get("summary")
+    public_record["summary"] = (
+        _utf8_prefix(summary, _ANALYSIS_SUMMARY_BYTES) if isinstance(summary, str) else ""
+    )
+    public_record["evidence"] = _compact_text_items(
+        public_record.get("evidence"),
+        maximum_items=_ANALYSIS_EVIDENCE_ITEMS,
+        maximum_bytes=_ANALYSIS_EVIDENCE_BYTES,
+    )
+    public_record["next_steps"] = _compact_text_items(
+        public_record.get("next_steps"),
+        maximum_items=_ANALYSIS_NEXT_STEP_ITEMS,
+        maximum_bytes=_ANALYSIS_NEXT_STEP_BYTES,
+    )
+    sanitized = _sanitize(public_record, sensitive_forms, active=set(), depth=0)
+    if not isinstance(sanitized, dict):
+        return None
+    if "summary" not in sanitized:
+        sanitized["summary"] = ""
+    if not any(
+        (
+            sanitized.get("summary"),
+            sanitized.get("evidence"),
+            sanitized.get("next_steps"),
+        )
+    ):
+        return None
+    return sanitized
+
+
+def _semantic_entry_order(
+    item: tuple[PublicMemoryRecord, dict[str, JSONValue]],
+    target: MemoryTarget,
+) -> tuple[int, int, int, str, int, str]:
+    record = item[0]
+    return (
+        -record.source_episode,
+        0 if record.source_lane == target.lane else 1,
+        record.source_lane,
+        record.source_attempt_id,
+        _KIND_ORDER[record.kind],
+        record.record_id,
+    )
+
+
+def _semantic_projection_order(
+    entries: Sequence[tuple[PublicMemoryRecord, dict[str, JSONValue]]],
+    target: MemoryTarget,
+) -> list[tuple[PublicMemoryRecord | None, dict[str, JSONValue]]]:
+    """Select compact signal, then interleave source observations across lanes."""
+    ordered: list[tuple[PublicMemoryRecord | None, dict[str, JSONValue]]] = []
+
+    newest_analysis_by_lane: dict[int, tuple[PublicMemoryRecord, dict[str, JSONValue]]] = {}
+    for item in sorted(entries, key=lambda value: _semantic_entry_order(value, target)):
+        record = item[0]
+        if record.kind == "analysis_claim" and record.source_lane not in newest_analysis_by_lane:
+            newest_analysis_by_lane[record.source_lane] = item
+    if target.lane in newest_analysis_by_lane:
+        ordered.append(newest_analysis_by_lane.pop(target.lane))
+    ordered.extend(
+        sorted(
+            newest_analysis_by_lane.values(), key=lambda value: _semantic_entry_order(value, target)
+        )
+    )
+
+    episodes = sorted({record.source_episode for record, _ in entries}, reverse=True)
+    for episode in episodes:
+        for kind in ("failure", "tactic_outcome"):
+            matches = [
+                item
+                for item in entries
+                if item[0].source_episode == episode and item[0].kind == kind
+            ]
+            if matches:
+                ordered.append(min(matches, key=lambda value: _semantic_entry_order(value, target)))
+
+    observations_by_lane: dict[int, deque[tuple[PublicMemoryRecord, dict[str, JSONValue]]]] = {}
+    for item in sorted(entries, key=lambda value: _semantic_entry_order(value, target)):
+        record, public_record = item
+        if (
+            record.kind != "host_observation"
+            or not record.source_bound
+            or len(canonical_bytes(public_record)) > _OBSERVATION_RECORD_BYTES
+        ):
+            continue
+        observations_by_lane.setdefault(record.source_lane, deque()).append(item)
+    lanes = sorted(observations_by_lane)
+    if target.lane in lanes:
+        lanes.remove(target.lane)
+        lanes.insert(0, target.lane)
+    while any(observations_by_lane[lane] for lane in lanes):
+        for lane in lanes:
+            if observations_by_lane[lane]:
+                ordered.append(observations_by_lane[lane].popleft())
+    return ordered
+
+
+def _rejection_ledger_record(
+    candidate_memory: CandidateMemoryAggregate | None,
+    target: MemoryTarget,
+) -> dict[str, JSONValue] | None:
+    if candidate_memory is None:
+        return None
+    counts = candidate_memory.public_counts()
+    if counts["invalid_context_count"] == 0 and counts["rejected_context_count"] == 0:
+        return None
+    return {
+        "kind": "host_observation",
+        "record_id": "rejection-ledger",
+        "source_episode": max(0, target.episode - 1),
+        "source_lane": target.lane,
+        "complete": True,
+        "gap": None,
+        "tool": "controller_rejection_ledger",
+        "success": None,
+        "source_bound": False,
+        "facts": counts,
+    }
+
+
 def project_memory(
     records: Iterable[PublicMemoryRecord],
     target: MemoryTarget,
@@ -880,30 +1036,43 @@ def project_memory(
         sanitized = _sanitize(public_by_identity[id(record)], forms, active=set(), depth=0)
         if not isinstance(sanitized, dict):
             continue
-        if record.kind == "analysis_claim" and "summary" not in sanitized:
-            sanitized["summary"] = ""
+        if record.kind == "analysis_claim":
+            sanitized = _compact_analysis(sanitized, forms)
+            if sanitized is None:
+                continue
         eligible.append((record, sanitized))
 
-    unique: list[dict[str, JSONValue]] = []
+    unique: list[tuple[PublicMemoryRecord, dict[str, JSONValue]]] = []
     seen: set[str] = set()
     deduplicated = 0
-    for _, public_record in eligible:
+    for record, public_record in sorted(
+        eligible, key=lambda value: _semantic_entry_order(value, target)
+    ):
         fingerprint = repeated_fingerprint(public_record)
         if fingerprint is not None and fingerprint in seen:
             deduplicated += 1
             continue
         if fingerprint is not None:
             seen.add(fingerprint)
-        unique.append(public_record)
+        unique.append((record, public_record))
 
+    semantic = _semantic_projection_order(unique, target)
+    ledger = _rejection_ledger_record(candidate_memory, target)
+    if ledger is not None:
+        analysis_count = sum(
+            record is not None and record.kind == "analysis_claim" for record, _ in semantic
+        )
+        semantic.insert(analysis_count, (None, ledger))
     selected: list[Mapping[str, JSONValue]] = []
-    omitted = 0
-    for index, public_record in enumerate(unique):
+    selected_source_records = 0
+    for record, public_record in semantic:
         proposed = [*selected, public_record]
         if len(canonical_bytes(proposed)) > projection_bytes:
-            omitted = len(unique) - index
-            break
+            continue
         selected.append(public_record)
+        if record is not None:
+            selected_source_records += 1
+    omitted = len(unique) - selected_source_records
     return MemoryProjection._create(selected, deduplicated, omitted, target, arm)
 
 

@@ -575,6 +575,10 @@ def build_turn_prompt(
             raise ValueError("carry episodes must be unique within a lineage")
         seen_episodes.add(attempt.episode)
         normalized_attempts.append(attempt)
+    carried_analysis = [
+        path for path in artifact_paths if path.startswith("rapido-analysis/carried/")
+    ]
+    source_artifacts = [path for path in artifact_paths if path not in carried_analysis]
     document: dict[str, Any] = {
         "label": "UNTRUSTED_CHALLENGE_DATA",
         "lane": lane,
@@ -590,7 +594,7 @@ def build_turn_prompt(
             "description": "",
             "value": challenge.value,
         },
-        "workspace_artifacts": artifact_paths,
+        "workspace_artifacts": source_artifacts,
         "prior_observations": None,
         "prior_attempts": [],
         "prior_attempts_omitted_for_budget": len(normalized_attempts),
@@ -603,6 +607,8 @@ def build_turn_prompt(
             "blocker; then return the required JSON."
         ),
     }
+    if carried_analysis:
+        document["carried_analysis_artifacts"] = carried_analysis
     if route_document is not None:
         document["control_route"] = route_document
         role = str(route_document["role"])
@@ -639,7 +645,10 @@ def build_turn_prompt(
     elif execution_phase == "shared_instance":
         document["task"] = (
             "One live instance is shared by this challenge's lanes. Test the strongest local "
-            "hypothesis through the bound target tools now. " + str(document["task"])
+            "hypothesis through the bound target tools now. For iterative exploits, save a Python "
+            "script in rapido-analysis and run it with run_target_script; import TargetClient from "
+            "rapido.target_script_client for brokered HTTP or TCP sessions. "
+            + str(document["task"])
         )
     _fit_challenge_description(document, challenge.description)
     if prior_observations is not None:
@@ -666,7 +675,12 @@ def build_turn_prompt(
 
 
 def build_primary_continuation_prompt(
-    *, reason: str, continuation_round: int, remaining_seconds: float | None
+    *,
+    reason: str,
+    continuation_round: int,
+    remaining_seconds: float | None,
+    prior_summary: str = "",
+    next_steps: tuple[str, ...] = (),
 ) -> str:
     """Build a changed, candidate-free instruction for one persistent primary thread."""
     if reason not in _PRIMARY_CONTINUATION_TASKS:
@@ -677,6 +691,14 @@ def build_primary_continuation_prompt(
         isinstance(remaining_seconds, bool) or remaining_seconds < 0
     ):
         raise ValueError("remaining_seconds is invalid")
+    if not _is_bounded_utf8_text(prior_summary, 2_000) or FLAG_RE.search(prior_summary):
+        raise ValueError("continuation summary is invalid")
+    if (
+        isinstance(next_steps, (str, bytes))
+        or len(next_steps) > 8
+        or any(not _is_bounded_utf8_text(item, 500) or FLAG_RE.search(item) for item in next_steps)
+    ):
+        raise ValueError("continuation next steps are invalid")
     remaining_milliseconds = (
         None if remaining_seconds is None else max(0, int(remaining_seconds * 1000))
     )
@@ -686,6 +708,10 @@ def build_primary_continuation_prompt(
             "continuation_round": continuation_round,
             "reason": reason,
             "remaining_milliseconds": remaining_milliseconds,
+            "prior_checkpoint": {
+                "summary": prior_summary,
+                "next_steps": list(next_steps),
+            },
             "task": (
                 "No correct flag has been accepted. Continue solving the same challenge in this "
                 "thread. Review the existing work, do not repeat the failed path, and run a "
