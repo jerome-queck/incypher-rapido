@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from rapido.tools import (
@@ -16,6 +17,7 @@ from rapido.tools import (
     MAX_ARCHIVE_ENTRIES,
     MAX_COMMAND_OUTPUT_BYTES,
     MAX_SCAN_BYTES,
+    MAX_WORKSPACE_ENTRIES,
     ToolError,
     ToolRegistry,
     Workspace,
@@ -84,10 +86,116 @@ class ToolFixture(unittest.TestCase):
             specs["decode_hex"]["inputSchema"]["oneOf"],
             [{"required": ["data"]}, {"required": ["path"]}],
         )
+        self.assertEqual(
+            specs["run_shell"]["inputSchema"]["required"],
+            ["command", "source_paths"],
+        )
         filesystem_schema = specs["inspect_filesystem"]["inputSchema"]
         self.assertEqual(filesystem_schema["required"], ["path"])
         self.assertEqual(filesystem_schema["oneOf"][1]["required"], ["action", "filesystem_path"])
         self.assertEqual(registry.dispatch("hash", {"path": "note.txt"})["path"], "note.txt")
+
+    def test_shell_binds_command_to_hashed_challenge_sources(self) -> None:
+        worker_result = {
+            "returncode": 0,
+            "stdout": "derived value\n",
+            "stderr": "",
+            "stop_reason": None,
+            "sandbox": {"enforced": True, "network": "denied"},
+            "cwd": "rapido-analysis",
+        }
+        with mock.patch(
+            "rapido.analysis_worker.run_analysis_worker", return_value=worker_result
+        ) as worker:
+            result = call_tool(
+                self.workspace,
+                "run_shell",
+                {
+                    "command": "python -c 'print(1)'",
+                    "source_paths": ["note.txt", "note.txt"],
+                    "timeout_seconds": 17,
+                },
+            )
+        worker.assert_called_once_with(self.workspace.root, "python -c 'print(1)'", 17)
+        self.assertEqual(result["stdout"], "derived value\n")
+        self.assertEqual(result["analysis_directory"], "rapido-analysis")
+        self.assertEqual(result["sources"][0]["path"], "note.txt")
+        self.assertEqual(len(result["sources"]), 1)
+        self.assertEqual(len(result["sources"][0]["sha256"]), 64)
+        self.assertEqual(len(result["command_sha256"]), 64)
+
+    def test_shell_rejects_missing_or_analysis_only_sources(self) -> None:
+        for source_paths in (None, [], ["rapido-analysis/generated.py"]):
+            arguments = {"command": "true"}
+            if source_paths is not None:
+                arguments["source_paths"] = source_paths
+            self.assertToolError(
+                "invalid_argument",
+                call_tool,
+                self.workspace,
+                "run_shell",
+                arguments,
+            )
+
+    def test_shell_registry_removes_new_entries_after_quota_failure(self) -> None:
+        _, current = self.workspace.snapshot()
+
+        def write_large_output(root: Path, _command: str, _timeout: int) -> dict[str, Any]:
+            analysis = root / "rapido-analysis"
+            analysis.mkdir()
+            (analysis / "large.bin").write_bytes(b"x" * 16)
+            return {"returncode": 0, "stdout": "", "stderr": "", "stop_reason": None}
+
+        registry = ToolRegistry(self.workspace, max_workspace_bytes=current + 8)
+        with mock.patch(
+            "rapido.analysis_worker.run_analysis_worker", side_effect=write_large_output
+        ):
+            self.assertToolError(
+                "workspace_quota",
+                registry.dispatch,
+                "run_shell",
+                {"command": "produce", "source_paths": ["note.txt"]},
+            )
+        self.assertFalse((self.root / "rapido-analysis").exists())
+
+    def test_shell_registry_removes_over_entry_limit_without_resnapshot(self) -> None:
+        def write_many(root: Path, _command: str, _timeout: int) -> dict[str, Any]:
+            analysis = root / "rapido-analysis"
+            analysis.mkdir()
+            for index in range(MAX_WORKSPACE_ENTRIES + 1):
+                (analysis / str(index)).touch()
+            return {"returncode": 0, "stdout": "", "stderr": "", "stop_reason": None}
+
+        registry = ToolRegistry(self.workspace)
+        with mock.patch("rapido.analysis_worker.run_analysis_worker", side_effect=write_many):
+            self.assertToolError(
+                "workspace_quota",
+                registry.dispatch,
+                "run_shell",
+                {"command": "produce", "source_paths": ["note.txt"]},
+            )
+        self.assertFalse((self.root / "rapido-analysis").exists())
+
+    def test_shell_registry_truncates_existing_file_after_byte_quota_failure(self) -> None:
+        analysis = self.root / "rapido-analysis"
+        analysis.mkdir()
+        retained = analysis / "retained.txt"
+        retained.write_bytes(b"old")
+        _, current = self.workspace.snapshot()
+
+        def enlarge(root: Path, _command: str, _timeout: int) -> dict[str, Any]:
+            (root / "rapido-analysis/retained.txt").write_bytes(b"old" + b"x" * 16)
+            return {"returncode": 0, "stdout": "", "stderr": "", "stop_reason": None}
+
+        registry = ToolRegistry(self.workspace, max_workspace_bytes=current + 8)
+        with mock.patch("rapido.analysis_worker.run_analysis_worker", side_effect=enlarge):
+            self.assertToolError(
+                "workspace_quota",
+                registry.dispatch,
+                "run_shell",
+                {"command": "produce", "source_paths": ["note.txt"]},
+            )
+        self.assertEqual(retained.read_bytes(), b"old")
 
     def test_large_files_use_ranges_streaming_hashes_and_bounded_scans(self) -> None:
         path = self.root / "large.bin"

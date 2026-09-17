@@ -55,6 +55,15 @@ _PROCESS_GROUP_SYSCALLS = {
     "aarch64": frozenset({154, 157}),
 }
 
+# Arbitrary challenge code must not signal the supervisor/Board owner or use a
+# pidfd to duplicate one of its credential-bearing descriptors.  The fixed
+# analysis supervisor is outside this filter and remains able to reap the whole
+# worker process group.
+_ANALYSIS_CONTROL_SYSCALLS = {
+    "x86_64": frozenset({62, 129, 200, 234, 297, 424, 438}),
+    "aarch64": frozenset({129, 130, 131, 138, 240, 424, 438}),
+}
+
 _ARCHITECTURES = {
     "x86_64": (
         0xC000003E,
@@ -71,7 +80,6 @@ _ARCHITECTURES = {
             50,
             51,
             52,
-            53,
             54,
             55,
             288,
@@ -87,7 +95,6 @@ _ARCHITECTURES = {
         0xC00000B7,
         {
             198,
-            199,
             200,
             201,
             202,
@@ -186,13 +193,23 @@ def _runtime_paths() -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _install_landlock(scratch_fd: int) -> int:
+def _install_landlock(
+    scratch_fd: int,
+    *,
+    minimum_abi: int = 1,
+    readable_root_fd: int | None = None,
+    scratch_executable: bool = False,
+    extra_scratch_fds: tuple[int, ...] = (),
+    extra_runtime_paths: tuple[str, ...] = (),
+) -> int:
     libc = _libc()
     create_number, add_number, restrict_number = 444, 445, 446
     abi = _checked(
         libc.syscall(create_number, 0, 0, _LANDLOCK_CREATE_RULESET_VERSION),
         "Landlock ABI query",
     )
+    if abi < minimum_abi:
+        raise SandboxUnavailable(f"Landlock ABI {abi} is below required ABI {minimum_abi}")
     handled = (
         _LANDLOCK_ACCESS_FS_EXECUTE
         | _LANDLOCK_ACCESS_FS_WRITE_FILE
@@ -218,14 +235,21 @@ def _install_landlock(scratch_fd: int) -> int:
         "Landlock ruleset creation",
     )
     try:
-        for path in _runtime_paths():
-            metadata = os.stat(path)
+        for path in (*_runtime_paths(), *extra_runtime_paths):
+            if not os.path.exists(path):
+                continue
+            real = os.path.realpath(path)
+            if real == "/" or any(
+                real == root or real.startswith(root + "/") for root in ("/auth", "/state")
+            ):
+                raise SandboxUnavailable("analysis runtime path is not safely confined")
+            metadata = os.stat(real)
             access = _LANDLOCK_ACCESS_FS_READ_FILE | _LANDLOCK_ACCESS_FS_EXECUTE
             if stat.S_ISDIR(metadata.st_mode):
                 access |= _LANDLOCK_ACCESS_FS_READ_DIR
-            elif path == "/dev/null":
+            elif real == "/dev/null":
                 access |= _LANDLOCK_ACCESS_FS_WRITE_FILE
-            parent = os.open(path, os.O_PATH | os.O_CLOEXEC)
+            parent = os.open(real, os.O_PATH | os.O_CLOEXEC)
             try:
                 rule = _PathBeneathAttr(access, parent)
                 _checked(
@@ -240,6 +264,24 @@ def _install_landlock(scratch_fd: int) -> int:
                 )
             finally:
                 os.close(parent)
+        if readable_root_fd is not None:
+            readable = os.fstat(readable_root_fd)
+            if not stat.S_ISDIR(readable.st_mode):
+                raise SandboxUnavailable("analysis readable root is not a directory")
+            readable_rule = _PathBeneathAttr(
+                _LANDLOCK_ACCESS_FS_READ_FILE | _LANDLOCK_ACCESS_FS_READ_DIR,
+                readable_root_fd,
+            )
+            _checked(
+                libc.syscall(
+                    add_number,
+                    ruleset,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(readable_rule),
+                    0,
+                ),
+                "Landlock readable-root rule installation",
+            )
         scratch_access = (
             _LANDLOCK_ACCESS_FS_WRITE_FILE
             | _LANDLOCK_ACCESS_FS_READ_FILE
@@ -249,21 +291,28 @@ def _install_landlock(scratch_fd: int) -> int:
             | _LANDLOCK_ACCESS_FS_MAKE_DIR
             | _LANDLOCK_ACCESS_FS_MAKE_REG
         )
+        if scratch_executable:
+            scratch_access |= (
+                _LANDLOCK_ACCESS_FS_EXECUTE
+                | _LANDLOCK_ACCESS_FS_MAKE_FIFO
+                | _LANDLOCK_ACCESS_FS_MAKE_SOCK
+            )
         if abi >= 2:
             scratch_access |= _LANDLOCK_ACCESS_FS_REFER
         if abi >= 3:
             scratch_access |= _LANDLOCK_ACCESS_FS_TRUNCATE
-        scratch_rule = _PathBeneathAttr(scratch_access, scratch_fd)
-        _checked(
-            libc.syscall(
-                add_number,
-                ruleset,
-                _LANDLOCK_RULE_PATH_BENEATH,
-                ctypes.byref(scratch_rule),
-                0,
-            ),
-            "Landlock scratch rule installation",
-        )
+        for descriptor in (scratch_fd, *extra_scratch_fds):
+            scratch_rule = _PathBeneathAttr(scratch_access, descriptor)
+            _checked(
+                libc.syscall(
+                    add_number,
+                    ruleset,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(scratch_rule),
+                    0,
+                ),
+                "Landlock scratch rule installation",
+            )
         _checked(libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "no-new-privileges")
         _checked(libc.syscall(restrict_number, ruleset, 0), "Landlock activation")
     finally:
@@ -271,10 +320,13 @@ def _install_landlock(scratch_fd: int) -> int:
     return abi
 
 
-def _seccomp_instructions(machine: str) -> list[_SockFilter]:
+def _seccomp_instructions(
+    machine: str, *, extra_denied: frozenset[int] = frozenset()
+) -> list[_SockFilter]:
     if machine not in _ARCHITECTURES:
         raise SandboxUnavailable(f"unsupported seccomp architecture: {machine}")
     audit_arch, denied = _ARCHITECTURES[machine]
+    denied = denied | extra_denied
     instructions = [
         _SockFilter(_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 4),
         _SockFilter(_BPF_JMP | _BPF_JEQ | _BPF_K, 1, 0, audit_arch),
@@ -301,9 +353,14 @@ def _seccomp_instructions(machine: str) -> list[_SockFilter]:
     return instructions
 
 
-def _install_seccomp_filter() -> str:
+def _install_seccomp_filter(*, analysis: bool = False) -> str:
     machine = platform.machine().lower()
-    instructions = _seccomp_instructions(machine)
+    instructions = _seccomp_instructions(
+        machine,
+        extra_denied=_ANALYSIS_CONTROL_SYSCALLS.get(machine, frozenset())
+        if analysis
+        else frozenset(),
+    )
     program_type = _SockFilter * len(instructions)
     program_data = program_type(*instructions)
     program = _SockFprog(len(instructions), program_data)
@@ -343,4 +400,73 @@ def apply_artifact_sandbox(source_fd: int, scratch_fd: int) -> dict[str, object]
     }
 
 
-__all__ = ["SandboxUnavailable", "apply_artifact_sandbox"]
+def apply_analysis_sandbox(
+    workspace_fd: int, analysis_fd: int, ephemeral_fd: int
+) -> dict[str, object]:
+    """Allow local analysis/IPC while hiding auth, state siblings, and networking."""
+    if sys.platform != "linux":
+        return {"platform": sys.platform, "enforced": False}
+    for descriptor, label in (
+        (workspace_fd, "workspace"),
+        (analysis_fd, "analysis"),
+        (ephemeral_fd, "ephemeral"),
+    ):
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise SandboxUnavailable(f"{label} descriptor is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SandboxUnavailable(f"{label} descriptor is not a directory")
+    runtime_paths = tuple(
+        path
+        for path in (
+            "/bin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/opt/venv/bin",
+            "/opt/angr",
+            "/opt/math",
+            "/opt/java/openjdk",
+            "/opt/ghidra",
+            "/opt/jadx",
+            "/usr/include",
+            "/usr/libexec",
+            "/usr/x86_64-linux-gnu",
+            "/usr/share",
+            "/sys/devices/system/cpu",
+            "/etc/alternatives",
+            "/etc/group",
+            "/etc/ssl",
+            "/etc/gdb",
+            "/etc/ImageMagick-6",
+            "/etc/OpenCL",
+            "/etc/nsswitch.conf",
+            "/etc/passwd",
+            "/etc/wireshark",
+            "/proc/cpuinfo",
+            "/proc/meminfo",
+        )
+        if os.path.exists(path)
+    )
+    abi = _install_landlock(
+        analysis_fd,
+        minimum_abi=3,
+        readable_root_fd=workspace_fd,
+        scratch_executable=True,
+        extra_scratch_fds=(ephemeral_fd,),
+        extra_runtime_paths=runtime_paths,
+    )
+    machine = _install_seccomp_filter(analysis=True)
+    return {
+        "platform": "linux",
+        "enforced": True,
+        "landlock_abi": abi,
+        "arch": machine,
+        "process_group_locked": True,
+        "network": "denied",
+        "ephemeral_scratch": True,
+    }
+
+
+__all__ = ["SandboxUnavailable", "apply_analysis_sandbox", "apply_artifact_sandbox"]

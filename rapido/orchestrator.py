@@ -55,6 +55,7 @@ from .solver import (
     build_primary_continuation_prompt,
     build_turn_prompt,
     candidate_is_eligible,
+    challenge_candidate_prose,
     project_attempt_carry,
 )
 from .state import StateStore
@@ -213,6 +214,7 @@ _DURABLE_TOOL_NAMES = frozenset(
         "list_zip",
         "read_bytes",
         "read_text",
+        "run_shell",
         "search_text",
         "target_info",
         "tcp_close",
@@ -916,6 +918,19 @@ class Orchestrator:
         )
         source_root = challenge_root / "source"
         source_root.mkdir(parents=True, exist_ok=False)
+        context_payload = json.dumps(
+            {
+                "id": challenge.id,
+                "name": challenge.name,
+                "category": challenge.category,
+                "type": challenge.type,
+                "description": challenge.description,
+                "value": challenge.value,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
         source_paths: list[Path] = []
         total_bytes = 0
         for index, file_ref in enumerate(challenge.files, 1):
@@ -941,7 +956,9 @@ class Orchestrator:
                 raise BoardError("challenge artifacts exceed the aggregate byte limit")
             source_paths.append(destination)
 
-        if total_bytes * (lanes + 1) > self.config.max_challenge_workspace_bytes:
+        if total_bytes * (lanes + 1) + len(context_payload) * lanes > (
+            self.config.max_challenge_workspace_bytes
+        ):
             raise BoardError("challenge artifact copies exceed the workspace byte limit")
 
         workspaces: list[tuple[Path, list[str]]] = []
@@ -949,7 +966,10 @@ class Orchestrator:
             workspace = challenge_root / f"lane-{lane}"
             artifact_root = workspace / "artifacts"
             artifact_root.mkdir(parents=True, exist_ok=False)
-            relative_paths: list[str] = []
+            context_path = artifact_root / ".rapido-context.json"
+            context_path.write_bytes(context_payload)
+            context_path.chmod(0o600)
+            relative_paths: list[str] = [context_path.relative_to(workspace).as_posix()]
             for source in source_paths:
                 destination = artifact_root / source.name
                 await self._drain_copyfile(source, destination)
@@ -1320,6 +1340,7 @@ class Orchestrator:
         tool_evidence_complete = False
         target_registry = None
         submission_status: str | None = None
+        candidate_requires_verification = False
 
         def finish_attempt(
             status: str,
@@ -1344,9 +1365,15 @@ class Orchestrator:
                 proof = run_evidence.attest_candidate(
                     attempt_id,
                     candidate_sha256=hashlib.sha256(candidate.encode()).hexdigest(),
+                    require_non_execution_observation=verifier_route,
                 )
                 if proof is None:
-                    raise CandidateProvenanceError("candidate_evidence_incomplete")
+                    reason = (
+                        "verifier_requires_fixed_observation"
+                        if verifier_route
+                        else "candidate_evidence_incomplete"
+                    )
+                    raise CandidateProvenanceError(reason)
             try:
                 self.state.finish_attempt(
                     attempt_id,
@@ -1477,24 +1504,32 @@ class Orchestrator:
                 finding: SolverFinding,
                 calls: tuple[ToolCallEvidence, ...],
                 complete: bool,
-            ) -> None:
+            ) -> bool:
                 if finding.candidate is None:
-                    return
+                    return False
                 if self._adaptive_control and not complete:
                     raise CandidateProvenanceError("candidate_evidence_incomplete")
-                if not candidate_is_eligible(finding.candidate, challenge.description):
+                if not candidate_is_eligible(
+                    finding.candidate, challenge_candidate_prose(challenge)
+                ):
                     raise CandidateProvenanceError("candidate_ineligible")
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
                 candidate_observed = False
+                candidate_observed_by_fixed_tool = False
                 candidate_supplied = False
                 for call in calls:
                     candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
                     if call.success is True and call.source_bound:
-                        candidate_observed |= candidate_fingerprint in call.candidate_sha256s
+                        observed_here = candidate_fingerprint in call.candidate_sha256s
+                        candidate_observed |= observed_here
+                        candidate_observed_by_fixed_tool |= (
+                            observed_here and call.name != "run_shell"
+                        )
                 if candidate_supplied:
                     raise CandidateProvenanceError("candidate_supplied")
                 if not candidate_observed:
                     raise CandidateProvenanceError("candidate_unobserved")
+                return not candidate_observed_by_fixed_tool
 
             def continue_primary(turn: NativeTurn, remaining_seconds: float | None) -> str | None:
                 nonlocal continuation_round
@@ -1671,7 +1706,9 @@ class Orchestrator:
             _, candidate_calls, candidate_evidence_complete = _normalize_tool_calls(
                 getattr(turn, "current_turn_tool_calls", turn.tool_calls)
             )
-            validate_candidate(finding, candidate_calls, candidate_evidence_complete)
+            candidate_requires_verification = validate_candidate(
+                finding, candidate_calls, candidate_evidence_complete
+            )
             terminal = "candidate" if finding.status == "candidate" else finding.status
             private_candidate = self._adaptive_control and finding.candidate is not None
             finish_attempt(
@@ -1729,12 +1766,13 @@ class Orchestrator:
                 failure_class="cancelled",
             )
             raise
-        except CandidateProvenanceError:
+        except CandidateProvenanceError as exc:
+            subreason = str(exc)
             finding = None
             terminal = "unsolved"
             finish_attempt(
                 terminal,
-                summary="flag-shaped hypothesis rejected by provenance policy",
+                summary=f"flag-shaped hypothesis rejected by provenance policy: {subreason}",
                 tool_count=tool_call_count,
                 failure_class="candidate_provenance",
             )
@@ -1746,6 +1784,7 @@ class Orchestrator:
                     "episode": episode,
                     "lane": lane,
                     "reason": "candidate_provenance",
+                    "subreason": subreason,
                 },
             )
         except SolverOutputError:
@@ -1857,6 +1896,7 @@ class Orchestrator:
             finding is not None
             and finding.candidate is not None
             and candidate_submitter is not None
+            and not candidate_requires_verification
         ):
             submission_status = await candidate_submitter(finding.candidate)
         return LaneResult(

@@ -28,6 +28,17 @@ def test_process_group_syscall_numbers_are_exact_for_supported_architectures():
     }
 
 
+def test_analysis_landlock_fails_closed_below_truncate_mediation(monkeypatch):
+    class FakeLibc:
+        def syscall(self, number, *args):
+            assert number == 444
+            return 2
+
+    monkeypatch.setattr(artifact_sandbox, "_libc", FakeLibc)
+    with pytest.raises(artifact_sandbox.SandboxUnavailable, match="below required ABI 3"):
+        artifact_sandbox._install_landlock(0, minimum_abi=3)
+
+
 def _instructions(machine: str) -> list[tuple[int, int, int, int]]:
     return [
         (instruction.code, instruction.jt, instruction.jf, instruction.k)

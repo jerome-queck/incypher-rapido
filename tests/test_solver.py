@@ -20,6 +20,7 @@ from rapido.solver import (
     SolverOutputError,
     admitted_candidate,
     build_turn_prompt,
+    challenge_candidate_prose,
     project_attempt_carry,
 )
 from rapido.state import StateStore
@@ -100,6 +101,19 @@ def test_candidate_requires_independent_agreement_and_rejects_prose_or_placehold
         assert (
             admitted_candidate([finding(placeholder), finding(placeholder)], "decode this") is None
         )
+
+
+@pytest.mark.parametrize("field", ("name", "category", "type", "description"))
+def test_candidate_rejects_every_controller_challenge_text_field(field: str) -> None:
+    decoy = "INCYPHER{metadata_decoy}"
+    challenge = Challenge(
+        7, "Name", "crypto", "standard", "Do thing", 100, (), False, 0, 0, None, None
+    )
+    challenge = replace(challenge, **{field: decoy})
+    assert (
+        admitted_candidate([finding(decoy), finding(decoy)], challenge_candidate_prose(challenge))
+        is None
+    )
 
 
 def test_turn_prompt_labels_untrusted_data_and_exposes_no_transport_fields() -> None:
@@ -479,15 +493,29 @@ def test_turn_prompt_accepts_typed_memory_but_fences_verifier_memory() -> None:
             same_run_memory=projection,
         )
 
+    verifier_prompt = json.loads(
+        build_turn_prompt(
+            challenge,
+            [],
+            0,
+            run_id="run-a",
+            episode=1,
+            control_route=verifier,
+        )
+    )
+    assert "non-run_shell fixed source or target tool observation" in verifier_prompt["task"]
+    assert "shell-only evidence remains private" in verifier_prompt["task"]
+
 
 def test_developer_instructions_truthfully_bound_authorized_ctf_scope() -> None:
     normalized = " ".join(DEVELOPER_INSTRUCTIONS.lower().split())
     assert "official in-cypher practice ctf" in normalized
     assert "organizer explicitly provides" in normalized
     assert "board-issued target" in normalized
-    assert "never probe, discover, or interact with any outside system" in normalized
-    assert "derive_artifact with the source path and byte range" in normalized
-    assert "returned content-addressed path" in normalized
+    assert "do not access any other system or authority" in normalized
+    assert "inspect, transform, compile, execute, emulate, and test" in normalized
+    assert "create reusable solve scripts" in normalized
+    assert "only through its bound target tools" in normalized
     offline = " ".join(OFFLINE_DEVELOPER_INSTRUCTIONS.lower().split())
     assert "synthetic, offline acceptance fixture" in offline
     assert "no external target access is authorized or provided" in offline

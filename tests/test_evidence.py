@@ -161,6 +161,60 @@ def test_memory_source_is_verified_narrow_and_candidate_digest_free(tmp_path: Pa
     state.close()
 
 
+def test_verifier_attestation_requires_non_execution_candidate_observation(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    candidate_digest = hashlib.sha256(b"INCYPHER{execution_only}").hexdigest()
+    evidence = RunEvidence.open(state, "run-a")
+    _attempt(state, "shell-only", lane=0)
+    evidence.commit(
+        "shell-only",
+        EvidenceBatch(
+            (
+                HostObservation(
+                    "run_shell",
+                    True,
+                    True,
+                    candidate_sha256s=(candidate_digest,),
+                ),
+            )
+        ),
+    )
+    assert (
+        evidence.attest_candidate(
+            "shell-only",
+            candidate_sha256=candidate_digest,
+            require_non_execution_observation=True,
+        )
+        is None
+    )
+
+    _attempt(state, "fixed", lane=1)
+    evidence.commit(
+        "fixed",
+        EvidenceBatch(
+            (
+                HostObservation(
+                    "inspect_file",
+                    True,
+                    True,
+                    candidate_sha256s=(candidate_digest,),
+                ),
+            )
+        ),
+    )
+    assert (
+        evidence.attest_candidate(
+            "fixed",
+            candidate_sha256=candidate_digest,
+            require_non_execution_observation=True,
+        )
+        is not None
+    )
+    state.close()
+
+
 def test_rows_are_immutable_and_verified_before_carry(tmp_path: Path) -> None:
     state = _state(tmp_path / "state.sqlite3", "run-a")
     _attempt(state, "a0")
@@ -609,6 +663,25 @@ def test_projector_preserves_structure_but_not_raw_or_authority() -> None:
     )
     target_facts = dict(target.facts)
     assert target_facts["status"] == 404
+
+    shell = project_tool_observation(
+        "run_shell",
+        success=True,
+        source_bound=True,
+        result={
+            "command_sha256": "a" * 64,
+            "returncode": 0,
+            "stdout": candidate,
+            "sources": [{"path": "artifacts/private.bin", "bytes": 7, "sha256": "b" * 64}],
+            "sandbox": {"network": "denied"},
+        },
+    )
+    shell_facts = dict(shell.facts)
+    assert shell_facts["command_sha256"] == "a" * 64
+    assert shell_facts["sources"] == ({"bytes": 7, "sha256": "b" * 64},)
+    assert shell_facts["returncode"] == 0
+    assert candidate not in repr(shell_facts)
+    assert "artifacts/private.bin" not in repr(shell_facts)
     assert target_facts["bytes"] == len(candidate.encode())
     assert target_facts["entry_count"] == 3
     assert target_facts["content_length"] == 99

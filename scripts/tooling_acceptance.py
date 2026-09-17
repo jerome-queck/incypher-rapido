@@ -33,9 +33,21 @@ from typing import Any
 PINNED_PARSERS = {
     "Pillow": ("PIL", "12.2.0"),
     "capstone": ("capstone", "5.0.9"),
+    "cryptography": ("cryptography", "50.0.1"),
     "dpkt": ("dpkt", "1.9.8"),
+    "gmpy2": ("gmpy2", "2.2.1"),
+    "httpx": ("httpx", "0.28.1"),
+    "numpy": ("numpy", "2.2.6"),
+    "opencv-python-headless": ("cv2", "4.12.0.88"),
     "pefile": ("pefile", "2024.8.26"),
+    "pwntools": ("pwnlib", "4.15.0"),
+    "pycryptodome": ("Crypto", "3.23.0"),
+    "pyelftools": ("elftools", "0.33"),
     "pypdf": ("pypdf", "6.18.1"),
+    "requests": ("requests", "2.34.2"),
+    "sympy": ("sympy", "1.14.0"),
+    "unicorn": ("unicorn", "2.1.2"),
+    "z3-solver": ("z3", "4.15.4.0"),
 }
 EXPECTED_TOOLS = (
     "list_workspace",
@@ -50,14 +62,31 @@ EXPECTED_TOOLS = (
     "decompress_gzip",
     "elf_symbols",
     "inspect_filesystem",
+    "run_shell",
 )
 OUTPUT_LIMIT = 128 * 1024
 NATIVE_PATHS = {
+    "analyzeHeadless": ("/opt/ghidra/support/analyzeHeadless",),
+    "binwalk": ("/usr/bin/binwalk",),
+    "curl": ("/usr/bin/curl",),
     "debugfs": ("/usr/bin/debugfs", "/usr/sbin/debugfs"),
+    "ffmpeg": ("/usr/bin/ffmpeg",),
+    "ffprobe": ("/usr/bin/ffprobe",),
+    "fls": ("/usr/bin/fls",),
+    "gdb": ("/usr/bin/gdb",),
+    "hashcat": ("/usr/bin/hashcat",),
+    "icat": ("/usr/bin/icat",),
+    "jadx": ("/opt/jadx/bin/jadx",),
+    "javac": ("/opt/java/openjdk/bin/javac",),
     "mke2fs": ("/usr/bin/mke2fs", "/usr/sbin/mke2fs"),
+    "mmls": ("/usr/bin/mmls",),
     "objdump": ("/usr/bin/objdump", "/usr/bin/llvm-objdump"),
+    "qpdf": ("/usr/bin/qpdf",),
     "readelf": ("/usr/bin/readelf", "/usr/bin/llvm-readelf"),
+    "sage": ("/usr/bin/sage",),
+    "sox": ("/usr/bin/sox",),
     "tesseract": ("/usr/bin/tesseract", "/usr/local/bin/tesseract"),
+    "tshark": ("/usr/bin/tshark",),
 }
 
 
@@ -166,6 +195,24 @@ def _bitplane_png_fixture() -> bytes:
     image.putdata([(bit, 0, 0, 255) for bit in bits])
     stream = io.BytesIO()
     image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def _animated_gif_fixture() -> bytes:
+    """Two distinct frames for deterministic FFmpeg extraction."""
+    from PIL import Image
+
+    first = Image.new("RGB", (16, 16), (255, 0, 0))
+    second = Image.new("RGB", (16, 16), (0, 0, 255))
+    stream = io.BytesIO()
+    first.save(
+        stream,
+        format="GIF",
+        save_all=True,
+        append_images=[second],
+        duration=100,
+        loop=0,
+    )
     return stream.getvalue()
 
 
@@ -403,12 +450,24 @@ def _dicom_fixture() -> bytes:
 
 def _fixture_files(root: Path) -> None:
     (root / "notes.txt").write_bytes(b"offline tooling acceptance fixture\n")
+    source_executable = root / "source-executable.sh"
+    source_executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    source_executable.chmod(0o700)
     (root / "opaque.bin").write_bytes(b"\x00VISIBLE_STRING\x00\x01")
     payload = b"benign derived payload\n"
     (root / "payload.b64").write_text(base64.b64encode(payload).decode("ascii"), encoding="ascii")
     (root / "payload.hex").write_text(payload.hex(), encoding="ascii")
     (root / "payload.url").write_text("benign%20derived%20payload%0A", encoding="ascii")
     (root / "archive.zip").write_bytes(_zip_bytes({"member.txt": b"inert archive member\n"}))
+    (root / "encrypted.zip").write_bytes(
+        base64.b64decode(
+            "UEsDBAoACQAAAFtTL13uf7cmIQAAABUAAAAJABwAcGxhaW4udHh0VVQJAAPurKhq7qyo"
+            "anV4CwABBPUBAAAEFAAAAIt6rrGjEoxMjOR8cji3ziWW71RDaasSyAcRj6dh033dClBL"
+            "Bwjuf7cmIQAAABUAAABQSwECHgMKAAkAAABbUy9d7n+3JiEAAAAVAAAACQAYAAAAAAAB"
+            "AAAApIEAAAAAcGxhaW4udHh0VVQFAAPurKhqdXgLAAEE9QEAAAQUAAAAUEsFBgAAAAAB"
+            "AAEATwAAAHQAAAAAAA=="
+        )
+    )
     (root / "archive.tar").write_bytes(_tar_bytes({"member.txt": b"inert tar member\n"}))
     (root / "payload.gz").write_bytes(_gzip_bytes(b"inert gzip member\n"))
     (root / "x86_64.elf").write_bytes(_elf_fixture(b"\x90\xc3", bits=64, machine=62))
@@ -419,8 +478,10 @@ def _fixture_files(root: Path) -> None:
         _elf_fixture(bytes.fromhex("200080d2c0035fd6"), bits=64, machine=183)
     )
     (root / "tiny.png").write_bytes(_png_fixture())
+    (root / "fixture.gif").write_bytes(_animated_gif_fixture())
     (root / "bitplane.png").write_bytes(_bitplane_png_fixture())
     (root / "fixture.pdf").write_bytes(_pdf_fixture())
+    (root / "malformed.pdf").write_bytes(_pdf_fixture()[:-20])
     (root / "fixture.pcap").write_bytes(_pcap_fixture())
     (root / "fixture.pcapng").write_bytes(_pcapng_fixture())
     (root / "fixture.exe").write_bytes(_pe_fixture())
@@ -437,6 +498,9 @@ def _filesystem_fixture(root: Path) -> None:
         raise AssertionError("mke2fs: no fixed executable for filesystem fixture")
     image = root / "fixture.ext2"
     image.write_bytes(b"\x00" * (4 * 1024 * 1024))
+    seed = root / ".filesystem-seed"
+    seed.mkdir()
+    (seed / "recovered.txt").write_bytes(b"sleuthkit-fixture\n")
     try:
         subprocess.run(
             [
@@ -451,6 +515,8 @@ def _filesystem_fixture(root: Path) -> None:
                 "00000000-0000-0000-0000-000000000011",
                 "-L",
                 "rapido",
+                "-d",
+                str(seed),
                 str(image),
             ],
             cwd=root,
@@ -461,6 +527,26 @@ def _filesystem_fixture(root: Path) -> None:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AssertionError("mke2fs: filesystem fixture creation failed") from exc
+    finally:
+        (seed / "recovered.txt").unlink(missing_ok=True)
+        seed.rmdir()
+
+    start_sector = 2048
+    sectors = image.stat().st_size // 512
+    prefix = bytearray(start_sector * 512)
+    struct.pack_into(
+        "<B3sB3sII",
+        prefix,
+        446,
+        0,
+        b"\x00\x02\x00",
+        0x83,
+        b"\xff\xff\xff",
+        start_sector,
+        sectors,
+    )
+    prefix[510:512] = b"\x55\xaa"
+    (root / "fixture.disk").write_bytes(prefix + image.read_bytes())
 
 
 def _zip_bytes(members: dict[str, bytes]) -> bytes:
@@ -824,7 +910,279 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     checks["fixed_tesseract"] = _assert_result(ocr, "fixed_tesseract", coverage=True)
     if ocr["coverage"] == "unsupported" or ocr.get("data", {}).get("inspector") != "tesseract":
         raise AssertionError("fixed tesseract smoke test failed")
+    shell = registry.dispatch(
+        "run_shell",
+        {
+            "command": r"""
+set -eu
+export PWNLIB_NOTERM=1
+cat > tiny.c <<'EOF'
+#include <stdio.h>
+int main(void) { puts("tiny-exec-ok"); return 0; }
+EOF
+gcc -static -O0 tiny.c -o tiny
+cat > reloc.c <<'EOF'
+extern int external_value;
+int load_external(void) { return external_value; }
+EOF
+gcc -c -O0 reloc.c -o reloc.o
+cat > solve.py <<'PY'
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from PIL import Image
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
+from pwn import ELF
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_64
+from unicorn.x86_const import UC_X86_REG_EAX
+import cv2
+import gmpy2
+import httpx
+import numpy
+import requests
+import sympy
+import z3
+
+assert AES.new(bytes(16), AES.MODE_ECB).encrypt(bytes(16)).hex().startswith("66e94bd4")
+cbc_key = bytes(range(16)); cbc_iv = bytes(range(16, 32)); cbc_plain = b"cbc-fixture"
+cbc_ciphertext = AES.new(cbc_key, AES.MODE_CBC, cbc_iv).encrypt(pad(cbc_plain, 16))
+assert unpad(AES.new(cbc_key, AES.MODE_CBC, cbc_iv).decrypt(cbc_ciphertext), 16) == cbc_plain
+gcm = AESGCM(bytes(range(16))); nonce = bytes(range(12)); sealed = gcm.encrypt(nonce, b"gcm-fixture", b"aad")
+assert gcm.decrypt(nonce, sealed, b"aad") == b"gcm-fixture"
+digest = hashes.Hash(hashes.SHA256()); digest.update(b"fixture"); assert len(digest.finalize()) == 32
+assert gmpy2.is_prime(65537) and sympy.factorint(15) == {3: 1, 5: 1}
+assert sympy.Matrix([[2, 1], [1, 1]]).lll() == sympy.Matrix([[-1, 0], [0, 1]])
+x = z3.Int("x"); solver = z3.Solver(); solver.add(x == 42); assert solver.check() == z3.sat
+assert list(Cs(CS_ARCH_X86, CS_MODE_64).disasm(b"\x90\xc3", 0x1000))[0].mnemonic == "nop"
+emu = Uc(UC_ARCH_X86, UC_MODE_64); emu.mem_map(0x1000, 0x1000)
+emu.mem_write(0x1000, b"\xb8\x2a\x00\x00\x00"); emu.emu_start(0x1000, 0x1005)
+assert emu.reg_read(UC_X86_REG_EAX) == 42
+assert ELF("./tiny", checksec=False).entry > 0
+with open("tiny", "rb") as handle: assert ELFFile(handle).header.e_type in ("ET_EXEC", "ET_DYN")
+with open("reloc.o", "rb") as handle:
+    reloc_elf = ELFFile(handle)
+    reloc_section = next(section for section in reloc_elf.iter_sections() if isinstance(section, RelocationSection))
+    relocation = next(reloc_section.iter_relocations())
+    symbols = reloc_elf.get_section(reloc_section["sh_link"])
+    symbol = symbols.get_symbol(relocation["r_info_sym"])
+    assert symbol.name == "external_value" and relocation["r_offset"] >= 0
+assert Image.open("../tiny.png").size == (1, 1)
+assert cv2.imread("../tiny.png").shape[:2] == (1, 1)
+assert numpy.array([40, 2]).sum() == 42
+assert httpx.Request("GET", "https://example.invalid/").method == "GET"
+assert requests.Request("GET", "https://example.invalid/").method == "GET"
+print("core-shell-ok")
+PY
+python solve.py
+./tiny
+""",
+            "source_paths": ["tiny.png", "x86_64.elf"],
+            "timeout_seconds": 180,
+        },
+    )
+    checks["run_shell"] = _assert_result(shell, "run_shell")
+    if (
+        shell.get("returncode") != 0
+        or shell.get("stop_reason") is not None
+        or "core-shell-ok" not in shell.get("stdout", "")
+        or "tiny-exec-ok" not in shell.get("stdout", "")
+        or shell.get("sandbox", {}).get("network") != "denied"
+    ):
+        raise AssertionError(f"analysis shell core fixture failed: {shell!r}")
+    checks.update(_analysis_toolchain_checks(registry, root))
     return checks
+
+
+def _analysis_toolchain_checks(registry: Any, root: Path) -> dict[str, Any]:
+    architecture = platform.machine().lower()
+    qemu = "qemu-aarch64" if architecture in {"aarch64", "arm64"} else "qemu-x86_64"
+    toolchain = registry.dispatch(
+        "run_shell",
+        {
+            "command": f"""
+set -eu
+sage -c 'assert list(factor(15)) == [(3,1),(5,1)]; print("sage-ok")'
+/opt/math/bin/python - <<'PY'
+import importlib.metadata
+import cysignals
+from ecdsa import NIST256p, SigningKey
+from fpylll import IntegerMatrix, LLL
+assert importlib.metadata.version("cysignals") == "1.12.5"
+assert importlib.metadata.version("ecdsa") == "0.19.2"
+assert importlib.metadata.version("fpylll") == "0.6.4"
+key = SigningKey.from_secret_exponent(1, curve=NIST256p)
+signature = key.sign_deterministic(b"x")
+assert key.verifying_key.verify(signature, b"x")
+matrix = IntegerMatrix.from_matrix([[2, 1], [1, 1]])
+LLL.reduction(matrix)
+print("math-ok")
+PY
+/opt/angr/bin/python - <<'PY'
+import angr
+project = angr.Project('./tiny', auto_load_libs=False)
+assert project.entry > 0
+print('angr-ok')
+PY
+tshark -r ../fixture.pcap -T fields -e tcp.dstport | grep -qx 80
+ffprobe -v error -show_entries stream=codec_name,width,height -of default=nw=1 ../fixture.gif | grep -q gif
+ffmpeg -v error -y -i ../fixture.gif -frames:v 1 extracted.png
+test -s extracted.png
+mmls ../fixture.disk | grep -q 'Linux (0x83)'
+sleuth_inode="$(fls -o 2048 ../fixture.disk | awk '/recovered.txt/ {{gsub(":", "", $2); print $2; exit}}')"
+test -n "$sleuth_inode"
+icat -o 2048 ../fixture.disk "$sleuth_inode" | grep -qx sleuthkit-fixture
+qpdf --check ../fixture.pdf >/dev/null
+malformed_before="$(sha256sum ../malformed.pdf)"
+if qpdf --check ../malformed.pdf > qpdf-malformed.txt 2>&1; then exit 1; fi
+grep -Eqi 'damaged|warning|not found|invalid' qpdf-malformed.txt
+test "$malformed_before" = "$(sha256sum ../malformed.pdf)"
+binwalk ../opaque.bin >/dev/null
+sox ../fixture.wav -n stat 2> sox-stat.txt
+grep -q 'Samples read' sox-stat.txt
+openssl dgst -sha256 ../notes.txt | grep -Eq '[0-9a-f]{{64}}'
+gdb -q -nx -batch -ex 'file ./tiny' -ex 'disassemble main' | grep -q 'Dump of assembler'
+{qemu} ./tiny | grep -qx tiny-exec-ok
+sqlite3 fixture.sqlite 'create table t(v); insert into t values(42);'
+test "$(sqlite3 fixture.sqlite 'select v from t;')" = 42
+7z a -bd -y fixture.7z solve.py >/dev/null
+7z t -bd fixture.7z >/dev/null
+printf 'test-pass\nwrong\n' > zip-words.txt
+fcrackzip -u -D -p zip-words.txt ../encrypted.zip | grep -q test-pass
+printf 'openssl-fixture' > openssl-plain.txt
+openssl enc -aes-128-cbc -K 000102030405060708090a0b0c0d0e0f \
+  -iv 101112131415161718191a1b1c1d1e1f -nosalt -in openssl-plain.txt -out openssl-cipher.bin
+openssl enc -d -aes-128-cbc -K 000102030405060708090a0b0c0d0e0f \
+  -iv 101112131415161718191a1b1c1d1e1f -nosalt -in openssl-cipher.bin | grep -qx openssl-fixture
+/opt/venv/bin/python - <<'PY' > netntlmv2.txt
+from Crypto.Hash import HMAC, MD4, MD5
+password = 'Password123!'; user = 'USER'; domain = 'DOMAIN'
+server = bytes.fromhex('1122334455667788')
+blob = bytes.fromhex('0101000000000000000000000000000011223344556677880000000000000000')
+nt_hash = MD4.new(password.encode('utf-16le')).digest()
+v2_hash = HMAC.new(nt_hash, (user.upper() + domain).encode('utf-16le'), MD5).digest()
+proof = HMAC.new(v2_hash, server + blob, MD5).hexdigest()
+print(f'{{user}}::{{domain}}:{{server.hex()}}:{{proof}}:{{blob.hex()}}')
+PY
+printf 'wrong\nPassword123!\n' > hash-words.txt
+hashcat -m 5600 netntlmv2.txt hash-words.txt --potfile-path hashcat.pot --quiet --force
+hashcat -m 5600 netntlmv2.txt --show --potfile-path hashcat.pot --quiet | grep -q ':Password123!'
+printf 'toolchain-ok\n'
+""",
+            "source_paths": [
+                "fixture.pcap",
+                "fixture.wav",
+                "fixture.gif",
+                "fixture.ext2",
+                "fixture.disk",
+                "fixture.pdf",
+                "malformed.pdf",
+                "opaque.bin",
+                "notes.txt",
+                "encrypted.zip",
+                "tiny.png",
+            ],
+            "timeout_seconds": 180,
+        },
+    )
+    if toolchain.get("returncode") != 0 or "toolchain-ok" not in toolchain.get("stdout", ""):
+        raise AssertionError(f"analysis toolchain fixture failed: {toolchain!r}")
+
+    reverse = registry.dispatch(
+        "run_shell",
+        {
+            "command": r"""
+set -eu
+rm -rf ghidra-project jadx-out Tiny.java Tiny.class tiny.jar
+if ! analyzeHeadless "$PWD" ghidra-project -import tiny -overwrite -analysisTimeoutPerFile 30 \
+    -postScript RapidoVerifyDecompile.java -deleteProject > ghidra.log; then
+    cat ghidra.log
+    exit 1
+fi
+test -s ghidra.log
+if ! grep -q 'Decompiler Switch Analysis' ghidra.log || \
+    ! grep -q 'Analysis succeeded for file:' ghidra.log || \
+    ! grep -q 'RAPIDO_DECOMPILE_OK' ghidra.log; then
+    cat ghidra.log
+    exit 2
+fi
+cat > Tiny.java <<'EOF'
+public class Tiny { public static int answer() { return 42; } }
+EOF
+javac Tiny.java
+jar --create --file tiny.jar Tiny.class
+if ! jadx --output-dir jadx-out tiny.jar > jadx.log 2>&1; then
+    cat jadx.log
+    exit 3
+fi
+if ! grep -R -q 'return 42' jadx-out/sources; then
+    cat jadx.log
+    find jadx-out -maxdepth 3 -type f -print
+    exit 4
+fi
+printf 'reverse-ok\n'
+""",
+            "source_paths": ["x86_64.elf"],
+            "timeout_seconds": 180,
+        },
+    )
+    if reverse.get("returncode") != 0 or "reverse-ok" not in reverse.get("stdout", ""):
+        output = f"{reverse.get('stdout', '')}\n{reverse.get('stderr', '')}"
+        raise AssertionError(f"analysis reverse fixture failed: {output[-8000:]}")
+
+    sentinel = root.parent / f"{root.name}-analysis-sentinel"
+    sentinel.write_text("must remain hidden", encoding="utf-8")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    try:
+        security = registry.dispatch(
+            "run_shell",
+            {
+                "command": f"""
+set -eu
+if cat {json.dumps(str(sentinel))} >/dev/null 2>&1; then exit 31; fi
+if printf blocked > ../notes.txt 2>/dev/null; then exit 32; fi
+if ../source-executable.sh 2>/dev/null; then exit 36; fi
+python - <<'PY'
+import ctypes, errno, os, socket
+try:
+    socket.create_connection(('127.0.0.1', {listener.getsockname()[1]}), timeout=1)
+except OSError as exc:
+    assert exc.errno in {{errno.EACCES, errno.EPERM}}
+else:
+    raise SystemExit(33)
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.ptrace(0x4206, os.getppid(), 0, 0) != -1:
+    libc.ptrace(17, os.getppid(), 0, 0)
+    raise SystemExit(35)
+assert ctypes.get_errno() in {{errno.EACCES, errno.EPERM}}
+PY
+if kill -0 1 2>/dev/null; then exit 34; fi
+sleep 30 >/dev/null 2>&1 &
+echo $! > detached.pid
+printf 'security-ok\n'
+""",
+                "source_paths": ["notes.txt"],
+                "timeout_seconds": 15,
+            },
+        )
+    finally:
+        listener.close()
+        sentinel.unlink(missing_ok=True)
+    if security.get("returncode") != 0 or "security-ok" not in security.get("stdout", ""):
+        raise AssertionError(f"analysis shell confinement failed: {security!r}")
+    if (root / "notes.txt").read_bytes() != b"offline tooling acceptance fixture\n":
+        raise AssertionError("analysis shell modified a controller-provided source")
+    descendant = int((root / "rapido-analysis/detached.pid").read_text(encoding="ascii"))
+    _wait_process_gone(descendant)
+    return {
+        "shell_toolchain": _assert_result(toolchain, "shell_toolchain"),
+        "shell_reverse": _assert_result(reverse, "shell_reverse"),
+        "shell_security": _assert_result(security, "shell_security"),
+    }
 
 
 def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, Any]:
@@ -838,8 +1196,22 @@ def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, 
         "gzip-out",
         "gzip-out/member.txt",
     }
-    if entries - before != expected_new:
-        raise AssertionError(f"unexpected workspace entries: {sorted(entries - before)!r}")
+    new_entries = entries - before
+    non_analysis_entries = {
+        entry
+        for entry in new_entries
+        if entry != ".DS_Store"
+        and entry != "rapido-analysis"
+        and not entry.startswith("rapido-analysis/")
+    }
+    if non_analysis_entries != expected_new:
+        raise AssertionError(f"unexpected workspace entries: {sorted(non_analysis_entries)!r}")
+    analysis_entries = new_entries - non_analysis_entries
+    if (
+        "rapido-analysis" not in analysis_entries
+        or "rapido-analysis/solve.py" not in analysis_entries
+    ):
+        raise AssertionError("analysis workspace did not retain reusable solve work")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise AssertionError("fixture workspace contains a symlink")
     # The harness has no worker pool or live subprocess left at this point.  On
@@ -858,7 +1230,12 @@ def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, 
                 continue
     if children:
         raise AssertionError(f"child processes remain: {children!r}")
-    return {"entries": len(entries), "bytes": total_bytes, "child_processes": len(children)}
+    return {
+        "entries": len(entries),
+        "bytes": total_bytes,
+        "analysis_entries": len(analysis_entries),
+        "child_processes": len(children),
+    }
 
 
 def _wait_process_gone(process_id: int) -> None:
@@ -953,7 +1330,16 @@ def _fd_count() -> int | None:
 def run() -> dict[str, Any]:
     parser_versions = _parser_check()
     native = _native_check()
-    with tempfile.TemporaryDirectory(prefix="rapido-tooling-") as temporary:
+    state_root = Path("/state")
+    temporary_parent = (
+        state_root
+        if platform.system() == "Linux" and state_root.is_dir() and os.access(state_root, os.W_OK)
+        else None
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="rapido-tooling-",
+        dir=temporary_parent,
+    ) as temporary:
         root = Path(temporary)
         _fixture_files(root)
         _filesystem_fixture(root)
@@ -1007,7 +1393,7 @@ def main() -> int:
                 "reasoning_effort": None,
                 "note": "deterministic fixture harness; no model inference is performed",
             },
-            "error": {"type": type(exc).__name__, "message": str(exc)[:240]},
+            "error": {"type": type(exc).__name__, "message": str(exc)[-8000:]},
         }
     print(_json_bytes(result).decode("utf-8"))
     return 0 if result["ok"] else 1

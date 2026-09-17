@@ -133,7 +133,7 @@ def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
     assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()
 
 
-def test_amd64_ci_runs_hardened_offline_tooling_acceptance() -> None:
+def test_both_architectures_run_hardened_offline_tooling_acceptance() -> None:
     text = CI_WORKFLOW.read_text()
     for value in (
         "scripts/tooling_acceptance.py",
@@ -141,20 +141,13 @@ def test_amd64_ci_runs_hardened_offline_tooling_acceptance() -> None:
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges:true",
+        "--platform ${{ matrix.platform }}",
         "--entrypoint /opt/venv/bin/python rapido:ci",
+        "load: true",
     ):
         assert value in text
-    assert re.search(
-        r"- if: matrix\.platform == 'linux/amd64'\n"
-        r"\s+run: >-\n"
-        r"\s+docker run .*--network none .*tooling_acceptance\.py",
-        text,
-        re.DOTALL,
-    )
-    assert not re.search(
-        r"- if: matrix\.platform == 'linux/arm64'[\s\S]{0,500}tooling_acceptance\.py",
-        text,
-    )
+    assert "matrix:\n        platform: [linux/amd64, linux/arm64]" in text
+    assert not re.search(r"if: matrix\.platform.*tooling_acceptance", text, re.DOTALL)
 
 
 def test_tooling_acceptance_does_not_claim_model_execution() -> None:

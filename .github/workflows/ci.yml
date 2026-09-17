@@ -30,6 +30,7 @@ jobs:
 
   container:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -41,17 +42,16 @@ jobs:
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          load: ${{ matrix.platform == 'linux/amd64' }}
+          load: true
           platforms: ${{ matrix.platform }}
           push: false
           tags: rapido:ci
-      - if: matrix.platform == 'linux/amd64'
-        run: docker run --rm --entrypoint codex rapido:ci --version
-      - if: matrix.platform == 'linux/amd64'
-        run: docker inspect rapido:ci --format '{{json .Config.User}} {{json .Config.Entrypoint}}'
-      - if: matrix.platform == 'linux/amd64'
-        run: >-
-          docker run --rm --init --network none --cpus=1 --memory=1g --pids-limit=128
+      - run: docker run --rm --platform ${{ matrix.platform }} --entrypoint codex rapido:ci --version
+      - run: docker inspect rapido:ci --format '{{json .Architecture}} {{json .Config.User}} {{json .Config.Entrypoint}}'
+      - run: >-
+          docker run --rm --init --network none --hostname localhost
+          --platform ${{ matrix.platform }}
+          --cpus=2 --memory=6g --memory-swap=6g --pids-limit=256
           --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev --cap-drop=ALL
           --security-opt=no-new-privileges:true
           --mount type=bind,src="$PWD/scripts/tooling_acceptance.py",dst=/tmp/tooling_acceptance.py,readonly

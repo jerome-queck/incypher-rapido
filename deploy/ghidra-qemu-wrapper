@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+tool="${0##*/}"
+exec /usr/bin/qemu-x86_64 -L /usr/x86_64-linux-gnu \
+    "/opt/ghidra/Ghidra/Features/Decompiler/os/linux_x86_64/$tool" "$@"

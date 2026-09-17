@@ -153,6 +153,7 @@ _CONTAINER_KEYS = frozenset(
         "regions",
         "sections",
         "segments",
+        "sources",
         "statistics",
         "streams",
         "symbols",
@@ -239,7 +240,8 @@ _DERIVATION_TOOLS = frozenset(
     }
 )
 _TARGET_TOOLS = frozenset({"http_request", "target_info", "tcp_close", "tcp_exchange", "tcp_open"})
-_KNOWN_TOOLS = _METADATA_TOOLS | _DERIVATION_TOOLS | _TARGET_TOOLS
+_EXECUTION_TOOLS = frozenset({"run_shell"})
+_KNOWN_TOOLS = _METADATA_TOOLS | _DERIVATION_TOOLS | _TARGET_TOOLS | _EXECUTION_TOOLS
 
 
 class EvidenceError(RuntimeError):
@@ -944,6 +946,9 @@ def _facts_for_tool(tool: str, facts: Mapping[str, Any]) -> dict[str, Any]:
         return _target_metadata(facts)
     if tool in _METADATA_TOOLS:
         return _metadata_facts(facts)
+    if tool in _EXECUTION_TOOLS:
+        projected = _recursive_facts(facts)
+        return projected if isinstance(projected, dict) else {}
     projected = _recursive_facts(facts)
     return projected if isinstance(projected, dict) else {}
 
@@ -984,7 +989,7 @@ def project_tool_observation(
             facts = _metadata_facts(result)
             if _contains_candidate(facts):
                 facts = {}
-        elif canonical_tool in _DERIVATION_TOOLS:
+        elif canonical_tool in _DERIVATION_TOOLS | _EXECUTION_TOOLS:
             projected = _recursive_facts(result)
             facts = projected if isinstance(projected, dict) else {}
             if _contains_candidate(facts):
@@ -1867,15 +1872,27 @@ class RunEvidence:
         attempt_id: str,
         *,
         candidate_sha256: str,
+        require_non_execution_observation: bool = False,
     ) -> MemoryEvidenceSource | None:
         """Bind one private candidate identity to its verified committed observation."""
+        if type(require_non_execution_observation) is not bool:
+            raise TypeError("candidate observation policy must be boolean")
         source = self.memory_source(attempt_id, candidate_sha256=candidate_sha256)
         manifest = self._load_manifest(attempt_id)
+        fixed_observation = any(
+            item.tool != "run_shell"
+            and (payload := json.loads(item.payload_json))["success"] is True
+            and payload["source_bound"] is True
+            and candidate_sha256 in payload["candidate_sha256s"]
+            for item in manifest.items
+        )
         if (
             not source.complete
             or source.gap is not None
             or not source.candidate_observed
             or source.candidate_supplied
+            or require_non_execution_observation
+            and not fixed_observation
         ):
             return None
         attempt = self._attempt(attempt_id)

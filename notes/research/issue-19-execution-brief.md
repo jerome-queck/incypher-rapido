@@ -853,6 +853,52 @@ cover interrupted checkpoints, empty manifests, legacy invalid rows, and observa
 post-normalization quota. Independent Daybreak/xhigh review was clean; Ruff and format are clean,
 and the full local suite passes 799 with one skip. Container/CI evidence remains pending.
 
+### Challenge-native analysis capability
+
+The corrected calibration showed a more basic solve-quality limit than agent count: peers could
+call fixed inspection tools but could not write and execute their own solver programs. Historical
+`ctf-workspace` solve paths were therefore audited through current and pre-purge commits instead of
+copying its install inventory. The resulting
+[`issue-19-ctf-workspace-tool-evidence-2026-09-17.md`](issue-19-ctf-workspace-tool-evidence-2026-09-17.md)
+contains 75 immutable source links and distinguishes tools that contributed to successful
+derivations from paper-installed, unsuccessful, architecture-specific, or unrelated stacks.
+
+The selected implementation adds one general challenge-local Bash capability rather than a wrapper
+per utility. A lane may read its challenge workspace, create and execute persistent scripts only in
+`rapido-analysis`, and use the evidence-backed crypto, math, pwn, reverse, forensics, packet, archive,
+media, PDF, and Android toolchain. Each call names one or more controller-provided challenge inputs;
+the controller durably records their hashes, the command hash, bounded execution facts, and resource
+use. Arbitrary shell output is useful analysis but cannot prove its own dataflow: a shell-only
+candidate stays private and never submits immediately. A fresh Verifier must independently obtain
+the same candidate through a non-shell fixed source/target receipt before it can authorize a Board
+effect. Model-created `rapido-analysis` files cannot become source roots through a later inspector or
+decoder. Exact-session continuations retain the `rapido-analysis` work and typed same-run findings.
+
+The shell is a fixed child boundary, not the credential-bearing Codex process. Landlock hides
+authentication and sibling state, makes the challenge root read-only, and confines writes and
+execution to `rapido-analysis`; seccomp denies networking and supervisor-control syscalls. CPU,
+output, file, descriptor, command, timeout, process-group RSS/task, and global-worker bounds remain explicit. Live
+interaction continues through the challenge-bound HTTP/TCP tools, preserving target allowlisting.
+The worker cap is eight concurrent local analyses with a 2 GiB process-group RSS watchdog each. Actual
+RSS, not summed address-space ceilings, controls safe concurrency; capacity is reserved for the P20
+agents and controller. This is a capacity ceiling, not a RAM-use claim.
+
+The offline E4 pressure protocol compares 4, 6, and 8 native-tool slots under the exact
+8 CPU/24 GiB/256 PID envelope while retaining five challenges and P20 solver admission. It runs
+three mixed Ghidra/JADX/Sage/angr/Hashcat/OpenCV/FFmpeg/forensics rounds per profile, held memory
+and PID phases, adversarial address-space/process-tree gates, and exact cleanup checks. The earlier
+receipt was invalidated when review changed the measured worker and sandbox source. Final selection
+and numbers remain pending a rerun from the committed current protocol and implementation.
+
+The exact final-container receipt must compile and run a solver program; exercise representative
+Python, Sage, angr, Ghidra, JADX, GDB static/QEMU execution, packet, forensic, archive, media, PDF, and CPU-hashcat
+operations; prove script persistence; and prove credential/sibling-state writes, networking,
+supervisor signalling, and leaked descendants fail. Presence-only version checks do not pass. The
+initial focused interface/security suite is green. A pre-review ARM64 image passed on both tmpfs and
+realistic bind-mounted state; the provenance, process-isolation, and quota fixes made afterward
+require fresh AMD64 acceptance plus dual-architecture semantic CI. Independent re-review and live
+solve contribution remain pending.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -919,6 +965,9 @@ and the full local suite passes 799 with one skip. Container/CI evidence remains
 | Same-run recovery edge review | `gpt-daybreak-blue-latest` / `xhigh` | code paths clean; two P2 proof gaps closed with real qualified-candidate process loss and current-run receiptless-instance fencing tests; no fallback |
 | Long-horizon solver research and `ctf-workspace` audit | `gpt-daybreak-blue-latest` / `xhigh` | complete; read-only evidence selects structural persistence and controlled short-prompt/tool-context tests, not framework import or broad fan-out |
 | Candidate-proof repair review | `gpt-daybreak-blue-latest` / `xhigh` | clean; exact candidate/source/non-supplied manifest binding, legacy-row fencing, and quota-omission path independently verified; no fallback |
+| Pressure harness implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; exact resource harness, no fallback |
+| E4 deterministic pressure execution | no inference | pre-review receipt invalidated; current-source rerun pending |
+| Native shell independent review | `gpt-daybreak-blue-latest` / `xhigh` | in progress; initial P1 findings drove provenance, quota, durable evidence, execution, and process-isolation fixes; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
