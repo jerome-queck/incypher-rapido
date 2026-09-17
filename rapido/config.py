@@ -245,7 +245,7 @@ class RuntimeConfig:
         lead_lanes = _integer(
             values,
             "RAPIDO_LEAD_LANES",
-            1,
+            2,
             minimum=1,
             maximum=attempts_per_challenge,
         )

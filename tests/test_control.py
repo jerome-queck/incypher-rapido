@@ -22,7 +22,7 @@ import rapido.orchestrator as orchestrator_module
 from rapido.board import BoardError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.control import DurableJobControl
-from rapido.evidence import project_tool_observation
+from rapido.evidence import EvidenceError, project_tool_observation
 from rapido.routing import baseline_route
 from rapido.state import StateStore
 
@@ -263,6 +263,12 @@ class UnsolvedBoundaryRuntime(BoundaryRuntime):
                 "tool_calls": [],
             },
         )()
+
+
+class FatalEvidenceBoundaryRuntime(UnsolvedBoundaryRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        del workspace, prompt, kwargs
+        raise EvidenceError("synthetic lane finalization failure")
 
 
 class MixedBoundaryRuntime(BoundaryRuntime):
@@ -663,9 +669,9 @@ class DynamicLocalFailureRuntime(DynamicPhaseRuntime):
 
 
 class WrongThenRecoveryRuntime(UnsolvedBoundaryRuntime):
-    def __init__(self, wrong: str, correct: str) -> None:
+    def __init__(self, wrongs: tuple[str, ...], correct: str) -> None:
         super().__init__("unused")
-        self.wrong = wrong
+        self.wrongs = wrongs
         self.correct = correct
 
     async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
@@ -674,7 +680,7 @@ class WrongThenRecoveryRuntime(UnsolvedBoundaryRuntime):
         lane = int(document["lane"])
         if episode == 0 and lane != 0:
             return await super().solve(workspace, prompt, **kwargs)
-        candidate = self.wrong if episode == 0 else self.correct
+        candidate = self.wrongs[episode] if episode < len(self.wrongs) else self.correct
         candidate_digest = hashlib.sha256(candidate.encode()).hexdigest()
         observation = project_tool_observation(
             "inspect_file",
@@ -805,7 +811,7 @@ def test_initial_queue_identity_and_order_survive_reopened_inspection(tmp_path: 
     assert all(job.started_sequence < job.closed_sequence for job in first.jobs)
 
 
-def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
+def test_mixed_peer_defaults_cover_all_fifteen_with_two_daybreak_leads_each(
     tmp_path: Path,
 ) -> None:
     runtime = BoundaryRuntime("INCYPHER{mixed-peer-fixture}")
@@ -814,7 +820,7 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
         active_challenges=5,
         attempts_per_challenge=4,
         concurrency=20,
-        lead_lanes=1,
+        lead_lanes=2,
         specialist_reasoning_efforts=("max", "xhigh", "max"),
     )
     challenges = [_challenge(challenge_id) for challenge_id in range(1, 16)]
@@ -834,9 +840,9 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
         jobs = [job for job in view.jobs if job.challenge_id == challenge_id]
         assert [(job.agent_role, job.model, job.effort) for job in jobs] == [
             ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+            ("lead", "gpt-daybreak-blue-latest", "xhigh"),
             ("specialist", "gpt-5.6-luna", "max"),
             ("specialist", "gpt-5.6-luna", "xhigh"),
-            ("specialist", "gpt-5.6-luna", "max"),
         ]
         assert all(
             job.started_sequence is not None and job.closed_sequence is not None for job in jobs
@@ -853,6 +859,8 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_one_daybreak_lead_each(
         assert kwargs["reasoning_effort"] == job.effort
         assert document["control_route"]["model"] == job.model
         assert document["control_route"]["effort"] == job.effort
+        assert "same cumulative solve window" in document["persistent_window"]
+        assert callable(kwargs["continuation_callback"])
 
 
 @pytest.mark.parametrize(
@@ -1137,28 +1145,74 @@ def test_limited_candidate_waits_for_one_fresh_verifier(tmp_path: Path) -> None:
     assert sum(job.role == "verifier" for job in view.jobs) == 1
 
 
-def test_wrong_unlimited_candidate_routes_recovery_before_second_submission(
+def test_repeated_wrong_unlimited_candidates_keep_routing_recovery_until_correct(
     tmp_path: Path,
 ) -> None:
-    wrong = "INCYPHER{first_hypothesis_wrong}"
+    wrongs = (
+        "INCYPHER{first_hypothesis_wrong}",
+        "INCYPHER{second_hypothesis_wrong}",
+    )
     correct = "INCYPHER{recovery_peer_agreement}"
     board = WrongThenCorrectBoundaryBoard([_challenge(1)], correct)
-    config = replace(_config(tmp_path), episodes_per_challenge=3, submit_candidates=True)
+    config = replace(_config(tmp_path), episodes_per_challenge=4, submit_candidates=True)
 
     report = asyncio.run(
         DurableJobControl.drive(
             config,
             board=board,
-            runtime=WrongThenRecoveryRuntime(wrong, correct),
+            runtime=WrongThenRecoveryRuntime(wrongs, correct),
         )
     )
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
 
     assert report.solved == 1
-    assert board.submissions == [(1, wrong), (1, correct)]
-    assert {job.role for job in view.jobs} == {"specialist", "recovery", "verifier"}
-    assert view.route_decisions[0].rule_id == "board_rejection_recovery_v1"
-    assert view.route_decisions[1].rule_id == "private_source_reobservation_v1"
+    assert board.submissions == [(1, wrongs[0]), (1, wrongs[1]), (1, correct)]
+    assert {job.role for job in view.jobs} == {"specialist", "recovery"}
+    assert [decision.rule_id for decision in view.route_decisions] == [
+        "board_rejection_recovery_v1",
+        "board_rejection_recovery_v1",
+    ]
+
+
+@pytest.mark.parametrize(("prior_wrong", "submitted"), ((4, True), (5, False)))
+def test_unlimited_candidates_submit_until_five_wrong_then_require_verification(
+    tmp_path: Path, prior_wrong: int, submitted: bool
+) -> None:
+    config = replace(_config(tmp_path), submit_candidates=True)
+    challenge = _challenge(1)
+    board = BoundaryBoard([challenge])
+    store = StateStore(config.state_path)
+    run_id = "wrong-threshold-run"
+    store.start_run(run_id, config.public_record())
+    store.upsert_challenge(1, challenge.name, challenge.category, challenge.type, challenge.value)
+    for index in range(prior_wrong):
+        store.record_submission(
+            run_id,
+            1,
+            f"INCYPHER{{wrong_{index}}}",
+            "incorrect",
+            200,
+        )
+
+    class AdaptiveOrchestrator(orchestrator_module.Orchestrator):
+        _adaptive_control = True
+
+    orchestrator = AdaptiveOrchestrator(config, board, store, UnsolvedBoundaryRuntime("unused"))
+
+    outcome = asyncio.run(
+        orchestrator._submit_candidate(
+            run_id,
+            challenge,
+            "INCYPHER{new_source_qualified_candidate}",
+            orchestrator_module.time.monotonic() + 10,
+        )
+    )
+
+    assert board.submissions == (
+        [(1, "INCYPHER{new_source_qualified_candidate}")] if submitted else []
+    )
+    assert outcome == ("solved" if submitted else "candidate")
+    store.close()
 
 
 def test_already_solved_candidate_is_verified_then_engagement_closes(tmp_path: Path) -> None:
@@ -1473,6 +1527,33 @@ def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path
     assert report.unsupported == 1
     assert view.initial_coverage_count == 1
     assert {(job.challenge_id, job.catalogue_rank) for job in view.jobs} == {(1, 1)}
+
+
+def test_fatal_lane_error_terminalizes_attempts_and_seals_missing_evidence(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), episodes_per_challenge=1)
+
+    with pytest.raises(EvidenceError, match="synthetic lane finalization failure"):
+        asyncio.run(
+            DurableJobControl.drive(
+                config,
+                board=BoundaryBoard([_challenge(1)]),
+                runtime=FatalEvidenceBoundaryRuntime("unused"),
+            )
+        )
+
+    view = DurableJobControl.inspect(config.state_path)
+    assert view.status == "failed"
+    assert all(job.state == "interrupted" for job in view.jobs)
+    with sqlite3.connect(config.state_path) as connection:
+        attempt_count = connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+        assert attempt_count > 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM attempts WHERE status='running'").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM evidence_manifests").fetchone()[0] == (
+            attempt_count
+        )
 
 
 def test_unsolved_analysis_routes_to_typed_recovery_and_config_changes_change_routes(

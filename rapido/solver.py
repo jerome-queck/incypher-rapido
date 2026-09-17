@@ -22,7 +22,7 @@ MAX_CARRY_SUMMARY_CHARS = 2_000
 MAX_CARRY_ITEMS = 8
 MAX_CARRY_ITEM_CHARS = 500
 MAX_CARRY_FAILURE_CLASS_CHARS = 128
-MAX_CARRY_TOOL_COUNT = 100
+MAX_CARRY_TOOL_COUNT = 2**63 - 1
 _SUCCESSOR_CONTEXT_RESERVE_BYTES = 32 * 1024
 _DESCRIPTION_OMISSION_MARKER = "\n...[description middle omitted for prompt budget]...\n"
 _PLACEHOLDER_MARKERS = {"changeme", "dummy", "placeholder", "redacted", "todo"}
@@ -31,10 +31,10 @@ _PLACEHOLDER_QUALIFIERS = {"example", "insert", "put", "replace", "sample", "tes
 _PLACEHOLDER_FILLERS = {"goes", "here", "me", "text", "value"}
 
 _LANE_STRATEGIES = (
-    "source inventory and direct observation",
-    "hypothesis branching and disconfirmation",
-    "alternate representation and boundary checks",
-    "invariant and decoy cross-checks",
+    "direct reconstruction: inventory sources, build the simplest end-to-end solve, and execute it",
+    "independent exploit path: branch hypotheses, write a solve script, and disconfirm quickly",
+    "automation-heavy alternate representation using the strongest category-native tools",
+    "adversarial validation: hunt decoys, boundary errors, and a genuinely different derivation",
 )
 
 _CARRY_GUIDANCE = (

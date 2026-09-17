@@ -870,6 +870,25 @@ def test_quota_omissions_are_explicit(
     state.close()
 
 
+def test_more_than_durable_observation_limit_omits_without_blocking_terminal_state(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "many-observations.sqlite3", "run-a")
+    _attempt(state, "a0")
+    observations = (_observation("many"),) * 10_001
+    manifest = RunEvidence.open(state, "run-a", EvidenceLimits(max_observations=1)).commit(
+        "a0", EvidenceBatch(observations)
+    )
+    state.finish_attempt("a0", "unsolved", tool_count=10_001)
+
+    assert manifest.observation_count == 10_001
+    assert manifest.committed_count == 1
+    assert manifest.omitted_count == 10_000
+    assert not manifest.complete
+    assert manifest.gap == "quota_omitted"
+    state.close()
+
+
 def test_empty_incomplete_manifests_and_bounded_deterministic_carry(tmp_path: Path) -> None:
     state = _state(tmp_path / "state.sqlite3", "run-a")
     limits = EvidenceLimits(max_carry_bytes=512)
@@ -892,7 +911,7 @@ def test_empty_incomplete_manifests_and_bounded_deterministic_carry(tmp_path: Pa
     state.close()
 
 
-@pytest.mark.parametrize("value", (0, -1, True, 101))
+@pytest.mark.parametrize("value", (0, -1, True, 10_001))
 def test_limits_are_strict_positive_bounded_integers(value: object) -> None:
     with pytest.raises(ValueError):
         EvidenceLimits(max_observations=value)  # type: ignore[arg-type]

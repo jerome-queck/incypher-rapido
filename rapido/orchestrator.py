@@ -187,6 +187,7 @@ _RUN_ROOT_NAME = re.compile(r"run-[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DURABLE_TOOL_CALLS = 10
 _MAX_DURABLE_TOOL_HASHES = 2
+_UNLIMITED_SUBMISSION_WRONG_THRESHOLD = 5
 _NO_PROGRESS_SECONDS = 600.0
 _DURABLE_TOOL_NAMES = frozenset(
     {
@@ -1340,7 +1341,6 @@ class Orchestrator:
         tool_evidence_complete = False
         target_registry = None
         submission_status: str | None = None
-        candidate_requires_verification = False
 
         def finish_attempt(
             status: str,
@@ -1415,7 +1415,6 @@ class Orchestrator:
             persistent_primary = (
                 self._adaptive_control
                 and self.config.peer_profile == "mixed_v1"
-                and model == self.config.model
                 and route is not None
                 and route.role != "verifier"
                 and (challenge.type != "dynamic_iac" or bool(target_endpoints))
@@ -1504,9 +1503,9 @@ class Orchestrator:
                 finding: SolverFinding,
                 calls: tuple[ToolCallEvidence, ...],
                 complete: bool,
-            ) -> bool:
+            ) -> None:
                 if finding.candidate is None:
-                    return False
+                    return
                 if self._adaptive_control and not complete:
                     raise CandidateProvenanceError("candidate_evidence_incomplete")
                 if not candidate_is_eligible(
@@ -1515,21 +1514,16 @@ class Orchestrator:
                     raise CandidateProvenanceError("candidate_ineligible")
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
                 candidate_observed = False
-                candidate_observed_by_fixed_tool = False
                 candidate_supplied = False
                 for call in calls:
                     candidate_supplied |= candidate_fingerprint in call.supplied_candidate_sha256s
                     if call.success is True and call.source_bound:
                         observed_here = candidate_fingerprint in call.candidate_sha256s
                         candidate_observed |= observed_here
-                        candidate_observed_by_fixed_tool |= (
-                            observed_here and call.name != "run_shell"
-                        )
                 if candidate_supplied:
                     raise CandidateProvenanceError("candidate_supplied")
                 if not candidate_observed:
                     raise CandidateProvenanceError("candidate_unobserved")
-                return not candidate_observed_by_fixed_tool
 
             def continue_primary(turn: NativeTurn, remaining_seconds: float | None) -> str | None:
                 nonlocal continuation_round
@@ -1611,7 +1605,7 @@ class Orchestrator:
                         else ("continue with changed evidence-specific work",)
                     ),
                     observations=checkpoint_observations,
-                    tool_count=min(100, checkpoint_tool_count),
+                    tool_count=checkpoint_tool_count,
                 )
                 if qualified_candidate:
                     self.state.event(
@@ -1706,9 +1700,7 @@ class Orchestrator:
             _, candidate_calls, candidate_evidence_complete = _normalize_tool_calls(
                 getattr(turn, "current_turn_tool_calls", turn.tool_calls)
             )
-            candidate_requires_verification = validate_candidate(
-                finding, candidate_calls, candidate_evidence_complete
-            )
+            validate_candidate(finding, candidate_calls, candidate_evidence_complete)
             terminal = "candidate" if finding.status == "candidate" else finding.status
             private_candidate = self._adaptive_control and finding.candidate is not None
             finish_attempt(
@@ -1896,7 +1888,6 @@ class Orchestrator:
             finding is not None
             and finding.candidate is not None
             and candidate_submitter is not None
-            and not candidate_requires_verification
         ):
             submission_status = await candidate_submitter(finding.candidate)
         return LaneResult(
@@ -1952,12 +1943,16 @@ class Orchestrator:
             prior_wrong = self.state.challenge_incorrect_submission_count(challenge.id)
             verified = self.state.candidate_is_verified(run_id, challenge.id, candidate)
             qualified = verified
-            if self._adaptive_control and not qualified and (not unlimited or prior_wrong > 0):
+            if (
+                self._adaptive_control
+                and not qualified
+                and (not unlimited or prior_wrong >= _UNLIMITED_SUBMISSION_WRONG_THRESHOLD)
+            ):
                 return self._withhold_candidate(
                     run_id,
                     challenge.id,
                     fingerprint,
-                    "candidate_unverified_after_limit_or_wrong",
+                    "candidate_unverified_after_limit_or_wrong_threshold",
                 )
             transport_timeout = float(getattr(self.board, "timeout", 15.0))
             if deadline - time.monotonic() <= transport_timeout:
@@ -3001,10 +2996,12 @@ class Orchestrator:
                 raise RecoveryBlocked(reason)
             status = "deadline"
             self.state.interrupt_control_run(run_id, "run_deadline")
+            seal_unavailable_attempt_evidence(self.state)
             self.state.finish_run(run_id, status)
         except (asyncio.CancelledError, KeyboardInterrupt):
             try:
                 self.state.interrupt_control_run(run_id, "supervisor_interrupted")
+                seal_unavailable_attempt_evidence(self.state)
                 self.state.finish_run(run_id, "interrupted")
             except ValueError:
                 pass
@@ -3012,6 +3009,7 @@ class Orchestrator:
         except BaseException:
             try:
                 self.state.interrupt_control_run(run_id, "run_failed")
+                seal_unavailable_attempt_evidence(self.state)
                 self.state.finish_run(run_id, "failed")
             except ValueError:
                 pass

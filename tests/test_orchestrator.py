@@ -203,7 +203,7 @@ class ManyToolCallsRuntime(FakeRuntime):
                 "source_bound": True,
                 "candidate_sha256s": [],
             }
-            for _ in range(12)
+            for _ in range(133)
         ]
         return turn
 
@@ -536,7 +536,7 @@ def test_finding_carry_and_uncensored_tool_count_are_durable_with_capped_wave_de
     assert len(attempts) == 2
     assert all(row["episode"] == 0 for row in attempts)
     assert all(row["id"].endswith(f":0:{row['lane']}") for row in attempts)
-    assert all(row["tool_count"] == 12 for row in attempts)
+    assert all(row["tool_count"] == 133 for row in attempts)
     assert all(
         json.loads(row["evidence_json"]) == ["archive header verified", "candidate path rejected"]
         for row in attempts
@@ -551,7 +551,7 @@ def test_finding_carry_and_uncensored_tool_count_are_durable_with_capped_wave_de
     wave = json.loads(wave_row["data_json"])
     assert wave["episode"] == 0
     assert all(item["episode"] == 0 for item in wave["tool_calls"])
-    assert all(item["tool_call_count"] == 12 for item in wave["tool_calls"])
+    assert all(item["tool_call_count"] == 133 for item in wave["tool_calls"])
     assert all(item["retained_tool_call_count"] == 10 for item in wave["tool_calls"])
     assert all(item["tool_calls_truncated"] is True for item in wave["tool_calls"])
     assert all(len(item["calls"]) == 10 for item in wave["tool_calls"])
@@ -563,7 +563,9 @@ def test_finding_carry_and_uncensored_tool_count_are_durable_with_capped_wave_de
     ).fetchall()
     assert len(manifests) == 2
     assert all(row["complete"] == 0 and row["gap"] == "provenance_incomplete" for row in manifests)
-    assert all(row["observation_count"] == 12 and row["committed_count"] == 12 for row in manifests)
+    assert all(
+        row["observation_count"] == 133 and row["committed_count"] == 133 for row in manifests
+    )
     store.close()
 
 
@@ -988,7 +990,7 @@ def test_candidate_rejected_when_committed_observation_is_omitted(tmp_path: Path
     store.close()
 
 
-def test_shell_only_candidate_is_retained_for_verifier_not_immediate_submission(
+def test_shell_only_candidate_is_retained_and_immediately_offered_to_unlimited_submitter(
     tmp_path: Path,
 ) -> None:
     class AdaptiveOrchestrator(Orchestrator):
@@ -1048,8 +1050,93 @@ def test_shell_only_candidate_is_retained_for_verifier_not_immediate_submission(
     )
 
     assert result.terminal_status == "candidate"
-    assert result.submission_status is None
-    assert submitted == []
+    assert result.submission_status == "solved"
+    assert submitted == [answer]
+    assert store.candidate_counts(run_id) == (1, 0)
+    store.close()
+
+
+def test_candidate_after_133_tools_keeps_complete_proof_and_terminalizes(tmp_path: Path) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class LongEvidenceRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            candidate = json.loads(turn.text)["candidate"]
+            fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+            ordinary_observation = HostObservation("inspect_file", True, True)
+            ordinary = {
+                "name": "inspect_file",
+                "success": True,
+                "source_bound": True,
+                "candidate_sha256s": [],
+                "host_observation": ordinary_observation,
+            }
+            candidate_observation = HostObservation(
+                "inspect_file", True, True, candidate_sha256s=(fingerprint,)
+            )
+            final_call = {
+                "name": "inspect_file",
+                "success": True,
+                "source_bound": True,
+                "candidate_sha256s": [fingerprint],
+                "host_observation": candidate_observation,
+            }
+            turn.tool_calls = [dict(ordinary) for _ in range(132)] + [final_call]
+            turn.current_turn_tool_calls = [final_call]
+            return turn
+
+    answer = "INCYPHER{long_horizon_source_proof}"
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    run_id = "long-horizon-proof-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    store.start_control_wave(run_id, 1, 0)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+    submitted: list[str] = []
+
+    async def submit(candidate: str) -> str:
+        submitted.append(candidate)
+        return "solved"
+
+    orchestrator = AdaptiveOrchestrator(
+        cfg, FakeBoard([challenge(1)]), store, LongEvidenceRuntime({1: {0: answer}})
+    )
+    orchestrator._run_evidence = RunEvidence.open(store, run_id)
+    result = asyncio.run(
+        orchestrator._lane(
+            run_id,
+            challenge(1),
+            0,
+            0,
+            workspace,
+            [],
+            10,
+            route=route,
+            candidate_submitter=submit,
+        )
+    )
+
+    assert result.terminal_status == "candidate"
+    assert result.tool_call_count == 133
+    assert result.submission_status == "solved"
+    assert submitted == [answer]
+    attempt = store._connection.execute(
+        "SELECT status, tool_count FROM attempts WHERE id=?", (f"{run_id}:1:0:0",)
+    ).fetchone()
+    manifest = store._connection.execute(
+        "SELECT complete, observation_count, committed_count, omitted_count "
+        "FROM evidence_manifests WHERE attempt_id=?",
+        (f"{run_id}:1:0:0",),
+    ).fetchone()
+    assert tuple(attempt) == ("candidate", 133)
+    assert tuple(manifest) == (1, 133, 133, 0)
     assert store.candidate_counts(run_id) == (1, 0)
     store.close()
 

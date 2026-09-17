@@ -12,7 +12,7 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert config.reasoning_effort == "xhigh"
     assert config.specialist_model == "gpt-5.6-luna"
     assert config.specialist_reasoning_efforts == ("max", "xhigh", "max")
-    assert config.lead_lanes == 1
+    assert config.lead_lanes == 2
     assert config.peer_profile == "mixed_v1"
     assert config.concurrency == 20
     assert config.active_challenges == 5

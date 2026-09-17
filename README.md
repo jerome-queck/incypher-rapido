@@ -81,14 +81,14 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_REASONING_EFFORT` | `xhigh` | Must be advertised by the selected model. |
 | `RAPIDO_SPECIALIST_MODEL` | `gpt-5.6-luna` | Exact peer-specialist model; no fallback. |
 | `RAPIDO_SPECIALIST_REASONING_EFFORTS` | `max,xhigh,max` | Repeating effort plan for non-lead lanes. |
-| `RAPIDO_LEAD_LANES` | `1` | Primary-model Lead lanes in every initial challenge wave. |
+| `RAPIDO_LEAD_LANES` | `2` | Primary-model Lead lanes in every initial challenge wave. |
 | `RAPIDO_PEER_PROFILE` | `mixed_v1` | Mixed direct-peer scheduler. `uniform_v1` exists for frozen historical replay. |
 | `RAPIDO_CONCURRENCY` | `20` | Lane admission bound; accepted range 2–32. |
 | `RAPIDO_ACTIVE_CHALLENGES` | `5` | Active challenge engagements; auxiliary Recovery/Verifier agents do not consume these slots. |
 | `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, recovery or shared-instance, then bounded verification; accepted range 1–4. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
-| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: one Lead plus three Specialists by default; accepted range 2–8. |
-| `RAPIDO_ATTEMPT_SECONDS` | `800` | Initial per-lane interrupt deadline. |
+| `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: two Daybreak Leads plus two Luna Specialists by default; accepted range 2–8. |
+| `RAPIDO_ATTEMPT_SECONDS` | `800` | Cumulative per-lane deadline across same-chat continuations. |
 | `RAPIDO_BOARD_TIMEOUT_SECONDS` | `15` | One bounded Board request. |
 | `RAPIDO_INSTANCE_READY_SECONDS` | `120` | Dynamic-instance readiness budget. |
 | `RAPIDO_INSTANCE_CLEANUP_SECONDS` | `45` | Dynamic cleanup budget; must cover three Board requests. |
@@ -99,7 +99,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
 | `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
-| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Immediate durable submission for the first qualified candidate on an unlimited challenge; limited or post-wrong candidates require an independent Verifier. |
+| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Unlimited challenges immediately submit distinct source-qualified candidates through the fifth wrong; later or Board-limited candidates require an independent Verifier. |
 | `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Local-first analysis plus one receipt-bound shared-instance lease at a time. |
 
 ## Evaluation and persistent Board state
@@ -130,7 +130,7 @@ authorities, paths, credentials, and candidate fingerprints are never carried in
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
-Initial and Recovery work defaults to Daybreak/xhigh plus Luna max/xhigh/max for each challenge;
+Initial and Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh for each challenge;
 a Verifier is one fresh Daybreak/xhigh lane. Dynamic challenges analyze locally first, then queue
 for the measured single Board instance slot. All four peers share that challenge's one live
 instance, which is removed before the lease passes to another challenge.
