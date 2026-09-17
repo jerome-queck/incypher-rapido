@@ -37,6 +37,25 @@ def test_analysis_fd_limit_supports_large_toolchains() -> None:
     assert analysis_worker_main.FILE_DESCRIPTOR_LIMIT == 1024
 
 
+def test_analysis_process_limit_reaches_shared_uid_headroom(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        analysis_worker_main,
+        "_set_limit",
+        lambda kind, soft, hard=None: calls.append((kind, soft, hard)),
+    )
+
+    analysis_worker_main._apply_limits(10)
+
+    assert analysis_worker_main.PROCESS_LIMIT == 224
+    if hasattr(analysis_worker_main.resource, "RLIMIT_NPROC"):
+        assert (
+            analysis_worker_main.resource.RLIMIT_NPROC,
+            analysis_worker_main.PROCESS_LIMIT,
+            None,
+        ) in calls
+
+
 def test_response_protocol_rejects_unrecognized_remote_errors() -> None:
     assert _response(
         json.dumps(

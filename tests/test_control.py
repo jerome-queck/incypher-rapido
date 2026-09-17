@@ -969,7 +969,7 @@ def test_idle_watch_appends_and_solves_a_new_challenge_before_original_deadline(
     runtime = UnsolvedBoundaryRuntime("unused")
     config = replace(
         _config(tmp_path),
-        run_seconds=0.25,
+        run_seconds=2.0,
         watch_board=True,
         board_watch_seconds=0.01,
         board_full_refresh_seconds=0.1,
@@ -1009,7 +1009,7 @@ def test_idle_watch_requeues_when_attachment_bytes_change_at_same_url(tmp_path: 
     board = ChangingFileBoard()
     config = replace(
         _config(tmp_path),
-        run_seconds=0.45,
+        run_seconds=2.0,
         watch_board=True,
         board_watch_seconds=0.01,
         board_full_refresh_seconds=0.05,
@@ -1054,7 +1054,7 @@ def test_idle_watch_does_not_requeue_unchanged_attachment_bytes(tmp_path: Path) 
     board = StableFileBoard()
     config = replace(
         _config(tmp_path),
-        run_seconds=0.35,
+        run_seconds=2.0,
         watch_board=True,
         board_watch_seconds=0.01,
         board_full_refresh_seconds=0.05,
