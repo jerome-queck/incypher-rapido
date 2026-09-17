@@ -1095,8 +1095,13 @@ printf 'toolchain-ok\n'
         {
             "command": r"""
 set -eu
-rm -rf ghidra-project jadx-out Tiny.java Tiny.class tiny.jar
-if ! analyzeHeadless "$PWD" ghidra-project -import tiny -overwrite -analysisTimeoutPerFile 30 \
+rm -rf ghidra-project jadx-out Tiny.java Tiny.class tiny.jar tiny-ghidra tiny-ghidra.c
+cat > tiny-ghidra.c <<'EOF'
+#include <stdio.h>
+int main(void) { puts("tiny-exec-ok"); return 0; }
+EOF
+gcc -O0 tiny-ghidra.c -o tiny-ghidra
+if ! analyzeHeadless "$PWD" ghidra-project -import tiny-ghidra -overwrite -analysisTimeoutPerFile 30 \
     -postScript RapidoVerifyDecompile.java -deleteProject > ghidra.log; then
     cat ghidra.log
     exit 1
