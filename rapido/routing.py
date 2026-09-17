@@ -253,10 +253,57 @@ def instance_follow_on_route(current: RouteSpec) -> RouteSpec:
     return replace(
         current,
         role="recovery",
-        tactic="instance_enabled_follow_on",
+        tactic=(f"instance_enabled_follow_on_{current.tactic}")[:100],
         context_profile="typed_local_history_with_fresh_target",
         tool_policy="bounded_registry_with_assigned_target",
         verification_recipe="source_reobservation_after_local_analysis",
+        workspace_generation=current.workspace_generation + 1,
+    )
+
+
+_CONTINUATION_PERSPECTIVES = (
+    "independent_reconstruction",
+    "input_to_output_dataflow",
+    "output_to_input_reversal",
+    "assumption_falsification",
+    "minimal_reproducer",
+    "state_machine_reconstruction",
+    "format_and_parser_audit",
+    "peer_hypothesis_counterexample",
+)
+_CONTINUATION_METHODS = (
+    "alternate_toolchain",
+    "constrained_enumeration",
+    "differential_experiment",
+    "manual_derivation",
+)
+
+
+def continued_solve_route(
+    current: RouteSpec,
+    *,
+    episode: int,
+    attempt_seconds: int,
+) -> RouteSpec:
+    """Create an executable, orthogonal solve wave after a closed route."""
+    if type(episode) is not int or episode < 1:
+        raise ValueError("continuation episode is invalid")
+    if type(attempt_seconds) is not int or not 1 <= attempt_seconds <= 19_800:
+        raise ValueError("continuation attempt budget is invalid")
+    strategy_index = episode - 1
+    perspective = _CONTINUATION_PERSPECTIVES[strategy_index % len(_CONTINUATION_PERSPECTIVES)]
+    method = _CONTINUATION_METHODS[
+        (strategy_index // len(_CONTINUATION_PERSPECTIVES)) % len(_CONTINUATION_METHODS)
+    ]
+    strategy = f"{perspective}_via_{method}"
+    return replace(
+        current,
+        role="recovery",
+        tactic=strategy,
+        context_profile="semantic_memory_carried_artifacts_and_rejection_ledger",
+        verification_recipe="none",
+        backoff_policy="none",
+        attempt_seconds=attempt_seconds,
         workspace_generation=current.workspace_generation + 1,
     )
 
@@ -545,6 +592,7 @@ __all__ = [
     "adaptive_attempt_seconds",
     "baseline_route",
     "classify_failure",
+    "continued_solve_route",
     "instance_follow_on_route",
     "route_failure",
 ]

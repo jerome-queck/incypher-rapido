@@ -101,6 +101,8 @@ class MonitorView:
     instance_waiting_challenge_ids: tuple[int, ...]
     terminal_challenge_ids: tuple[int, ...]
     lane_states: tuple[tuple[str, int], ...]
+    reserved_lane_count: int
+    completed_waiting_lane_count: int
     running_lanes: tuple[RunningLaneView, ...]
     attempt_count: int
     tool_call_count: int
@@ -166,6 +168,12 @@ def _current_candidate_counts(connection: sqlite3.Connection, run_id: str) -> tu
               WHERE proposal.run_id=?
                 AND proposal.episode>=catalogue.context_episode
                 AND proposal.role IN ('specialist', 'recovery')
+                AND NOT EXISTS (
+                  SELECT 1 FROM submission_intents AS settled
+                  WHERE settled.challenge_id=proposal.challenge_id
+                    AND settled.candidate_sha256=lower(hex(proposal.candidate_key))
+                    AND settled.status IN ('correct', 'incorrect', 'already_solved')
+                )
                 AND NOT EXISTS (
                   SELECT 1 FROM candidate_verifications AS verification
                   JOIN candidate_evidence_proofs AS producer_proof
@@ -424,36 +432,66 @@ class DurableJobControl:
             active_ids = {
                 int(row[0])
                 for row in connection.execute(
-                    "SELECT DISTINCT challenge_id FROM control_jobs "
-                    "WHERE run_id=? AND state='running'",
+                    "SELECT DISTINCT jobs.challenge_id FROM control_jobs AS jobs "
+                    "JOIN attempts AS attempt "
+                    "ON attempt.run_id=jobs.run_id "
+                    "AND attempt.challenge_id=jobs.challenge_id "
+                    "AND attempt.episode=jobs.episode AND attempt.lane=jobs.lane "
+                    "WHERE jobs.run_id=? AND jobs.state='running' "
+                    "AND attempt.status='running' AND attempt.finished_at IS NULL",
                     (selected_run_id,),
                 ).fetchall()
             }
-            queued_rows = connection.execute(
+            queued_ids = {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT challenge_id FROM control_jobs "
+                    "WHERE run_id=? AND state='queued'",
+                    (selected_run_id,),
+                ).fetchall()
+            }
+            lease_rows = connection.execute(
                 """
-                SELECT DISTINCT jobs.challenge_id, routes.route_json
-                FROM control_jobs AS jobs
-                JOIN control_routes AS routes
-                  ON routes.run_id=jobs.run_id
-                 AND routes.challenge_id=jobs.challenge_id
-                 AND routes.route_fingerprint=jobs.route_fingerprint
-                WHERE jobs.run_id=? AND jobs.state='queued'
+                SELECT kind, data_json FROM events
+                WHERE run_id=? AND kind IN (
+                  'instance_lease_waiting', 'instance_lease_granted',
+                  'instance_lease_active', 'instance_lease_releasable',
+                  'instance_lease_released', 'instance_lease_poisoned',
+                  'instance_lease_deferred', 'instance_lease_admission_expired'
+                ) ORDER BY sequence
                 """,
                 (selected_run_id,),
             ).fetchall()
-            queued_ids: set[int] = set()
-            waiting_ids: set[int] = set()
-            for row in queued_rows:
+            lease_phase: dict[int, str] = {}
+            for row in lease_rows:
                 try:
-                    route = json.loads(str(row["route_json"]))
+                    data = json.loads(str(row["data_json"]))
                 except json.JSONDecodeError as exc:
-                    raise ValueError("queued route is invalid") from exc
-                challenge_id = int(row["challenge_id"])
-                if isinstance(route, dict) and route.get("tactic") == "instance_enabled_follow_on":
-                    waiting_ids.add(challenge_id)
-                else:
-                    queued_ids.add(challenge_id)
-            terminal_ids = catalogue_ids - active_ids - queued_ids - waiting_ids
+                    raise ValueError("instance lease event is invalid") from exc
+                if isinstance(data, dict) and type(data.get("challenge_id")) is int:
+                    lease_phase[int(data["challenge_id"])] = str(row["kind"])
+            waiting_ids = {
+                challenge_id
+                for challenge_id, phase in lease_phase.items()
+                if phase == "instance_lease_waiting"
+            }
+            queued_ids -= waiting_ids
+            control_waiting_ids = {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT jobs.challenge_id FROM control_jobs AS jobs "
+                    "LEFT JOIN attempts AS attempt "
+                    "ON attempt.run_id=jobs.run_id "
+                    "AND attempt.challenge_id=jobs.challenge_id "
+                    "AND attempt.episode=jobs.episode AND attempt.lane=jobs.lane "
+                    "WHERE jobs.run_id=? AND jobs.state='running' "
+                    "AND (attempt.id IS NULL OR attempt.finished_at IS NOT NULL)",
+                    (selected_run_id,),
+                ).fetchall()
+            }
+            terminal_ids = (
+                catalogue_ids - active_ids - queued_ids - waiting_ids - control_waiting_ids
+            )
 
             running_rows = connection.execute(
                 """
@@ -461,12 +499,13 @@ class DurableJobControl:
                        jobs.agent_role, jobs.model, jobs.effort,
                        COALESCE(attempt.tool_count, 0) AS tool_count
                 FROM control_jobs AS jobs
-                LEFT JOIN attempts AS attempt
+                JOIN attempts AS attempt
                   ON attempt.run_id=jobs.run_id
                  AND attempt.challenge_id=jobs.challenge_id
                  AND attempt.episode=jobs.episode
                  AND attempt.lane=jobs.lane
                 WHERE jobs.run_id=? AND jobs.state='running'
+                  AND attempt.status='running' AND attempt.finished_at IS NULL
                 ORDER BY jobs.catalogue_rank, jobs.episode, jobs.lane
                 """,
                 (selected_run_id,),
@@ -478,6 +517,20 @@ class DurableJobControl:
                     "WHERE run_id=? GROUP BY state ORDER BY state",
                     (selected_run_id,),
                 ).fetchall()
+            )
+            reserved_lane_count, completed_waiting_lane_count = (
+                int(value)
+                for value in connection.execute(
+                    "SELECT "
+                    "COALESCE(SUM(CASE WHEN attempt.id IS NULL THEN 1 ELSE 0 END), 0), "
+                    "COALESCE(SUM(CASE WHEN attempt.finished_at IS NOT NULL THEN 1 ELSE 0 END), 0) "
+                    "FROM control_jobs AS jobs LEFT JOIN attempts AS attempt "
+                    "ON attempt.run_id=jobs.run_id "
+                    "AND attempt.challenge_id=jobs.challenge_id "
+                    "AND attempt.episode=jobs.episode AND attempt.lane=jobs.lane "
+                    "WHERE jobs.run_id=? AND jobs.state='running'",
+                    (selected_run_id,),
+                ).fetchone()
             )
             attempt_row = connection.execute(
                 "SELECT COUNT(*) AS count, COALESCE(SUM(tool_count), 0) AS tools "
@@ -509,11 +562,11 @@ class DurableJobControl:
             )
             watching = (
                 bool(config.get("watch_board"))
-                and not (active_ids or queued_ids or waiting_ids)
+                and not (active_ids or queued_ids or waiting_ids or control_waiting_ids)
                 and str(run["status"]) == "running"
             )
             return MonitorView(
-                schema="rapido.monitor.v1",
+                schema="rapido.monitor.v2",
                 sampled_at=sampled.isoformat(),
                 run_id=selected_run_id,
                 status=str(run["status"]),
@@ -528,6 +581,8 @@ class DurableJobControl:
                 instance_waiting_challenge_ids=tuple(sorted(waiting_ids)),
                 terminal_challenge_ids=tuple(sorted(terminal_ids)),
                 lane_states=lane_states,
+                reserved_lane_count=reserved_lane_count,
+                completed_waiting_lane_count=completed_waiting_lane_count,
                 running_lanes=tuple(
                     RunningLaneView(
                         challenge_id=int(row["challenge_id"]),

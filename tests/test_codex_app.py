@@ -478,7 +478,7 @@ def test_canonical_metadata_tools_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {"path": "artifacts/input.bin"})
 
 
-@pytest.mark.parametrize("name", ("http_request", "tcp_open", "tcp_exchange"))
+@pytest.mark.parametrize("name", ("http_request", "run_target_script", "tcp_open", "tcp_exchange"))
 def test_assigned_target_observations_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {})
 
@@ -706,6 +706,69 @@ async def test_shell_independently_derived_candidate_remains_source_bound(
     assert state.tool_calls[0]["supplied_candidate_sha256s"] == []
     assert candidate_hash in state.tool_calls[0]["candidate_sha256s"]
     assert state.provenance_outputs == []
+    await client.close()
+
+
+@run_async
+async def test_target_script_candidate_provenance_uses_only_broker_observations(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    printed = "INCYPHER{model_created_stdout}"
+    observed = "INCYPHER{broker_observed_target}"
+
+    class ScriptRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "run_target_script"
+            assert arguments["path"] == "rapido-analysis/solve.py"
+            return {
+                "returncode": 0,
+                "stdout": printed,
+                "stderr": "",
+                "script_sha256": "a" * 64,
+                "sources": [{"path": "artifacts/source.bin", "sha256": "b" * 64}],
+                "broker": {
+                    "operations": 1,
+                    "connects": 1,
+                    "sent_bytes": 4,
+                    "received_bytes": len(observed),
+                    "open_connections": 0,
+                    "open_http_sessions": 0,
+                    "target_observations": [{"kind": "tcp_exchange", "text": observed}],
+                },
+            }
+
+    registry = ScriptRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 205,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "target-script",
+                "tool": {"name": "run_target_script"},
+                "arguments": {
+                    "path": "rapido-analysis/solve.py",
+                    "source_paths": ["artifacts/source.bin"],
+                },
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    call = state.tool_calls[0]
+    assert hashlib.sha256(observed.encode()).hexdigest() in call["candidate_sha256s"]
+    assert hashlib.sha256(printed.encode()).hexdigest() not in call["candidate_sha256s"]
+    assert "model_created_stdout" not in str(call["host_observation"].facts)
     await client.close()
 
 
@@ -1209,6 +1272,9 @@ async def test_tool_call_and_structured_tool_error(
     assert all(isinstance(call["host_observation"], HostObservation) for call in state.tool_calls)
     assert state.tool_calls[0]["host_observation"].success is True
     assert state.tool_calls[1]["host_observation"].success is False
+    assert state.tool_calls[1]["host_observation"].facts["error_code"] == "bad_tool"
+    assert state.tool_calls[1]["host_observation"].facts["retryable"] is False
+    assert state.tool_calls[1]["host_observation"].facts["duration_milliseconds"] >= 0
     await client.close()
 
 

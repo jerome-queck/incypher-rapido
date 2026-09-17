@@ -475,7 +475,7 @@ def test_correct_closes_one_of_five_engagements_and_admits_next(tmp_path: Path) 
     asyncio.run(exercise())
 
 
-def test_engagement_slots_hold_successors_and_carry_is_lane_local(tmp_path: Path) -> None:
+def test_initial_coverage_precedes_successors_and_carry_is_lane_local(tmp_path: Path) -> None:
     async def exercise() -> None:
         cfg = config(
             tmp_path,
@@ -496,7 +496,7 @@ def test_engagement_slots_hold_successors_and_carry_is_lane_local(tmp_path: Path
         episode_one = asyncio.create_task(runtime.episode_one_admitted.wait())
         try:
             await asyncio.wait_for(episode_one, timeout=1)
-            assert not runtime.all_episode_zero_admitted.is_set()
+            assert runtime.all_episode_zero_admitted.is_set()
         finally:
             runtime.release_slow_episode_zero.set()
             await task
@@ -515,7 +515,7 @@ def test_engagement_slots_hold_successors_and_carry_is_lane_local(tmp_path: Path
             for index, (challenge_id, episode, _) in enumerate(runtime.admissions)
             if challenge_id == 3 and episode == 0
         )
-        assert challenge_one_successor < challenge_three_initial
+        assert challenge_three_initial < challenge_one_successor
         assert runtime.overlapping_episode_violations == []
         assert runtime.invalid_carry == []
         assert runtime.invalid_observations == []

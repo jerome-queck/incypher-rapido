@@ -216,7 +216,7 @@ def test_projection_enforces_exact_run_challenge_episode_and_lane_scope() -> Non
         host("other-host", episode=0, lane=1, facts={"match_count": 2}),
         tactic("other-tactic", episode=0, lane=1),
         failure("other-failure", episode=0, lane=1),
-        analysis("other-analysis", episode=0, lane=1),
+        analysis("other-analysis", episode=0, lane=1, summary="peer fact"),
         host("current-episode", episode=3),
         host("future-episode", episode=4),
         host("wrong-run", episode=0, run_id="run-B"),
@@ -226,13 +226,13 @@ def test_projection_enforces_exact_run_challenge_episode_and_lane_scope() -> Non
     lane = project_memory(records, target(), arm="lane_local_v1")
     typed = project_memory(records, target(), arm="typed_challenge_v1")
 
-    assert lane.record_ids == ("same-host", "same-analysis")
+    assert lane.record_ids == ("same-analysis", "same-host")
     assert typed.record_ids == (
-        "same-host",
         "same-analysis",
-        "other-host",
-        "other-tactic",
         "other-failure",
+        "other-tactic",
+        "same-host",
+        "other-host",
     )
 
 
@@ -249,11 +249,11 @@ def test_projection_order_is_deterministic_and_kind_typed() -> None:
     projected = project_memory(records, target(), arm="typed_challenge_v1")
 
     assert projected.record_ids == (
-        "e2-lane1",
-        "e1-host",
-        "e1-tactic",
-        "e1-failure",
         "e1-analysis",
+        "e1-failure",
+        "e1-tactic",
+        "e1-host",
+        "e2-lane1",
         "e1-attempt-b",
     )
 
@@ -289,16 +289,16 @@ def test_projection_deduplicates_exact_repeated_fingerprints_after_canonical_ord
 
     projected = project_memory(records, target(), arm="lane_local_v1")
 
-    assert projected.record_ids == ("a-host", "a-tactic", "a-failure", "a-analysis")
+    assert projected.record_ids == ("a-analysis", "a-failure", "a-tactic", "a-host")
     assert projected.deduplicated_record_count == 4
     assert projected.omitted_record_count == 0
 
 
-def test_projection_uses_64k_greedy_selection_without_backfill() -> None:
+def test_projection_uses_compact_budget_and_backfills_after_oversized_record() -> None:
     large = host(
         "large",
         episode=3,
-        facts={"blob": "x" * 63_000},
+        facts={"blob": "x" * 23_000},
     )
     medium = host(
         "medium",
@@ -320,9 +320,78 @@ def test_projection_uses_64k_greedy_selection_without_backfill() -> None:
         arm="lane_local_v1",
     )
 
-    assert projected.record_ids == ("large",)
-    assert projected.omitted_record_count == 2
+    assert projected.record_ids == ("medium", "tiny")
+    assert projected.omitted_record_count == 1
     assert projected.encoded_bytes <= PROJECTION_BYTES
+
+
+def test_low_budget_retains_newest_same_lane_analysis_without_peer_prose() -> None:
+    records = [
+        analysis("lane-0-old", episode=0, lane=0, summary="old"),
+        analysis("lane-0-new", episode=2, lane=0, summary="own next step"),
+        analysis("lane-1", episode=1, lane=1, summary="peer one"),
+        analysis("lane-2", episode=1, lane=2, summary="peer two"),
+        *(host(f"raw-{index}", episode=2, facts={"blob": "x" * 1000}) for index in range(12)),
+    ]
+
+    projected = project_memory(
+        records,
+        target(episode=3),
+        arm="typed_challenge_v1",
+        projection_bytes=1800,
+    )
+
+    assert projected.record_ids[0] == "lane-0-new"
+    assert "lane-0-old" not in projected.record_ids
+    assert "lane-1" not in projected.record_ids
+    assert "lane-2" not in projected.record_ids
+    assert projected.encoded_bytes <= 1800
+
+
+def test_cross_lane_analysis_is_never_shared_as_peer_memory() -> None:
+    records = [analysis("own", lane=0), analysis("peer", lane=1, summary="peer method")]
+
+    typed = project_memory(records, target(), arm="typed_challenge_v1")
+    local = project_memory(records, target(), arm="lane_local_v1")
+
+    assert typed.record_ids == ("own",)
+    assert local.record_ids == ("own",)
+
+
+def test_source_observations_round_robin_across_lanes() -> None:
+    records = [
+        host("lane-0-new", episode=2, lane=0, facts={"value": "0-new"}),
+        host("lane-0-old", episode=1, lane=0, facts={"value": "0-old"}),
+        host("lane-1-new", episode=2, lane=1, facts={"value": "1-new"}),
+        host("lane-1-old", episode=1, lane=1, facts={"value": "1-old"}),
+        host("lane-2-new", episode=2, lane=2, facts={"value": "2-new"}),
+    ]
+
+    projected = project_memory(records, target(episode=3), projection_bytes=1600)
+
+    assert projected.record_ids == (
+        "lane-0-new",
+        "lane-1-new",
+        "lane-2-new",
+        "lane-0-old",
+        "lane-1-old",
+    )
+
+
+def test_candidate_rejections_are_shared_as_counts_without_candidate_values() -> None:
+    incomplete = context(evidence=producer_evidence(manifest_complete=False))
+    candidate_memory = CandidateMemoryAggregate.from_contexts((incomplete,))
+
+    projected = project_memory(
+        [analysis("analysis")],
+        target(),
+        candidate_memory=candidate_memory,
+    )
+
+    assert projected.record_ids == ("analysis", "rejection-ledger")
+    ledger = projected.as_public()[1]
+    assert ledger["facts"]["rejected_context_count"] == 1
+    assert CANDIDATE not in str(ledger)
 
 
 @pytest.mark.parametrize(
@@ -397,6 +466,17 @@ def test_projection_redacts_nested_private_public_fields_and_keeps_required_anal
     public = projected.as_public()
 
     assert public[0] == {
+        "kind": "analysis_claim",
+        "record_id": "analysis",
+        "source_episode": 0,
+        "source_lane": 0,
+        "status": "unsolved",
+        "summary": "",
+        "evidence": ["source.txt"],
+        "next_steps": ["inspect"],
+        "tool_count": 1,
+    }
+    assert public[1] == {
         "kind": "host_observation",
         "record_id": "host",
         "source_episode": 0,
@@ -407,17 +487,6 @@ def test_projection_redacts_nested_private_public_fields_and_keeps_required_anal
         "success": True,
         "source_bound": True,
         "facts": {"nested": {"keep": 7}, "safe": "retained"},
-    }
-    assert public[1] == {
-        "kind": "analysis_claim",
-        "record_id": "analysis",
-        "source_episode": 0,
-        "source_lane": 0,
-        "status": "unsolved",
-        "summary": "",
-        "evidence": ["source.txt"],
-        "next_steps": ["inspect"],
-        "tool_count": 1,
     }
 
 

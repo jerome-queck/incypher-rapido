@@ -17,6 +17,7 @@ import inspect
 import json
 import os
 import re
+import time
 import urllib.parse
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
@@ -105,7 +106,7 @@ MAX_AGENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_AGENT_MESSAGE_CHUNKS = 4096
 MAX_TURN_ITEMS = 100
 MAX_TURN_ITEM_BYTES = 2 * 1024 * 1024
-MAX_TURN_TOOL_CALLS = 100
+MAX_TURN_TOOL_CALLS = 512
 MAX_ACTIVE_SERVER_TASKS = 128
 MAX_PROVENANCE_BYTES = 2 * 1024 * 1024
 INTERRUPT_TIMEOUT_SECONDS = 2.0
@@ -126,6 +127,21 @@ MAX_TURN_TAINT_CANDIDATES = 512
 MAX_TURN_TAINT_STATE_VALUES = 128
 MAX_TURN_TAINT_STATE_BYTES = 256 * 1024
 MAX_TURN_CANDIDATE_HASHES = 512
+
+_RETRYABLE_TOOL_ERRORS = frozenset(
+    {
+        "connection_limit",
+        "deadline_exceeded",
+        "generation_revoked",
+        "session_limit",
+        "source_changed",
+        "stale_cursor",
+        "target_transport",
+        "tcp_session",
+        "tool_busy",
+        "tool_timeout",
+    }
+)
 
 _ARTIFACT_TOOLS = {
     "audio_metadata",
@@ -150,7 +166,12 @@ _ARTIFACT_TOOLS = {
     "wav_analyze",
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
-_TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
+_TARGET_OBSERVATION_TOOLS = {
+    "http_request",
+    "run_target_script",
+    "tcp_open",
+    "tcp_exchange",
+}
 _EXECUTION_OBSERVATION_TOOLS = {"run_shell"}
 _SOURCE_OBSERVATION_TOOLS = (
     _ARTIFACT_TOOLS | _TARGET_OBSERVATION_TOOLS | _EXECUTION_OBSERVATION_TOOLS
@@ -370,7 +391,7 @@ class _TurnState:
     taint_state_bytes: int = 0
     candidate_hashes: int = 0
     tool_request_active: bool = False
-    progress_callback: Callable[[], None] | None = None
+    progress_callback: Callable[[HostObservation | None], None] | None = None
     last_event: dict[str, Any] = field(default_factory=dict)
 
 
@@ -432,6 +453,45 @@ def _controller_source_path(value: Any) -> bool:
     return _artifact_relative_path(value) and value.replace("\\", "/").split("/")[0] != (
         "rapido-analysis"
     )
+
+
+def _trusted_observation_result(name: str, result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Exclude model-created script output from target provenance and progress."""
+    if name != "run_target_script":
+        return result
+    broker = result.get("broker")
+    if not isinstance(broker, Mapping):
+        return {}
+    observations = broker.get("target_observations")
+    if not isinstance(observations, list):
+        observations = []
+    safe_broker = {
+        key: broker[key]
+        for key in (
+            "operations",
+            "connects",
+            "sent_bytes",
+            "received_bytes",
+            "open_connections",
+            "open_http_sessions",
+            "cleanup_closed_connections",
+            "cleanup_closed_http_sessions",
+        )
+        if type(broker.get(key)) is int and broker[key] >= 0
+    }
+    safe_broker["target_observations"] = observations
+    projected: dict[str, Any] = {"broker": safe_broker}
+    for key in (
+        "returncode",
+        "script_sha256",
+        "sources",
+        "peak_group_rss_bytes",
+        "peak_group_tasks",
+        "peak_group_processes",
+    ):
+        if key in result:
+            projected[key] = result[key]
+    return projected
 
 
 def _source_bound_tool_call(
@@ -1397,6 +1457,15 @@ class CodexAppClient:
         }
         state.tool_calls.append(call_record)
         observation_result: Mapping[str, Any] | None = None
+        tool_started_at = time.monotonic()
+
+        def failed_observation(error_code: str) -> dict[str, Any]:
+            return {
+                "error_code": error_code,
+                "retryable": error_code in _RETRYABLE_TOOL_ERRORS,
+                "duration_milliseconds": max(0, int((time.monotonic() - tool_started_at) * 1_000)),
+            }
+
         try:
             dispatch = getattr(registry, "dispatch", None) or getattr(registry, "call", None)
             if dispatch is None:
@@ -1423,7 +1492,7 @@ class CodexAppClient:
             if inspect.isawaitable(result):
                 result = await result
             if isinstance(result, Mapping):
-                observation_result = result
+                observation_result = _trusted_observation_result(canonical_name, result)
             encoded_result = _json_text(result, limit=MAX_TOOL_RESULT_BYTES)
             payload = {
                 "success": True,
@@ -1434,9 +1503,14 @@ class CodexAppClient:
                 canonical_name in _TRANSFORM_TOOLS
                 or (canonical_name in _SOURCE_OBSERVATION_TOOLS and source_taint_complete)
             ):
+                trusted_result = (
+                    _json_text(observation_result, limit=MAX_TOOL_RESULT_BYTES)
+                    if canonical_name == "run_target_script"
+                    else encoded_result
+                )
                 provenance_result = _target_provenance_output(
                     name,
-                    encoded_result,
+                    trusted_result,
                     call_tainted_inputs,
                     call_tainted_candidates,
                 )
@@ -1519,6 +1593,7 @@ class CodexAppClient:
                     state.provenance_outputs.append(provenance_result)
                     state.provenance_bytes += encoded_bytes
         except ToolError as exc:
+            observation_result = failed_observation(exc.code)
             error_payload = {"code": exc.code, "message": exc.message}
             if exc.details:
                 error_payload["details"] = dict(exc.details)
@@ -1534,6 +1609,7 @@ class CodexAppClient:
             if call_record is not None:
                 call_record["success"] = False
         except (ProtocolError, ValueError, TypeError) as exc:
+            observation_result = failed_observation("invalid_result")
             payload = {
                 "success": False,
                 "contentItems": [
@@ -1549,6 +1625,7 @@ class CodexAppClient:
             if call_record is not None:
                 call_record["success"] = False
         except Exception:  # noqa: BLE001 - dynamic tool boundary must never leak exceptions
+            observation_result = failed_observation("internal_error")
             payload = {
                 "success": False,
                 "contentItems": [
@@ -1586,7 +1663,7 @@ class CodexAppClient:
                 call_record["host_observation"] = None
             if state.progress_callback is not None:
                 with suppress(Exception):
-                    state.progress_callback()
+                    state.progress_callback(call_record.get("host_observation"))
         await self._send_response(message_id, result=payload)
 
     async def _handle_notification(self, method: str, params: Any) -> None:
@@ -1796,7 +1873,7 @@ class CodexAppClient:
         model: str | None = None,
         reasoning_effort: str | None = None,
         raise_on_timeout: bool = True,
-        progress_callback: Callable[[], None] | None = None,
+        progress_callback: Callable[[HostObservation | None], None] | None = None,
     ) -> TurnResult:
         target_thread = thread_id or self.thread_id
         if not target_thread:
@@ -1918,7 +1995,7 @@ class CodexAppClient:
         tool_registry: ToolRegistry | None = None,
         workspace_registry: WorkspaceThreadRegistry | MutableMapping[str, str] | None = None,
         raise_on_timeout: bool = True,
-        progress_callback: Callable[[], None] | None = None,
+        progress_callback: Callable[[HostObservation | None], None] | None = None,
         continuation_callback: Callable[[TurnResult, float | None], str | None] | None = None,
     ) -> TurnResult:
         """Start one thread and execute one or more cumulatively bounded structured turns."""

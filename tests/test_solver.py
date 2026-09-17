@@ -136,6 +136,24 @@ def test_turn_prompt_labels_untrusted_data_and_exposes_no_transport_fields() -> 
     assert "https://" not in encoded
 
 
+def test_turn_prompt_separates_carried_scripts_and_explains_brokered_execution() -> None:
+    challenge = Challenge(
+        7, "Name", "pwn", "dynamic_iac", "Exploit it", 500, (), False, 0, 0, None, None
+    )
+    prompt = json.loads(
+        build_turn_prompt(
+            challenge,
+            ["artifacts/input.bin", "rapido-analysis/carried/solve.py"],
+            0,
+            execution_phase="shared_instance",
+        )
+    )
+    assert prompt["workspace_artifacts"] == ["artifacts/input.bin"]
+    assert prompt["carried_analysis_artifacts"] == ["rapido-analysis/carried/solve.py"]
+    assert "run_target_script" in prompt["task"]
+    assert "rapido.target_script_client" in prompt["task"]
+
+
 @pytest.mark.parametrize(
     "description",
     (

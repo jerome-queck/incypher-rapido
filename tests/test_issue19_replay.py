@@ -54,8 +54,9 @@ def _assert_rejected(value: dict[str, object]) -> None:
 
 def test_expected_red_is_empirical_all_15_and_truthful() -> None:
     result = HARNESS.run_replay()
-    assert result["gate"]["passed"] is True
+    assert result["gate"]["passed"] is False
     assert result["gate"]["observed_red"] is True
+    assert result["gate"]["failures"] == ["observed queue admission/completion coverage changed"]
     assert "production_gate_passed" not in result["gate"]
     assert result["fixture"]["execution_surfaces"] == [
         "Orchestrator.run",
@@ -96,7 +97,7 @@ def test_expected_red_is_empirical_all_15_and_truthful() -> None:
     assert sorted(coverage["initial_order"]) == [
         challenge_id for challenge_id in range(1, 16) if challenge_id != HARNESS.BOARD_CASE_ID
     ]
-    assert coverage["all_initial_admitted_before_first_retry"] is False
+    assert coverage["all_initial_admitted_before_first_retry"] is True
     assert [item["challenge_id"] for item in coverage["episode_observations"]] == list(range(1, 16))
     assert all(
         item[phase]
@@ -426,11 +427,12 @@ def test_lexical_inventory_counts_broken_link_without_following_link_root(
 def test_cli_emits_json_and_expected_red_exit() -> None:
     completed = subprocess.run(
         [sys.executable, "scripts/issue19_replay.py"],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": str(Path.cwd())},
     )
     result = json.loads(completed.stdout)
-    assert result["gate"]["passed"] is True
+    assert completed.returncode == 1
+    assert result["gate"]["passed"] is False
     assert result["gate"]["observed_red"] is True

@@ -219,13 +219,21 @@ class CancelledStartRuntime(FakeRuntime):
 
 
 class CancelledSolveRuntime(FakeRuntime):
-    def __init__(self, *, with_observation: bool) -> None:
+    def __init__(
+        self,
+        *,
+        with_observation: bool,
+        streamed_only: bool = False,
+        streamed_incomplete: bool = False,
+    ) -> None:
         super().__init__({})
         self.with_observation = with_observation
+        self.streamed_only = streamed_only
+        self.streamed_incomplete = streamed_incomplete
         self.solve_started = asyncio.Event()
 
     async def solve(self, workspace, prompt, **kwargs):
-        del workspace, prompt, kwargs
+        del workspace, prompt
         self.solve_started.set()
         try:
             await asyncio.Event().wait()
@@ -250,7 +258,12 @@ class CancelledSolveRuntime(FakeRuntime):
                 if self.with_observation
                 else []
             )
-            exc.result = type("CancelledEvidence", (), {"tool_calls": calls})()
+            if self.streamed_only and calls:
+                if self.streamed_incomplete:
+                    kwargs["progress_callback"](None)
+                kwargs["progress_callback"](observation)
+            else:
+                exc.result = type("CancelledEvidence", (), {"tool_calls": calls})()
             raise
 
 
@@ -793,11 +806,20 @@ def test_cancellation_persists_interrupted_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("with_observation", "expected_count"),
-    ((True, 1), (False, 0)),
+    ("with_observation", "streamed_only", "streamed_incomplete", "expected_count"),
+    (
+        (True, False, False, 1),
+        (True, True, False, 1),
+        (True, True, True, 2),
+        (False, False, False, 0),
+    ),
 )
 def test_lane_cancellation_commits_completed_tool_evidence_with_explicit_gap(
-    tmp_path: Path, with_observation: bool, expected_count: int
+    tmp_path: Path,
+    with_observation: bool,
+    streamed_only: bool,
+    streamed_incomplete: bool,
+    expected_count: int,
 ) -> None:
     async def exercise() -> tuple[StateStore, str]:
         cfg = config(tmp_path)
@@ -806,7 +828,11 @@ def test_lane_cancellation_commits_completed_tool_evidence_with_explicit_gap(
         store.upsert_challenge(1, "A", "crypto", "standard", 100)
         workspace = tmp_path / "lane"
         workspace.mkdir()
-        runtime = CancelledSolveRuntime(with_observation=with_observation)
+        runtime = CancelledSolveRuntime(
+            with_observation=with_observation,
+            streamed_only=streamed_only,
+            streamed_incomplete=streamed_incomplete,
+        )
         lane = asyncio.create_task(
             Orchestrator(cfg, FakeBoard([challenge(1)]), store, runtime)._lane(
                 "run", challenge(1), 0, 0, workspace, [], 10
@@ -835,7 +861,7 @@ def test_lane_cancellation_commits_completed_tool_evidence_with_explicit_gap(
     assert dict(manifest) == {
         "complete": 0,
         "gap": "turn_cancelled",
-        "observation_count": expected_count,
+        "observation_count": int(with_observation),
     }
     if with_observation:
         payload = (

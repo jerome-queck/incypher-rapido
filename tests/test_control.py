@@ -826,6 +826,76 @@ def test_drive_inspect_round_trip_exposes_only_sanitized_run_contract(tmp_path: 
     assert monitor.tool_call_count == 2
 
 
+def test_monitor_does_not_report_a_finished_attempt_as_running(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    state = StateStore(config.state_path)
+    run_id = "monitor-finished-lane"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=800)
+    state.start_run(run_id, config.public_record())
+    state.upsert_challenge(1, "A", "crypto", "standard", 100)
+    state.record_control_catalogue(run_id, [(0, 1, True)])
+    state.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    state.start_control_wave(run_id, 1, 0)
+    attempt_id = f"{run_id}:1:0:0"
+    state.start_attempt(
+        attempt_id,
+        run_id,
+        1,
+        0,
+        0,
+        "gpt-daybreak-blue-latest",
+        "xhigh",
+        require_control_assignment=True,
+    )
+    state.finish_attempt(attempt_id, "unsolved")
+    state.close()
+
+    monitor = DurableJobControl.monitor_snapshot(config.state_path, run_id=run_id)
+    assert monitor.schema == "rapido.monitor.v2"
+    assert monitor.active_challenge_ids == ()
+    assert monitor.running_lanes == ()
+    assert monitor.completed_waiting_lane_count == 1
+    assert monitor.terminal_challenge_ids == ()
+
+
+@pytest.mark.parametrize(
+    "closing_kind", ("instance_lease_deferred", "instance_lease_admission_expired")
+)
+def test_monitor_does_not_leave_closed_instance_waiter_waiting(
+    tmp_path: Path, closing_kind: str
+) -> None:
+    config = _config(tmp_path)
+    state = StateStore(config.state_path)
+    run_id = f"monitor-{closing_kind}"
+    route = baseline_route(model=config.model, effort=config.reasoning_effort, attempt_seconds=800)
+    state.start_run(run_id, config.public_record())
+    state.upsert_challenge(1, "A", "web", "dynamic_iac", 100)
+    state.initialize_control_catalogue(
+        run_id,
+        [(0, 1, True)],
+        1,
+        route,
+        (("lead", config.model, config.reasoning_effort),),
+        {1: "a" * 64},
+    )
+    state.event(
+        run_id,
+        "instance_lease_waiting",
+        {"challenge_id": 1, "episode": 0, "ticket": 0},
+    )
+    state.event(
+        run_id,
+        closing_kind,
+        {"challenge_id": 1, "episode": 0, "ticket": 0},
+    )
+
+    monitor = DurableJobControl.monitor_snapshot(config.state_path, run_id=run_id)
+
+    assert monitor.instance_waiting_challenge_ids == ()
+    assert monitor.queued_challenge_ids == (1,)
+    state.close()
+
+
 def test_initial_queue_identity_and_order_survive_reopened_inspection(tmp_path: Path) -> None:
     board = BoundaryBoard([_challenge(1), _challenge(2), _challenge(3)])
     runtime = BoundaryRuntime("INCYPHER{durable-job-fixture}")
@@ -899,8 +969,12 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_two_daybreak_leads_each(
         assert kwargs["reasoning_effort"] == job.effort
         assert document["control_route"]["model"] == job.model
         assert document["control_route"]["effort"] == job.effort
-        assert "same cumulative solve window" in document["persistent_window"]
-        assert callable(kwargs["continuation_callback"])
+        if job.agent_role == "lead":
+            assert "same cumulative solve window" in document["persistent_window"]
+            assert callable(kwargs["continuation_callback"])
+        else:
+            assert "persistent_window" not in document
+            assert kwargs["continuation_callback"] is None
 
 
 def test_focus_order_and_value_scale_initial_attempt_time_without_narrowing_coverage(
@@ -931,7 +1005,9 @@ def test_focus_order_and_value_scale_initial_attempt_time_without_narrowing_cove
         int(document["challenge"]["id"]): int(document["control_route"]["attempt_seconds"])
         for document, _ in runtime.calls
     }
-    assert budgets == {1: 800, 2: 1_800, 3: 1_800, 4: 800}
+    assert budgets[1] == budgets[4] == 800
+    assert budgets[2] == 1_800
+    assert budgets[3] == 1_800
     assert view.initial_coverage_count == 4
 
 
@@ -1338,6 +1414,7 @@ def test_first_unlimited_candidate_submits_immediately_without_verifier(tmp_path
     assert board.submissions == [(1, candidate)]
     assert {job.role for job in view.jobs} == {"specialist"}
     assert view.verified_candidate_count == 0
+    assert view.pending_candidate_count == 0
 
 
 def test_limited_candidate_waits_for_one_fresh_verifier(tmp_path: Path) -> None:
@@ -1426,7 +1503,90 @@ def test_unlimited_candidates_submit_until_five_wrong_then_require_verification(
     store.close()
 
 
-def test_already_solved_candidate_is_verified_then_engagement_closes(tmp_path: Path) -> None:
+def test_known_incorrect_candidate_is_not_resubmitted_or_left_candidate_like(
+    tmp_path: Path,
+) -> None:
+    config = replace(_config(tmp_path), submit_candidates=True)
+    challenge = _challenge(1)
+    board = BoundaryBoard([challenge])
+    store = StateStore(config.state_path)
+    run_id = "known-wrong-run"
+    candidate = "INCYPHER{known_wrong_candidate}"
+    store.start_run(run_id, config.public_record())
+    store.upsert_challenge(1, challenge.name, challenge.category, challenge.type, challenge.value)
+    store.record_submission(run_id, 1, candidate, "incorrect", 200)
+
+    class AdaptiveOrchestrator(orchestrator_module.Orchestrator):
+        _adaptive_control = True
+
+    orchestrator = AdaptiveOrchestrator(config, board, store, UnsolvedBoundaryRuntime("unused"))
+    outcome = asyncio.run(
+        orchestrator._submit_candidate(
+            run_id,
+            challenge,
+            candidate,
+            orchestrator_module.time.monotonic() + 10,
+        )
+    )
+
+    assert outcome == "unsolved"
+    assert board.submissions == []
+    assert (
+        store._connection.execute("SELECT status FROM challenges WHERE id=1").fetchone()[0]
+        == "unsolved"
+    )
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "prior_outcome",
+    ("correct", "already_solved", "incorrect"),
+)
+def test_historical_candidate_effect_does_not_suppress_a_fresh_submission(
+    tmp_path: Path, prior_outcome: str
+) -> None:
+    candidate = "INCYPHER{historical_candidate_identity}"
+    challenge = _challenge(1)
+    config = replace(
+        _config(tmp_path),
+        episodes_per_challenge=1,
+        submit_candidates=True,
+    )
+    store = StateStore(config.state_path)
+    store.bind_board_identity(1, 2)
+    store.start_run("historical-run", config.public_record())
+    store.upsert_challenge(1, challenge.name, challenge.category, challenge.type, challenge.value)
+    route = baseline_route(
+        model=config.model,
+        effort=config.reasoning_effort,
+        attempt_seconds=config.attempt_seconds,
+    )
+    store.initialize_control_catalogue(
+        "historical-run",
+        [(0, 1, True)],
+        config.attempts_per_challenge,
+        route,
+        (("lead", config.model, config.reasoning_effort),) * config.attempts_per_challenge,
+        {1: orchestrator_module._challenge_material_sha256(challenge)},
+    )
+    store.record_submission("historical-run", 1, candidate, prior_outcome, 200)
+    store.finish_run("historical-run", "completed")
+    store.close()
+    board = BoundaryBoard([challenge])
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 1
+    assert report.candidates == 0
+    assert report.unsolved == 0
+    assert view.pending_candidate_count == 0
+    assert board.submissions == [(1, candidate)]
+
+
+def test_already_solved_candidate_closes_without_wasting_a_verifier(tmp_path: Path) -> None:
     candidate = "INCYPHER{fresh_candidate_for_solved_board_item}"
     board = AlreadySolvedBoundaryBoard([_challenge(1)])
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
@@ -1443,9 +1603,9 @@ def test_already_solved_candidate_is_verified_then_engagement_closes(tmp_path: P
     assert report.solved == 0
     assert report.candidates == 1
     assert board.submissions == [(1, candidate)]
-    assert {job.role for job in view.jobs} == {"specialist", "verifier"}
+    assert {job.role for job in view.jobs} == {"specialist"}
     assert view.pending_candidate_count == 0
-    assert view.verified_candidate_count == 1
+    assert view.verified_candidate_count == 0
 
 
 def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
@@ -1482,7 +1642,7 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     assert all(has_target for _, has_target in live)
     assert all(document["same_run_memory"] for document, _ in live)
     assert {job.role for job in view.jobs if job.episode == 1} == {"recovery"}
-    assert not any(
+    assert any(
         continued
         for phase, model, continued in runtime.continuations
         if phase == "local_analysis" and model == "gpt-daybreak-blue-latest"
@@ -1494,7 +1654,7 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     )
 
 
-def test_instance_waiters_do_not_consume_productive_challenge_slots(tmp_path: Path) -> None:
+def test_dynamic_waiters_stay_in_five_residencies_and_rotate_the_instance(tmp_path: Path) -> None:
     challenges = [_challenge(value, challenge_type="dynamic_iac") for value in range(1, 7)]
     board = ManagedInstanceBoundaryBoard(challenges)
 
@@ -1556,13 +1716,166 @@ def test_instance_waiters_do_not_consume_productive_challenge_slots(tmp_path: Pa
     finally:
         connection.close()
     kinds = [kind for kind, _ in events]
-    wake_ids = [data["challenge_id"] for kind, data in events if kind == "instance_wait_woken"]
-    assert kinds.count("instance_wait_parked") == 6
-    assert kinds.count("instance_wait_woken") == 6
-    assert wake_ids == post_ids
+    waits = [data for kind, data in events if kind == "instance_lease_waiting"]
+    wait_ids = [data["challenge_id"] for data in waits]
+    deferred = [data for kind, data in events if kind == "instance_lease_deferred"]
+    grant_ids = [data["challenge_id"] for kind, data in events if kind == "instance_lease_granted"]
+    grant_tickets = [data["ticket"] for kind, data in events if kind == "instance_lease_granted"]
+    assert len(wait_ids) == len(grant_ids) + len(deferred)
+    assert sorted(wait_ids) == sorted([*grant_ids, *(data["challenge_id"] for data in deferred)])
+    assert grant_tickets == sorted(grant_tickets)
+    assert grant_ids == post_ids
+    assert "instance_wait_parked" not in kinds
 
 
-def test_dynamic_productive_timeout_reuses_lease_for_daybreak_heavy_recovery(
+def test_instance_waiters_yield_slots_to_queued_static_work(tmp_path: Path) -> None:
+    challenges = [
+        *[_challenge(value, challenge_type="dynamic_iac") for value in range(1, 6)],
+        _challenge(6),
+    ]
+    board = ManagedInstanceBoundaryBoard(challenges)
+
+    class MixedQueueRuntime(DynamicPhaseRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.static_started = asyncio.Event()
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            challenge_id = int(document["challenge"]["id"])
+            if challenge_id == 6:
+                self.static_started.set()
+            elif document["execution_phase"] == "shared_instance":
+                await asyncio.wait_for(self.static_started.wait(), timeout=2)
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = MixedQueueRuntime()
+    config = replace(
+        _config(tmp_path),
+        active_challenges=5,
+        attempts_per_challenge=2,
+        concurrency=10,
+        manage_dynamic_instances=True,
+        episodes_per_challenge=2,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    assert report.status == "completed"
+    assert runtime.static_started.is_set()
+    assert board.peak_active == 1
+    assert board.active == set()
+
+
+def test_persistent_scheduler_requeues_unresolved_past_episode_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.05)
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        attempts_per_challenge=1,
+        concurrency=1,
+        episodes_per_challenge=1,
+        run_seconds=0.25,
+        watch_board=True,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    with sqlite3.connect(config.state_path) as connection:
+        max_episode = connection.execute(
+            "SELECT MAX(episode) FROM control_jobs WHERE run_id=?", (report.run_id,)
+        ).fetchone()[0]
+        closed = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=? AND kind='challenge_engagement_closed'",
+            (report.run_id,),
+        ).fetchone()[0]
+
+    assert report.status == "deadline"
+    assert max_episode > config.episodes_per_challenge
+    assert closed == 0
+
+
+def test_active_watch_appends_new_work_while_prior_challenge_remains_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.05)
+
+    class GrowingBoard(BoundaryBoard):
+        def __init__(self) -> None:
+            super().__init__([_challenge(1)])
+            self.list_calls = 0
+
+        def list_challenges(self) -> list[dict[str, int]]:
+            self.list_calls += 1
+            if self.list_calls >= 4:
+                self._challenges[2] = _challenge(2)
+            return super().list_challenges()
+
+    config = replace(
+        _config(tmp_path),
+        active_challenges=2,
+        attempts_per_challenge=1,
+        concurrency=2,
+        episodes_per_challenge=1,
+        run_seconds=0.3,
+        watch_board=True,
+        board_watch_seconds=0.01,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=GrowingBoard(),
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "deadline"
+    assert view.catalogue_count == 2
+    assert {job.challenge_id for job in view.jobs} == {1, 2}
+
+
+def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.5)
+    challenges = [_challenge(value, challenge_type="dynamic_iac") for value in (1, 2)]
+    board = ManagedInstanceBoundaryBoard(challenges)
+
+    class SlowLiveRuntime(DynamicPhaseRuntime):
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            if document["execution_phase"] == "shared_instance":
+                await asyncio.sleep(0.4)
+            return await super().solve(workspace, prompt, **kwargs)
+
+    config = replace(
+        _config(tmp_path),
+        active_challenges=2,
+        attempts_per_challenge=2,
+        concurrency=4,
+        manage_dynamic_instances=True,
+        run_seconds=0.8,
+        watch_board=True,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=SlowLiveRuntime()))
+
+    posts = [call for call in board.instance_calls if call[0] == "POST"]
+    assert report.status == "deadline"
+    assert len(posts) == 1
+    assert board.active == set()
+
+
+def test_dynamic_productive_timeout_releases_then_reacquires_for_changed_recovery(
     tmp_path: Path,
 ) -> None:
     challenge = _challenge(1, challenge_type="dynamic_iac")
@@ -1584,14 +1897,20 @@ def test_dynamic_productive_timeout_reuses_lease_for_daybreak_heavy_recovery(
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
 
     assert report.status == "completed"
-    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
-    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [("DELETE", 1)]
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [
+        ("POST", 1),
+        ("POST", 1),
+    ]
+    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [
+        ("DELETE", 1),
+        ("DELETE", 1),
+    ]
     recovery_jobs = [job for job in view.jobs if job.episode == 2]
     assert [(job.model, job.effort) for job in recovery_jobs] == [
         ("gpt-daybreak-blue-latest", "xhigh"),
         ("gpt-daybreak-blue-latest", "xhigh"),
-        ("gpt-daybreak-blue-latest", "xhigh"),
         ("gpt-5.6-luna", "max"),
+        ("gpt-5.6-luna", "xhigh"),
     ]
     recovery_prompts = [document for document, _ in runtime.prompts if document["episode"] == 2]
     assert len(recovery_prompts) == 4
@@ -1619,7 +1938,7 @@ def test_dynamic_create_failure_is_not_retried_unchanged(
     assert board.active == set()
 
 
-def test_dynamic_local_failure_enters_shared_phase_without_wasting_episode(
+def test_dynamic_local_failure_changes_local_strategy_without_wasting_an_instance(
     tmp_path: Path,
 ) -> None:
     dynamic = _challenge(1, challenge_type="dynamic_iac")
@@ -1636,12 +1955,12 @@ def test_dynamic_local_failure_enters_shared_phase_without_wasting_episode(
     assert report.status == "completed"
     phases = [(document["execution_phase"], document["episode"]) for document, _ in runtime.prompts]
     assert phases[:2] == [("local_analysis", 0), ("local_analysis", 0)]
-    assert ("shared_instance", 1) in phases
-    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert all(phase == "local_analysis" for phase, _ in phases)
+    assert [call for call in board.instance_calls if call[0] == "POST"] == []
     assert board.active == set()
 
 
-def test_limited_dynamic_candidate_uses_same_instance_for_verifier(tmp_path: Path) -> None:
+def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(tmp_path: Path) -> None:
     candidate = "INCYPHER{limited_dynamic_verified}"
     dynamic = replace(
         _challenge(1, challenge_type="dynamic_iac"),
@@ -1661,8 +1980,14 @@ def test_limited_dynamic_candidate_uses_same_instance_for_verifier(tmp_path: Pat
 
     assert report.solved == 1
     assert board.submissions == [(1, candidate)]
-    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
-    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [("DELETE", 1)]
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [
+        ("POST", 1),
+        ("POST", 1),
+    ]
+    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [
+        ("DELETE", 1),
+        ("DELETE", 1),
+    ]
     assert {job.role for job in view.jobs} == {"specialist", "recovery", "verifier"}
     auxiliary = [
         (document["control_route"]["role"], kwargs["tool_registry"] is not None)

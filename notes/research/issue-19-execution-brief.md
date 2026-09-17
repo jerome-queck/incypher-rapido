@@ -1039,6 +1039,71 @@ show whether local CPU becomes the next bottleneck. After the prior one-hour evi
 exact stopped container and state volume were deleted from `colima-rapido`; both are absent, while
 the legacy `rapido-auth-v4` volume and current private host-bound credentials remain present.
 
+### Post-diagnostic audit and selected execution repair
+
+The owner supplied a private GPT-6 Pro audit archive after the two-hour diagnostic. It was extracted
+into a private temporary directory, treated as untrusted data, and deleted after read-only triage;
+its scripts were never executed and the archive is not a repository artifact. Cross-checking its
+claims against the durable database and source confirmed a continuation concentration (737 total,
+609 on one challenge), extensive failed observations, cancellation-evidence loss, five serialized
+leases, and settled-candidate/monitor projection defects. Aggregate findings informed fixes; raw
+candidate, target, alias, event, and timeline data remain private.
+
+Controlled review selected these bounded repairs over a new agent framework:
+
+1. **Persistent challenge residency.** Production watching runs treat an episode as a fair work
+   quantum, not a give-up cap. Unresolved work re-enters FIFO with one of 32 semantically distinct
+   perspective/tool-method combinations until the
+   original deadline. A challenge closes only on current-run `correct`, non-validating
+   `already_solved`, unsupported type, or deadline interruption. New Board challenge IDs are
+   qualified and appended during active work without interrupting current lanes; the idle watcher
+   retains full same-URL material refresh. The no-progress guard is 900 seconds, intentionally above
+   the normal 800-second pass so it cannot cut off a thinking Daybreak lead; absolute attempt and run
+   deadlines remain authoritative.
+2. **Productive instance arbitration.** Dynamic challenges analyze locally first. A ready dynamic
+   blocked behind the occupied lease yields its challenge residency when non-instance work is queued,
+   preventing waiters from starving static analysis. With free lease capacity, or when only dynamic
+   work remains, ready challenges stay resident and use the target slot.
+   FIFO tickets survive deferral; one shared target wave releases and proves deletion before the
+   next lease. Admission is rechecked before grant and after instance creation, so a waiter cannot
+   cross the 600-second live-work floor unnoticed.
+3. **Selective same-run context.** Typed memory projects up to 24 KiB of newest useful per-peer
+   methods, host facts, failures, and next steps without cross-lane prose or candidate material.
+   Safe files under `rapido-analysis` may carry into a changed non-Verifier episode for identical
+   material, bounded to 64 files/16 MiB. Endpoint-, flag-, credential-, link-, and hardlink-like
+   content is rejected; Verifiers receive neither memory nor carried scripts.
+4. **Useful shell and target scripting.** The normal confined shell remains available for writing
+   and running analysis code. `run_target_script` adds saved Python scripts whose worker has no
+   direct network; an AF_UNIX broker exposes only the assigned target through bounded HTTP/TCP
+   operations, multiple sessions/connections, exact cleanup, and candidate-safe target
+   observations. Per-turn and target call ceilings rise from 100/80 to 512; they remain hard
+   resource guards rather than attempt-longevity controls.
+5. **Immediate effect and private retention.** Distinct source-qualified candidates still submit
+   immediately through the fifth wrong on unlimited challenges. A settled same-context identity is
+   never resubmitted; each intent snapshots its material digest, so historical effects cannot become
+   a fresh run-local solve or suppress changed-material candidates. `correct` and `already_solved` cancel siblings and vacate the challenge slot
+   immediately; rejected identities no longer remain candidate-like.
+6. **Exact recovery and observability.** Attempt tool counts are monotonic across checkpoints.
+   Streamed host observations survive timeout/cancellation without relying on exception attributes;
+   incomplete projections retain exact call counts and an explicit evidence gap. Failed tool facts
+   add bounded error code, retryability, and duration. Monitor v2 distinguishes running,
+   reserved, completed-waiting, queued, and instance-wait states and consumes deferral/expiry
+   transitions instead of leaving phantom waiters.
+
+Post-implementation focused verification covers persistent requeue past the configured episode cap,
+active Board append, static work escaping instance-wait starvation, FIFO lease lifecycle, late
+instance admission, same-material carry and unsafe-content rejection, Verifier isolation, streamed
+cancellation evidence, settled-candidate run/material scope, immediate-correct pending-count
+cleanup, and target-script transport/provenance. Independent Daybreak/xhigh review found the
+watcher, ticket, monitor, admission, and historical-effect defects above; all selected findings were
+reproduced before correction. Full suite, final independent two-axis review, CI, exact-image
+pressure/preflight, and the fresh two-hour Board diagnostic remain gates.
+
+The two-hour diagnostic protocol remains all 15 challenges with focus order 15/94/42, five challenge
+residencies, four peers per challenge, submissions/instances/watch enabled, a fresh empty state,
+and the exact merged image. It is diagnostic only. The unchanged issue-19 completion gate still
+requires later owner authorization and a fresh unattended 19,800-second acceptance run.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -1118,6 +1183,9 @@ the legacy `rapido-auth-v4` volume and current private host-bound credentials re
 | Instance-ready queue design | requested `gpt-daybreak-blue-latest` / `xhigh` | derived durable park/wake queue selected over a duplicate lease table; worker-side effective model metadata unavailable |
 | Priority/budget/watcher design | requested `gpt-daybreak-blue-latest` / `xhigh` | deterministic focus/value policy and meaningful 600-second floor selected over unsupported learned scoring; worker-side effective model metadata unavailable |
 | Monitor design | requested `gpt-daybreak-blue-latest` / `xhigh` | query-only snapshot plus self-cgroup sampler selected over a daemon; worker-side effective model metadata unavailable |
+| Private GPT-6 Pro archive triage | `gpt-daybreak-blue-latest` / `xhigh` | read-only untrusted extraction; validated scheduler/evidence/monitor findings only, archive excluded from Git |
+| Selective analysis-carry tests | `gpt-5.6-luna` / `xhigh` | four focused tests cover safe carry, unsafe/link rejection, Verifier isolation, and latest-generation replacement |
+| Post-diagnostic scheduler audit | `gpt-daybreak-blue-latest` / `xhigh` | watcher starvation, FIFO ticket loss, stale waiter projection, late admission, and historical-effect scope found and repaired locally |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were

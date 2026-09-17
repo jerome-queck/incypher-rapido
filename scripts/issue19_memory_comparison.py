@@ -29,7 +29,6 @@ if str(ROOT) not in sys.path:
 from rapido.board import Challenge
 from rapido.memory import (
     MEMORY_ARMS,
-    PROJECTION_BYTES,
     PROTOCOL_SHA256,
     PUBLIC_RECORD_FIELDS,
     AnalysisClaim,
@@ -44,7 +43,6 @@ from rapido.memory import (
     PublicMemoryRecord,
     TacticOutcome,
     canonical_bytes,
-    project_memory,
     record_order,
     repeated_fingerprint,
     sanitize_public_value,
@@ -53,6 +51,7 @@ from rapido.routing import RouteSpec
 from rapido.solver import MAX_AGENT_MESSAGE_BYTES, build_turn_prompt
 
 EXPECTED_PROTOCOL_SHA256 = "4605399b8ff84acef4ecbcd30bd1856a86b8e3792d94f03fd525db4d70cd8a6e"
+FROZEN_PROJECTION_BYTES = 65_536
 DEFAULT_PROTOCOL_PATH = ROOT / "notes/research/issue-19-memory-comparison-protocol-v1.json"
 DEFAULT_RESULT_PATH = ROOT / "notes/research/issue-19-memory-comparison-v1.json"
 COMMAND_ADDENDUM_PATH = ROOT / "notes/research/issue-19-memory-comparison-command-addendum-v1.json"
@@ -318,7 +317,7 @@ def validate_protocol(protocol: object) -> None:
     }
     _exact_keys(projection, required_projection, "projection")
     if (
-        projection["projection_bytes"] != PROJECTION_BYTES
+        projection["projection_bytes"] != FROZEN_PROJECTION_BYTES
         or projection["prompt_bytes"] != MAX_AGENT_MESSAGE_BYTES
         or projection["verifier_prompt_record_count"] != 0
         or projection["kind_order"]
@@ -535,7 +534,7 @@ def _expand_generated(value: object, inherited_payload_bytes: int | None = None)
             if not set(value) <= {"generator", "payload_bytes"}:
                 raise ValueError("M1 large fact generator schema changed")
             payload_bytes = value.get("payload_bytes", inherited_payload_bytes)
-            if type(payload_bytes) is not int or not 0 <= payload_bytes <= PROJECTION_BYTES:
+            if type(payload_bytes) is not int or not 0 <= payload_bytes <= FROZEN_PROJECTION_BYTES:
                 raise ValueError("M1 large fact payload is invalid")
             return "X" * payload_bytes
         if "generator" in value:
@@ -911,16 +910,70 @@ def _projection_inputs(
     return records, aggregate
 
 
+def _frozen_project_memory(
+    records: Sequence[PublicMemoryRecord],
+    target: MemoryTarget,
+    arm: str,
+    candidate_memory: CandidateMemoryAggregate,
+    sensitive_values: tuple[str, ...],
+) -> MemoryProjection:
+    """Replay the registered v1 projection without inheriting production policy changes."""
+    if target.role == "verifier":
+        return MemoryProjection._create((), 0, 0, target, arm)  # type: ignore[arg-type]
+
+    eligible: list[dict[str, Any]] = []
+    for record in sorted(records, key=record_order):
+        if (
+            record.run_id != target.run_id
+            or record.challenge_id != target.challenge_id
+            or record.source_episode >= target.episode
+            or (
+                record.source_lane != target.lane
+                and (arm != "typed_challenge_v1" or record.kind == "analysis_claim")
+            )
+        ):
+            continue
+        public = sanitize_public_value(record.public_record(), sensitive_values=sensitive_values)
+        if not isinstance(public, dict):
+            continue
+        if record.kind == "analysis_claim" and "summary" not in public:
+            public["summary"] = ""
+        eligible.append(public)
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    deduplicated = 0
+    for public in eligible:
+        fingerprint = repeated_fingerprint(public)
+        if fingerprint is not None and fingerprint in seen:
+            deduplicated += 1
+            continue
+        if fingerprint is not None:
+            seen.add(fingerprint)
+        unique.append(public)
+
+    selected: list[dict[str, Any]] = []
+    omitted = 0
+    for index, public in enumerate(unique):
+        if len(canonical_bytes([*selected, public])) > FROZEN_PROJECTION_BYTES:
+            omitted = len(unique) - index
+            break
+        selected.append(public)
+    return MemoryProjection._create(  # type: ignore[arg-type]
+        selected, deduplicated, omitted, target, arm
+    )
+
+
 def _project(
-    expanded: Mapping[str, Any], arm: str, permutation: str
+    expanded: Mapping[str, Any], arm: str, permutation: str, protocol: Mapping[str, Any]
 ) -> tuple[MemoryProjection, CandidateMemoryAggregate, str]:
     records, aggregate = _projection_inputs(expanded, permutation)
-    projection = project_memory(
+    projection = _frozen_project_memory(
         records,
         _target(expanded["target"]),
-        arm=arm,
-        candidate_memory=aggregate,
-        projection_bytes=PROJECTION_BYTES,
+        arm,
+        aggregate,
+        _sensitive_values(protocol),
     )
     prompt = build_turn_prompt(
         _challenge(expanded["target"]),
@@ -978,8 +1031,8 @@ def _row(
     permutation: str,
     protocol: Mapping[str, Any],
 ) -> dict[str, object]:
-    projection, aggregate, prompt = _project(expanded, arm, permutation)
-    reopened, reopened_aggregate, reopened_prompt = _project(expanded, arm, permutation)
+    projection, aggregate, prompt = _project(expanded, arm, permutation, protocol)
+    reopened, reopened_aggregate, reopened_prompt = _project(expanded, arm, permutation, protocol)
     records = projection.as_public()
     counts = aggregate.public_counts()
     reopened_counts = reopened_aggregate.public_counts()

@@ -232,6 +232,12 @@ def test_material_refresh_retires_old_correct_submission_authority(tmp_path: Pat
         {1: "a" * 64},
     )
     store.record_submission("run-1", 1, "INCYPHER{old_material}", "correct", 200)
+    assert store.candidate_submission_status("run-1", 1, "INCYPHER{old_material}") == (
+        "correct",
+        "run-1",
+        0,
+        "a" * 64,
+    )
     store.finish_control_wave("run-1", 1, 0, "solved")
 
     kind, episode, _ = store.admit_control_catalogue_revision(
@@ -251,10 +257,51 @@ def test_material_refresh_retires_old_correct_submission_authority(tmp_path: Pat
 
     assert (kind, episode) == ("refreshed", 1)
     assert not store.challenge_has_correct_submission("run-1", 1)
-    assert not store.reserve_submission("run-1", 1, "INCYPHER{old_material}")
+    assert store.reserve_submission("run-1", 1, "INCYPHER{old_material}")
+    assert store.candidate_submission_status("run-1", 1, "INCYPHER{old_material}") == (
+        "pending",
+        "run-1",
+        1,
+        "b" * 64,
+    )
+    store.finalize_submission("run-1", 1, "INCYPHER{old_material}", "incorrect", 200)
     assert store.reserve_submission("run-1", 1, "INCYPHER{new_material}")
     store.finalize_submission("run-1", 1, "INCYPHER{new_material}", "incorrect", 200)
+    rows = store._connection.execute(
+        "SELECT context_episode, context_sha256, status FROM submission_intents "
+        "WHERE challenge_id=1 ORDER BY context_episode, candidate_sha256"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (0, "a" * 64, "correct"),
+        (1, "b" * 64, "incorrect"),
+        (1, "b" * 64, "incorrect"),
+    ]
+    assert store.challenge_incorrect_submission_count("run-1", 1) == 2
     store.finish_control_wave("run-1", 1, 1, "unsolved")
+    kind, episode, _ = store.admit_control_catalogue_revision(
+        run_id="run-1",
+        challenge_id=1,
+        name="A",
+        category="crypto",
+        challenge_type="standard",
+        value=100,
+        executable=True,
+        context_sha256="a" * 64,
+        new_catalogue_rank=2,
+        lanes=2,
+        route=route,
+        assignments=assignments,
+    )
+    assert (kind, episode) == ("refreshed", 2)
+    assert store.candidate_submission_status("run-1", 1, "INCYPHER{old_material}") == (
+        "correct",
+        "run-1",
+        0,
+        "a" * 64,
+    )
+    assert not store.reserve_submission("run-1", 1, "INCYPHER{old_material}")
+    assert store.challenge_incorrect_submission_count("run-1", 1) == 0
+    store.finish_control_wave("run-1", 1, 2, "unsolved")
     store.set_challenge_status(1, "unsolved")
     assert store.run_terminal_outcomes("run-1") == {1: "unsolved"}
     store.close()
