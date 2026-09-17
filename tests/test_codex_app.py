@@ -465,6 +465,29 @@ def test_assigned_target_observations_are_source_bound(name: str) -> None:
     assert _source_bound_tool_call(None, name, {})
 
 
+def test_shell_is_source_bound_only_with_declared_challenge_inputs() -> None:
+    assert _source_bound_tool_call(
+        None,
+        "run_shell",
+        {"command": "python solve.py", "source_paths": ["artifacts/input.bin"]},
+    )
+    assert not _source_bound_tool_call(
+        None,
+        "run_shell",
+        {"command": "python solve.py", "source_paths": ["rapido-analysis/guess.txt"]},
+    )
+    assert not _source_bound_tool_call(
+        None,
+        "inspect_artifact",
+        {"path": "rapido-analysis/guess.txt"},
+    )
+    assert not _source_bound_tool_call(
+        None,
+        "decode_base64",
+        {"path": "rapido-analysis/guess.txt"},
+    )
+
+
 def test_exact_computation_is_never_source_bound() -> None:
     assert not _source_bound_tool_call(
         None,
@@ -555,6 +578,116 @@ async def test_source_rooted_artifact_and_transform_results_remain_candidate_evi
     assert state.tool_calls[0]["source_bound"]
     assert state.tool_calls[0]["supplied_candidate_sha256s"] == []
     assert expected in state.tool_calls[0]["candidate_sha256s"]
+    await client.close()
+
+
+@run_async
+@pytest.mark.parametrize("mode", ("literal", "delayed"))
+async def test_shell_candidate_provenance_rejects_model_supplied_laundering(
+    fake_process: FakeProcess,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    candidate = "INCYPHER{model_supplied_shell_value}"
+
+    class ShellRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "run_shell"
+            if mode == "delayed" and candidate in arguments["command"]:
+                return {"stdout": "saved\n", "sources": [{"path": "artifacts/source.txt"}]}
+            return {
+                "stdout": candidate + "\n",
+                "sources": [{"path": "artifacts/source.txt"}],
+            }
+
+    registry = ShellRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    commands = (
+        [f"printf '%s' '{candidate}' > candidate.txt", "cat candidate.txt"]
+        if mode == "delayed"
+        else [f"printf '%s\\n' '{candidate}'"]
+    )
+    for index, command in enumerate(commands):
+        await client._route_message(
+            {
+                "id": 200 + index,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": f"shell-{index}",
+                    "tool": {"name": "run_shell"},
+                    "arguments": {
+                        "command": command,
+                        "source_paths": ["artifacts/source.txt"],
+                    },
+                },
+            }
+        )
+        await asyncio.gather(*client._server_tasks)
+
+    candidate_hash = hashlib.sha256(candidate.encode()).hexdigest()
+    assert candidate_hash in state.tool_calls[0]["supplied_candidate_sha256s"]
+    assert all(candidate_hash not in call["candidate_sha256s"] for call in state.tool_calls)
+    await client.close()
+
+
+@run_async
+async def test_shell_independently_derived_candidate_remains_source_bound(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    candidate = "INCYPHER{shell_derived_from_input}"
+
+    class ShellRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "run_shell"
+            assert candidate not in arguments["command"]
+            return {
+                "stdout": candidate + "\n",
+                "sources": [{"path": "artifacts/source.txt"}],
+            }
+
+    registry = ShellRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 204,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "shell-derived",
+                "tool": {"name": "run_shell"},
+                "arguments": {
+                    "command": "python solve.py ../artifacts/source.txt",
+                    "source_paths": ["artifacts/source.txt"],
+                },
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    candidate_hash = hashlib.sha256(candidate.encode()).hexdigest()
+    assert state.tool_calls[0]["source_bound"]
+    assert state.tool_calls[0]["supplied_candidate_sha256s"] == []
+    assert candidate_hash in state.tool_calls[0]["candidate_sha256s"]
+    assert state.provenance_outputs == []
     await client.close()
 
 

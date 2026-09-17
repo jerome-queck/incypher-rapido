@@ -895,7 +895,8 @@ def test_daybreak_primary_continues_changed_same_session_until_source_bound_cand
     assert follow_up["reason"] == reason
     assert follow_up["remaining_milliseconds"] == 14_000
     initial = runtime.calls[0][0]
-    assert "primary flag solver, not a coordinator" in initial["task"]
+    assert initial["task"].startswith("Capture the flag for this challenge.")
+    assert "same cumulative solve window" in initial["persistent_window"]
     with sqlite3.connect(config.state_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
         assert (

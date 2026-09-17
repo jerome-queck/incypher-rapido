@@ -151,6 +151,10 @@ _ARTIFACT_TOOLS = {
 }
 _TRANSFORM_TOOLS = {"decode_base64", "decode_hex", "decode_url"}
 _TARGET_OBSERVATION_TOOLS = {"http_request", "tcp_open", "tcp_exchange"}
+_EXECUTION_OBSERVATION_TOOLS = {"run_shell"}
+_SOURCE_OBSERVATION_TOOLS = (
+    _ARTIFACT_TOOLS | _TARGET_OBSERVATION_TOOLS | _EXECUTION_OBSERVATION_TOOLS
+)
 _BASE64_TAINT_TOKEN = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
 _URLSAFE_BASE64_TAINT_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}={0,2}(?![A-Za-z0-9_=-])"
@@ -423,17 +427,31 @@ def _artifact_relative_path(value: Any) -> bool:
     )
 
 
+def _controller_source_path(value: Any) -> bool:
+    """Accept immutable challenge inputs, never model-created analysis output."""
+    return _artifact_relative_path(value) and value.replace("\\", "/").split("/")[0] != (
+        "rapido-analysis"
+    )
+
+
 def _source_bound_tool_call(
     state: _TurnState | None, name: str, arguments: Mapping[str, Any]
 ) -> bool:
     canonical = ALIASES.get(name, name)
     if canonical in _TARGET_OBSERVATION_TOOLS:
         return True
-    if canonical in _ARTIFACT_TOOLS and _artifact_relative_path(arguments.get("path")):
+    if canonical in _EXECUTION_OBSERVATION_TOOLS:
+        source_paths = arguments.get("source_paths")
+        return (
+            isinstance(source_paths, list)
+            and bool(source_paths)
+            and all(_controller_source_path(path) for path in source_paths)
+        )
+    if canonical in _ARTIFACT_TOOLS and _controller_source_path(arguments.get("path")):
         return True
     if canonical not in _TRANSFORM_TOOLS or state is None:
         return False
-    if _artifact_relative_path(arguments.get("path")):
+    if _controller_source_path(arguments.get("path")):
         return True
     data = arguments.get("data")
     if not isinstance(data, str):
@@ -751,7 +769,7 @@ def _supplied_candidate_values(name: str, arguments: Mapping[str, Any]) -> set[s
     """Find candidate-shaped model input, including supported transport encodings."""
     values = _argument_strings(arguments)
     canonical = ALIASES.get(name, name)
-    if canonical in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS:
+    if canonical in _SOURCE_OBSERVATION_TOOLS:
         return _target_candidate_taint(arguments)[0]
     # The handler calls this only after source binding. Reversible transform
     # inputs found verbatim in earlier host output therefore remain host-rooted.
@@ -813,7 +831,7 @@ def _target_provenance_output(
     tainted_candidates: set[str],
 ) -> str | None:
     canonical = ALIASES.get(name, name)
-    if canonical not in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS:
+    if canonical not in _SOURCE_OBSERVATION_TOOLS:
         return encoded_result
     taint_fragments = {*tainted_candidates, *tainted_inputs}
     encoded_needles, encoded_scan_complete = _reversibly_encoded_taint_needles(
@@ -1331,7 +1349,9 @@ class CodexAppClient:
         call_tainted_inputs: set[str] = set()
         call_tainted_candidates: set[str] = set()
         source_taint_complete = state.target_taint_complete
-        if source_bound and canonical_name in _TARGET_OBSERVATION_TOOLS:
+        if canonical_name in _EXECUTION_OBSERVATION_TOOLS or (
+            source_bound and canonical_name in _TARGET_OBSERVATION_TOOLS
+        ):
             _expand_target_taint(argument_scan)
             _commit_target_taint(state, argument_scan)
             current_supplied = argument_scan.candidates
@@ -1357,7 +1377,7 @@ class CodexAppClient:
         )
         if (
             source_bound
-            and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+            and canonical_name in _SOURCE_OBSERVATION_TOOLS
             and not supplied_hashes_complete
         ):
             state.target_taint_complete = False
@@ -1370,7 +1390,7 @@ class CodexAppClient:
             "candidate_sensitive": bool(current_supplied)
             or (
                 source_bound
-                and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                and canonical_name in _SOURCE_OBSERVATION_TOOLS
                 and not source_taint_complete
             ),
             "supplied_candidate_sha256s": supplied_hashes,
@@ -1412,10 +1432,7 @@ class CodexAppClient:
             provenance_result: str | None = None
             if source_bound and (
                 canonical_name in _TRANSFORM_TOOLS
-                or (
-                    canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
-                    and source_taint_complete
-                )
+                or (canonical_name in _SOURCE_OBSERVATION_TOOLS and source_taint_complete)
             ):
                 provenance_result = _target_provenance_output(
                     name,
@@ -1428,10 +1445,7 @@ class CodexAppClient:
                     source_taint_complete = False
             if call_record is not None:
                 call_record["success"] = True
-                if (
-                    observation_result is not None
-                    and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
-                ):
+                if observation_result is not None and canonical_name in _SOURCE_OBSERVATION_TOOLS:
                     result_scan = _argument_scan(observation_result)
                     if not result_scan.invalid_unicode:
                         _expand_target_taint(result_scan)
@@ -1454,7 +1468,7 @@ class CodexAppClient:
                     or result_candidates
                     or not result_candidates_complete
                 )
-                if canonical_name in _TARGET_OBSERVATION_TOOLS:
+                if canonical_name in _TARGET_OBSERVATION_TOOLS | _EXECUTION_OBSERVATION_TOOLS:
                     if not result_candidates_complete:
                         state.target_taint_complete = False
                     fragments = {*state.tainted_candidates, *state.tainted_target_inputs}
@@ -1488,15 +1502,17 @@ class CodexAppClient:
                 )
                 if (
                     source_bound
-                    and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                    and canonical_name in _SOURCE_OBSERVATION_TOOLS
                     and not candidate_hashes_complete
                 ):
                     state.target_taint_complete = False
                     source_taint_complete = False
                     candidate_hashes = []
                 call_record["candidate_sha256s"] = candidate_hashes
-            if provenance_result is not None and (
-                canonical_name in _TRANSFORM_TOOLS or source_taint_complete
+            if (
+                provenance_result is not None
+                and canonical_name not in _EXECUTION_OBSERVATION_TOOLS
+                and (canonical_name in _TRANSFORM_TOOLS or source_taint_complete)
             ):
                 encoded_bytes = len(provenance_result.encode("utf-8"))
                 if state.provenance_bytes + encoded_bytes <= MAX_PROVENANCE_BYTES:
@@ -1550,7 +1566,7 @@ class CodexAppClient:
         if call_record is not None:
             if (
                 source_bound
-                and canonical_name in _TARGET_OBSERVATION_TOOLS | _ARTIFACT_TOOLS
+                and canonical_name in _SOURCE_OBSERVATION_TOOLS
                 and not source_taint_complete
             ):
                 call_record["candidate_sensitive"] = True

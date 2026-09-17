@@ -640,7 +640,7 @@ comparison green while independent review is pending.
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: persistent Daybreak primary plus parallel Luna racers implemented; live P20 Recovery already produced two correct solves; final proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
-| Productive bounded resource scaling | E4 measurements and selected profile | in progress: calibration reached 20 simultaneous attempts, 1,362 tools, 92 sampled PIDs, and 347.2 MiB sampled RAM; conversion, not local capacity, dominated; final proof pending |
+| Productive bounded resource scaling | E4 measurements and selected profile | complete offline: committed-source E4 selects 8 native workers while retaining five challenges/P20; 7.568 CPU cores, 16.20 GB RSS, and 188/256 PIDs peaked with zero cgroup limit events and exact cleanup; live conversion proof pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: exact merged image verified through real process loss, same-run continuation, private candidate retention, changed verification, original deadline, durable ordering/memory, effect fencing, and cleanup; final live proof pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
@@ -853,6 +853,63 @@ cover interrupted checkpoints, empty manifests, legacy invalid rows, and observa
 post-normalization quota. Independent Daybreak/xhigh review was clean; Ruff and format are clean,
 and the full local suite passes 799 with one skip. Container/CI evidence remains pending.
 
+### Challenge-native analysis capability
+
+The corrected calibration showed a more basic solve-quality limit than agent count: peers could
+call fixed inspection tools but could not write and execute their own solver programs. Historical
+`ctf-workspace` solve paths were therefore audited through current and pre-purge commits instead of
+copying its install inventory. The resulting
+[`issue-19-ctf-workspace-tool-evidence-2026-09-17.md`](issue-19-ctf-workspace-tool-evidence-2026-09-17.md)
+contains 75 immutable source links and distinguishes tools that contributed to successful
+derivations from paper-installed, unsuccessful, architecture-specific, or unrelated stacks.
+
+The selected implementation adds one general challenge-local Bash capability rather than a wrapper
+per utility. A lane may read its challenge workspace, create and execute persistent scripts only in
+`rapido-analysis`, and use the evidence-backed crypto, math, pwn, reverse, forensics, packet, archive,
+media, PDF, and Android toolchain. Each call names one or more controller-provided challenge inputs;
+the controller durably records their hashes, the command hash, bounded execution facts, and resource
+use. Arbitrary shell output is useful analysis but cannot prove its own dataflow: a shell-only
+candidate stays private and never submits immediately. A fresh Verifier must independently obtain
+the same candidate through a non-shell fixed source/target receipt before it can authorize a Board
+effect. Model-created `rapido-analysis` files cannot become source roots through a later inspector or
+decoder. Exact-session continuations retain the `rapido-analysis` work and typed same-run findings.
+
+The shell is a fixed child boundary, not the credential-bearing Codex process. Landlock hides
+authentication and sibling state, makes the challenge root read-only, and confines writes and
+execution to `rapido-analysis`; seccomp denies networking and supervisor-control syscalls. CPU,
+output, file, descriptor, command, timeout, process-group RSS/task, and global-worker bounds remain explicit. Live
+interaction continues through the challenge-bound HTTP/TCP tools, preserving target allowlisting.
+The worker cap is eight concurrent local analyses with a 2 GiB process-group RSS watchdog each. Actual
+RSS, not summed address-space ceilings, controls safe concurrency; capacity is reserved for the P20
+agents and controller. This is a capacity ceiling, not a RAM-use claim.
+
+The offline E4 pressure protocol compared 4, 6, and 8 native-tool slots under the exact
+8 CPU/24 GiB/256 PID envelope while retaining five challenges and P20 solver admission. It runs
+three mixed Ghidra/JADX/Sage/angr/Hashcat/OpenCV/FFmpeg/forensics rounds per profile, held memory
+and PID phases, adversarial address-space/process-tree gates, and exact cleanup checks. The earlier
+receipt was invalidated when review changed the measured worker and sandbox source. The exact rerun
+used committed source `9a33d6642b31ee756b76fa140e5ca4a6015babef` and image
+`sha256:0af9bb4fd6a06cfda4cc314db39b0b7eb34d8111267decbfbe5694acfacdfc3e`.
+All P4/P6/P8 mixed, held-memory, held-PID, P20 admission, changed-follow-up, adversarial,
+source-immutability, sampler, cgroup-event, and cleanup gates passed in 381.821 seconds. P8 is the
+selected native-tool ceiling: mixed work peaked at 7.568 CPU cores; the held phase peaked at
+16,197,509,120 bytes and 188 PIDs; all memory/PID/OOM event deltas were zero; tracked groups,
+temporary state, child processes, threads, and file descriptors returned exactly to baseline. The
+sanitized receipt is
+[`issue-19-tool-pressure-evidence-2026-09-17.json`](issue-19-tool-pressure-evidence-2026-09-17.json),
+SHA-256 `1bcac3725a7ce7a5ee9fb6810069842c8a6971b09f6dd15c248f15d8265cd254`.
+
+The exact final-container receipt must compile and run a solver program; exercise representative
+Python, Sage, angr, Ghidra, JADX, GDB static/QEMU execution, packet, forensic, archive, media, PDF, and CPU-hashcat
+operations; prove script persistence; and prove credential/sibling-state writes, networking,
+supervisor signalling, and leaked descendants fail. Presence-only version checks do not pass. The
+final committed-source ARM64 image passed both tmpfs and realistic bind-mounted state after all
+review fixes, including real Ghidra `main` decompilation, FFmpeg frame extraction, SleuthKit recovery,
+malformed-PDF detection, exact lattice/relocation work, CPU hashcat, confinement, and exact cleanup.
+The full local suite passes 827 with one skip; Ruff, format, and diff checks are clean. Independent
+review found no remaining P0-P3 findings. Fresh AMD64 acceptance, dual-architecture CI, and live solve
+contribution remain pending.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -919,6 +976,9 @@ and the full local suite passes 799 with one skip. Container/CI evidence remains
 | Same-run recovery edge review | `gpt-daybreak-blue-latest` / `xhigh` | code paths clean; two P2 proof gaps closed with real qualified-candidate process loss and current-run receiptless-instance fencing tests; no fallback |
 | Long-horizon solver research and `ctf-workspace` audit | `gpt-daybreak-blue-latest` / `xhigh` | complete; read-only evidence selects structural persistence and controlled short-prompt/tool-context tests, not framework import or broad fan-out |
 | Candidate-proof repair review | `gpt-daybreak-blue-latest` / `xhigh` | clean; exact candidate/source/non-supplied manifest binding, legacy-row fencing, and quota-omission path independently verified; no fallback |
+| Pressure harness implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; exact resource harness, no fallback |
+| E4 deterministic pressure execution | no inference | complete from committed source and exact image; P4/P6/P8 green, P8 selected, P20 unchanged, 7.568 CPU cores/16.20 GB/188 PIDs peak, zero limit events, exact cleanup |
+| Native shell independent review | requested `gpt-daybreak-blue-latest` / `xhigh` | complete; findings drove provenance, quota, durable evidence, execution, process isolation, semantic tool receipts, and Landlock fixes; final review found no P0-P3, but worker-side effective model metadata was unavailable |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were

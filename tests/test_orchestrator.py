@@ -472,6 +472,33 @@ def config(tmp_path: Path, *, submit: bool = True) -> RuntimeConfig:
     return replace(base, run_seconds=60, attempt_seconds=15, episodes_per_challenge=1)
 
 
+def test_every_lane_receives_source_bound_challenge_context(tmp_path: Path) -> None:
+    item = challenge(7)
+    board = FakeBoard([item])
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}))
+    prepared = asyncio.run(
+        orchestrator._prepare_workspaces(
+            tmp_path / "run",
+            item,
+            0,
+            float("inf"),
+            lane_count=1,
+        )
+    )
+    workspace, paths = prepared[0]
+    assert paths == ["artifacts/.rapido-context.json"]
+    assert json.loads((workspace / paths[0]).read_text()) == {
+        "category": "crypto",
+        "description": "derive the value",
+        "id": 7,
+        "name": "Challenge 7",
+        "type": "standard",
+        "value": 100,
+    }
+    store.close()
+
+
 def test_two_lanes_overlap_agree_submit_once_and_persist_without_plain_candidate(
     tmp_path: Path,
 ) -> None:
@@ -958,6 +985,140 @@ def test_candidate_rejected_when_committed_observation_is_omitted(tmp_path: Path
         (f"{run_id}:1:0:0",),
     ).fetchone()
     assert tuple(manifest) == (0, "quota_omitted", 1)
+    store.close()
+
+
+def test_shell_only_candidate_is_retained_for_verifier_not_immediate_submission(
+    tmp_path: Path,
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class ShellEvidenceRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            candidate = json.loads(turn.text)["candidate"]
+            fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+            turn.tool_calls[0] = {
+                "name": "run_shell",
+                "success": True,
+                "source_bound": True,
+                "candidate_sha256s": [fingerprint],
+                "host_observation": HostObservation(
+                    "run_shell",
+                    True,
+                    True,
+                    candidate_sha256s=(fingerprint,),
+                ),
+            }
+            return turn
+
+    answer = "INCYPHER{shell_requires_fresh_verifier}"
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    run_id = "shell-proof-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    store.start_control_wave(run_id, 1, 0)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+    submitted: list[str] = []
+
+    async def submit(candidate: str) -> str:
+        submitted.append(candidate)
+        return "solved"
+
+    result = asyncio.run(
+        AdaptiveOrchestrator(
+            cfg, FakeBoard([challenge(1)]), store, ShellEvidenceRuntime({1: {0: answer}})
+        )._lane(
+            run_id,
+            challenge(1),
+            0,
+            0,
+            workspace,
+            [],
+            10,
+            route=route,
+            candidate_submitter=submit,
+        )
+    )
+
+    assert result.terminal_status == "candidate"
+    assert result.submission_status is None
+    assert submitted == []
+    assert store.candidate_counts(run_id) == (1, 0)
+    store.close()
+
+
+def test_verifier_shell_only_candidate_reports_fixed_observation_requirement(
+    tmp_path: Path,
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class ShellEvidenceRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            candidate = json.loads(turn.text)["candidate"]
+            fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+            turn.tool_calls[0] = {
+                "name": "run_shell",
+                "success": True,
+                "source_bound": True,
+                "candidate_sha256s": [fingerprint],
+                "host_observation": HostObservation(
+                    "run_shell",
+                    True,
+                    True,
+                    candidate_sha256s=(fingerprint,),
+                ),
+            }
+            return turn
+
+    answer = "INCYPHER{verifier_needs_fixed_observation}"
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    run_id = "verifier-shell-proof-run"
+    route = replace(
+        baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15),
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    store.start_control_wave(run_id, 1, 0)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+
+    result = asyncio.run(
+        AdaptiveOrchestrator(
+            cfg, FakeBoard([challenge(1)]), store, ShellEvidenceRuntime({1: {0: answer}})
+        )._lane(
+            run_id,
+            challenge(1),
+            0,
+            0,
+            workspace,
+            [],
+            10,
+            route=route,
+        )
+    )
+
+    assert result.terminal_status == "unsolved"
+    failure = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    assert '"reason":"candidate_provenance"' in failure["data_json"]
+    assert '"subreason":"verifier_requires_fixed_observation"' in failure["data_json"]
     store.close()
 
 

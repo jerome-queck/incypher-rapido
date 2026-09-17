@@ -243,9 +243,16 @@ class _Runtime:
 
     def _read_source(self, workspace: Path, document: dict[str, object]) -> dict[str, str]:
         artifacts = document.get("workspace_artifacts")
-        if not isinstance(artifacts, list) or len(artifacts) != 1:
+        if not isinstance(artifacts, list):
+            raise TypeError("fixture artifact scope changed")
+        challenge_artifacts = [
+            path
+            for path in artifacts
+            if isinstance(path, str) and not path.endswith("/.rapido-context.json")
+        ]
+        if len(challenge_artifacts) != 1:
             raise AssertionError("fixture artifact scope changed")
-        artifact = (workspace / str(artifacts[0])).resolve()
+        artifact = (workspace / challenge_artifacts[0]).resolve()
         if not artifact.is_relative_to(workspace.resolve()):
             raise AssertionError("fixture artifact escaped the lane workspace")
         decoded = json.loads(artifact.read_text(encoding="ascii"))

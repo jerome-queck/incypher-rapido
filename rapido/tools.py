@@ -171,9 +171,9 @@ class Workspace:
     def ensure_capacity(self, additional_bytes: int = 0) -> None:
         if additional_bytes < 0:
             raise _error("invalid_argument", "additional workspace bytes cannot be negative")
+        _, current = self.snapshot()
         if self.max_workspace_bytes is None:
             return
-        _, current = self.snapshot()
         if current + additional_bytes > self.max_workspace_bytes:
             raise _error(
                 "workspace_quota",
@@ -1424,6 +1424,60 @@ def inspect_filesystem(workspace: Workspace, arguments: Mapping[str, Any]) -> di
     return _result(record)
 
 
+def run_shell(workspace: Workspace, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Run arbitrary local analysis without exposing credentials, Board state, or networking."""
+    from .analysis_worker import MAX_COMMAND_BYTES, MAX_TIMEOUT_SECONDS, run_analysis_worker
+
+    command = _bounded_text(arguments.get("command"), "command", MAX_COMMAND_BYTES)
+    timeout_seconds = _bounded_int(
+        arguments.get("timeout_seconds"),
+        "timeout_seconds",
+        1,
+        MAX_TIMEOUT_SECONDS,
+        60,
+    )
+    raw_sources = arguments.get("source_paths")
+    if (
+        not isinstance(raw_sources, list)
+        or not 1 <= len(raw_sources) <= 16
+        or any(not isinstance(path, str) for path in raw_sources)
+    ):
+        raise _error("invalid_argument", "source_paths must contain 1 to 16 workspace files")
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in raw_sources:
+        path = _bounded_text(raw_path, "source path")
+        parts = workspace._parts(path)
+        if not parts or parts[0] == "rapido-analysis":
+            raise _error(
+                "invalid_argument",
+                "source_paths must identify controller-provided or derived challenge inputs",
+            )
+        normalized = "/".join(parts)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        manifest = inspect_file(workspace, {"path": normalized, "algorithms": ["sha256"]})
+        sources.append(
+            {
+                "path": normalized,
+                "bytes": manifest["size"],
+                "sha256": manifest["hashes"]["sha256"],
+            }
+        )
+    if not sources:
+        raise _error("invalid_argument", "source_paths must contain a unique challenge input")
+    result = run_analysis_worker(workspace.root, command, timeout_seconds)
+    return _result(
+        {
+            **result,
+            "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            "sources": sources,
+            "analysis_directory": "rapido-analysis",
+        }
+    )
+
+
 ToolFunction = Callable[[Workspace, Mapping[str, Any]], dict[str, Any]]
 
 TOOLS: dict[str, tuple[ToolFunction, str]] = {
@@ -1485,6 +1539,10 @@ TOOLS: dict[str, tuple[ToolFunction, str]] = {
         inspect_filesystem,
         "Inspect ext-family images with fixed read-only superblock, directory, deleted-file, stat, or read operations.",
     ),
+    "run_shell": (
+        run_shell,
+        "Run arbitrary Bash and create reusable solve scripts in rapido-analysis inside this challenge workspace. The main Python has crypto, algebra/SMT, pwn/ELF/emulation, packet, image, PDF, and HTTP libraries; /opt/angr/bin/python and /opt/math/bin/python provide isolated symbolic-execution and lattice environments. SageMath, Ghidra headless, JADX, compilers, GDB static inspection, QEMU execution, packet/forensics/archive/media/PDF tools, and CPU hashcat are on PATH. Declare challenge input files in source_paths. The shell reads this challenge workspace and writes rapido-analysis, but cannot read credentials or sibling state, signal supervisors, or directly network; use bound target tools for live interaction. A verifier may derive a candidate here, but must also observe that exact candidate through a successful non-run_shell fixed source or target tool before it qualifies.",
+    ),
 }
 
 # Friendly short aliases are useful for tiny clients, while canonical names remain
@@ -1515,6 +1573,7 @@ AGENT_TOOL_NAMES = (
     "decompress_gzip",
     "elf_symbols",
     "inspect_filesystem",
+    "run_shell",
 )
 
 
@@ -1581,6 +1640,22 @@ def tool_schemas() -> list[dict[str, Any]]:
             },
             "filesystem_path": {"type": "string"},
         },
+        "run_shell": {
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "description": "Bash command. The current directory is persistent rapido-analysis; challenge files are readable as ../<workspace-relative-path>.",
+            },
+            "source_paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": common_path,
+                "description": "Controller-provided or derived challenge inputs used by the command; rapido-analysis files are not valid source roots.",
+            },
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 180},
+        },
     }
     extension_specs = {
         spec["name"]: spec
@@ -1607,6 +1682,7 @@ def tool_schemas() -> list[dict[str, Any]]:
         "audio_metadata": ["path"],
         "inspect_binary": ["path"],
         "inspect_filesystem": ["path"],
+        "run_shell": ["command", "source_paths"],
     }
 
     def generic_spec(name: str, description: str) -> dict[str, Any]:
@@ -1721,6 +1797,65 @@ class ToolRegistry:
                 # Never recurse through an unexpected entry during error recovery.
                 continue
 
+    def _rollback_manifest(self, entries: set[str]) -> dict[str, tuple[int, int]]:
+        manifest: dict[str, tuple[int, int]] = {}
+        for relative in entries:
+            path = self.workspace.root.joinpath(*relative.split("/"))
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise _error("path_unavailable", "workspace rollback state is unavailable") from exc
+            manifest[relative] = (
+                stat.S_IFMT(metadata.st_mode),
+                metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0,
+            )
+        return manifest
+
+    def _restore_run_shell_capacity(self, before: dict[str, tuple[int, int]]) -> None:
+        """Remove new residue and undo file growth without trusting bounded snapshot()."""
+        failures = 0
+        for directory, directories, files in os.walk(
+            self.workspace.root, topdown=False, followlinks=False
+        ):
+            base = Path(directory)
+            for name in [*files, *directories]:
+                path = base / name
+                relative = path.relative_to(self.workspace.root).as_posix()
+                if relative in before:
+                    continue
+                try:
+                    mode = path.lstat().st_mode
+                    path.rmdir() if stat.S_ISDIR(mode) else path.unlink()
+                except OSError:
+                    failures += 1
+        for relative, (original_kind, original_size) in before.items():
+            path = self.workspace.root.joinpath(*relative.split("/"))
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                failures += 1
+                continue
+            current_kind = stat.S_IFMT(metadata.st_mode)
+            try:
+                if original_kind == stat.S_IFREG and current_kind == stat.S_IFREG:
+                    if metadata.st_size > original_size:
+                        os.truncate(path, original_size)
+                elif original_kind != current_kind:
+                    path.rmdir() if stat.S_ISDIR(metadata.st_mode) else path.unlink()
+            except OSError:
+                failures += 1
+        if failures:
+            raise _error("tool_cleanup_failed", "analysis quota cleanup was incomplete")
+        try:
+            self.workspace.snapshot()
+            self.workspace.ensure_capacity()
+        except ToolError as exc:
+            raise _error(
+                "tool_cleanup_failed", "analysis quota cleanup did not restore capacity"
+            ) from exc
+
     def dynamic_tools(self) -> list[dict[str, Any]]:
         return [dict(spec) for spec in self._tools]
 
@@ -1741,15 +1876,24 @@ class ToolRegistry:
         canonical = ALIASES.get(name, name) if isinstance(name, str) else name
         with self._dispatch_lock:
             before: set[str] | None = None
+            shell_before: dict[str, tuple[int, int]] | None = None
             if canonical == "extract_archive":
                 before, _ = self.workspace.snapshot()
+            elif canonical == "run_shell":
+                entries, _ = self.workspace.snapshot()
+                shell_before = self._rollback_manifest(entries)
             try:
                 result = dispatch(self.workspace, name, arguments)
                 self.workspace.ensure_capacity()
                 return result
-            except BaseException:
-                if before is not None:
-                    self._remove_added_entries(before)
+            except BaseException as exc:
+                try:
+                    if shell_before is not None:
+                        self._restore_run_shell_capacity(shell_before)
+                    elif before is not None:
+                        self._remove_added_entries(before)
+                except ToolError as cleanup:
+                    raise cleanup from exc
                 raise
 
     def call(self, name: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
