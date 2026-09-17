@@ -305,6 +305,7 @@ def _config(root: Path, arm: str) -> RuntimeConfig:
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
             "RAPIDO_PEER_PROFILE": "uniform_v1",
             "RAPIDO_MEMORY_ARM": "lane_local_v1",
+            "RAPIDO_WATCH_BOARD": "false",
         }
     )
     return replace(

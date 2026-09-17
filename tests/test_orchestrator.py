@@ -467,6 +467,7 @@ def config(tmp_path: Path, *, submit: bool = True) -> RuntimeConfig:
             "RAPIDO_CONCURRENCY": "4",
             "RAPIDO_PEER_PROFILE": "uniform_v1",
             "RAPIDO_MEMORY_ARM": "lane_local_v1",
+            "RAPIDO_WATCH_BOARD": "false",
         }
     )
     return replace(base, run_seconds=60, attempt_seconds=15, episodes_per_challenge=1)
@@ -479,6 +480,7 @@ def test_every_lane_receives_source_bound_challenge_context(tmp_path: Path) -> N
     orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}))
     prepared = asyncio.run(
         orchestrator._prepare_workspaces(
+            "run",
             tmp_path / "run",
             item,
             0,

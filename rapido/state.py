@@ -11,7 +11,7 @@ import stat
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -171,6 +171,7 @@ class StateStore:
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
                 at TEXT NOT NULL,
                 candidate_sha256 TEXT NOT NULL,
+                context_episode INTEGER NOT NULL DEFAULT 0,
                 outcome TEXT NOT NULL,
                 http_status INTEGER NOT NULL
             );
@@ -178,6 +179,7 @@ class StateStore:
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
                 candidate_sha256 TEXT NOT NULL,
                 first_run_id TEXT NOT NULL REFERENCES runs(id),
+                context_episode INTEGER NOT NULL DEFAULT 0,
                 reserved_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -209,6 +211,7 @@ class StateStore:
                 catalogue_rank INTEGER NOT NULL,
                 executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
                 context_sha256 TEXT,
+                context_episode INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(run_id, challenge_id),
                 UNIQUE(run_id, catalogue_rank)
             );
@@ -367,6 +370,29 @@ class StateStore:
                     source_attempt_id, run_id, challenge_id, role, candidate_key
                   )
             );
+            CREATE TABLE IF NOT EXISTS candidate_verification_history (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
+                producer_attempt_id TEXT NOT NULL,
+                producer_role TEXT NOT NULL,
+                verifier_attempt_id TEXT NOT NULL,
+                verifier_role TEXT NOT NULL,
+                recipe_kind TEXT NOT NULL,
+                verified_at TEXT NOT NULL,
+                retired_context_episode INTEGER NOT NULL,
+                retired_at TEXT NOT NULL,
+                UNIQUE(
+                  run_id, challenge_id, candidate_key, producer_attempt_id, verifier_attempt_id
+                )
+            );
+            CREATE TRIGGER IF NOT EXISTS candidate_verification_history_no_update
+            BEFORE UPDATE ON candidate_verification_history
+            BEGIN SELECT RAISE(ABORT, 'candidate verification history is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS candidate_verification_history_no_delete
+            BEFORE DELETE ON candidate_verification_history
+            BEGIN SELECT RAISE(ABORT, 'candidate verification history is immutable'); END;
             """
         )
         self._connection.execute(
@@ -413,6 +439,27 @@ class StateStore:
         }
         if "context_sha256" not in catalogue_columns:
             self._connection.execute("ALTER TABLE control_catalogue ADD COLUMN context_sha256 TEXT")
+        if "context_episode" not in catalogue_columns:
+            self._connection.execute(
+                "ALTER TABLE control_catalogue ADD COLUMN context_episode INTEGER NOT NULL DEFAULT 0"
+            )
+        submission_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(submissions)").fetchall()
+        }
+        if "context_episode" not in submission_columns:
+            self._connection.execute(
+                "ALTER TABLE submissions ADD COLUMN context_episode INTEGER NOT NULL DEFAULT 0"
+            )
+        intent_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(submission_intents)").fetchall()
+        }
+        if "context_episode" not in intent_columns:
+            self._connection.execute(
+                "ALTER TABLE submission_intents "
+                "ADD COLUMN context_episode INTEGER NOT NULL DEFAULT 0"
+            )
         origin_columns = {
             str(row["name"])
             for row in self._connection.execute(
@@ -1283,6 +1330,9 @@ class StateStore:
             """
             SELECT proposal.source_attempt_id, proposal.role
             FROM candidate_proposals AS proposal
+            JOIN control_catalogue AS catalogue
+              ON catalogue.run_id=proposal.run_id
+             AND catalogue.challenge_id=proposal.challenge_id
             JOIN attempts AS attempt ON attempt.id=proposal.source_attempt_id
             JOIN candidate_evidence_proofs AS producer_proof
               ON producer_proof.source_attempt_id=proposal.source_attempt_id
@@ -1303,6 +1353,7 @@ class StateStore:
              AND verifier_manifest.attempt_id=verifier_proof.source_attempt_id
              AND verifier_manifest.digest=verifier_proof.manifest_digest
             WHERE proposal.run_id=? AND proposal.challenge_id=?
+              AND proposal.episode>=catalogue.context_episode
               AND proposal.role IN ('specialist', 'recovery')
               AND proposal.candidate_key=? AND proposal.candidate=?
               AND attempt.status='candidate'
@@ -1416,7 +1467,11 @@ class StateStore:
                     """
                     SELECT COUNT(DISTINCT proposal.candidate_key)
                     FROM candidate_proposals AS proposal
+                    JOIN control_catalogue AS catalogue
+                      ON catalogue.run_id=proposal.run_id
+                     AND catalogue.challenge_id=proposal.challenge_id
                     WHERE proposal.run_id=? AND proposal.challenge_id=?
+                      AND proposal.episode>=catalogue.context_episode
                       AND proposal.role IN ('specialist', 'recovery')
                       AND NOT EXISTS (
                         SELECT 1 FROM candidate_verifications AS verification
@@ -1448,6 +1503,9 @@ class StateStore:
                 FROM candidate_verifications AS verification
                 JOIN candidate_proposals AS proposal
                   ON proposal.source_attempt_id=verification.producer_attempt_id
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=proposal.run_id
+                 AND catalogue.challenge_id=proposal.challenge_id
                 JOIN candidate_evidence_proofs AS producer_proof
                   ON producer_proof.source_attempt_id=verification.producer_attempt_id
                  AND producer_proof.run_id=verification.run_id
@@ -1459,6 +1517,7 @@ class StateStore:
                  AND verifier_proof.challenge_id=verification.challenge_id
                  AND verifier_proof.candidate_key=verification.candidate_key
                 WHERE verification.run_id=? AND verification.challenge_id=?
+                  AND proposal.episode>=catalogue.context_episode
                 ORDER BY verification.verified_at, verification.candidate_key
                 """,
                 (run_id, challenge_id),
@@ -1487,6 +1546,9 @@ class StateStore:
                 FROM candidate_verifications AS verification
                 JOIN candidate_proposals AS producer
                   ON producer.source_attempt_id=verification.producer_attempt_id
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=producer.run_id
+                 AND catalogue.challenge_id=producer.challenge_id
                 JOIN candidate_evidence_proofs AS producer_proof
                   ON producer_proof.source_attempt_id=verification.producer_attempt_id
                  AND producer_proof.run_id=verification.run_id
@@ -1498,6 +1560,7 @@ class StateStore:
                  AND verifier_proof.challenge_id=verification.challenge_id
                  AND verifier_proof.candidate_key=verification.candidate_key
                 WHERE verification.run_id=? AND verification.challenge_id=?
+                  AND producer.episode>=catalogue.context_episode
                 """,
                 (candidate_key, encoded, run_id, challenge_id),
             ).fetchone()
@@ -1651,7 +1714,7 @@ class StateStore:
         run_id: str,
         entries: list[tuple[int, int, bool]],
         lanes: int,
-        route: RouteSpec,
+        route: RouteSpec | dict[int, RouteSpec],
         assignments: Sequence[tuple[str, str, str]],
         context_sha256s: dict[int, str] | None = None,
     ) -> None:
@@ -1664,11 +1727,17 @@ class StateStore:
             for digest in contexts.values()
         ):
             raise ValueError("catalogue context identity is invalid")
+        if isinstance(route, dict):
+            executable_ids = {challenge_id for _, challenge_id, executable in entries if executable}
+            if set(route) != executable_ids or any(
+                not isinstance(item, RouteSpec) for item in route.values()
+            ):
+                raise ValueError("catalogue routes are incomplete")
         with self.transaction() as connection:
             connection.executemany(
                 "INSERT INTO control_catalogue("
-                "run_id, challenge_id, catalogue_rank, executable, context_sha256) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "run_id, challenge_id, catalogue_rank, executable, context_sha256, context_episode) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
                 [
                     (
                         run_id,
@@ -1682,6 +1751,7 @@ class StateStore:
             )
             for catalogue_rank, challenge_id, executable in entries:
                 if executable:
+                    selected_route = route[challenge_id] if isinstance(route, dict) else route
                     self._admit_control_wave(
                         connection,
                         run_id,
@@ -1689,10 +1759,159 @@ class StateStore:
                         0,
                         catalogue_rank,
                         lanes,
-                        route,
+                        selected_route,
                         assignments,
                         require_unused_route=False,
                     )
+
+    def admit_control_catalogue_revision(
+        self,
+        *,
+        run_id: str,
+        challenge_id: int,
+        name: str,
+        category: str,
+        challenge_type: str,
+        value: int,
+        executable: bool,
+        context_sha256: str,
+        new_catalogue_rank: int,
+        lanes: int,
+        route: RouteSpec,
+        assignments: Sequence[tuple[str, str, str]],
+    ) -> tuple[str, int | None, int]:
+        """Atomically append new work or admit one materially refreshed challenge wave."""
+        if (
+            type(challenge_id) is not int
+            or challenge_id <= 0
+            or type(new_catalogue_rank) is not int
+            or new_catalogue_rank < 0
+            or len(context_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in context_sha256)
+        ):
+            raise ValueError("catalogue revision is invalid")
+        with self.transaction() as connection:
+            run = connection.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None or str(run["status"]) != "running":
+                raise ValueError("catalogue revision requires a running run")
+            existing = connection.execute(
+                "SELECT catalogue_rank, context_sha256 FROM control_catalogue "
+                "WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+            if existing is not None and str(existing["context_sha256"]) == context_sha256:
+                return "unchanged", None, int(existing["catalogue_rank"])
+            connection.execute(
+                """
+                INSERT INTO challenges(id, name, category, challenge_type, value, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  name=excluded.name, category=excluded.category,
+                  challenge_type=excluded.challenge_type, value=excluded.value,
+                  status='queued', updated_at=excluded.updated_at
+                """,
+                (challenge_id, name, category, challenge_type, value, self._now()),
+            )
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO control_catalogue("
+                    "run_id, challenge_id, catalogue_rank, executable, context_sha256, "
+                    "context_episode) VALUES (?, ?, ?, ?, ?, 0)",
+                    (
+                        run_id,
+                        challenge_id,
+                        new_catalogue_rank,
+                        int(executable),
+                        context_sha256,
+                    ),
+                )
+                kind = "appended"
+                episode = 0
+                catalogue_rank = new_catalogue_rank
+            else:
+                kind = "refreshed"
+                catalogue_rank = int(existing["catalogue_rank"])
+                episode = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(episode), -1) + 1 FROM control_jobs "
+                        "WHERE run_id=? AND challenge_id=?",
+                        (run_id, challenge_id),
+                    ).fetchone()[0]
+                )
+                outstanding = connection.execute(
+                    "SELECT DISTINCT episode FROM control_jobs "
+                    "WHERE run_id=? AND challenge_id=? AND state IN ('queued', 'running') "
+                    "ORDER BY episode",
+                    (run_id, challenge_id),
+                ).fetchall()
+                for row in outstanding:
+                    self._finish_control_wave(
+                        connection,
+                        run_id,
+                        challenge_id,
+                        int(row["episode"]),
+                        "error",
+                    )
+                if outstanding:
+                    self._control_event(
+                        connection,
+                        run_id,
+                        "catalogue_revision_superseded",
+                        None,
+                        {
+                            "challenge_id": challenge_id,
+                            "episodes": [int(row["episode"]) for row in outstanding],
+                        },
+                    )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO candidate_verification_history(
+                      run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
+                      verifier_attempt_id, verifier_role, recipe_kind, verified_at,
+                      retired_context_episode, retired_at
+                    )
+                    SELECT run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
+                           verifier_attempt_id, verifier_role, recipe_kind, verified_at, ?, ?
+                    FROM candidate_verifications WHERE run_id=? AND challenge_id=?
+                    """,
+                    (episode, self._now(), run_id, challenge_id),
+                )
+                connection.execute(
+                    "DELETE FROM candidate_verifications WHERE run_id=? AND challenge_id=?",
+                    (run_id, challenge_id),
+                )
+                connection.execute(
+                    "UPDATE control_catalogue SET executable=?, context_sha256=?, context_episode=? "
+                    "WHERE run_id=? AND challenge_id=?",
+                    (int(executable), context_sha256, episode, run_id, challenge_id),
+                )
+            admitted_episode: int | None = episode if executable else None
+            if executable:
+                revised_route = replace(route, workspace_generation=episode)
+                self._admit_control_wave(
+                    connection,
+                    run_id,
+                    challenge_id,
+                    episode,
+                    catalogue_rank,
+                    lanes,
+                    revised_route,
+                    assignments,
+                    require_unused_route=kind == "refreshed",
+                )
+            self._control_event(
+                connection,
+                run_id,
+                f"catalogue_{kind}",
+                None,
+                {
+                    "challenge_id": challenge_id,
+                    "catalogue_rank": catalogue_rank,
+                    "episode": admitted_episode,
+                    "executable": executable,
+                },
+            )
+            return kind, admitted_episode, catalogue_rank
 
     def control_catalogue_entries(self, run_id: str) -> list[tuple[int, int, bool]]:
         with self._lock:
@@ -1751,6 +1970,55 @@ class StateStore:
         ):
             raise ValueError("durable catalogue context identity is invalid")
         return contexts
+
+    def control_catalogue_context_episode(self, run_id: str, challenge_id: int) -> int:
+        """Return the first episode allowed to consume current-material memory."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+        if row is None or type(row["context_episode"]) is not int or row["context_episode"] < 0:
+            raise ValueError("durable catalogue context episode is invalid")
+        return int(row["context_episode"])
+
+    def bind_control_catalogue_material(
+        self,
+        run_id: str,
+        challenge_id: int,
+        expected_sha256: str,
+        material_sha256: str,
+    ) -> bool:
+        """Bind the current generation to the exact attachment bytes used by its lanes."""
+        for digest in (expected_sha256, material_sha256):
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("catalogue material identity is invalid")
+        with self.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE control_catalogue SET context_sha256=?
+                WHERE run_id=? AND challenge_id=? AND context_sha256=?
+                """,
+                (material_sha256, run_id, challenge_id, expected_sha256),
+            ).rowcount
+            if changed:
+                self._control_event(
+                    connection,
+                    run_id,
+                    "catalogue_material_bound",
+                    None,
+                    {"challenge_id": challenge_id},
+                )
+                return True
+            current = connection.execute(
+                "SELECT context_sha256 FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+            if current is None:
+                raise ValueError("catalogue material challenge is absent")
+            if str(current["context_sha256"]) == material_sha256:
+                return False
+            raise ValueError("challenge attachment bytes changed within one material generation")
 
     def queued_control_waves(
         self, run_id: str, *, exclude_pending_submissions: bool = False
@@ -1821,7 +2089,11 @@ class StateStore:
                   ON jobs.run_id=origin.run_id
                  AND jobs.challenge_id=origin.challenge_id
                  AND jobs.episode=origin.episode
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=origin.run_id
+                 AND catalogue.challenge_id=origin.challenge_id
                 WHERE origin.run_id=?
+                  AND origin.episode>=catalogue.context_episode
                   AND NOT EXISTS (
                     SELECT 1 FROM control_route_decisions AS decision
                     WHERE decision.run_id=origin.run_id
@@ -1832,12 +2104,14 @@ class StateStore:
                     SELECT 1 FROM submissions AS submission
                     WHERE submission.run_id=origin.run_id
                       AND submission.challenge_id=origin.challenge_id
+                      AND submission.context_episode=catalogue.context_episode
                       AND submission.outcome='correct'
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM submission_intents AS intent
                     WHERE intent.first_run_id=origin.run_id
                       AND intent.challenge_id=origin.challenge_id
+                      AND intent.context_episode=catalogue.context_episode
                       AND intent.status='correct'
                   )
                 GROUP BY origin.challenge_id, origin.episode
@@ -1885,9 +2159,15 @@ class StateStore:
     def recovery_dispatch_count(self, run_id: str, challenge_id: int) -> int:
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) AS count FROM control_route_decisions "
-                "WHERE run_id=? AND challenge_id=? AND failure_kind='container' "
-                "AND failure_subreason='process_restart' AND disposition='dispatch'",
+                "SELECT COUNT(*) AS count FROM control_route_decisions AS decision "
+                "JOIN control_catalogue AS catalogue "
+                "ON catalogue.run_id=decision.run_id "
+                "AND catalogue.challenge_id=decision.challenge_id "
+                "WHERE decision.run_id=? AND decision.challenge_id=? "
+                "AND decision.source_episode>=catalogue.context_episode "
+                "AND decision.failure_kind='container' "
+                "AND decision.failure_subreason='process_restart' "
+                "AND decision.disposition='dispatch'",
                 (run_id, challenge_id),
             ).fetchone()
         return int(row["count"])
@@ -1902,11 +2182,13 @@ class StateStore:
                          SELECT 1 FROM submissions AS submission
                          WHERE submission.run_id=catalogue.run_id
                            AND submission.challenge_id=catalogue.challenge_id
+                           AND submission.context_episode=catalogue.context_episode
                            AND submission.outcome='correct'
                        ) OR EXISTS(
                          SELECT 1 FROM submission_intents AS intent
                          WHERE intent.first_run_id=catalogue.run_id
                            AND intent.challenge_id=catalogue.challenge_id
+                           AND intent.context_episode=catalogue.context_episode
                            AND intent.status='correct'
                        ) AS correct
                 FROM control_catalogue AS catalogue
@@ -2684,6 +2966,8 @@ class StateStore:
         terminal: str,
         attempts_remaining: bool,
         remaining_milliseconds: int,
+        unresolved_challenge_count: int = 1,
+        parallel_challenge_count: int = 1,
     ) -> RouteDecision | None:
         route_rows = connection.execute(
             """
@@ -2716,7 +3000,11 @@ class StateStore:
                 """
                 SELECT COUNT(DISTINCT proposal.candidate_key)
                 FROM candidate_proposals AS proposal
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=proposal.run_id
+                 AND catalogue.challenge_id=proposal.challenge_id
                 WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND proposal.episode>=catalogue.context_episode
                   AND proposal.role IN ('specialist', 'recovery')
                   AND NOT EXISTS (
                     SELECT 1 FROM candidate_verifications AS verification
@@ -2759,13 +3047,18 @@ class StateStore:
                 """
                 SELECT 1
                 FROM candidate_proposals AS proposal
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=proposal.run_id
+                 AND catalogue.challenge_id=proposal.challenge_id
                 JOIN submission_intents AS intent
                   ON intent.challenge_id=proposal.challenge_id
                  AND intent.candidate_sha256=lower(hex(proposal.candidate_key))
                 WHERE proposal.run_id=? AND proposal.challenge_id=?
                   AND proposal.episode=?
                   AND proposal.role IN ('specialist', 'recovery')
-                  AND intent.first_run_id=? AND intent.status='incorrect'
+                  AND intent.first_run_id=?
+                  AND intent.context_episode=catalogue.context_episode
+                  AND intent.status='incorrect'
                 LIMIT 1
                 """,
                 (run_id, challenge_id, source_episode, run_id),
@@ -2822,9 +3115,14 @@ class StateStore:
             )
             timeout_recovery_used = (
                 connection.execute(
-                    "SELECT 1 FROM control_route_decisions "
-                    "WHERE run_id=? AND challenge_id=? "
-                    "AND rule_id='typed_timeout_recovery_v1' AND disposition='dispatch'",
+                    "SELECT 1 FROM control_route_decisions AS decision "
+                    "JOIN control_catalogue AS catalogue "
+                    "ON catalogue.run_id=decision.run_id "
+                    "AND catalogue.challenge_id=decision.challenge_id "
+                    "WHERE decision.run_id=? AND decision.challenge_id=? "
+                    "AND decision.source_episode>=catalogue.context_episode "
+                    "AND decision.rule_id='typed_timeout_recovery_v1' "
+                    "AND decision.disposition='dispatch'",
                     (run_id, challenge_id),
                 ).fetchone()
                 is not None
@@ -2840,6 +3138,8 @@ class StateStore:
                 instances_safe=instances_safe,
                 durable_observation_count=durable_observation_count,
                 timeout_recovery_used=timeout_recovery_used,
+                unresolved_challenge_count=unresolved_challenge_count,
+                parallel_challenge_count=parallel_challenge_count,
             )
         )
         successor_fingerprint = (
@@ -2976,6 +3276,8 @@ class StateStore:
         terminal: str,
         attempts_remaining: bool,
         remaining_milliseconds: int,
+        unresolved_challenge_count: int = 1,
+        parallel_challenge_count: int = 1,
     ) -> RouteDecision | None:
         """Close a wave, decide, record, and admit its successor in one transaction."""
         with self.transaction() as connection:
@@ -2991,6 +3293,8 @@ class StateStore:
                 terminal=terminal,
                 attempts_remaining=attempts_remaining,
                 remaining_milliseconds=remaining_milliseconds,
+                unresolved_challenge_count=unresolved_challenge_count,
+                parallel_challenge_count=parallel_challenge_count,
             )
 
     @classmethod
@@ -3394,22 +3698,29 @@ class StateStore:
         fingerprint = self._candidate_fingerprint(candidate)
         with self.transaction() as connection:
             now = self._now()
+            catalogue = connection.execute(
+                "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+            context_episode = 0 if catalogue is None else int(catalogue["context_episode"])
             changed = connection.execute(
                 """
                 INSERT OR IGNORE INTO submission_intents(
-                    challenge_id, candidate_sha256, first_run_id, reserved_at, status, updated_at
-                ) VALUES (?, ?, ?, ?, 'pending', ?)
+                    challenge_id, candidate_sha256, first_run_id, context_episode,
+                    reserved_at, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
                 """,
-                (challenge_id, fingerprint, run_id, now, now),
+                (challenge_id, fingerprint, run_id, context_episode, now, now),
             ).rowcount
             if changed == 0:
                 changed = connection.execute(
                     """
                     UPDATE submission_intents
-                    SET first_run_id=?, reserved_at=?, status='pending', updated_at=?
+                    SET first_run_id=?, context_episode=?, reserved_at=?,
+                        status='pending', updated_at=?
                     WHERE challenge_id=? AND candidate_sha256=? AND status='not_delivered'
                     """,
-                    (run_id, now, now, challenge_id, fingerprint),
+                    (run_id, context_episode, now, now, challenge_id, fingerprint),
                 ).rowcount
         return changed == 1
 
@@ -3498,22 +3809,45 @@ class StateStore:
             raise ValueError("invalid submission outcome")
         fingerprint = self._candidate_fingerprint(candidate)
         with self.transaction() as connection:
+            catalogue = connection.execute(
+                "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=?",
+                (run_id, challenge_id),
+            ).fetchone()
+            context_episode = 0 if catalogue is None else int(catalogue["context_episode"])
+            intent = connection.execute(
+                "SELECT context_episode FROM submission_intents "
+                "WHERE challenge_id=? AND candidate_sha256=? "
+                "AND first_run_id=? AND context_episode=? AND status='pending'",
+                (challenge_id, fingerprint, run_id, context_episode),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("submission intent is absent, settled, or owned by a prior effect")
             changed = connection.execute(
                 """
                 UPDATE submission_intents SET status=?, updated_at=?
-                WHERE challenge_id=? AND candidate_sha256=? AND status='pending'
+                WHERE challenge_id=? AND candidate_sha256=?
+                  AND first_run_id=? AND context_episode=? AND status='pending'
                 """,
-                (outcome, self._now(), challenge_id, fingerprint),
+                (outcome, self._now(), challenge_id, fingerprint, run_id, context_episode),
             ).rowcount
             if changed != 1:
                 raise ValueError("submission intent is absent, settled, or owned by a prior effect")
             cursor = connection.execute(
                 """
                 INSERT INTO submissions(
-                    run_id, challenge_id, at, candidate_sha256, outcome, http_status
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    run_id, challenge_id, at, candidate_sha256, context_episode,
+                    outcome, http_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, challenge_id, self._now(), fingerprint, outcome, http_status),
+                (
+                    run_id,
+                    challenge_id,
+                    self._now(),
+                    fingerprint,
+                    int(intent["context_episode"]),
+                    outcome,
+                    http_status,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -3568,10 +3902,20 @@ class StateStore:
     def challenge_has_correct_submission(self, run_id: str, challenge_id: int) -> bool:
         with self._lock:
             row = self._connection.execute(
-                "SELECT (SELECT COUNT(*) FROM submissions "
-                "WHERE run_id=? AND challenge_id=? AND outcome='correct') + "
-                "(SELECT COUNT(*) FROM submission_intents "
-                "WHERE first_run_id=? AND challenge_id=? AND status='correct') AS count",
+                "SELECT (SELECT COUNT(*) FROM submissions AS submission "
+                "JOIN control_catalogue AS catalogue "
+                "ON catalogue.run_id=submission.run_id "
+                "AND catalogue.challenge_id=submission.challenge_id "
+                "WHERE submission.run_id=? AND submission.challenge_id=? "
+                "AND submission.context_episode=catalogue.context_episode "
+                "AND submission.outcome='correct') + "
+                "(SELECT COUNT(*) FROM submission_intents AS intent "
+                "JOIN control_catalogue AS catalogue "
+                "ON catalogue.run_id=intent.first_run_id "
+                "AND catalogue.challenge_id=intent.challenge_id "
+                "WHERE intent.first_run_id=? AND intent.challenge_id=? "
+                "AND intent.context_episode=catalogue.context_episode "
+                "AND intent.status='correct') AS count",
                 (run_id, challenge_id, run_id, challenge_id),
             ).fetchone()
         return int(row["count"]) > 0

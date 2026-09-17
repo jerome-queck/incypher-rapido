@@ -14,7 +14,7 @@ import sqlite3
 import tempfile
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -150,7 +150,7 @@ def _config(root: Path, arm: Arm) -> RuntimeConfig:
     auth_file = auth / "auth.json"
     auth_file.write_text("{}", encoding="utf-8")
     auth_file.chmod(0o600)
-    return RuntimeConfig.from_env(
+    config = RuntimeConfig.from_env(
         {
             "RAPIDO_STATE_PATH": str(root / "state.sqlite3"),
             "RAPIDO_WORK_ROOT": str(root / "work"),
@@ -162,13 +162,15 @@ def _config(root: Path, arm: Arm) -> RuntimeConfig:
             "RAPIDO_EPISODES_PER_CHALLENGE": str(EPISODES),
             "RAPIDO_ATTEMPTS_PER_CHALLENGE": str(LANES),
             "RAPIDO_RUN_SECONDS": "60",
-            "RAPIDO_ATTEMPT_SECONDS": "15",
+            "RAPIDO_ATTEMPT_SECONDS": "600",
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
             "RAPIDO_PEER_PROFILE": "uniform_v1",
             "RAPIDO_MEMORY_ARM": "lane_local_v1",
+            "RAPIDO_WATCH_BOARD": "false",
         }
     )
+    return replace(config, attempt_seconds=15)
 
 
 async def _run_arm(root: Path, arm: Arm, turn_delay_seconds: float) -> dict[str, Any]:

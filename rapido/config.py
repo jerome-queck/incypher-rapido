@@ -86,19 +86,19 @@ def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false")
 
 
-def _challenge_ids(env: Mapping[str, str]) -> tuple[int, ...]:
-    raw = env.get("RAPIDO_CHALLENGE_IDS", "").strip()
+def _id_list(env: Mapping[str, str], name: str) -> tuple[int, ...]:
+    raw = env.get(name, "").strip()
     if not raw:
         return ()
     parts = raw.split(",")
     if len(parts) > 1000:
-        raise ConfigError("RAPIDO_CHALLENGE_IDS exceeds the challenge limit")
+        raise ConfigError(f"{name} exceeds the challenge limit")
     try:
         values = tuple(int(part.strip()) for part in parts)
     except ValueError as exc:
-        raise ConfigError("RAPIDO_CHALLENGE_IDS must be comma-separated integers") from exc
+        raise ConfigError(f"{name} must be comma-separated integers") from exc
     if any(value <= 0 for value in values) or len(values) != len(set(values)):
-        raise ConfigError("RAPIDO_CHALLENGE_IDS must contain unique positive integers")
+        raise ConfigError(f"{name} must contain unique positive integers")
     return values
 
 
@@ -154,8 +154,12 @@ class RuntimeConfig:
     profile: str
     memory_arm: str
     challenge_ids: tuple[int, ...]
+    focus_challenge_ids: tuple[int, ...]
     submit_candidates: bool
     manage_dynamic_instances: bool
+    watch_board: bool
+    board_watch_seconds: int
+    board_full_refresh_seconds: int
 
     @classmethod
     def from_env(
@@ -271,6 +275,24 @@ class RuntimeConfig:
                 "RAPIDO_MAX_WORKSPACE_BYTES must cover source plus every lane artifact copy "
                 "for all active challenges"
             )
+        board_watch_seconds = _integer(
+            values, "RAPIDO_BOARD_WATCH_SECONDS", 60, minimum=15, maximum=900
+        )
+        board_full_refresh_seconds = _integer(
+            values,
+            "RAPIDO_BOARD_FULL_REFRESH_SECONDS",
+            900,
+            minimum=60,
+            maximum=3_600,
+        )
+        if board_full_refresh_seconds < board_watch_seconds:
+            raise ConfigError("RAPIDO_BOARD_FULL_REFRESH_SECONDS must cover one watch interval")
+        challenge_ids = _id_list(values, "RAPIDO_CHALLENGE_IDS")
+        focus_challenge_ids = _id_list(values, "RAPIDO_FOCUS_CHALLENGE_IDS")
+        if challenge_ids and focus_challenge_ids:
+            raise ConfigError(
+                "RAPIDO_CHALLENGE_IDS and RAPIDO_FOCUS_CHALLENGE_IDS are mutually exclusive"
+            )
 
         return cls(
             board_url=_origin(values),
@@ -289,7 +311,7 @@ class RuntimeConfig:
             dynamic_concurrency=dynamic_concurrency,
             attempts_per_challenge=attempts_per_challenge,
             attempt_seconds=_integer(
-                values, "RAPIDO_ATTEMPT_SECONDS", 800, minimum=15, maximum=7200
+                values, "RAPIDO_ATTEMPT_SECONDS", 800, minimum=600, maximum=7200
             ),
             instance_ready_seconds=instance_ready_seconds,
             instance_cleanup_seconds=instance_cleanup_seconds,
@@ -303,9 +325,13 @@ class RuntimeConfig:
             codex_binary=_text(values, "RAPIDO_CODEX_BINARY", "codex"),
             profile=profile,
             memory_arm=memory_arm,
-            challenge_ids=_challenge_ids(values),
+            challenge_ids=challenge_ids,
+            focus_challenge_ids=focus_challenge_ids,
             submit_candidates=_boolean(values, "RAPIDO_SUBMIT_CANDIDATES", True),
             manage_dynamic_instances=_boolean(values, "RAPIDO_MANAGE_DYNAMIC_INSTANCES", True),
+            watch_board=_boolean(values, "RAPIDO_WATCH_BOARD", True),
+            board_watch_seconds=board_watch_seconds,
+            board_full_refresh_seconds=board_full_refresh_seconds,
         )
 
     def public_record(self) -> dict[str, object]:
@@ -340,8 +366,12 @@ class RuntimeConfig:
             "profile": self.profile,
             "memory_arm": self.memory_arm,
             "challenge_ids": list(self.challenge_ids),
+            "focus_challenge_ids": list(self.focus_challenge_ids),
             "submit_candidates": self.submit_candidates,
             "manage_dynamic_instances": self.manage_dynamic_instances,
+            "watch_board": self.watch_board,
+            "board_watch_seconds": self.board_watch_seconds,
+            "board_full_refresh_seconds": self.board_full_refresh_seconds,
             "board_token_present": bool(self.board_token),
             "team_key_present": bool(self.team_key),
         }

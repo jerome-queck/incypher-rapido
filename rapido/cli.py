@@ -5,16 +5,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from .board import BoardClient, BoardError
 from .codex_app import CodexAppClient, CodexAppError
 from .config import ConfigError, RuntimeConfig, validate_codex_home
 from .control import DurableJobControl
+from .monitor import append_private_jsonl, monitor_payload, render_text
 from .orchestrator import _challenge_coherence_key
 from .state import StateStore
 
@@ -182,6 +186,32 @@ def _reconcile(challenge_id: int, candidate_sha256: str, outcome: str) -> int:
     return 0
 
 
+def _monitor(
+    *, run_id: str | None, output_format: str, follow: bool, interval: int, record_jsonl: bool
+) -> int:
+    state_path = Path(os.environ.get("RAPIDO_STATE_PATH", "/state/rapido.sqlite3"))
+    if not state_path.is_absolute():
+        raise ConfigError("RAPIDO_STATE_PATH must be absolute")
+    record_path = state_path.with_name("rapido-monitor.jsonl")
+    if record_jsonl and record_path == state_path:
+        raise ValueError("monitor record path must differ from the state database")
+    previous: tuple[float, int] | None = None
+    while True:
+        view = DurableJobControl.monitor_snapshot(state_path, run_id=run_id)
+        payload, previous = monitor_payload(view, previous)
+        print(
+            json.dumps(payload, sort_keys=True)
+            if output_format == "json"
+            else render_text(payload),
+            flush=True,
+        )
+        if record_jsonl:
+            append_private_jsonl(record_path, payload)
+        if not follow or view.status != "running":
+            return 0
+        time.sleep(interval)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rapido")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -196,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument(
         "--outcome", choices=("correct", "incorrect", "not-delivered"), required=True
     )
+    monitor = subcommands.add_parser("monitor", help="show sanitized live queue and resource stats")
+    monitor.add_argument("--run-id")
+    monitor.add_argument("--format", choices=("text", "json"), default="text")
+    monitor.add_argument("--follow", action="store_true")
+    monitor.add_argument("--interval", type=int, choices=range(5, 301), default=10)
+    monitor.add_argument("--record-jsonl", action="store_true")
     subcommands.add_parser("run", help="run the autonomous native-Codex queue")
     return parser
 
@@ -215,6 +251,14 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.challenge_id,
                 arguments.candidate_sha256,
                 arguments.outcome,
+            )
+        if arguments.command == "monitor":
+            return _monitor(
+                run_id=arguments.run_id,
+                output_format=arguments.format,
+                follow=arguments.follow,
+                interval=arguments.interval,
+                record_jsonl=arguments.record_jsonl,
             )
         if arguments.command == "run":
             return _run()

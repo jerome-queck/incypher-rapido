@@ -762,6 +762,7 @@ def _config(tmp_path: Path) -> RuntimeConfig:
             "RAPIDO_CODEX_HOME": str(tmp_path / "auth"),
             "RAPIDO_SUBMIT_CANDIDATES": "false",
             "RAPIDO_MANAGE_DYNAMIC_INSTANCES": "false",
+            "RAPIDO_WATCH_BOARD": "false",
             "RAPIDO_ACTIVE_CHALLENGES": "2",
             "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
             "RAPIDO_CONCURRENCY": "4",
@@ -804,6 +805,7 @@ def test_drive_inspect_round_trip_exposes_only_sanitized_run_contract(tmp_path: 
 
     report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+    monitor = DurableJobControl.monitor_snapshot(config.state_path, run_id=report.run_id)
 
     assert view.run_id == report.run_id
     assert view.status == "completed"
@@ -817,6 +819,11 @@ def test_drive_inspect_round_trip_exposes_only_sanitized_run_contract(tmp_path: 
     encoded = json.dumps(asdict(view), sort_keys=True)
     assert candidate not in encoded
     assert re.search(r"\b[0-9a-fA-F]{64}\b", encoded) is None
+    monitor_encoded = json.dumps(asdict(monitor), sort_keys=True)
+    assert candidate not in monitor_encoded
+    assert monitor.status == "completed"
+    assert monitor.terminal_challenge_ids == (1,)
+    assert monitor.tool_call_count == 2
 
 
 def test_initial_queue_identity_and_order_survive_reopened_inspection(tmp_path: Path) -> None:
@@ -894,6 +901,177 @@ def test_mixed_peer_defaults_cover_all_fifteen_with_two_daybreak_leads_each(
         assert document["control_route"]["effort"] == job.effort
         assert "same cumulative solve window" in document["persistent_window"]
         assert callable(kwargs["continuation_callback"])
+
+
+def test_focus_order_and_value_scale_initial_attempt_time_without_narrowing_coverage(
+    tmp_path: Path,
+) -> None:
+    challenges = [
+        replace(_challenge(1), value=100),
+        replace(_challenge(2), value=500),
+        replace(_challenge(3), value=300),
+        replace(_challenge(4), value=100, solved=True),
+    ]
+    runtime = BoundaryRuntime("INCYPHER{budget-fixture}")
+    config = replace(
+        _config(tmp_path),
+        run_seconds=7_200,
+        attempt_seconds=800,
+        focus_challenge_ids=(3,),
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(config, board=BoundaryBoard(challenges), runtime=runtime)
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    first_rank = {job.challenge_id: job.catalogue_rank for job in view.jobs if job.episode == 0}
+    assert sorted(first_rank, key=first_rank.__getitem__) == [3, 1, 2, 4]
+    budgets = {
+        int(document["challenge"]["id"]): int(document["control_route"]["attempt_seconds"])
+        for document, _ in runtime.calls
+    }
+    assert budgets == {1: 800, 2: 1_800, 3: 1_800, 4: 800}
+    assert view.initial_coverage_count == 4
+
+
+def test_missing_focus_id_fails_before_any_solver_work(tmp_path: Path) -> None:
+    runtime = BoundaryRuntime("unused")
+    config = replace(_config(tmp_path), focus_challenge_ids=(99,))
+
+    with pytest.raises(BoardError, match="focus challenge ids are absent"):
+        asyncio.run(
+            DurableJobControl.drive(
+                config,
+                board=BoundaryBoard([_challenge(1)]),
+                runtime=runtime,
+            )
+        )
+
+    assert runtime.calls == []
+
+
+def test_idle_watch_appends_and_solves_a_new_challenge_before_original_deadline(
+    tmp_path: Path,
+) -> None:
+    class GrowingBoard(BoundaryBoard):
+        def __init__(self) -> None:
+            super().__init__([_challenge(1)])
+            self.list_calls = 0
+
+        def list_challenges(self) -> list[dict[str, int]]:
+            self.list_calls += 1
+            if self.list_calls >= 4:
+                self._challenges[2] = _challenge(2)
+            return super().list_challenges()
+
+    board = GrowingBoard()
+    runtime = UnsolvedBoundaryRuntime("unused")
+    config = replace(
+        _config(tmp_path),
+        run_seconds=0.25,
+        watch_board=True,
+        board_watch_seconds=0.01,
+        board_full_refresh_seconds=0.1,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert report.challenge_count == 2
+    assert view.catalogue_count == view.initial_coverage_count == 2
+    assert {job.challenge_id for job in view.jobs} == {1, 2}
+    connection = sqlite3.connect(config.state_path)
+    try:
+        kinds = [row[0] for row in connection.execute("SELECT kind FROM control_events")]
+    finally:
+        connection.close()
+    assert "catalogue_appended" in kinds
+
+
+def test_idle_watch_requeues_when_attachment_bytes_change_at_same_url(tmp_path: Path) -> None:
+    class ChangingFileBoard(BoundaryBoard):
+        def __init__(self) -> None:
+            super().__init__([_file_challenge(1, challenge_type="standard")])
+            self.download_calls = 0
+
+        def download(
+            self, file_ref: str, destination: Path, *, byte_limit: int
+        ) -> dict[str, object]:
+            del file_ref, byte_limit
+            self.download_calls += 1
+            payload = b"old-material" if self.download_calls == 1 else b"new-material"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            return {"bytes": len(payload), "redirect_hosts": ["board"]}
+
+    board = ChangingFileBoard()
+    config = replace(
+        _config(tmp_path),
+        run_seconds=0.45,
+        watch_board=True,
+        board_watch_seconds=0.01,
+        board_full_refresh_seconds=0.05,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert {job.episode for job in view.jobs} == {0, 1}
+    assert board.download_calls >= 3
+    with sqlite3.connect(config.state_path) as connection:
+        context_episode = connection.execute(
+            "SELECT context_episode FROM control_catalogue WHERE run_id=? AND challenge_id=1",
+            (report.run_id,),
+        ).fetchone()[0]
+    assert context_episode == 1
+
+
+def test_idle_watch_does_not_requeue_unchanged_attachment_bytes(tmp_path: Path) -> None:
+    class StableFileBoard(BoundaryBoard):
+        def __init__(self) -> None:
+            super().__init__([_file_challenge(1, challenge_type="standard")])
+            self.download_calls = 0
+
+        def download(
+            self, file_ref: str, destination: Path, *, byte_limit: int
+        ) -> dict[str, object]:
+            del file_ref, byte_limit
+            self.download_calls += 1
+            payload = b"stable-material"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            return {"bytes": len(payload), "redirect_hosts": ["board"]}
+
+    board = StableFileBoard()
+    config = replace(
+        _config(tmp_path),
+        run_seconds=0.35,
+        watch_board=True,
+        board_watch_seconds=0.01,
+        board_full_refresh_seconds=0.05,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=UnsolvedBoundaryRuntime("unused"),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert {job.episode for job in view.jobs} == {0}
+    assert board.download_calls >= 2
 
 
 @pytest.mark.parametrize(
@@ -1291,14 +1469,12 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     assert report.status == "completed"
     assert board.peak_active == 1
     assert board.active == set()
-    assert [call for call in board.instance_calls if call[0] == "POST"] == [
-        ("POST", 1),
-        ("POST", 2),
+    post_ids = [challenge_id for method, challenge_id in board.instance_calls if method == "POST"]
+    delete_ids = [
+        challenge_id for method, challenge_id in board.instance_calls if method == "DELETE"
     ]
-    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [
-        ("DELETE", 1),
-        ("DELETE", 2),
-    ]
+    assert sorted(post_ids) == [1, 2]
+    assert delete_ids == post_ids
     local = [item for item in runtime.prompts if item[0]["execution_phase"] == "local_analysis"]
     live = [item for item in runtime.prompts if item[0]["execution_phase"] == "shared_instance"]
     assert len(local) == len(live) == 4
@@ -1318,6 +1494,74 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
     )
 
 
+def test_instance_waiters_do_not_consume_productive_challenge_slots(tmp_path: Path) -> None:
+    challenges = [_challenge(value, challenge_type="dynamic_iac") for value in range(1, 7)]
+    board = ManagedInstanceBoundaryBoard(challenges)
+
+    class ParkedWaitRuntime(DynamicPhaseRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.local_started: set[int] = set()
+            self.first_five_started = asyncio.Event()
+            self.all_local_started = asyncio.Event()
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            challenge_id = int(document["challenge"]["id"])
+            if document["execution_phase"] == "local_analysis":
+                self.local_started.add(challenge_id)
+                if len(self.local_started) >= 5:
+                    self.first_five_started.set()
+                if challenge_id <= 5:
+                    await asyncio.wait_for(self.first_five_started.wait(), timeout=2)
+                if self.local_started == set(range(1, 7)):
+                    self.all_local_started.set()
+            elif challenge_id == 1:
+                await asyncio.wait_for(self.all_local_started.wait(), timeout=2)
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = ParkedWaitRuntime()
+    config = replace(
+        _config(tmp_path),
+        active_challenges=5,
+        attempts_per_challenge=2,
+        concurrency=10,
+        manage_dynamic_instances=True,
+        episodes_per_challenge=2,
+        run_seconds=700,
+        attempt_seconds=800,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+
+    assert report.status == "completed"
+    assert runtime.local_started == set(range(1, 7))
+    assert board.peak_active == 1
+    assert board.active == set()
+    post_ids = [challenge_id for method, challenge_id in board.instance_calls if method == "POST"]
+    delete_ids = [
+        challenge_id for method, challenge_id in board.instance_calls if method == "DELETE"
+    ]
+    assert sorted(post_ids) == list(range(1, 7))
+    assert delete_ids == post_ids
+    connection = sqlite3.connect(config.state_path)
+    try:
+        events = [
+            (row[0], json.loads(row[1]))
+            for row in connection.execute(
+                "SELECT kind, data_json FROM events WHERE run_id=? ORDER BY sequence",
+                (report.run_id,),
+            )
+        ]
+    finally:
+        connection.close()
+    kinds = [kind for kind, _ in events]
+    wake_ids = [data["challenge_id"] for kind, data in events if kind == "instance_wait_woken"]
+    assert kinds.count("instance_wait_parked") == 6
+    assert kinds.count("instance_wait_woken") == 6
+    assert wake_ids == post_ids
+
+
 def test_dynamic_productive_timeout_reuses_lease_for_daybreak_heavy_recovery(
     tmp_path: Path,
 ) -> None:
@@ -1333,6 +1577,7 @@ def test_dynamic_productive_timeout_reuses_lease_for_daybreak_heavy_recovery(
         specialist_reasoning_efforts=("max", "xhigh", "max"),
         manage_dynamic_instances=True,
         episodes_per_challenge=3,
+        run_seconds=1_200,
     )
 
     report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
@@ -1594,7 +1839,7 @@ def test_catalogue_count_includes_entries_that_are_not_executable(tmp_path: Path
     assert report.challenge_count == view.catalogue_count == 2
     assert report.unsupported == 1
     assert view.initial_coverage_count == 1
-    assert {(job.challenge_id, job.catalogue_rank) for job in view.jobs} == {(1, 1)}
+    assert {(job.challenge_id, job.catalogue_rank) for job in view.jobs} == {(1, 0)}
 
 
 def test_fatal_lane_error_terminalizes_attempts_and_seals_missing_evidence(tmp_path: Path) -> None:
@@ -1987,7 +2232,7 @@ def test_restart_closes_jobs_left_open_by_process_loss(
             def list_challenges(self): return [{"id": 1}, {"id": 2}]
             def challenge(self, challenge_id):
                 return Challenge(challenge_id, f"Crash {challenge_id}", "crypto", "standard",
-                                 "derive", 100, (), False, 0, 0, None, None)
+                                 "derive", 100, ("fixture-file",), False, 0, 0, None, None)
             def download(self, file_ref, destination, *, byte_limit):
                 destination.write_bytes(b"fixture")
                 return {"bytes": min(7, byte_limit), "redirect_hosts": ["board"]}
@@ -2046,9 +2291,11 @@ def test_restart_closes_jobs_left_open_by_process_loss(
             "RAPIDO_ATTEMPTS_PER_CHALLENGE": "2",
             "RAPIDO_CONCURRENCY": "2",
             "RAPIDO_EPISODES_PER_CHALLENGE": "1",
-            "RAPIDO_ATTEMPT_SECONDS": "15",
-            "RAPIDO_RUN_SECONDS": "60",
-        })
+            "RAPIDO_ATTEMPT_SECONDS": "600",
+                "RAPIDO_RUN_SECONDS": "60",
+                "RAPIDO_WATCH_BOARD": "false",
+            })
+        config = replace(config, attempt_seconds=15)
         asyncio.run(DurableJobControl.drive(config, board=Board(), runtime=Runtime()))
         """
     )
@@ -2090,7 +2337,12 @@ def test_restart_closes_jobs_left_open_by_process_loss(
 
     runtime = RecoveryRuntime()
     resumed_challenges = [
-        replace(_challenge(challenge_id), name=f"Crash {challenge_id}", description="derive")
+        replace(
+            _challenge(challenge_id),
+            name=f"Crash {challenge_id}",
+            description="derive",
+            files=("fixture-file",),
+        )
         for challenge_id in (1, 2)
     ]
     changed_runtime = BoundaryRuntime("unused")

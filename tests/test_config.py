@@ -31,6 +31,10 @@ def test_defaults_are_a_mixed_twenty_lane_practice_profile() -> None:
     assert config.max_challenge_workspace_bytes == 100 * 1024 * 1024 * 1024
     assert config.max_lane_workspace_bytes > 20 * 1024 * 1024 * 1024
     assert config.challenge_ids == ()
+    assert config.focus_challenge_ids == ()
+    assert config.watch_board is True
+    assert config.board_watch_seconds == 60
+    assert config.board_full_refresh_seconds == 900
     assert config.submit_candidates is True
     assert config.manage_dynamic_instances is True
     public = config.public_record()
@@ -59,10 +63,10 @@ def test_registered_typed_memory_arm_is_explicit_and_public() -> None:
     assert config.public_record()["memory_arm"] == "typed_challenge_v1"
 
 
-def test_short_calibration_budgets_are_explicit_and_safe() -> None:
+def test_minimum_live_attempt_budget_is_six_hundred_seconds() -> None:
     config = RuntimeConfig.from_env(
         {
-            "RAPIDO_ATTEMPT_SECONDS": "90",
+            "RAPIDO_ATTEMPT_SECONDS": "600",
             "RAPIDO_BOARD_TIMEOUT_SECONDS": "4",
             "RAPIDO_INSTANCE_READY_SECONDS": "20",
             "RAPIDO_INSTANCE_CLEANUP_SECONDS": "20",
@@ -73,7 +77,10 @@ def test_short_calibration_budgets_are_explicit_and_safe() -> None:
         config.board_timeout_seconds,
         config.instance_ready_seconds,
         config.instance_cleanup_seconds,
-    ) == (90, 4, 20, 20)
+    ) == (600, 4, 20, 20)
+
+    with pytest.raises(ConfigError, match="RAPIDO_ATTEMPT_SECONDS"):
+        RuntimeConfig.from_env({"RAPIDO_ATTEMPT_SECONDS": "599"})
 
 
 @pytest.mark.parametrize(
@@ -111,6 +118,8 @@ def test_instance_budgets_cover_board_requests(values: dict[str, str]) -> None:
         ("RAPIDO_MAX_WORKSPACE_BYTES", "1024"),
         ("RAPIDO_CHALLENGE_IDS", "7,7"),
         ("RAPIDO_CHALLENGE_IDS", "7,nope"),
+        ("RAPIDO_FOCUS_CHALLENGE_IDS", "7,7"),
+        ("RAPIDO_WATCH_BOARD", "sometimes"),
     ],
 )
 def test_rejects_unsupported_or_unsafe_configuration(name: str, value: str) -> None:
@@ -205,6 +214,32 @@ def test_accepts_bounded_challenge_selection_for_acceptance_runs() -> None:
     config = RuntimeConfig.from_env({"RAPIDO_CHALLENGE_IDS": "109, 42"})
     assert config.challenge_ids == (109, 42)
     assert config.public_record()["challenge_ids"] == [109, 42]
+
+
+def test_accepts_ordered_focus_challenges_without_narrowing_coverage() -> None:
+    config = RuntimeConfig.from_env({"RAPIDO_FOCUS_CHALLENGE_IDS": "15, 94, 42"})
+    assert config.focus_challenge_ids == (15, 94, 42)
+    assert config.public_record()["focus_challenge_ids"] == [15, 94, 42]
+
+
+def test_focus_and_narrowed_catalogue_cannot_be_combined() -> None:
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_CHALLENGE_IDS": "15",
+                "RAPIDO_FOCUS_CHALLENGE_IDS": "15",
+            }
+        )
+
+
+def test_full_board_refresh_cannot_be_faster_than_idle_polling() -> None:
+    with pytest.raises(ConfigError, match="cover one watch interval"):
+        RuntimeConfig.from_env(
+            {
+                "RAPIDO_BOARD_WATCH_SECONDS": "120",
+                "RAPIDO_BOARD_FULL_REFRESH_SECONDS": "60",
+            }
+        )
 
 
 def test_native_auth_home_must_be_private_regular_and_writable(tmp_path: Path) -> None:
