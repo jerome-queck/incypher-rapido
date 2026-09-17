@@ -900,6 +900,18 @@ sanitized receipt is
 [`issue-19-tool-pressure-evidence-2026-09-17.json`](issue-19-tool-pressure-evidence-2026-09-17.json),
 SHA-256 `1bcac3725a7ce7a5ee9fb6810069842c8a6971b09f6dd15c248f15d8265cd254`.
 
+A pre-live repetition on merged scheduler commit `eea3875ee9af025e3704737ec30fbf393917b796`
+and image `sha256:486c6ed88e5154ff0a55e3265029040b38004e4e0033361aabe0ffa7328517da`
+found one real P8 boundary: Ghidra failed its JDK probe in two of three eight-way mixed rounds,
+although P4/P6, a fresh P8 lane, held memory/PID phases, every other tool, cgroup events, and exact
+cleanup were green. A 33-second isolated P8 loop reproduced it; three sequential Ghidra calls did
+not. Pinning Ghidra's configured JDK did not help. The evidence isolated the failure to
+`RLIMIT_NPROC=192`: Linux counts that limit across every process and thread sharing UID 10001, so
+the Java probe lost its next child
+before the 256-PID container fence. Raising only the worker/descendant ceiling to 224 made the same
+P8 loop green at 182 PIDs. The 192-PID new-tool admission fence and 256-PID cgroup hard stop remain.
+An exact committed-image full pressure rerun is required before live registration.
+
 The exact final-container receipt must compile and run a solver program; exercise representative
 Python, Sage, angr, Ghidra, JADX, GDB static/QEMU execution, packet, forensic, archive, media, PDF, and CPU-hashcat
 operations; prove script persistence; and prove credential/sibling-state writes, networking,

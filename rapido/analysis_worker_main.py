@@ -21,6 +21,7 @@ MAX_RESPONSE_BYTES = 128 * 1024
 MAX_TIMEOUT_SECONDS = 180
 FILE_LIMIT_BYTES = 512 * 1024 * 1024
 FILE_DESCRIPTOR_LIMIT = 1024
+PROCESS_LIMIT = 224
 
 _SAFE_ENV = {
     "PATH": (
@@ -82,7 +83,7 @@ def _apply_limits(timeout_seconds: int) -> None:
     _set_limit(resource.RLIMIT_FSIZE, FILE_LIMIT_BYTES)
     _set_limit(resource.RLIMIT_NOFILE, FILE_DESCRIPTOR_LIMIT)
     if hasattr(resource, "RLIMIT_NPROC"):
-        _set_limit(resource.RLIMIT_NPROC, 192)
+        _set_limit(resource.RLIMIT_NPROC, PROCESS_LIMIT)
     _set_limit(resource.RLIMIT_CPU, timeout_seconds, timeout_seconds + 2)
 
 
