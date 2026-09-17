@@ -639,8 +639,8 @@ comparison green while independent review is pending.
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: gap-specific same-chat correction plus one evidence-earned changed timeout Recovery implemented and focused locally; final live proof pending |
 | Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: clean one-hour rerun exercised all roles and nonempty Recovery memory; hard-timeout Recovery now uses three Daybreak plus one Luna without increasing four-peer concurrency; final proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
-| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
-| Productive bounded resource scaling | E4 measurements and selected profile | complete offline: committed-source E4 selects 8 native workers while retaining five challenges/P20; 7.568 CPU cores, 16.20 GB RSS, and 188/256 PIDs peaked with zero cgroup limit events and exact cleanup; live conversion proof pending |
+| Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable focus order, evidence-scaled 800–1,800s grants, 600s admission floor, derived instance park/wake queue, and same-deadline Board watcher implemented locally; final live coverage pending |
+| Productive bounded resource scaling | E4 measurements and selected profile | in progress: prior E4 selected 8 native tool workers/P20 at 7.568 cores, 16.20 GB, and 188/256 PIDs; current 14-CPU host now exposes 12 container CPUs while retaining two host CPUs, but live sampler evidence is pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: exact merged image verified through real process loss, same-run continuation, private candidate retention, changed verification, original deadline, durable ordering/memory, effect fencing, and cleanup; final live proof pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
@@ -770,9 +770,9 @@ dispatches. Every completed persistent-primary checkpoint durably retains candid
 next steps, tool count, and sanitized host observations for the changed Recovery route. A qualified
 candidate is also committed to the private vault inside the callback before control returns to the
 runtime, closing the crash window between Daybreak discovery and normal attempt completion. Stable
-Board identity plus a description/stable-attachment material digest are rechecked while durable
-catalogue ranks remain authoritative. Before workspace cleanup or model startup, instances are
-reconciled under an independent bound. A receipt mismatch remains fenced; a receiptless active
+Board identity plus qualified metadata and attachment-content identities are rechecked while
+durable catalogue ranks remain authoritative. Before workspace cleanup or model startup, instances
+are reconciled under an independent bound. A receipt mismatch remains fenced; a receiptless active
 generation is never adopted or deleted because the Board offers no generation token that proves it
 belongs to the persisted create intent. An
 ambiguous submission fences only its challenge while unaffected work continues, then keeps the run
@@ -967,6 +967,66 @@ contained. Initial waves stay 2 Daybreak + 2 Luna; the single hard-timeout Recov
 Daybreak/xhigh + 1 Luna/max based on measured conversion, with no peer-count increase. Dynamic work
 keeps the same one-instance lease across that successor and cleans once.
 
+### Two-hour diagnostic scheduler design
+
+The owner authorized a two-hour diagnostic before the final 5.5-hour acceptance and identified
+three currently Board-unsolved targets: Telltale Beacon (15), Zip (94), and Parcelport (42). The
+diagnostic must still cover the full catalogue, enable submissions and instances, and use the same
+competition behavior except its outer deadline. `RAPIDO_FOCUS_CHALLENGE_IDS=15,94,42` supplies an
+ordered prefix without narrowing coverage.
+
+Controlled comparisons selected four small changes:
+
+1. **Derived instance-ready heap over a new lease table.** The durable queued control wave and its
+   `instance_enabled_follow_on` route already identify parked work. A new table duplicated that
+   truth and added crash states. The selected broker parks the wave outside the five productive
+   challenge slots, reconstructs it from the journal, and wakes exactly one waiter with priority.
+   The live phase still consumes one of five slots. DELETE must prove absence before the next POST.
+2. **Deterministic difficulty prior over learned scoring.** Learned expected-value scoring lacked
+   duration and reliable practice crowd data. The selected order is explicit focus, then existing
+   Board-unsolved/category/value order. The 800-second baseline remains. Explicit focus gets the
+   available grant; other unsolved work scales from 800 to 1,800 seconds by Board value.
+   Board-solved coverage stays 800 seconds. A full live admission needs 600 seconds. One productive
+   timeout Recovery recomputes an automatic grant up to 1,800 seconds from remaining wall time,
+   unresolved Board work, and five-way capacity. An explicitly configured larger baseline is
+   preserved. Observed work, rather than guessed category, identifies later difficulty.
+3. **Same-run idle watch over a second run.** A second run would reset the deadline and corrupt
+   run-local accounting. The selected watcher retains the original run, polls IDs each minute,
+   fully requalifies metadata and bounded attachment bytes every 15 minutes, atomically appends new
+   challenges, and admits changed material as a new workspace generation. Earlier-generation facts,
+   candidates, verification, routes, and Board outcomes remain private durable audit history but are
+   excluded from new-generation memory and authority.
+4. **Read-only CLI snapshot over a monitoring daemon.** `rapido monitor` reads query-only SQLite
+   counters plus the solver container's cgroup-v2 files. `--follow --record-jsonl` appends sanitized
+   0600 JSONL every ten seconds. It accesses no Board or model service, auth, model prose, candidate
+   value, Docker socket, or process tree.
+
+The prior queue held an entire engagement coroutine in each worker, so one live dynamic challenge
+plus four lease waiters could consume all five slots. A six-dynamic regression now proves all six
+finish local analysis while only one instance exists, then verifies six one-for-one POST/DELETE
+cycles whose durable wake order matches actual lease order, plus six park/wake pairs. Focus/budget,
+same-URL content refresh, idle append, query-only monitoring, private JSONL, and 12-core cgroup
+parsing have focused coverage. The final local gate is green: Ruff and diff checks pass, and pytest
+reports 857 passed and
+one skipped in 107.13 seconds. Independent review found no unresolved P0-P3 defect after clarifying
+that 1,800 seconds caps automatic grants, not an explicitly configured longer baseline. Exact-image
+validation and the two-hour live result remain pending.
+
+The Board client exposes no strong attachment validator, so exact same-URL change detection uses
+bounded GETs during the 900-second idle full refresh. At the default 128 MiB per attachment and 15
+challenges, the conservative ceiling is about 1.9 GiB per refresh, or about 41 GiB across 5.5 hours.
+This cost occurs only after the solve queue drains; probe bytes are deleted immediately, and the
+actual lane download is hashed again before use. Conditional GET with a proven strong ETag is a
+future optimization, not a reason to weaken current-generation isolation.
+
+The current host has 14 CPUs. The dedicated `colima-rapido` VM changed from 8 to 12 CPUs while
+retaining 24 GiB RAM and expanding from 500 to 700 GiB disk; `docker info` reports 12 CPUs and
+25,146,642,432 bytes. This leaves two host CPUs and provides headroom for offline crypto or
+tool-heavy challenges. It does not raise P20 model admission by itself; the diagnostic sampler must
+show whether local CPU becomes the next bottleneck. After the prior one-hour evidence merged, its
+exact stopped container and state volume were deleted from `colima-rapido`; both are absent, while
+the legacy `rapido-auth-v4` volume and current private host-bound credentials remain present.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -1043,6 +1103,9 @@ keeps the same one-instance lease across that successor and cleans once.
 | Hard-target timeout diagnosis | `gpt-daybreak-blue-latest` / `xhigh` | Telltale Beacon, Zip, and Parcelport all had productive 800-second waves incorrectly contained; one bounded evidence-earned Recovery and 3+1 recovery roster selected, no fallback |
 | Timeout-Recovery standards review | requested `gpt-daybreak-blue-latest` / `xhigh` | no P0-P2 defect; declined a P3 extraction that added abstraction without behavior; worker-side effective model metadata unavailable, so not accepted as model-attested evidence |
 | Timeout-Recovery specification review | requested `gpt-daybreak-blue-latest` / `xhigh` | found an interleaved second-timeout dispatch defect; durable prior-Recovery fencing and regression coverage fixed it; re-review found no P0-P3 blocker; worker-side effective model metadata unavailable |
+| Instance-ready queue design | requested `gpt-daybreak-blue-latest` / `xhigh` | derived durable park/wake queue selected over a duplicate lease table; worker-side effective model metadata unavailable |
+| Priority/budget/watcher design | requested `gpt-daybreak-blue-latest` / `xhigh` | deterministic focus/value policy and meaningful 600-second floor selected over unsupported learned scoring; worker-side effective model metadata unavailable |
+| Monitor design | requested `gpt-daybreak-blue-latest` / `xhigh` | query-only snapshot plus self-cgroup sampler selected over a daemon; worker-side effective model metadata unavailable |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1059,11 +1122,12 @@ the mismatch; the main owner reopened #19 before the timeout-recovery delivery. 
 
 ## Open decisions
 
-- Complete independent timeout-recovery review, full tests, PR/CI, squash merge, and exact-image
-  container acceptance.
-- Merge this sanitized one-hour evidence, then delete only its exact container/state while
-  preserving authentication and verify absence.
-- Register the exact merged final commit, image digest, all-15 queue with Telltale Beacon, Zip, and
-  Parcelport first, deadlines, and durable sampler before the acceptance state exists.
-- Run and audit the unchanged 19,800-second acceptance contract; merge evidence, clean exact state,
-  and close #19 only if every gate passes.
+- Finish scheduler/monitor/docs tests, independent review, focused PR, all green CI, and exact-image
+  verification. Confirm the 12-CPU/24-GiB/256-PID launch and sampler before Board work.
+- Pre-register and run the owner-authorized fresh two-hour diagnostic: all 15, focus 15/94/42,
+  submissions/instances/watch enabled, no steering, exact merged image, durable monitor JSONL.
+- Audit solve conversion, park/wake order, context on requeue, productive time, CPU/RSS/PIDs,
+  effects, instances, and residue. Merge sanitized evidence and delete that exact diagnostic state
+  while preserving authentication.
+- The two-hour diagnostic does not replace the unchanged 19,800-second issue #19 acceptance. Await
+  owner direction after reporting it; close #19 only after the final contract passes.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -88,6 +89,9 @@ _ROUTE_FIELDS = (
     "workspace_generation",
 )
 ROUTE_AXES = frozenset(_ROUTE_FIELDS)
+MIN_MEANINGFUL_ATTEMPT_SECONDS = 600
+ADAPTIVE_ATTEMPT_CAP_SECONDS = 1_800
+RUN_CLEANUP_GUARD_SECONDS = 60
 
 
 def _bounded(value: object, field: str) -> str:
@@ -175,6 +179,8 @@ class RouteRequest:
     instances_safe: bool = True
     durable_observation_count: int = 0
     timeout_recovery_used: bool = False
+    unresolved_challenge_count: int = 1
+    parallel_challenge_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,41 @@ def baseline_route(
         model=model,
         effort=effort,
         workspace_generation=workspace_generation,
+    )
+
+
+def adaptive_attempt_seconds(
+    *,
+    configured_seconds: int,
+    remaining_milliseconds: int,
+    unresolved_challenge_count: int,
+    parallel_challenge_count: int,
+) -> int:
+    """Allocate meaningful lane time across the remaining challenge waves."""
+    if (
+        type(configured_seconds) is not int
+        or not 1 <= configured_seconds <= 19_800
+        or type(remaining_milliseconds) is not int
+        or remaining_milliseconds < 0
+        or type(unresolved_challenge_count) is not int
+        or unresolved_challenge_count < 0
+        or type(parallel_challenge_count) is not int
+        or parallel_challenge_count < 1
+    ):
+        raise ValueError("adaptive attempt budget input is invalid")
+    if unresolved_challenge_count == 0:
+        return configured_seconds
+    usable_seconds = max(
+        1,
+        remaining_milliseconds // 1_000 - RUN_CLEANUP_GUARD_SECONDS,
+    )
+    waves = max(1, math.ceil(unresolved_challenge_count / parallel_challenge_count))
+    fair_seconds = max(1, usable_seconds // waves)
+    if fair_seconds < MIN_MEANINGFUL_ATTEMPT_SECONDS:
+        return configured_seconds
+    return min(
+        max(configured_seconds, ADAPTIVE_ATTEMPT_CAP_SECONDS),
+        max(configured_seconds, fair_seconds),
     )
 
 
@@ -291,6 +332,13 @@ def route_failure(request: RouteRequest) -> RouteDecision:
         raise ValueError("durable_observation_count is invalid")
     if type(request.timeout_recovery_used) is not bool:
         raise TypeError("timeout_recovery_used must be boolean")
+    if (
+        type(request.unresolved_challenge_count) is not int
+        or request.unresolved_challenge_count < 0
+        or type(request.parallel_challenge_count) is not int
+        or request.parallel_challenge_count < 1
+    ):
+        raise ValueError("challenge budget state is invalid")
     if not request.attempts_remaining:
         return _terminal(request, "route_budget_exhausted", "no successor episode remains")
 
@@ -359,12 +407,28 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 "timeout_recovery_exhausted",
                 "the evidence-earned timeout recovery was already attempted",
             )
+        if (
+            request.remaining_milliseconds
+            < (MIN_MEANINGFUL_ATTEMPT_SECONDS + RUN_CLEANUP_GUARD_SECONDS) * 1_000
+        ):
+            return _terminal(
+                request,
+                "timeout_recovery_below_meaningful_budget",
+                "too little run time remains for a productive recovery",
+            )
+        recovery_seconds = adaptive_attempt_seconds(
+            configured_seconds=request.current.attempt_seconds,
+            remaining_milliseconds=request.remaining_milliseconds,
+            unresolved_challenge_count=request.unresolved_challenge_count,
+            parallel_challenge_count=request.parallel_challenge_count,
+        )
         rule_id = "typed_timeout_recovery_v1"
         successor = replace(
             request.current,
             role="recovery",
             tactic="typed_timeout_recovery",
             context_profile="durable_timeout_facts_with_changed_strategy",
+            attempt_seconds=recovery_seconds,
             workspace_generation=request.current.workspace_generation + 1,
         )
     if failure.kind == "quota":
@@ -469,6 +533,7 @@ __all__ = [
     "FAILURE_KINDS",
     "FAILURE_ORIGINS",
     "KNOWN_FAILURE_CLASSES",
+    "MIN_MEANINGFUL_ATTEMPT_SECONDS",
     "ROUTE_AXES",
     "Disposition",
     "FailureKind",
@@ -477,6 +542,7 @@ __all__ = [
     "RouteDecision",
     "RouteRequest",
     "RouteSpec",
+    "adaptive_attempt_seconds",
     "baseline_route",
     "classify_failure",
     "instance_follow_on_route",

@@ -10,6 +10,7 @@ from rapido.routing import (
     FAILURE_KINDS,
     FailureSignal,
     RouteRequest,
+    adaptive_attempt_seconds,
     baseline_route,
     classify_failure,
     route_failure,
@@ -96,7 +97,14 @@ def test_quota_failure_earns_one_bounded_wait_without_model_fallback() -> None:
 
 
 def test_productive_timeout_earns_exactly_one_changed_recovery() -> None:
-    first = route_failure(_request("timeout", subreason="timeout", durable_observation_count=12))
+    first = route_failure(
+        _request(
+            "timeout",
+            subreason="timeout",
+            durable_observation_count=12,
+            remaining_milliseconds=2_000_000,
+        )
+    )
     assert first.disposition == "dispatch"
     assert first.rule_id == "typed_timeout_recovery_v1"
     assert first.successor is not None
@@ -105,8 +113,10 @@ def test_productive_timeout_earns_exactly_one_changed_recovery() -> None:
         "role",
         "tactic",
         "context_profile",
+        "attempt_seconds",
         "workspace_generation",
     }
+    assert first.successor.attempt_seconds == 1_800
 
     interleaved = route_failure(
         RouteRequest(
@@ -155,6 +165,40 @@ def test_timeout_without_safe_evidence_or_budget_is_contained(
 ) -> None:
     assert route_failure(_request("timeout", subreason="timeout", **changes)).disposition == (
         "contain"
+    )
+
+
+def test_adaptive_budget_uses_remaining_unsolved_waves_and_a_meaningful_floor() -> None:
+    assert (
+        adaptive_attempt_seconds(
+            configured_seconds=800,
+            remaining_milliseconds=7_200_000,
+            unresolved_challenge_count=3,
+            parallel_challenge_count=5,
+        )
+        == 1_800
+    )
+    assert (
+        adaptive_attempt_seconds(
+            configured_seconds=800,
+            remaining_milliseconds=1_000_000,
+            unresolved_challenge_count=10,
+            parallel_challenge_count=2,
+        )
+        == 800
+    )
+    assert (
+        route_failure(
+            _request(
+                "timeout",
+                subreason="timeout",
+                durable_observation_count=12,
+                remaining_milliseconds=100_000,
+                unresolved_challenge_count=10,
+                parallel_challenge_count=2,
+            )
+        ).rule_id
+        == "timeout_recovery_below_meaningful_budget"
     )
 
 

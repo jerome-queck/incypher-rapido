@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from rapido import cli
@@ -18,6 +20,9 @@ def test_run_command_exists_and_codex_child_env_excludes_board_credentials() -> 
     assert build_parser().parse_args(["run"]).command == "run"
     pending = build_parser().parse_args(["pending"])
     assert pending.command == "pending"
+    monitor = build_parser().parse_args(["monitor", "--follow", "--interval", "10"])
+    assert monitor.command == "monitor"
+    assert monitor.follow is True
     reconcile = build_parser().parse_args(
         [
             "reconcile",
@@ -69,3 +74,59 @@ def test_run_command_uses_durable_job_control(monkeypatch, capsys) -> None:
         "selected_runtime": runtime,
     }
     assert '"status": "completed"' in capsys.readouterr().out
+
+
+def test_monitor_is_read_only_and_never_constructs_board_or_runtime(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    monkeypatch.setenv("RAPIDO_STATE_PATH", str(state_path))
+    monkeypatch.setenv("CTFD_API_TOKEN", "monitor-must-not-read-this")
+    monkeypatch.setenv("TEAM_KEY", "monitor-must-not-read-this-either")
+    view = SimpleNamespace(status="completed")
+    monkeypatch.setattr(
+        cli.RuntimeConfig,
+        "from_env",
+        classmethod(lambda cls, **kwargs: pytest.fail("full config or credentials read")),
+    )
+    observed = {}
+    monkeypatch.setattr(
+        cli.DurableJobControl,
+        "monitor_snapshot",
+        staticmethod(
+            lambda path, run_id=None: observed.setdefault("snapshot", (path, run_id)) and view
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "monitor_payload", lambda selected, previous=None: ({"status": selected.status}, None)
+    )
+    monkeypatch.setattr(cli, "render_text", lambda payload: f"status={payload['status']}")
+    monkeypatch.setattr(cli, "BoardClient", lambda *args, **kwargs: pytest.fail("Board opened"))
+    monkeypatch.setattr(
+        cli, "CodexAppClient", lambda *args, **kwargs: pytest.fail("runtime opened")
+    )
+
+    assert (
+        cli._monitor(
+            run_id=None,
+            output_format="text",
+            follow=False,
+            interval=10,
+            record_jsonl=False,
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == "status=completed\n"
+    assert observed == {"snapshot": (state_path, None)}
+
+
+def test_monitor_record_never_aliases_state_database(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("RAPIDO_STATE_PATH", str(tmp_path / "rapido-monitor.jsonl"))
+    with pytest.raises(ValueError, match="must differ"):
+        cli._monitor(
+            run_id=None,
+            output_format="json",
+            follow=False,
+            interval=10,
+            record_jsonl=True,
+        )

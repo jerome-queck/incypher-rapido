@@ -75,7 +75,8 @@ ports. Optional artifact-parser workers deny networking entirely.
 
 ## Resources and shutdown
 
-The competition launch profile assigns 8 CPUs, 24 GiB RAM, and 256 PIDs. The default
+The portable launch profile assigns 8 CPUs, 24 GiB RAM, and 256 PIDs. Issue #19 acceptance on the
+current 14-CPU host uses `--cpus=12`, leaving two host CPUs. The default
 `RAPIDO_MAX_WORKSPACE_BYTES=536870912000` is a run-wide ceiling partitioned across configured
 active challenges; it is not a host filesystem quota. Per-artifact, aggregate-source, per-lane,
 tool-output, deadline, and PID bounds remain. SQLite/WAL growth, auth-home refresh files, and
@@ -93,7 +94,7 @@ new work, drains bounded operations before deleting workspaces, and persists amb
 Abrupt host/daemon failure relies on the next run using the same state/auth/work mounts.
 
 The hardened launch contract retains `--env-file=/path/to/rapido.env`, `--init`,
-`--stop-timeout=180`, `--cpus=8`, `--memory=24g`, `--pids-limit=256`, `--read-only`,
+`--stop-timeout=180`, `--cpus=8` (or the pre-registered measured host override), `--memory=24g`, `--pids-limit=256`, `--read-only`,
 `--tmpfs /tmp:rw,noexec,nosuid,nodev`, `--cap-drop=ALL`,
 `--security-opt=no-new-privileges:true`,
 `--mount type=bind,src=/private/path/rapido-state,dst=/state`, and

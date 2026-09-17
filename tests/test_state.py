@@ -217,6 +217,49 @@ def test_reconciled_correct_closes_interrupted_challenge_without_retry(tmp_path:
     store.close()
 
 
+def test_material_refresh_retires_old_correct_submission_authority(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    route = baseline_route(model="model", effort="xhigh", attempt_seconds=800)
+    assignments = (("lead", "model", "xhigh"), ("specialist", "model", "xhigh"))
+    store.initialize_control_catalogue(
+        "run-1",
+        [(0, 1, True)],
+        2,
+        route,
+        assignments,
+        {1: "a" * 64},
+    )
+    store.record_submission("run-1", 1, "INCYPHER{old_material}", "correct", 200)
+    store.finish_control_wave("run-1", 1, 0, "solved")
+
+    kind, episode, _ = store.admit_control_catalogue_revision(
+        run_id="run-1",
+        challenge_id=1,
+        name="A",
+        category="crypto",
+        challenge_type="standard",
+        value=100,
+        executable=True,
+        context_sha256="b" * 64,
+        new_catalogue_rank=1,
+        lanes=2,
+        route=route,
+        assignments=assignments,
+    )
+
+    assert (kind, episode) == ("refreshed", 1)
+    assert not store.challenge_has_correct_submission("run-1", 1)
+    assert not store.reserve_submission("run-1", 1, "INCYPHER{old_material}")
+    assert store.reserve_submission("run-1", 1, "INCYPHER{new_material}")
+    store.finalize_submission("run-1", 1, "INCYPHER{new_material}", "incorrect", 200)
+    store.finish_control_wave("run-1", 1, 1, "unsolved")
+    store.set_challenge_status(1, "unsolved")
+    assert store.run_terminal_outcomes("run-1") == {1: "unsolved"}
+    store.close()
+
+
 def test_supervisor_lease_excludes_concurrent_recovery(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     first = StateStore(path)
@@ -346,7 +389,7 @@ def test_productive_timeout_preserves_checkpoint_and_admits_daybreak_heavy_recov
         lanes=4,
         terminal="error",
         attempts_remaining=True,
-        remaining_milliseconds=10_000,
+        remaining_milliseconds=2_000_000,
     )
     assert decision is not None and decision.rule_id == "typed_timeout_recovery_v1"
     rows = store._connection.execute(

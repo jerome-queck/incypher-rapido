@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -43,7 +44,13 @@ from .memory import (
     sanitize_public_value,
 )
 from .memory import HostObservation as MemoryHostObservation
-from .routing import RouteSpec, baseline_route, instance_follow_on_route
+from .routing import (
+    MIN_MEANINGFUL_ATTEMPT_SECONDS,
+    RouteSpec,
+    adaptive_attempt_seconds,
+    baseline_route,
+    instance_follow_on_route,
+)
 from .solver import (
     DEVELOPER_INSTRUCTIONS,
     MAX_PRIOR_ATTEMPTS,
@@ -237,6 +244,37 @@ def _category_rank(value: str) -> int:
     return _CATEGORY_ORDER.get(normalized, len(_CATEGORY_ORDER))
 
 
+def _initial_attempt_seconds(
+    *,
+    configured_seconds: int,
+    challenge: Challenge,
+    unsolved_values: tuple[int, ...],
+    focus_ids: frozenset[int],
+    remaining_milliseconds: int,
+    unresolved_challenge_count: int,
+    parallel_challenge_count: int,
+) -> int:
+    """Use Board value as a light difficulty prior; live evidence controls later extensions."""
+    if challenge.solved:
+        return configured_seconds
+    capacity_budget = adaptive_attempt_seconds(
+        configured_seconds=configured_seconds,
+        remaining_milliseconds=remaining_milliseconds,
+        unresolved_challenge_count=unresolved_challenge_count,
+        parallel_challenge_count=parallel_challenge_count,
+    )
+    if challenge.id in focus_ids:
+        return capacity_budget
+    low = min(unsolved_values, default=challenge.value)
+    high = max(unsolved_values, default=challenge.value)
+    if high == low or capacity_budget <= configured_seconds:
+        return min(configured_seconds, capacity_budget)
+    scaled = configured_seconds + (capacity_budget - configured_seconds) * (
+        challenge.value - low
+    ) // (high - low)
+    return max(1, scaled // 100 * 100)
+
+
 def _durable_tool_name(value: object) -> str:
     return value if isinstance(value, str) and value in _DURABLE_TOOL_NAMES else "unknown_tool"
 
@@ -368,8 +406,12 @@ def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
     )
 
 
-def _challenge_material_sha256(challenge: Challenge) -> str:
+def _challenge_material_sha256(
+    challenge: Challenge, file_sha256s: tuple[str, ...] | None = None
+) -> str:
     """Bind same-run memory to stable solver inputs, excluding mutable Board counters."""
+    if file_sha256s is not None and len(file_sha256s) != len(challenge.files):
+        raise ValueError("challenge material digest count does not match file references")
     encoded = json.dumps(
         {
             "id": challenge.id,
@@ -379,6 +421,7 @@ def _challenge_material_sha256(challenge: Challenge) -> str:
             "description": challenge.description,
             "value": challenge.value,
             "files": _stable_challenge_files(challenge),
+            **({} if file_sha256s is None else {"file_sha256s": file_sha256s}),
             "shared": challenge.shared,
         },
         ensure_ascii=False,
@@ -386,6 +429,17 @@ def _challenge_material_sha256(challenge: Challenge) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise OSError("challenge material must be a regular file")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Orchestrator:
@@ -866,43 +920,168 @@ class Orchestrator:
             raise BoardError("Board identity changed during qualification")
         details.sort(
             key=lambda challenge: (
+                challenge.solved,
                 _category_rank(challenge.category),
                 challenge.value,
                 challenge.id,
             )
         )
-        balanced: list[Challenge] = []
-        standard_slots = max(1, self.config.active_challenges - 1)
-        for solved in (False, True):
-            group = [challenge for challenge in details if challenge.solved is solved]
-            dynamics = [challenge for challenge in group if challenge.type == "dynamic_iac"]
-            standards = [challenge for challenge in group if challenge.type == "standard"]
-            others = [
-                challenge
-                for challenge in group
-                if challenge.type not in {"dynamic_iac", "standard"}
-            ]
-            while dynamics or standards:
-                if dynamics:
-                    balanced.append(dynamics.pop(0))
-                for _ in range(standard_slots):
-                    if standards:
-                        balanced.append(standards.pop(0))
-                    elif dynamics:
-                        balanced.append(dynamics.pop(0))
-            balanced.extend(others)
-        details = balanced
         if self.config.challenge_ids:
             available = {challenge.id for challenge in details}
             missing = sorted(set(self.config.challenge_ids) - available)
             if missing:
                 raise BoardError("configured challenge ids are absent from the qualified catalogue")
-            selected = set(self.config.challenge_ids)
-            details = [challenge for challenge in details if challenge.id in selected]
+            by_id = {challenge.id: challenge for challenge in details}
+            details = [by_id[challenge_id] for challenge_id in self.config.challenge_ids]
+        elif self.config.focus_challenge_ids:
+            available = {challenge.id for challenge in details}
+            missing = sorted(set(self.config.focus_challenge_ids) - available)
+            if missing:
+                raise BoardError("configured focus challenge ids are absent from the catalogue")
+            focus_rank = {
+                challenge_id: rank
+                for rank, challenge_id in enumerate(self.config.focus_challenge_ids)
+            }
+            stable_rank = {challenge.id: rank for rank, challenge in enumerate(details)}
+            details.sort(
+                key=lambda challenge: (
+                    0 if challenge.id in focus_rank else 1,
+                    focus_rank.get(challenge.id, stable_rank[challenge.id]),
+                    stable_rank[challenge.id],
+                )
+            )
         return details
+
+    async def _wait_for_catalogue_revision(
+        self,
+        run_id: str,
+        run_root: Path,
+        deadline: float,
+        identity: tuple[int, int],
+        current: list[Challenge],
+    ) -> tuple[list[Challenge], dict[int, str]] | None:
+        """Stay idle until new or refreshed Board work appears, or the run deadline ends."""
+        known_ids = {challenge.id for challenge in current}
+        next_full_refresh = time.monotonic() + self.config.board_full_refresh_seconds
+        self.state.event(
+            run_id,
+            "board_watch_started",
+            {"known_challenges": len(known_ids)},
+        )
+        read_guard = float(getattr(self.board, "timeout", 15.0)) * 3 + 0.1
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= read_guard:
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                return None
+            await asyncio.sleep(min(float(self.config.board_watch_seconds), remaining - read_guard))
+            remaining = deadline - time.monotonic()
+            if remaining <= read_guard:
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                return None
+            first = await self._board_read(deadline, self.board.list_challenges)
+            second = await self._board_read(deadline, self.board.list_challenges)
+            first_ids = [row.get("id") for row in first]
+            second_ids = [row.get("id") for row in second]
+            if (
+                not first_ids
+                or any(type(value) is not int or value <= 0 for value in first_ids + second_ids)
+                or len(first_ids) != len(set(first_ids))
+                or len(second_ids) != len(set(second_ids))
+                or sorted(first_ids) != sorted(second_ids)
+            ):
+                raise BoardError("Board watch observed an incoherent challenge list")
+            final_identity = await self._board_read(deadline, self.board.identity)
+            if (
+                final_identity.get("id") != identity[0]
+                or final_identity.get("team_id") != identity[1]
+            ):
+                raise BoardError("Board identity changed during idle watch")
+            id_changed = not self.config.challenge_ids and set(first_ids) != known_ids
+            if id_changed or time.monotonic() >= next_full_refresh:
+                refreshed = await self._challenge_catalogue(deadline, identity)
+                refreshed_contexts = await self._probe_material_contexts(
+                    run_root,
+                    refreshed,
+                    deadline,
+                )
+                prior_material = self.state.control_catalogue_contexts(run_id)
+                revised = [
+                    challenge
+                    for challenge in refreshed
+                    if challenge.id not in prior_material
+                    or refreshed_contexts[challenge.id] != prior_material[challenge.id]
+                ]
+                if revised:
+                    self.state.event(
+                        run_id,
+                        "board_watch_changed",
+                        {"challenge_ids": sorted(challenge.id for challenge in revised)},
+                    )
+                    return refreshed, refreshed_contexts
+                current = refreshed
+                known_ids = {challenge.id for challenge in current}
+                next_full_refresh = time.monotonic() + self.config.board_full_refresh_seconds
+
+    async def _probe_material_contexts(
+        self,
+        run_root: Path,
+        challenges: list[Challenge],
+        deadline: float,
+    ) -> dict[int, str]:
+        """Hash current attachment bytes during infrequent qualified idle refreshes."""
+        probe_root = run_root / f".material-probe-{uuid.uuid4().hex}"
+        probe_root.mkdir(mode=0o700)
+        contexts: dict[int, str] = {}
+        try:
+            for challenge in challenges:
+                executable = challenge.type == "standard" or (
+                    challenge.type == "dynamic_iac" and self.config.manage_dynamic_instances
+                )
+                if not executable or not challenge.files:
+                    contexts[challenge.id] = _challenge_material_sha256(challenge)
+                    continue
+                total_bytes = 0
+                file_sha256s: list[str] = []
+                for index, file_ref in enumerate(challenge.files, 1):
+                    remaining_bytes = self.config.max_challenge_bytes - total_bytes
+                    if remaining_bytes <= 0:
+                        raise BoardError("challenge material probe exceeded aggregate byte limit")
+                    destination = (
+                        probe_root / f"challenge-{challenge.id}" / _artifact_name(file_ref, index)
+                    )
+                    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    result = await self._board_call(
+                        deadline,
+                        self.board.download,
+                        file_ref,
+                        destination,
+                        byte_limit=min(self.config.max_artifact_bytes, remaining_bytes),
+                    )
+                    downloaded = result.get("bytes") if isinstance(result, dict) else None
+                    if type(downloaded) is not int or downloaded < 0:
+                        raise BoardError("challenge material probe returned invalid byte evidence")
+                    if destination.stat().st_size != downloaded:
+                        raise BoardError("challenge material probe byte evidence disagreed")
+                    total_bytes += downloaded
+                    if total_bytes > self.config.max_challenge_bytes:
+                        raise BoardError("challenge material probe exceeded aggregate byte limit")
+                    file_sha256s.append(await asyncio.to_thread(_file_sha256, destination))
+                contexts[challenge.id] = _challenge_material_sha256(
+                    challenge,
+                    tuple(file_sha256s),
+                )
+            return contexts
+        finally:
+            await self._drain_rmtree(probe_root)
+            if probe_root.exists():
+                raise OSError("challenge material probe cleanup failed")
 
     async def _prepare_workspaces(
         self,
+        run_id: str,
         run_root: Path,
         challenge: Challenge,
         episode: int,
@@ -933,6 +1112,7 @@ class Orchestrator:
             sort_keys=True,
         ).encode("utf-8")
         source_paths: list[Path] = []
+        source_sha256s: list[str] = []
         total_bytes = 0
         for index, file_ref in enumerate(challenge.files, 1):
             remaining = deadline - time.monotonic()
@@ -956,6 +1136,20 @@ class Orchestrator:
             if total_bytes > self.config.max_challenge_bytes:
                 raise BoardError("challenge artifacts exceed the aggregate byte limit")
             source_paths.append(destination)
+            source_sha256s.append(await asyncio.to_thread(_file_sha256, destination))
+
+        if challenge.files:
+            try:
+                self.state.bind_control_catalogue_material(
+                    run_id,
+                    challenge.id,
+                    _challenge_material_sha256(challenge),
+                    _challenge_material_sha256(challenge, tuple(source_sha256s)),
+                )
+            except ValueError as exc:
+                raise BoardError(
+                    "challenge attachment changed within one material generation"
+                ) from exc
 
         if total_bytes * (lanes + 1) + len(context_payload) * lanes > (
             self.config.max_challenge_workspace_bytes
@@ -1066,12 +1260,15 @@ class Orchestrator:
     ) -> tuple[MemoryProjection, CandidateMemoryAggregate]:
         """Project verified earlier-episode facts; keep candidate identity controller-private."""
         target = MemoryTarget(run_id, challenge_id, episode, lane, route.role)
+        context_episode = self.state.control_catalogue_context_episode(run_id, challenge_id)
         contexts: list[CandidateContext] = []
         for source in self.state.private_candidate_context_sources(
             run_id,
             challenge_id,
             before_episode=episode,
         ):
+            if source["episode"] < context_episode:
+                continue
             try:
                 candidate = source["candidate"].decode("utf-8")
             except (AttributeError, UnicodeDecodeError) as exc:
@@ -1173,6 +1370,8 @@ class Orchestrator:
             target_lane=lane,
             before_episode=episode,
         ):
+            if source["source_episode"] < context_episode:
+                continue
             evidence_source = run_evidence.memory_source(source["source_attempt_id"])
             if source["summary"] is not None:
                 records.append(
@@ -1263,6 +1462,8 @@ class Orchestrator:
             challenge_id,
             before_episode=episode,
         ):
+            if failure["source_episode"] < context_episode:
+                continue
             records.append(
                 FailureRecord(
                     record_id=failure["record_id"],
@@ -1284,6 +1485,91 @@ class Orchestrator:
             ),
             candidate_memory,
         )
+
+    def _admit_catalogue_revisions(
+        self,
+        run_id: str,
+        challenges: list[Challenge],
+        deadline: float,
+        outcomes: dict[int, str],
+        material_contexts: dict[int, str] | None = None,
+    ) -> set[int]:
+        """Append or refresh only materially changed work under the run identity."""
+        durable_entries = self.state.control_catalogue_entries(run_id)
+        durable_contexts = self.state.control_catalogue_contexts(run_id)
+        next_rank = max((rank for rank, _, _ in durable_entries), default=-1) + 1
+        unresolved_count = sum(1 for challenge in challenges if not challenge.solved)
+        unsolved_values = tuple(challenge.value for challenge in challenges if not challenge.solved)
+        remaining_milliseconds = max(0, int((deadline - time.monotonic()) * 1_000))
+        changed: set[int] = set()
+        for challenge in challenges:
+            context_sha256 = (
+                _challenge_material_sha256(challenge)
+                if material_contexts is None
+                else material_contexts[challenge.id]
+            )
+            if durable_contexts.get(challenge.id) == context_sha256:
+                continue
+            executable = not (
+                challenge.type != "standard"
+                and (challenge.type != "dynamic_iac" or not self.config.manage_dynamic_instances)
+            )
+            route = baseline_route(
+                model=self.config.model,
+                effort=self.config.reasoning_effort,
+                attempt_seconds=_initial_attempt_seconds(
+                    configured_seconds=self.config.attempt_seconds,
+                    challenge=challenge,
+                    unsolved_values=unsolved_values,
+                    focus_ids=frozenset(self.config.focus_challenge_ids),
+                    remaining_milliseconds=remaining_milliseconds,
+                    unresolved_challenge_count=unresolved_count,
+                    parallel_challenge_count=self.config.active_challenges,
+                ),
+            )
+            kind, episode, catalogue_rank = self.state.admit_control_catalogue_revision(
+                run_id=run_id,
+                challenge_id=challenge.id,
+                name=challenge.name,
+                category=challenge.category,
+                challenge_type=challenge.type,
+                value=challenge.value,
+                executable=executable,
+                context_sha256=context_sha256,
+                new_catalogue_rank=next_rank,
+                lanes=self.config.attempts_per_challenge,
+                route=route,
+                assignments=self._initial_peer_assignments(),
+            )
+            if kind == "unchanged":
+                continue
+            changed.add(challenge.id)
+            outcomes.pop(challenge.id, None)
+            if kind == "appended":
+                next_rank += 1
+            if not executable:
+                self.state.set_challenge_status(challenge.id, "unsupported")
+                outcomes[challenge.id] = "unsupported"
+                self.state.event(
+                    run_id,
+                    "challenge_unsupported",
+                    {
+                        "challenge_id": challenge.id,
+                        "reason": "organizer_challenge_type_unavailable",
+                    },
+                )
+            elif episode is None:
+                raise AssertionError("executable catalogue revision was not admitted")
+            self.state.event(
+                run_id,
+                "challenge_revision_admitted",
+                {
+                    "challenge_id": challenge.id,
+                    "catalogue_rank": catalogue_rank,
+                    "kind": kind,
+                },
+            )
+        return changed
 
     async def _lane(
         self,
@@ -2030,6 +2316,7 @@ class Orchestrator:
         self.state.set_challenge_status(challenge.id, "running")
         try:
             workspaces = await self._prepare_workspaces(
+                run_id,
                 run_root,
                 challenge,
                 episode,
@@ -2305,17 +2592,25 @@ class Orchestrator:
         *,
         resumed: bool = False,
     ) -> dict[int, str]:
-        """Keep five challenge engagements active; auxiliary waves stay inside them."""
+        """Keep productive engagements active; park dynamic work outside their slots."""
         queue: asyncio.PriorityQueue[tuple[int, Challenge | None, float, int, RouteSpec]] = (
             asyncio.PriorityQueue()
         )
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
-        dynamic_ids = {challenge.id for challenge in challenges if challenge.type == "dynamic_iac"}
         instance_condition = asyncio.Condition()
         instance_holders: set[int] = set()
-        instance_completed: set[int] = set()
+        instance_reserved: set[int] = set()
+        instance_waiters: list[tuple[int, int, int, Challenge, float, RouteSpec]] = []
+        unfinished: set[int] = set()
+        all_finished = asyncio.Event()
+        admission_closed = asyncio.Event()
+        shutdown_only = asyncio.Event()
+
+        class AdmissionDeferred(Exception):
+            pass
+
         initial_route = baseline_route(
             model=self.config.model,
             effort=self.config.reasoning_effort,
@@ -2335,37 +2630,67 @@ class Orchestrator:
             )
             return queued_at
 
+        def close_admission(reason: str) -> None:
+            if admission_closed.is_set():
+                return
+            admission_closed.set()
+            self.state.event(
+                run_id,
+                "challenge_admission_closed",
+                {
+                    "reason": reason,
+                    "remaining_milliseconds": max(0, int((deadline - time.monotonic()) * 1_000)),
+                },
+            )
+
         challenges_by_id = {challenge.id: challenge for challenge in challenges}
-        if resumed:
-            for wave in self.state.queued_control_waves(run_id, exclude_pending_submissions=True):
-                challenge = challenges_by_id.get(wave.challenge_id)
-                if challenge is None:
-                    raise RecoveryBlocked("durable queued challenge is absent from the Board")
-                queued_at = record_queued(challenge, wave.episode, "supervisor_restart")
+        board_unsolved = {challenge.id for challenge in challenges if not challenge.solved}
+        waves = self.state.queued_control_waves(
+            run_id, exclude_pending_submissions=resumed and self._adaptive_control
+        )
+        for wave in waves:
+            challenge = challenges_by_id.get(wave.challenge_id)
+            if challenge is None:
+                raise RecoveryBlocked("durable queued challenge is absent from the Board")
+            unfinished.add(challenge.id)
+            reason = "supervisor_restart" if resumed else "initial_coverage"
+            queued_at = record_queued(challenge, wave.episode, reason)
+            if wave.route.tactic == "instance_enabled_follow_on" or (
+                not self._adaptive_control and challenge.type == "dynamic_iac"
+            ):
+                heapq.heappush(
+                    instance_waiters,
+                    (
+                        wave.catalogue_rank,
+                        wave.episode,
+                        challenge.id,
+                        challenge,
+                        queued_at,
+                        wave.route,
+                    ),
+                )
+                self.state.event(
+                    run_id,
+                    "instance_wait_parked",
+                    {
+                        "challenge_id": challenge.id,
+                        "episode": wave.episode,
+                        "reason": "supervisor_restart" if resumed else "durable_replay",
+                    },
+                )
+            else:
                 replay_priority = (
                     wave.catalogue_rank if wave.episode == 0 else 2**30 + wave.catalogue_rank
                 )
-                queue.put_nowait(
-                    (
-                        replay_priority,
-                        challenge,
-                        queued_at,
-                        wave.episode,
-                        wave.route,
-                    )
+                queue.put_nowait((replay_priority, challenge, queued_at, wave.episode, wave.route))
+            if not resumed and challenge.solved:
+                self.state.event(
+                    run_id,
+                    "prior_board_solved_ignored",
+                    {"challenge_id": challenge.id, "run_local_verified": False},
                 )
-        else:
-            for challenge in challenges:
-                queued_at = record_queued(challenge, 0, "initial_coverage")
-                queue.put_nowait(
-                    (catalogue_ranks[challenge.id], challenge, queued_at, 0, initial_route)
-                )
-                if challenge.solved:
-                    self.state.event(
-                        run_id,
-                        "prior_board_solved_ignored",
-                        {"challenge_id": challenge.id, "run_local_verified": False},
-                    )
+        if not unfinished:
+            all_finished.set()
 
         async def execute_episode(
             challenge: Challenge,
@@ -2454,7 +2779,11 @@ class Orchestrator:
             peak_active = max(peak_active, len(active))
             self.state.event(
                 run_id,
-                "challenge_engagement_started",
+                (
+                    "challenge_engagement_resumed"
+                    if resumed or initial_episode > 0
+                    else "challenge_engagement_started"
+                ),
                 {"challenge_id": challenge.id, "active_challenges": len(active)},
             )
 
@@ -2466,20 +2795,18 @@ class Orchestrator:
                     {"challenge_id": challenge.id, "episode": episode},
                 )
                 async with instance_condition:
-                    while True:
-                        eligible = sorted(
-                            active & dynamic_ids - instance_completed - instance_holders,
-                            key=catalogue_ranks.__getitem__,
-                        )
-                        if (
-                            len(instance_holders) < self.config.dynamic_concurrency
-                            and challenge.id
-                            in eligible[: self.config.dynamic_concurrency - len(instance_holders)]
-                        ):
-                            instance_holders.add(challenge.id)
-                            lease_acquired = True
-                            break
-                        await instance_condition.wait()
+                    if (
+                        not self._adaptive_control
+                        and challenge.id not in instance_reserved
+                        and len(instance_holders) < self.config.dynamic_concurrency
+                    ):
+                        instance_reserved.add(challenge.id)
+                    if challenge.id not in instance_reserved:
+                        raise RuntimeError("dynamic challenge started without a broker reservation")
+                    instance_reserved.remove(challenge.id)
+                    instance_holders.add(challenge.id)
+                    lease_acquired = True
+                    instance_condition.notify_all()
                 existing = self.state.owned_instances()
                 unsafe = any(record["status"] != "owned" for record in existing)
                 if unsafe or len(existing) >= self.config.dynamic_concurrency:
@@ -2574,8 +2901,7 @@ class Orchestrator:
                     target_endpoints = ()
                     async with instance_condition:
                         instance_holders.discard(challenge.id)
-                        if create_attempted:
-                            instance_completed.add(challenge.id)
+                        instance_reserved.discard(challenge.id)
                         instance_condition.notify_all()
                 if not clean:
                     return False
@@ -2585,6 +2911,12 @@ class Orchestrator:
 
             try:
                 while True:
+                    if (
+                        route.attempt_seconds >= MIN_MEANINGFUL_ATTEMPT_SECONDS
+                        and deadline - time.monotonic() < MIN_MEANINGFUL_ATTEMPT_SECONDS
+                    ):
+                        close_admission("below_meaningful_attempt_budget")
+                        raise AdmissionDeferred
                     needs_instance = challenge.type == "dynamic_iac" and (
                         not self._adaptive_control
                         or route.tactic == "instance_enabled_follow_on"
@@ -2612,8 +2944,12 @@ class Orchestrator:
                         )
 
                     recovery_allowance = self.state.recovery_dispatch_count(run_id, challenge.id)
+                    context_episode = self.state.control_catalogue_context_episode(
+                        run_id, challenge.id
+                    )
                     has_successor_budget = (
-                        episode + 1 < self.config.episodes_per_challenge + recovery_allowance
+                        episode - context_episode + 1
+                        < self.config.episodes_per_challenge + recovery_allowance
                         and time.monotonic() < deadline
                     )
                     dynamic_local_follow_on = (
@@ -2654,7 +2990,29 @@ class Orchestrator:
                         episode += 1
                         route = successor
                         queued_at = record_queued(challenge, episode, "local_analysis_complete")
-                        continue
+                        heapq.heappush(
+                            instance_waiters,
+                            (
+                                catalogue_ranks[challenge.id],
+                                episode,
+                                challenge.id,
+                                challenge,
+                                queued_at,
+                                route,
+                            ),
+                        )
+                        self.state.event(
+                            run_id,
+                            "instance_wait_parked",
+                            {
+                                "challenge_id": challenge.id,
+                                "episode": episode,
+                                "reason": "local_analysis_complete",
+                            },
+                        )
+                        async with instance_condition:
+                            instance_condition.notify_all()
+                        return
                     if self._adaptive_control:
                         decision = self.state.finish_and_decide_control_wave(
                             run_id=run_id,
@@ -2668,6 +3026,15 @@ class Orchestrator:
                             remaining_milliseconds=max(
                                 0, int((deadline - time.monotonic()) * 1000)
                             ),
+                            unresolved_challenge_count=len(
+                                board_unsolved
+                                - {
+                                    challenge_id
+                                    for challenge_id, value in outcomes.items()
+                                    if value == "solved"
+                                }
+                            ),
+                            parallel_challenge_count=self.config.active_challenges,
                         )
                         if decision is not None and decision.disposition == "dispatch":
                             assert decision.successor is not None
@@ -2712,43 +3079,115 @@ class Orchestrator:
                     "active_challenges": len(active),
                 },
             )
+            unfinished.remove(challenge.id)
+            if not unfinished:
+                all_finished.set()
+                async with instance_condition:
+                    instance_condition.notify_all()
 
         async def worker() -> None:
             while True:
+                if admission_closed.is_set():
+                    await shutdown_only.wait()
                 item = await queue.get()
+                _, challenge, queued_at, episode, route = item
+                if (
+                    challenge is not None
+                    and route.attempt_seconds >= MIN_MEANINGFUL_ATTEMPT_SECONDS
+                    and deadline - time.monotonic() < MIN_MEANINGFUL_ATTEMPT_SECONDS
+                ):
+                    queue.put_nowait(item)
+                    queue.task_done()
+                    close_admission("below_meaningful_attempt_budget")
+                    await shutdown_only.wait()
+                    continue
                 try:
-                    _, challenge, queued_at, episode, route = item
                     if challenge is None:
                         return
-                    await run_engagement(challenge, queued_at, episode, route)
+                    try:
+                        await run_engagement(challenge, queued_at, episode, route)
+                    except AdmissionDeferred:
+                        await shutdown_only.wait()
                 finally:
                     queue.task_done()
 
-        workers = [
-            asyncio.create_task(worker())
-            for _ in range(min(self.config.active_challenges, max(1, len(challenges))))
-        ]
-        join = asyncio.create_task(queue.join())
+        async def instance_broker() -> None:
+            """Wake one durable live phase only when both scarce slots are available."""
+            while True:
+                async with instance_condition:
+                    while True:
+                        if all_finished.is_set():
+                            return
+                        if time.monotonic() >= deadline:
+                            raise RunDeadlineReached
+                        if (
+                            deadline - time.monotonic() < MIN_MEANINGFUL_ATTEMPT_SECONDS
+                            and instance_waiters
+                            and instance_waiters[0][5].attempt_seconds
+                            >= MIN_MEANINGFUL_ATTEMPT_SECONDS
+                        ):
+                            close_admission("below_meaningful_instance_budget")
+                            await instance_condition.wait()
+                            continue
+                        waiter_ready = (
+                            bool(instance_waiters) and instance_waiters[0][3].id not in active
+                        )
+                        capacity_ready = (
+                            len(instance_holders) + len(instance_reserved)
+                            < self.config.dynamic_concurrency
+                        )
+                        if waiter_ready and capacity_ready:
+                            break
+                        await instance_condition.wait()
+                    _, episode, challenge_id, challenge, queued_at, route = heapq.heappop(
+                        instance_waiters
+                    )
+                    instance_reserved.add(challenge_id)
+                self.state.event(
+                    run_id,
+                    "instance_wait_woken",
+                    {"challenge_id": challenge_id, "episode": episode},
+                )
+                queue.put_nowait((-1, challenge, queued_at, episode, route))
+
+        remaining_seconds = max(1, int(deadline - time.monotonic()))
+        if remaining_seconds < MIN_MEANINGFUL_ATTEMPT_SECONDS and any(
+            wave.route.attempt_seconds >= MIN_MEANINGFUL_ATTEMPT_SECONDS for wave in waves
+        ):
+            raise RunDeadlineReached
+        worker_count = min(
+            self.config.active_challenges,
+            max(1, len(unfinished)),
+        )
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        broker = asyncio.create_task(instance_broker())
+        finished = asyncio.create_task(all_finished.wait())
         timer = asyncio.create_task(asyncio.sleep(max(0.0, deadline - time.monotonic())))
         try:
-            watched: set[asyncio.Task[Any]] = {join, timer, *workers}
+            watched: set[asyncio.Task[Any]] = {finished, timer, broker, *workers}
             done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
-            if join in done:
-                await join
+            if finished in done:
+                await finished
+                await queue.join()
             elif timer in done:
                 raise RunDeadlineReached
             else:
-                failed_worker = next(task for task in done if task in workers)
-                await failed_worker
-                raise RuntimeError("challenge queue worker exited before drain")
+                failed_task = next(task for task in done if task in {*workers, broker})
+                await failed_task
+                raise RuntimeError("challenge queue task exited before completion")
             for _ in workers:
                 queue.put_nowait((2**31, None, 0.0, 0, initial_route))
             await asyncio.gather(*workers)
+            await broker
+            if instance_waiters or instance_reserved or instance_holders:
+                raise RuntimeError("challenge queue completed with live instance work")
         finally:
-            for task in (join, timer, *workers):
+            for task in (finished, timer, broker, *workers):
                 if not task.done():
                     task.cancel()
-            shutdown = await asyncio.gather(join, timer, *workers, return_exceptions=True)
+            shutdown = await asyncio.gather(
+                finished, timer, broker, *workers, return_exceptions=True
+            )
             if self.state.owned_instances():
                 raise BoardError("instance cleanup remained indeterminate during queue shutdown")
             failure = next(
@@ -2827,7 +3266,12 @@ class Orchestrator:
                 outcomes.update(self.state.run_terminal_outcomes(run_id))
                 challenge_count = len(durable_catalogue)
                 pending_effects = self.state.pending_submission_intents()
-                if durable_catalogue and not pending_effects and len(outcomes) == challenge_count:
+                if (
+                    durable_catalogue
+                    and not pending_effects
+                    and len(outcomes) == challenge_count
+                    and not self.config.watch_board
+                ):
                     status = "completed"
                     self.state.finish_run(run_id, status)
                     return self._run_report(run_id, status, challenge_count, outcomes)
@@ -2901,9 +3345,37 @@ class Orchestrator:
                 current_contexts[challenge.id] = _challenge_material_sha256(challenge)
                 if executable:
                     eligible.append(challenge)
-            if durable_signature and durable_signature != current_signature:
+            if session.resumed and durable_catalogue:
+                current_contexts = await self._probe_material_contexts(
+                    run_root,
+                    challenges,
+                    deadline,
+                )
+                for challenge in challenges:
+                    metadata_context = _challenge_material_sha256(challenge)
+                    if (
+                        challenge.files
+                        and durable_contexts.get(challenge.id) == metadata_context
+                        and current_contexts[challenge.id] != metadata_context
+                    ):
+                        self.state.bind_control_catalogue_material(
+                            run_id,
+                            challenge.id,
+                            metadata_context,
+                            current_contexts[challenge.id],
+                        )
+                durable_contexts = self.state.control_catalogue_contexts(run_id)
+            if (
+                durable_signature
+                and durable_signature != current_signature
+                and not self.config.watch_board
+            ):
                 raise RecoveryBlocked("Board catalogue identity changed during same-run recovery")
-            if durable_contexts and durable_contexts != current_contexts:
+            if (
+                durable_contexts
+                and durable_contexts != current_contexts
+                and not self.config.watch_board
+            ):
                 raise RecoveryBlocked("Board challenge material changed during same-run recovery")
             for challenge, (_, _, executable) in zip(challenges, catalogue_entries, strict=True):
                 self.state.upsert_challenge(
@@ -2929,57 +3401,135 @@ class Orchestrator:
                     )
                     outcomes[challenge.id] = "unsupported"
             if not durable_catalogue:
-                initial_route = baseline_route(
-                    model=self.config.model,
-                    effort=self.config.reasoning_effort,
-                    attempt_seconds=self.config.attempt_seconds,
+                unresolved_count = sum(
+                    1
+                    for challenge, (_, _, executable) in zip(
+                        challenges, catalogue_entries, strict=True
+                    )
+                    if executable and not challenge.solved
                 )
+                unsolved_values = tuple(
+                    challenge.value
+                    for challenge, (_, _, executable) in zip(
+                        challenges, catalogue_entries, strict=True
+                    )
+                    if executable and not challenge.solved
+                )
+                remaining_milliseconds = max(0, int((deadline - time.monotonic()) * 1_000))
+                initial_routes = {
+                    challenge.id: baseline_route(
+                        model=self.config.model,
+                        effort=self.config.reasoning_effort,
+                        attempt_seconds=_initial_attempt_seconds(
+                            configured_seconds=self.config.attempt_seconds,
+                            challenge=challenge,
+                            unsolved_values=unsolved_values,
+                            focus_ids=frozenset(self.config.focus_challenge_ids),
+                            remaining_milliseconds=remaining_milliseconds,
+                            unresolved_challenge_count=unresolved_count,
+                            parallel_challenge_count=self.config.active_challenges,
+                        ),
+                    )
+                    for challenge, (_, _, executable) in zip(
+                        challenges, catalogue_entries, strict=True
+                    )
+                    if executable
+                }
                 self.state.initialize_control_catalogue(
                     run_id,
                     catalogue_entries,
                     self.config.attempts_per_challenge,
-                    initial_route,
+                    initial_routes,
                     self._initial_peer_assignments(),
                     current_contexts,
                 )
-            catalogue_ranks = {
-                challenge_id: catalogue_rank
-                for catalogue_rank, challenge_id, _ in (durable_catalogue or catalogue_entries)
-            }
-            outcomes.update(self.state.run_terminal_outcomes(run_id))
-            queued_waves = self.state.queued_control_waves(
-                run_id,
-                exclude_pending_submissions=session.resumed and self._adaptive_control,
-            )
-            if (
-                session.resumed
-                and not queued_waves
-                and len(outcomes) != challenge_count
-                and not self.state.pending_submission_intents()
-            ):
-                raise RecoveryBlocked("durable run has neither queued nor terminal challenge work")
-            if eligible and queued_waves:
-                if self._adaptive_control:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise RunDeadlineReached
-                    try:
-                        await asyncio.wait_for(self.runtime.start(), timeout=remaining)
-                    except TimeoutError as exc:
-                        raise RunDeadlineReached from exc
-                    await self._validate_peer_models(run_id, deadline)
-                await self._run_challenge_queue(
+            elif self.config.watch_board:
+                self._admit_catalogue_revisions(
                     run_id,
-                    run_root,
-                    eligible,
-                    catalogue_ranks,
+                    challenges,
                     deadline,
                     outcomes,
-                    resumed=session.resumed and bool(durable_catalogue),
+                    current_contexts,
                 )
+            runtime_started = not self._adaptive_control
+            queue_resumed = session.resumed and bool(durable_catalogue)
+            while True:
+                durable_catalogue = self.state.control_catalogue_entries(run_id)
+                challenge_count = len(durable_catalogue)
+                catalogue_ranks = {
+                    challenge_id: catalogue_rank
+                    for catalogue_rank, challenge_id, _ in durable_catalogue
+                }
+                outcomes.update(self.state.run_terminal_outcomes(run_id))
+                queued_waves = self.state.queued_control_waves(
+                    run_id,
+                    exclude_pending_submissions=self._adaptive_control,
+                )
+                if (
+                    queue_resumed
+                    and not queued_waves
+                    and len(outcomes) != challenge_count
+                    and not self.state.pending_submission_intents()
+                ):
+                    raise RecoveryBlocked(
+                        "durable run has neither queued nor terminal challenge work"
+                    )
+                queued_ids = {wave.challenge_id for wave in queued_waves}
+                current_ids = {challenge.id for challenge in challenges}
+                if queued_ids - current_ids:
+                    raise RecoveryBlocked(
+                        "durable queued challenge is absent from the current Board catalogue"
+                    )
+                eligible = [challenge for challenge in challenges if challenge.id in queued_ids]
+                if eligible and queued_waves:
+                    if not runtime_started:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RunDeadlineReached
+                        try:
+                            await asyncio.wait_for(self.runtime.start(), timeout=remaining)
+                        except TimeoutError as exc:
+                            raise RunDeadlineReached from exc
+                        await self._validate_peer_models(run_id, deadline)
+                        runtime_started = True
+                    await self._run_challenge_queue(
+                        run_id,
+                        run_root,
+                        eligible,
+                        catalogue_ranks,
+                        deadline,
+                        outcomes,
+                        resumed=queue_resumed,
+                    )
+                    queue_resumed = False
+                    outcomes.update(self.state.run_terminal_outcomes(run_id))
+                if self._adaptive_control and self.state.pending_submission_intents():
+                    raise RecoveryBlocked(
+                        "pending submission effect requires explicit reconciliation"
+                    )
+                if not self.config.watch_board:
+                    break
+                refresh = await self._wait_for_catalogue_revision(
+                    run_id,
+                    run_root,
+                    deadline,
+                    identity,
+                    challenges,
+                )
+                if refresh is None:
+                    break
+                refreshed, material_contexts = refresh
+                self._admit_catalogue_revisions(
+                    run_id,
+                    refreshed,
+                    deadline,
+                    outcomes,
+                    material_contexts,
+                )
+                challenges = refreshed
             outcomes.update(self.state.run_terminal_outcomes(run_id))
-            if self._adaptive_control and self.state.pending_submission_intents():
-                raise RecoveryBlocked("pending submission effect requires explicit reconciliation")
+            if self.state.queued_control_waves(run_id) or len(outcomes) != challenge_count:
+                raise RecoveryBlocked("run ended with unfinished durable challenge work")
             status = "completed"
             self.state.finish_run(run_id, status)
         except RecoveryBlocked as exc:

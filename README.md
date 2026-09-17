@@ -88,7 +88,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, shared-instance or one evidence-earned changed Recovery, then bounded verification; accepted range 1–4. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: two Daybreak Leads plus two Luna Specialists by default; accepted range 2–8. |
-| `RAPIDO_ATTEMPT_SECONDS` | `800` | Cumulative per-lane deadline across same-chat continuations. |
+| `RAPIDO_ATTEMPT_SECONDS` | `800` | First-pass baseline; accepted range 600–7,200s. Automatic scaling reaches 1,800s when wall time allows; a larger configured baseline is preserved. |
 | `RAPIDO_BOARD_TIMEOUT_SECONDS` | `15` | One bounded Board request. |
 | `RAPIDO_INSTANCE_READY_SECONDS` | `120` | Dynamic-instance readiness budget. |
 | `RAPIDO_INSTANCE_CLEANUP_SECONDS` | `45` | Dynamic cleanup budget; must cover three Board requests. |
@@ -99,8 +99,12 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
 | `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
+| `RAPIDO_FOCUS_CHALLENGE_IDS` | empty | Ordered priority prefix without narrowing full-catalogue coverage. |
 | `RAPIDO_SUBMIT_CANDIDATES` | `true` | Unlimited challenges immediately submit distinct source-qualified candidates through the fifth wrong; later or Board-limited candidates require an independent Verifier. |
 | `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Local-first analysis plus one receipt-bound shared-instance lease at a time. |
+| `RAPIDO_WATCH_BOARD` | `true` | After the queue drains, remain alive until the original deadline and resume new or materially changed work. |
+| `RAPIDO_BOARD_WATCH_SECONDS` | `60` | Idle challenge-list polling interval. |
+| `RAPIDO_BOARD_FULL_REFRESH_SECONDS` | `900` | Periodic qualified metadata and bounded attachment-content refresh while idle. |
 
 ## Evaluation and persistent Board state
 
@@ -132,11 +136,35 @@ authorities, paths, credentials, and candidate fingerprints are never carried in
 The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
 Initial and ordinary Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh. A productive
 timeout may earn one changed Recovery with three Daybreak/xhigh plus one Luna/max; repeated or
-zero-evidence timeouts stop. A Verifier is one fresh Daybreak/xhigh lane. Dynamic challenges analyze locally first, then queue
-for the measured single Board instance slot. All four peers share that challenge's one live
-instance, which is removed before the lease passes to another challenge.
+zero-evidence timeouts stop. A Verifier is one fresh Daybreak/xhigh lane. The ordered queue puts
+`RAPIDO_FOCUS_CHALLENGE_IDS` first, then Board-unsolved work, while preserving deterministic
+category/value order. Normal work starts near 800s; higher-value or explicitly focused unsolved
+work can receive an automatic grant up to 1,800s, and productive timeout Recovery recomputes its
+grant from remaining time and unsolved work. An explicitly configured larger baseline is not
+reduced. No full live wave starts with less than 600s left.
+
+Dynamic challenges analyze locally, then park in a durable instance-ready queue without occupying
+one of the five productive challenge slots. The next waiter gets priority when the single lease
+and a productive slot are free. All peers for that challenge share one instance; receipt-bound
+cleanup completes before the lease moves. After all queued work closes, the Board watcher keeps
+the same original deadline, appends new challenges, and gives materially changed challenges a new
+workspace generation. Full refreshes compare bounded attachment bytes even when a URL is unchanged.
+Earlier-generation observations, candidates, verification, routes, and Board effects remain private
+durable audit history, but cannot drive new-material prompts, routing, verification, or outcomes.
 
 ## Stop, restart, and cleanup
+
+View one sanitized snapshot, or record 10-second JSONL samples inside the private state volume:
+
+```sh
+docker exec rapido rapido monitor
+docker exec rapido rapido monitor --follow --interval 10 --record-jsonl
+```
+
+The monitor reads SQLite in query-only mode and the solver container's own cgroup. It reports
+queue/instance-wait IDs, lane states, tools, continuations, submissions, CPU, memory, and PIDs; it
+never calls the Board or reads candidate values, credentials, raw Board payloads, model prose, or
+Docker state. Recorded samples use `/state/rapido-monitor.jsonl` and mode `0600`.
 
 Use the 180-second grace period so bounded target drains, native shutdown, and instance cleanup can
 finish:
