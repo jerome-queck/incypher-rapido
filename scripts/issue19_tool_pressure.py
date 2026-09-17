@@ -36,7 +36,7 @@ SAMPLE_SECONDS = 0.1
 OUTER_SECONDS = 20 * 60
 SHELL_SECONDS = 180
 EXPECTED_LIMITS = {
-    "cpu_cores": 8.0,
+    "cpu_cores": 12.0,
     "memory_bytes": 24 * GIB,
     "swap_bytes": 0,
     "pids": 256,
@@ -53,6 +53,16 @@ MEMORY_MIN_PER_WORKER = int(1.65 * GIB)
 ADVERSARIAL_GROUP_MEMORY = int(2.25 * GIB)
 ADVERSARIAL_GROUP_TASKS = 48
 ANALYSIS_DIRECTORY = "rapido-analysis"
+
+
+def _resource_envelope_matches(limits: dict[str, Any]) -> bool:
+    return (
+        abs(limits["cpu_cores"] - EXPECTED_LIMITS["cpu_cores"]) < 1e-9
+        and limits["memory_max"] == EXPECTED_LIMITS["memory_bytes"]
+        and limits["memory_swap_max"] == EXPECTED_LIMITS["swap_bytes"]
+        and limits["pids_max"] == EXPECTED_LIMITS["pids"]
+        and limits["uid"] == EXPECTED_LIMITS["uid"]
+    )
 
 
 class PreconditionError(RuntimeError):
@@ -744,14 +754,7 @@ class Harness:
         self.cgroup = Cgroup()
         limits = self.cgroup.limits()
         self.result["limits"] = limits
-        exact = (
-            abs(limits["cpu_cores"] - EXPECTED_LIMITS["cpu_cores"]) < 1e-9
-            and limits["memory_max"] == EXPECTED_LIMITS["memory_bytes"]
-            and limits["memory_swap_max"] == EXPECTED_LIMITS["swap_bytes"]
-            and limits["pids_max"] == EXPECTED_LIMITS["pids"]
-            and limits["uid"] == EXPECTED_LIMITS["uid"]
-        )
-        if not exact:
+        if not _resource_envelope_matches(limits):
             raise PreconditionError(f"resource envelope mismatch: {limits!r}")
         self.initial_cgroup = self.cgroup.snapshot()
 
