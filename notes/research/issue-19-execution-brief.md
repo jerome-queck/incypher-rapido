@@ -1186,6 +1186,7 @@ requires later owner authorization and a fresh unattended 19,800-second acceptan
 | Private GPT-6 Pro archive triage | `gpt-daybreak-blue-latest` / `xhigh` | read-only untrusted extraction; validated scheduler/evidence/monitor findings only, archive excluded from Git |
 | Selective analysis-carry tests | `gpt-5.6-luna` / `xhigh` | four focused tests cover safe carry, unsafe/link rejection, Verifier isolation, and latest-generation replacement |
 | Post-diagnostic scheduler audit | `gpt-daybreak-blue-latest` / `xhigh` | watcher starvation, FIFO ticket loss, stale waiter projection, late admission, and historical-effect scope found and repaired locally |
+| First exact two-hour diagnostic failure audits | two independent `gpt-daybreak-blue-latest` / `xhigh` lanes | writer/reader asymmetry for failed target-tool evidence confirmed against the immutable live database; no corruption, fallback, pending effect, or retained instance |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1200,11 +1201,36 @@ and honest closeout remain pending.
 PR #46 later auto-closed #19 again when its rerun fix merged. The independent one-hour audit caught
 the mismatch; the main owner reopened #19 before the timeout-recovery delivery. It remains open.
 
+### First exact two-hour diagnostic: failed evidence validation
+
+The pre-registered run `b7ae2092c38a44559d660edbcce6462a` started from empty state on exact
+image digest `sha256:008a035cb3325798b10c8839c9a696bde97abb247e3a9f7731d24284c213eec9`.
+It exited 2 after 1,174 seconds, so it is failed diagnostic evidence and contributes no acceptance
+solve. Before failure it began 9/15 challenges, closed three Board-solved challenges, submitted one
+incorrect candidate, exercised prompt continuations, refilled solved slots, and requeued an
+unsolved challenge instead of terminalizing it.
+
+The fatal path was challenge 33 episode 1 after its local-analysis transition. Failed target tools
+stored conservative error facts through `_recursive_facts`; object verification incorrectly applied
+successful target metadata projection to the same facts. Three of 738 immutable evidence objects
+therefore failed self-validation. SQLite integrity and foreign keys were clean. The exception
+cancelled the wave, removed its sole instance, released its lease, sealed attempts, and finalized
+the run `failed`. All four submission intents were settled; no local instance or pending effect
+remained. The run is not eligible for same-run recovery because only process-lost `running` runs
+resume. Its state must not be edited or reused.
+
+The selected repair makes failed-object verification use the same conservative projection as its
+writer. It accepts all 738 archived objects without weakening canonical digest, metadata,
+candidate, or immutability checks. Regression coverage round-trips every target tool through
+commit, reopen, and carry. A replacement diagnostic requires a new exact image, new protocol
+registration, and newly empty state/workspace.
+
 ## Open decisions
 
-- Finish scheduler/monitor/docs tests, independent review, focused PR, all green CI, and exact-image
-  verification. Confirm the 12-CPU/24-GiB/256-PID launch and sampler before Board work.
-- Pre-register and run the owner-authorized fresh two-hour diagnostic: all 15, focus 15/94/42,
+- Merge and exact-image verify the failed-target evidence symmetry repair. Preserve sanitized
+  failure evidence, then delete only the failed diagnostic's exact container/state/workspace while
+  retaining its private archive and authentication.
+- Pre-register and run a replacement fresh two-hour diagnostic: all 15, focus 15/94/42,
   submissions/instances/watch enabled, no steering, exact merged image, durable monitor JSONL.
 - Audit solve conversion, park/wake order, context on requeue, productive time, CPU/RSS/PIDs,
   effects, instances, and residue. Merge sanitized evidence and delete that exact diagnostic state
