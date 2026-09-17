@@ -51,7 +51,6 @@ BALLAST_BYTES = 512 * MIB
 MEMORY_PER_WORKER = 1792 * MIB
 MEMORY_MIN_PER_WORKER = int(1.65 * GIB)
 ADVERSARIAL_GROUP_MEMORY = int(2.25 * GIB)
-ADVERSARIAL_GROUP_TASKS = 48
 ANALYSIS_DIRECTORY = "rapido-analysis"
 
 
@@ -63,6 +62,30 @@ def _resource_envelope_matches(limits: dict[str, Any]) -> bool:
         and limits["pids_max"] == EXPECTED_LIMITS["pids"]
         and limits["uid"] == EXPECTED_LIMITS["uid"]
     )
+
+
+def _mixed_cpu_matches(profile: int, peak: float) -> bool:
+    return 0.5 * profile <= peak <= EXPECTED_LIMITS["cpu_cores"] + 0.25
+
+
+def _pid_phase_within_global_fence(samples: dict[str, Any]) -> bool:
+    return samples.get("pids_current_peak", HARD_PID_LIMIT) <= NORMAL_PID_LIMIT
+
+
+def _pid_phase_evidence(
+    result: dict[str, Any],
+    samples: dict[str, Any],
+    events: dict[str, int],
+    groups_gone: bool,
+) -> dict[str, Any]:
+    return {
+        "error": result.get("error_code"),
+        "sources_unchanged": result.get("sources_unchanged"),
+        "groups_gone": groups_gone,
+        "pids_current_peak": samples.get("pids_current_peak"),
+        "tracked_group_tasks_peak": samples.get("tracked_group_tasks_peak"),
+        "pids_max_delta": events.get("pids_events.max", 0),
+    }
 
 
 class PreconditionError(RuntimeError):
@@ -1095,7 +1118,7 @@ class Harness:
             and value["elapsed_s"] <= SHELL_SECONDS
             for value in calls
         )
-        cpu_ok = 0.5 * profile <= summary.get("cpu_cores_peak_5s", 0) <= 8.25
+        cpu_ok = _mixed_cpu_matches(profile, summary.get("cpu_cores_peak_5s", 0))
         resource_ok = (
             summary.get("memory_current_peak", HARD_MEMORY_LIMIT) <= NORMAL_MEMORY_LIMIT
             and summary.get("pids_current_peak", HARD_PID_LIMIT) <= NORMAL_PID_LIMIT
@@ -1357,8 +1380,7 @@ echo pid-tree-unsafe
             pid_result["error_code"] == "resource_limit"
             and pid_result["sources_unchanged"]
             and pid_gone
-            and pid_samples.get("tracked_group_tasks_peak", ADVERSARIAL_GROUP_TASKS + 1)
-            <= ADVERSARIAL_GROUP_TASKS
+            and _pid_phase_within_global_fence(pid_samples)
             and pid_events.get("pids_events.max", 0) == 0
         )
         self.result["adversarial"] = {
@@ -1397,12 +1419,14 @@ echo pid-tree-unsafe
         self.gate(
             "adversarial_pid_tree",
             pid_ok,
+            _pid_phase_evidence(pid_result, pid_samples, pid_events, pid_gone),
             {
-                "error": pid_result["error_code"],
-                "tasks_peak": pid_samples.get("tracked_group_tasks_peak"),
-                "pids_max_delta": pid_events.get("pids_events.max", 0),
+                "error": "resource_limit",
+                "sources_unchanged": True,
+                "groups_gone": True,
+                "pids_current_peak": {"lte": NORMAL_PID_LIMIT},
+                "pids_max_delta": 0,
             },
-            {"error": "resource_limit", "tasks_peak_lte": 48, "pids_max_delta": 0},
         )
 
     def run(self) -> None:

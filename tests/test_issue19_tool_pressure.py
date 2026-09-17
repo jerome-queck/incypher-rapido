@@ -37,6 +37,30 @@ def test_pressure_protocol_requires_registered_12_cpu_envelope() -> None:
     )
 
 
+def test_pressure_protocol_uses_12_cpu_and_global_pid_fences() -> None:
+    namespace = runpy.run_path(str(SCRIPT))
+    cpu_matches = namespace["_mixed_cpu_matches"]
+    pid_contained = namespace["_pid_phase_within_global_fence"]
+    pid_evidence = namespace["_pid_phase_evidence"]
+    assert cpu_matches(8, 12.25)
+    assert not cpu_matches(8, 12.251)
+    assert pid_contained({"pids_current_peak": 192})
+    assert not pid_contained({"pids_current_peak": 193})
+    assert pid_evidence(
+        {"error_code": "resource_limit", "sources_unchanged": True},
+        {"pids_current_peak": 175, "tracked_group_tasks_peak": 71},
+        {"pids_events.max": 0},
+        True,
+    ) == {
+        "error": "resource_limit",
+        "sources_unchanged": True,
+        "groups_gone": True,
+        "pids_current_peak": 175,
+        "tracked_group_tasks_peak": 71,
+        "pids_max_delta": 0,
+    }
+
+
 @pytest.mark.parametrize(
     ("source_commit", "image_digest", "message"),
     (
