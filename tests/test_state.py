@@ -85,6 +85,23 @@ def test_records_run_attempt_and_restart_recovery(tmp_path: Path) -> None:
     store.close()
 
 
+def test_control_run_interruption_terminalizes_orphaned_running_attempt(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.start_attempt("attempt-1", "run-1", 1, 0, 0, "model", "xhigh")
+
+    assert store.interrupt_control_run("run-1", "run_failed") == 0
+    assert store.active_attempts() == []
+    row = store._connection.execute(
+        "SELECT status, finished_at, failure_class FROM attempts WHERE id='attempt-1'"
+    ).fetchone()
+    assert row["status"] == "interrupted"
+    assert row["finished_at"] is not None
+    assert row["failure_class"] == "interrupted"
+    store.close()
+
+
 def test_same_run_recovery_is_idempotent_and_rejects_config_change(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     config = {"run_seconds": 19_800, "model": "gpt-daybreak-blue-latest"}
@@ -954,7 +971,7 @@ def test_private_memory_verification_is_visible_only_after_its_episode(tmp_path:
         ("evidence", ["x" * 1001]),
         ("next_steps", {"x"}),
         ("tool_count", -1),
-        ("tool_count", 101),
+        ("tool_count", 2**63),
         ("tool_count", True),
         ("failure_class", "provider leaked details"),
     ),

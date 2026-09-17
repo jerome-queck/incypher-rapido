@@ -42,6 +42,7 @@ from .routing_policy import (
 MAX_EVENT_BYTES = 128 * 1024
 MAX_ATTEMPT_EVIDENCE_ITEMS = 20
 MAX_ATTEMPT_EVIDENCE_ITEM_CHARS = 1000
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 _FAILURE_CLASSES = KNOWN_FAILURE_CLASSES
 
@@ -1041,8 +1042,8 @@ class StateStore:
             raise ValueError("confidence must be in [0, 1]")
         evidence_json = self._encode_attempt_evidence("evidence", evidence)
         next_steps_json = self._encode_attempt_evidence("next_steps", next_steps)
-        if type(tool_count) is not int or not 0 <= tool_count <= 100:
-            raise ValueError("tool_count must be an integer in [0, 100]")
+        if type(tool_count) is not int or not 0 <= tool_count <= MAX_SQLITE_INTEGER:
+            raise ValueError("tool_count must be a nonnegative SQLite integer")
         if failure_class is not None and (
             not isinstance(failure_class, str) or failure_class not in _FAILURE_CLASSES
         ):
@@ -1122,8 +1123,8 @@ class StateStore:
         )
         if len(observations_json.encode("utf-8")) > MAX_EVENT_BYTES:
             raise ValueError("checkpoint observations exceed the durable audit limit")
-        if type(tool_count) is not int or not 0 <= tool_count <= 100:
-            raise ValueError("tool_count must be an integer in [0, 100]")
+        if type(tool_count) is not int or not 0 <= tool_count <= MAX_SQLITE_INTEGER:
+            raise ValueError("tool_count must be a nonnegative SQLite integer")
         with self.transaction() as connection:
             changed = connection.execute(
                 "UPDATE attempts SET summary=?, evidence_json=?, next_steps_json=?, "
@@ -2722,14 +2723,25 @@ class StateStore:
             candidate_identity_count=candidate_identity_count,
             attempt_count=len(attempts),
         )
-        current_run_wrong = int(
+        current_wave_wrong = (
             connection.execute(
-                "SELECT COUNT(*) FROM submission_intents "
-                "WHERE first_run_id=? AND challenge_id=? AND status='incorrect'",
-                (run_id, challenge_id),
-            ).fetchone()[0]
+                """
+                SELECT 1
+                FROM candidate_proposals AS proposal
+                JOIN submission_intents AS intent
+                  ON intent.challenge_id=proposal.challenge_id
+                 AND intent.candidate_sha256=lower(hex(proposal.candidate_key))
+                WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND proposal.episode=?
+                  AND proposal.role IN ('specialist', 'recovery')
+                  AND intent.first_run_id=? AND intent.status='incorrect'
+                LIMIT 1
+                """,
+                (run_id, challenge_id, source_episode, run_id),
+            ).fetchone()
+            is not None
         )
-        if terminal == "candidate" and current_run_wrong > 0 and current.role == "specialist":
+        if terminal == "candidate" and current_wave_wrong:
             signal = FailureSignal("disagreement", "board_rejected_candidate")
         if signal is None:
             return None
@@ -2928,6 +2940,14 @@ class StateStore:
 
     def interrupt_control_run(self, run_id: str, reason: str) -> int:
         with self.transaction() as connection:
+            now = self._now()
+            connection.execute(
+                "UPDATE attempts SET finished_at=?, status='interrupted', "
+                "summary=CASE WHEN summary='' THEN 'run ended before lane finalization' "
+                "ELSE summary END, failure_class='interrupted' "
+                "WHERE run_id=? AND status='running'",
+                (now, run_id),
+            )
             return self._interrupt_control_jobs(connection, run_id, reason)
 
     def active_attempts(self) -> list[dict[str, Any]]:

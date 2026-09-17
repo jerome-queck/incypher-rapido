@@ -637,15 +637,15 @@ comparison green while independent review is pending.
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
 | Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: gap-specific same-chat provenance/early-exit correction implemented and focused locally; final live proof pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: persistent Daybreak primary plus parallel Luna racers implemented; live P20 Recovery already produced two correct solves; final proof pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: failed one-hour diagnostic produced six corrects, four through typed-memory Recovery; next fresh run uses two persistent Daybreak plus two persistent Luna racers; final proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | complete offline: committed-source E4 selects 8 native workers while retaining five challenges/P20; 7.568 CPU cores, 16.20 GB RSS, and 188/256 PIDs peaked with zero cgroup limit events and exact cleanup; live conversion proof pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: exact merged image verified through real process loss, same-run continuation, private candidate retention, changed verification, original deadline, durable ordering/memory, effect fencing, and cleanup; final live proof pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
-| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; diagnostic produced two new correct solves and cumulative at least five, but began only 13 challenges |
-| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; diagnostic trace places changed shared-instance Recovery routing on both solve paths, with typed memory participating but no counterfactual causality claim |
+| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; first one-hour diagnostic started all 15 and produced six new corrects, but failed lifecycle at 44 minutes |
+| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; first one-hour diagnostic placed nonzero typed memory and changed Recovery routing on four correct paths, without claiming isolated memory causality |
 | No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | pending |
 | Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | complete for corrected calibration; final run pending |
 | #19 closed honestly | GitHub closeout linked to merged evidence | pending |
@@ -692,8 +692,8 @@ challenge then reached ready state alone; a changed pair again failed at level t
 instance was removed and two final all-nine reads were inactive. The selected bound is therefore
 one live instance, not a guessed container limit.
 
-The corrected scheduler keeps five challenge waves active locally and launches four direct peers
-per wave (Daybreak/xhigh Lead plus Luna max/xhigh/max Specialists). A dynamic episode starts as
+The next-run scheduler keeps five challenge waves active locally and launches four direct peers
+per wave (two Daybreak/xhigh Leads plus Luna max/xhigh Specialists). A dynamic episode starts as
 artifact/local analysis with no Board mutation. Its changed Recovery route enters a single unified
 lease, starts durable jobs only after lease grant, creates one instance shared by all four peers,
 and deletes it before release. All dynamic initial phases close before any live lease; live tickets
@@ -701,11 +701,11 @@ then follow durable episode/catalogue order. Indeterminate cleanup poisons the m
 run before another live job starts.
 
 The shared-instance Recovery prompt must contain nonempty typed earlier-episode memory. Unlimited
-challenges submit the first source-bound candidate immediately through durable reserve/POST/finalize;
-`correct` cancels siblings and triggers early instance deletion. Limited challenges require one
-fresh Daybreak verifier. After an HTTP-200 wrong verdict, a changed mixed Recovery wave may derive
-a new candidate, but one fresh-source Daybreak Verifier must independently reproduce it before
-submission. Pending or unread
+challenges submit each distinct source-qualified candidate immediately through the fifth wrong via
+durable reserve/POST/finalize; `correct` cancels siblings and triggers early instance deletion.
+Limited challenges require one fresh Daybreak verifier. After five HTTP-200 wrong verdicts, a
+fresh-source Daybreak Verifier must independently reproduce the next candidate before submission.
+Pending or unread
 effects fence every later submission. The global artificial wrong ceiling was removed; Board limits
 remain authoritative. Every lane is capped at 800 seconds; a lane with no host-visible tool progress
 for 600 seconds is interrupted and classified for a changed route. The exact-image calibration
@@ -868,10 +868,11 @@ per utility. A lane may read its challenge workspace, create and execute persist
 `rapido-analysis`, and use the evidence-backed crypto, math, pwn, reverse, forensics, packet, archive,
 media, PDF, and Android toolchain. Each call names one or more controller-provided challenge inputs;
 the controller durably records their hashes, the command hash, bounded execution facts, and resource
-use. Arbitrary shell output is useful analysis but cannot prove its own dataflow: a shell-only
-candidate stays private and never submits immediately. A fresh Verifier must independently obtain
-the same candidate through a non-shell fixed source/target receipt before it can authorize a Board
-effect. Model-created `rapido-analysis` files cannot become source roots through a later inspector or
+use. Shell output qualifies only when its host receipt binds the command to controller-provided
+challenge inputs, contains the candidate without receiving it as input, and has no incomplete
+provenance. Such candidates may use the unlimited-challenge immediate path through the fifth wrong;
+limited or later candidates require a fresh Verifier to obtain the same candidate through a
+non-shell fixed source/target receipt. Model-created `rapido-analysis` files cannot become source roots through a later inspector or
 decoder. Exact-session continuations retain the `rapido-analysis` work and typed same-run findings.
 
 The shell is a fixed child boundary, not the credential-bearing Codex process. Landlock hides
@@ -909,6 +910,39 @@ malformed-PDF detection, exact lattice/relocation work, CPU hashcat, confinement
 The full local suite passes 827 with one skip; Ruff, format, and diff checks are clean. Independent
 review found no remaining P0-P3 findings. Fresh AMD64 acceptance, dual-architecture CI, and live solve
 contribution remain pending.
+
+### First one-hour diagnostic and changed next-run control
+
+The exact registered run from merged source `62909ac` started all 15 engagements and produced six
+new HTTP-200 `correct` solves before failing at 44 minutes. Four corrects came from changed Recovery
+episodes with nonzero typed memory; two came from initial Daybreak lanes. It exercised 28 same-chat
+Daybreak continuations, immediate submission, correct-triggered sibling cancellation, five complete
+instance create/delete cycles, and zero pending effects. It is not a successful one-hour lifecycle
+run: a Daybreak Recovery lane reached 133 cumulative tools, evidence retained only 100, the terminal
+counter rejected 133, and one attempt remained incorrectly `running`. Full sanitized evidence is
+in [`issue-19-one-hour-diagnostic-evidence-2026-09-17.md`](issue-19-one-hour-diagnostic-evidence-2026-09-17.md).
+
+Before a fresh rerun, the owner directed solve conversion over conservative post-wrong gating. The
+selected light change removes the artificial terminal tool-count ceiling, raises immutable evidence
+capacity to 10,000 observations/64 MiB per lane, and terminalizes orphan attempts on fatal shutdown.
+At the measured 133 observations per 803 seconds, the observation ceiling exceeds eight times the
+projection for the maximum configurable 7,200-second lane; actual bytes are stored, not preallocated.
+
+The diagnostic's model split was decisive enough for the next calibration: Daybreak produced 10
+candidates and five corrects across 25 terminal attempts, while Luna produced three candidates and
+one correct across 66. With at most five percent observed quota movement, the next roster is two
+Daybreak/xhigh and two Luna max/xhigh racers per challenge under the same P20/five-challenge caps.
+All four receive distinct, non-exclusive solve strategies and same-chat changed continuations until
+candidate, cumulative deadline, or interruption. Dynamic local-only passes still hand off early to
+the one-instance queue.
+
+Submission policy now separates candidate source qualification from method review. On a challenge
+whose Board metadata exposes no attempt limit, each distinct source-qualified, non-model-supplied
+candidate is durably reserved and submitted immediately through the fifth wrong response. The next
+candidate requires existing independent verification. Explicit Board limits require verification
+from the first candidate; pending/unread effects still fence all repeats; a current-run `correct`
+still cancels siblings and closes the engagement. Verification remains available to improve or
+confirm derivations, but no longer delays a free early Board oracle.
 
 ## Model/effort ledger
 
@@ -979,6 +1013,9 @@ contribution remain pending.
 | Pressure harness implementation | `gpt-daybreak-blue-latest` / `xhigh` | complete locally; exact resource harness, no fallback |
 | E4 deterministic pressure execution | no inference | complete from committed source and exact image; P4/P6/P8 green, P8 selected, P20 unchanged, 7.568 CPU cores/16.20 GB/188 PIDs peak, zero limit events, exact cleanup |
 | Native shell independent review | requested `gpt-daybreak-blue-latest` / `xhigh` | complete; findings drove provenance, quota, durable evidence, execution, process isolation, semantic tool receipts, and Landlock fixes; final review found no P0-P3, but worker-side effective model metadata was unavailable |
+| Failed one-hour diagnostic audits | `gpt-daybreak-blue-latest` / `xhigh` | complete; independently confirmed 133-tool lifecycle defect, 2+2 peer mix, persistent peers, immediate-through-five submissions, and exact sanitized result accounting; no fallback |
+| Rerun-fix standards review | `gpt-daybreak-blue-latest` / `xhigh` | clean against `62909ac`; no code-quality, lifecycle, concurrency, SQLite, or maintainability findings; no fallback |
+| Rerun-fix specification review | `gpt-daybreak-blue-latest` / `xhigh` | code clean; one stale README roster sentence corrected before release; merged-image diagnostic evidence remains pending, no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were

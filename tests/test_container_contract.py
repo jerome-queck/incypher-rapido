@@ -108,7 +108,7 @@ def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> Non
         'write_env RAPIDO_MODEL "gpt-daybreak-blue-latest"',
         'write_env RAPIDO_SPECIALIST_MODEL "gpt-5.6-luna"',
         'write_env RAPIDO_SPECIALIST_REASONING_EFFORTS "max,xhigh,max"',
-        'write_env RAPIDO_LEAD_LANES "1"',
+        'write_env RAPIDO_LEAD_LANES "2"',
         'write_env RAPIDO_PEER_PROFILE "mixed_v1"',
         'write_env RAPIDO_MEMORY_ARM "typed_challenge_v1"',
         'write_env RAPIDO_CONCURRENCY "20"',

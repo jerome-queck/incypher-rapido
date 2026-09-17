@@ -53,7 +53,7 @@ _DIGEST_VALUE = re.compile(r"[0-9a-fA-F]{32,128}")
 _TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,96}")
 _TOOL = re.compile(r"[a-z0-9_]{1,96}")
 _MAX_HOST_RESULT_BYTES = 128 * 1024
-_MAX_BATCH_OBSERVATIONS = 1_000
+_MAX_DURABLE_OBSERVATIONS = 10_000
 
 _GAPS = frozenset(
     {
@@ -267,9 +267,9 @@ CanonicalValue: TypeAlias = (
 
 @dataclass(frozen=True)
 class EvidenceLimits:
-    max_observations: int = 100
+    max_observations: int = _MAX_DURABLE_OBSERVATIONS
     max_object_bytes: int = 16 * 1024
-    max_attempt_bytes: int = 512 * 1024
+    max_attempt_bytes: int = 64 * 1024 * 1024
     max_carry_bytes: int = 64 * 1024
 
     def __post_init__(self) -> None:
@@ -281,12 +281,12 @@ class EvidenceLimits:
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.max_observations > 100:
-            raise ValueError("max_observations exceeds 100")
+        if self.max_observations > _MAX_DURABLE_OBSERVATIONS:
+            raise ValueError(f"max_observations exceeds {_MAX_DURABLE_OBSERVATIONS}")
         if self.max_object_bytes > 16 * 1024:
             raise ValueError("max_object_bytes exceeds 16 KiB")
-        if self.max_attempt_bytes > 512 * 1024:
-            raise ValueError("max_attempt_bytes exceeds 512 KiB")
+        if self.max_attempt_bytes > 64 * 1024 * 1024:
+            raise ValueError("max_attempt_bytes exceeds 64 MiB")
         if self.max_carry_bytes > 64 * 1024:
             raise ValueError("max_carry_bytes exceeds 64 KiB")
 
@@ -458,10 +458,8 @@ class EvidenceBatch:
         if isinstance(self.observations, (str, bytes)):
             raise TypeError("evidence batch observations must be typed observations")
         observations = tuple(self.observations)
-        if len(observations) > _MAX_BATCH_OBSERVATIONS or any(
-            not isinstance(item, HostObservation) for item in observations
-        ):
-            raise ValueError("evidence batch observations are invalid or unbounded")
+        if any(not isinstance(item, HostObservation) for item in observations):
+            raise ValueError("evidence batch observations must be typed observations")
         object.__setattr__(self, "observations", observations)
 
 
