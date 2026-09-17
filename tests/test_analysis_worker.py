@@ -112,7 +112,19 @@ def test_ptrace_isolation_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert caught.value.code == "tool_unavailable"
 
 
-def test_watchdog_kills_oversized_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("resident", "tasks", "expected_breach"),
+    (
+        (analysis_worker.GROUP_RSS_LIMIT_BYTES + 1, 3, "memory"),
+        (1, analysis_worker.GROUP_TASK_LIMIT + 1, "tasks"),
+    ),
+)
+def test_watchdog_kills_oversized_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    resident: int,
+    tasks: int,
+    expected_breach: str,
+) -> None:
     class Process:
         pid = 42
 
@@ -125,7 +137,7 @@ def test_watchdog_kills_oversized_process_group(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         analysis_worker,
         "_process_group_usage",
-        lambda _process_group: (analysis_worker.GROUP_RSS_LIMIT_BYTES + 1, 3, 2),
+        lambda _process_group: (resident, tasks, 2),
     )
     monkeypatch.setattr(
         analysis_worker.os,
@@ -138,6 +150,6 @@ def test_watchdog_kills_oversized_process_group(monkeypatch: pytest.MonkeyPatch)
         "peak_processes": 0,
     }
     analysis_worker._watch_process_group(Process(), threading.Event(), state)  # type: ignore[arg-type]
-    assert state["breach"] == "memory"
-    assert state["peak_tasks"] == 3
+    assert state["breach"] == expected_breach
+    assert state["peak_tasks"] == tasks
     assert killed == [(42, analysis_worker.signal.SIGKILL)]
