@@ -82,6 +82,7 @@ class FakeStdin:
         self.writes.append(message)
         if "method" not in message:
             self.server.responses.append(message)
+            self.server.response_event.set()
             return
         self.server.handle(message)
 
@@ -100,6 +101,7 @@ class FakeProcess:
         self.returncode: int | None = None
         self.closed = False
         self.responses: list[dict[str, Any]] = []
+        self.response_event = asyncio.Event()
         self.next_thread = 0
         self.next_turn = 0
 
@@ -234,6 +236,22 @@ def run_async(function: Any) -> Any:
         return asyncio.run(function(*args, **kwargs))
 
     return wrapper
+
+
+async def wait_for_response(process: FakeProcess, request_id: int) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        response = next(
+            (item for item in process.responses if item.get("id") == request_id),
+            None,
+        )
+        if response is not None:
+            return response
+        process.response_event.clear()
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise AssertionError(f"response {request_id} was not received")
+        await asyncio.wait_for(process.response_event.wait(), remaining)
 
 
 def make_client(process: FakeProcess, tmp_path: Path, **kwargs: Any) -> CodexAppClient:
@@ -2184,11 +2202,7 @@ async def test_aliased_pending_turn_tool_request_is_rejected_without_queuing_wor
             },
         }
     )
-    for _ in range(20):
-        if any(item["id"] == 96 for item in fake_process.responses):
-            break
-        await asyncio.sleep(0)
-    busy = next(item for item in fake_process.responses if item["id"] == 96)
+    busy = await wait_for_response(fake_process, 96)
     assert busy["result"]["success"] is False
     assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
     assert registry.calls == 1
@@ -2259,11 +2273,7 @@ async def test_repeated_cancellation_retains_tool_admission_until_worker_finishe
             },
         }
     )
-    for _ in range(20):
-        if any(item["id"] == 98 for item in fake_process.responses):
-            break
-        await asyncio.sleep(0)
-    busy = next(item for item in fake_process.responses if item["id"] == 98)
+    busy = await wait_for_response(fake_process, 98)
     assert '"tool_busy"' in busy["result"]["contentItems"][0]["text"]
 
     registry.release.set()
@@ -2352,23 +2362,6 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
             await fake_process.stdout.push(
                 {"id": message["id"], "result": {"turn": {"id": "cancelled-turn"}}}
             )
-            for _ in range(100):
-                if "cancelled-turn" in client._turns:
-                    break
-                await asyncio.sleep(0)
-            await fake_process.stdout.push(
-                {
-                    "id": 991,
-                    "method": "item/tool/call",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "cancelled-turn",
-                        "callId": "completed-before-cancel",
-                        "tool": {"name": "decode_hex"},
-                        "arguments": {"data": "73656e7369746976652d7261772d7061796c6f6164"},
-                    },
-                }
-            )
         elif message.get("method") == "turn/interrupt":
             await fake_process.stdout.push({"id": message["id"], "result": {}})
             await fake_process.stdout.push(
@@ -2383,13 +2376,26 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
 
     fake_process.handle = lambda message: asyncio.create_task(controlled_turn(message))  # type: ignore[method-assign]
     running = asyncio.create_task(client.run_turn("wait"))
-    for _ in range(100):
-        if any(response.get("id") == 991 for response in fake_process.responses):
-            break
-        await asyncio.sleep(0)
-    tool_response = next(
-        response for response in fake_process.responses if response.get("id") == 991
+
+    async def wait_for_turn_registration() -> None:
+        while "cancelled-turn" not in client._turns:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(wait_for_turn_registration(), 5)
+    await fake_process.stdout.push(
+        {
+            "id": 991,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "cancelled-turn",
+                "callId": "completed-before-cancel",
+                "tool": {"name": "decode_hex"},
+                "arguments": {"data": "73656e7369746976652d7261772d7061796c6f6164"},
+            },
+        }
     )
+    tool_response = await wait_for_response(fake_process, 991)
     assert "result" in tool_response, tool_response
     assert tool_response["result"]["success"] is True
 
