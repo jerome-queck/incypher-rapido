@@ -432,14 +432,14 @@ Daybreak/xhigh review verified all 27 merged-source hashes, raw selection, repla
 digests, privacy, and 30/30 focused tests with no blocker. This is development E3 evidence only;
 live-controller promotion and every final-image/live gate remain pending.
 
-The provisional implementation uses the smallest fail-closed shape: exactly eight failure kinds,
-two dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
-material route fingerprint. Policy, provenance, timeout, quota, and Board failures remain
-contained. Only two database-derived disagreement subreasons—one retained source candidate needing
-verification or multiple distinct retained source candidates—may dispatch the exact Verifier
-route; all other disagreement remains contained. Tool and safely identified local-container
-failures may dispatch one changed route; persistent failures cannot turn episode, timestamp, or
-retry ordinal into a change. This is a tracer under test, not the final E3 selection.
+The implementation uses the smallest fail-closed shape: exactly eight failure kinds, two
+dispositions (`dispatch` or `contain`), immutable model/effort/effect authority, and a unique
+material route fingerprint. Policy, provenance, and Board failures remain contained. Durable
+candidate disagreement may dispatch an exact Verifier; quota may earn one bounded wait; tool and
+safely identified local-container failures may dispatch one changed route. A timeout may earn one
+changed Recovery only when its source wave committed observations and budget/effect/instance gates
+remain safe. A repeated or zero-evidence timeout remains contained. Persistent failures cannot use
+episode, timestamp, or retry ordinal alone as change.
 
 E2 now has a reproducible, effect-free storage-subdecision candidate at
 `scripts/issue19_vault_comparison.py`, with the exact sanitized result in
@@ -636,17 +636,17 @@ comparison green while independent review is pending.
 | --- | --- | --- |
 | Required sources and predecessor inspected | This brief plus source note and cited paths | complete |
 | Controlled architecture selection | Three-Interface comparison plus E0-E3; closed-core hybrid recorded | in progress: Interface selected; E2 selects private single-SQLite verification; clean-source E3 selects the closed rule table; final-image replay pending |
-| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: gap-specific same-chat provenance/early-exit correction implemented and focused locally; final live proof pending |
-| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: failed one-hour diagnostic produced six corrects, four through typed-memory Recovery; next fresh run uses two persistent Daybreak plus two persistent Luna racers; final proof pending |
+| Adaptive failure routing; no unchanged retry | Replay fixtures and route-fingerprint assertions | in progress: gap-specific same-chat correction plus one evidence-earned changed timeout Recovery implemented and focused locally; final live proof pending |
+| Lead/Specialist/Verifier/Recovery cooperation | Typed engagement/replay tests | in progress: clean one-hour rerun exercised all roles and nonempty Recovery memory; hard-timeout Recovery now uses three Daybreak plus one Luna without increasing four-peer concurrency; final proof pending |
 | Private candidate retention and verification | Vault isolation, deterministic admission, false-positive tests | in progress: transactional same-run vault, unique exact verification, producer/Verifier crash and privacy/false-positive tests, corrected 20-repetition E2 comparison, and clean review green; final-image replay pending |
 | Replayable ordering, extensions, 15/15 coverage | Queue replay/crash tests and final-run evidence | in progress: durable catalogue/lease order, truthful pre-lease queued state, and evidence-earned changed successor episodes implemented; five workers retain challenge engagements through auxiliary waves, and solve/exhaustion admits the next identity; final 19,800-second coverage pending |
 | Productive bounded resource scaling | E4 measurements and selected profile | complete offline: committed-source E4 selects 8 native workers while retaining five challenges/P20; 7.568 CPU cores, 16.20 GB RSS, and 188/256 PIDs peaked with zero cgroup limit events and exact cleanup; live conversion proof pending |
 | Crash-safe 19,800-second recovery | E5 plus final-run/restart evidence | in progress: exact merged image verified through real process loss, same-run continuation, private candidate retention, changed verification, original deadline, durable ordering/memory, effect fencing, and cleanup; final live proof pending |
 | Board inactive semantics established | E6 independent evidence | complete: two coherent zero-write HTTP-404 rounds across all nine dynamic IDs |
 | Exact final image/protocol registered before state creation | Issue comment and immutable digest/source | corrected 1,800-second calibration complete; final 19,800-second registration pending |
-| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; first one-hour diagnostic started all 15 and produced six new corrects, but failed lifecycle at 44 minutes |
-| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; first one-hour diagnostic placed nonzero typed memory and changed Recovery routing on four correct paths, without claiming isolated memory causality |
-| No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | pending |
+| Fresh unattended all-15 run; >=1 new `correct`; cumulative >=4 | Sanitized exact-run evidence | pending final run; clean one-hour rerun started all 15 and added Combination, but was diagnostic-only |
+| New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; one-hour correct was initial and does not satisfy this gate; timeout Recovery must prove live contribution |
+| No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | one-hour rerun independently clean except its raw resource sampler was not durably retained; final proof pending |
 | Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | complete for corrected calibration; final run pending |
 | #19 closed honestly | GitHub closeout linked to merged evidence | pending |
 
@@ -944,6 +944,29 @@ from the first candidate; pending/unread effects still fence all repeats; a curr
 still cancels siblings and closes the engagement. Verification remains available to improve or
 confirm derivations, but no longer delays a free early Board oracle.
 
+### Clean one-hour rerun and evidence-earned timeout Recovery
+
+The replacement exact-image run from merged `b13cef5` completed its full hour with exit 0, started
+all 15 engagements, terminalized all 94 attempts and 102 jobs, added one HTTP-200 `correct` on
+Combination, and left zero pending effects, owned instances, live processes, or workspace residue.
+It recorded 132 same-chat continuations, 2,681 committed tool observations with zero omission, 94
+typed-memory projections, and 28 nonempty Recovery projections. Independent Daybreak/xhigh audit
+found DB, evidence, model, Board, instance, and cleanup state clean. The raw external CPU/RSS/PID
+series was not durably retained, so its observed aggregates are not promoted to independently
+verified evidence. Full sanitized facts are in
+[`issue-19-one-hour-rerun-evidence-2026-09-17.md`](issue-19-one-hour-rerun-evidence-2026-09-17.md).
+
+The run exposed one narrow performance defect: all five timeout decisions were contained despite
+committed evidence and unused successor budget. Three of those decisions ended the only three
+Board-unsolved targets:
+Telltale Beacon and Zip after one standard wave, and Parcelport after local plus one shared-instance
+wave. The selected repair preserves safe candidate-free timeout checkpoints and admits exactly one
+materially changed Recovery when committed observations and safety/deadline gates allow it.
+Zero-evidence, unsafe, Verifier, duplicate, exhausted, and repeated Recovery timeouts remain
+contained. Initial waves stay 2 Daybreak + 2 Luna; the single hard-timeout Recovery uses 3
+Daybreak/xhigh + 1 Luna/max based on measured conversion, with no peer-count increase. Dynamic work
+keeps the same one-instance lease across that successor and cleans once.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -1016,6 +1039,10 @@ confirm derivations, but no longer delays a free early Board oracle.
 | Failed one-hour diagnostic audits | `gpt-daybreak-blue-latest` / `xhigh` | complete; independently confirmed 133-tool lifecycle defect, 2+2 peer mix, persistent peers, immediate-through-five submissions, and exact sanitized result accounting; no fallback |
 | Rerun-fix standards review | `gpt-daybreak-blue-latest` / `xhigh` | clean against `62909ac`; no code-quality, lifecycle, concurrency, SQLite, or maintainability findings; no fallback |
 | Rerun-fix specification review | `gpt-daybreak-blue-latest` / `xhigh` | code clean; one stale README roster sentence corrected before release; merged-image diagnostic evidence remains pending, no fallback |
+| Clean one-hour rerun lifecycle/result audit | `gpt-daybreak-blue-latest` / `xhigh` | clean DB/container/Board/evidence/model/memory/instance audit; all 15 started, one new correct, no fallback or residue; raw resource sampler not durable |
+| Hard-target timeout diagnosis | `gpt-daybreak-blue-latest` / `xhigh` | Telltale Beacon, Zip, and Parcelport all had productive 800-second waves incorrectly contained; one bounded evidence-earned Recovery and 3+1 recovery roster selected, no fallback |
+| Timeout-Recovery standards review | requested `gpt-daybreak-blue-latest` / `xhigh` | no P0-P2 defect; declined a P3 extraction that added abstraction without behavior; worker-side effective model metadata unavailable, so not accepted as model-attested evidence |
+| Timeout-Recovery specification review | requested `gpt-daybreak-blue-latest` / `xhigh` | found an interleaved second-timeout dispatch defect; durable prior-Recovery fencing and regression coverage fixed it; re-review found no P0-P3 blocker; worker-side effective model metadata unavailable |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1027,11 +1054,16 @@ PR #38 had auto-closed #19 on 2026-09-17 despite its diagnostic-only protocol. T
 detected during this recovery slice and #19 was reopened before further delivery; final acceptance
 and honest closeout remain pending.
 
+PR #46 later auto-closed #19 again when its rerun fix merged. The independent one-hour audit caught
+the mismatch; the main owner reopened #19 before the timeout-recovery delivery. It remains open.
+
 ## Open decisions
 
-- Live-measure the merged persistent Daybreak and content-addressed artifact-lineage changes before
-  authorizing the final acceptance run.
-- Re-measure the focused changes before any 19,800-second run; the completed calibration cannot
-  lower the final acceptance contract.
-- Register the exact merged final commit, image digest, challenge order, deadlines, and sampler
-  before the acceptance state exists.
+- Complete independent timeout-recovery review, full tests, PR/CI, squash merge, and exact-image
+  container acceptance.
+- Merge this sanitized one-hour evidence, then delete only its exact container/state while
+  preserving authentication and verify absence.
+- Register the exact merged final commit, image digest, all-15 queue with Telltale Beacon, Zip, and
+  Parcelport first, deadlines, and durable sampler before the acceptance state exists.
+- Run and audit the unchanged 19,800-second acceptance contract; merge evidence, clean exact state,
+  and close #19 only if every gate passes.

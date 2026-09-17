@@ -649,6 +649,39 @@ class DynamicPhaseRuntime(UnsolvedBoundaryRuntime):
         )()
 
 
+class DynamicTimeoutRecoveryRuntime(DynamicPhaseRuntime):
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        document = json.loads(prompt)
+        if document["control_route"]["tactic"] != "instance_enabled_follow_on":
+            return await super().solve(workspace, prompt, **kwargs)
+        self.prompts.append((document, kwargs.get("tool_registry") is not None))
+        observation = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "fixture", "size": document["lane"] + 1},
+        )
+        error = TimeoutError("synthetic productive timeout")
+        error.result = type(
+            "DynamicTimeoutTurn",
+            (),
+            {
+                "tool_calls": [
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "candidate_sensitive": False,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": observation,
+                    }
+                ]
+            },
+        )()
+        raise error
+
+
 class DynamicLocalFailureRuntime(DynamicPhaseRuntime):
     async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
         if kwargs.get("tool_registry") is not None:
@@ -1283,6 +1316,41 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
         for phase, model, continued in runtime.continuations
         if phase == "shared_instance" and model == "gpt-daybreak-blue-latest"
     )
+
+
+def test_dynamic_productive_timeout_reuses_lease_for_daybreak_heavy_recovery(
+    tmp_path: Path,
+) -> None:
+    challenge = _challenge(1, challenge_type="dynamic_iac")
+    board = ManagedInstanceBoundaryBoard([challenge])
+    runtime = DynamicTimeoutRecoveryRuntime()
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        attempts_per_challenge=4,
+        concurrency=4,
+        lead_lanes=2,
+        specialist_reasoning_efforts=("max", "xhigh", "max"),
+        manage_dynamic_instances=True,
+        episodes_per_challenge=3,
+    )
+
+    report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.status == "completed"
+    assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert [call for call in board.instance_calls if call[0] == "DELETE"] == [("DELETE", 1)]
+    recovery_jobs = [job for job in view.jobs if job.episode == 2]
+    assert [(job.model, job.effort) for job in recovery_jobs] == [
+        ("gpt-daybreak-blue-latest", "xhigh"),
+        ("gpt-daybreak-blue-latest", "xhigh"),
+        ("gpt-daybreak-blue-latest", "xhigh"),
+        ("gpt-5.6-luna", "max"),
+    ]
+    recovery_prompts = [document for document, _ in runtime.prompts if document["episode"] == 2]
+    assert len(recovery_prompts) == 4
+    assert all(document["same_run_memory"] for document in recovery_prompts)
 
 
 @pytest.mark.parametrize("invalid_connection", (False, True))
