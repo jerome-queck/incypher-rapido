@@ -1862,6 +1862,57 @@ class RunEvidence:
             candidate_supplied=candidate_supplied,
         )
 
+    def attest_candidate(
+        self,
+        attempt_id: str,
+        *,
+        candidate_sha256: str,
+    ) -> MemoryEvidenceSource | None:
+        """Bind one private candidate identity to its verified committed observation."""
+        source = self.memory_source(attempt_id, candidate_sha256=candidate_sha256)
+        manifest = self._load_manifest(attempt_id)
+        if (
+            not source.complete
+            or source.gap is not None
+            or not source.candidate_observed
+            or source.candidate_supplied
+        ):
+            return None
+        attempt = self._attempt(attempt_id)
+        candidate_key = bytes.fromhex(candidate_sha256)
+        expected = (
+            self.run_id,
+            int(attempt["challenge_id"]),
+            candidate_key,
+            manifest.digest,
+        )
+        with self._state.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT run_id, challenge_id, candidate_key, manifest_digest
+                FROM candidate_evidence_proofs WHERE source_attempt_id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO candidate_evidence_proofs(
+                        source_attempt_id, run_id, challenge_id, candidate_key,
+                        manifest_digest, attested_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (attempt_id, *expected, self._state._now()),
+                )
+            elif (
+                str(existing["run_id"]),
+                int(existing["challenge_id"]),
+                bytes(existing["candidate_key"]),
+                str(existing["manifest_digest"]),
+            ) != expected:
+                raise EvidenceConflictError("candidate evidence proof changed")
+        return source
+
     @staticmethod
     def _bundle_size(bundle: EvidenceBundle) -> tuple[EvidenceBundle, int]:
         current = bundle

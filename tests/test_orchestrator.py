@@ -11,7 +11,7 @@ import pytest
 
 from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
-from rapido.evidence import EvidenceError, HostObservation
+from rapido.evidence import EvidenceError, EvidenceLimits, HostObservation, RunEvidence
 from rapido.orchestrator import Orchestrator
 from rapido.routing import baseline_route
 from rapido.state import StateStore
@@ -897,6 +897,67 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
         "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
     ).fetchone()
     assert '"reason":"candidate_provenance"' in failure["data_json"]
+    store.close()
+
+
+def test_candidate_rejected_when_committed_observation_is_omitted(tmp_path: Path) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class CompleteEvidenceRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            candidate = json.loads(turn.text)["candidate"]
+            fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+            turn.tool_calls[0]["host_observation"] = HostObservation(
+                "inspect_file",
+                True,
+                True,
+                candidate_sha256s=(fingerprint,),
+            )
+            return turn
+
+    answer = "INCYPHER{omitted_after_normalization}"
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    run_id = "omitted-proof-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    store.start_control_wave(run_id, 1, 0)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+    orchestrator = AdaptiveOrchestrator(
+        cfg, FakeBoard([challenge(1)]), store, CompleteEvidenceRuntime({1: {0: answer}})
+    )
+    orchestrator._run_evidence = RunEvidence.open(
+        store,
+        run_id,
+        EvidenceLimits(max_object_bytes=1),
+    )
+
+    result = asyncio.run(
+        orchestrator._lane(
+            run_id,
+            challenge(1),
+            0,
+            0,
+            workspace,
+            [],
+            10,
+            route=route,
+        )
+    )
+
+    assert result.terminal_status == "unsolved"
+    assert store.candidate_counts(run_id) == (0, 0)
+    manifest = store._connection.execute(
+        "SELECT complete, gap, omitted_count FROM evidence_manifests WHERE attempt_id=?",
+        (f"{run_id}:1:0:0",),
+    ).fetchone()
+    assert tuple(manifest) == (0, "quota_omitted", 1)
     store.close()
 
 

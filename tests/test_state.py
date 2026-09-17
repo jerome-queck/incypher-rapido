@@ -11,8 +11,27 @@ from pathlib import Path
 
 import pytest
 
+from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
 from rapido.routing import baseline_route
 from rapido.state import MAX_EVENT_BYTES, StateStore
+
+
+def _attest_candidate(evidence: RunEvidence, attempt_id: str, candidate: str) -> None:
+    fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+    evidence.commit(
+        attempt_id,
+        EvidenceBatch(
+            (
+                HostObservation(
+                    "inspect_file",
+                    True,
+                    True,
+                    candidate_sha256s=(fingerprint,),
+                ),
+            )
+        ),
+    )
+    assert evidence.attest_candidate(attempt_id, candidate_sha256=fingerprint) is not None
 
 
 def test_state_database_and_journal_are_private(tmp_path: Path) -> None:
@@ -364,6 +383,7 @@ def test_private_candidate_crash_boundary_is_atomic(
         import sys
         from pathlib import Path
 
+        from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
         from rapido.routing import baseline_route
         from rapido.state import StateStore
 
@@ -431,6 +451,7 @@ def test_private_verification_crash_boundary_is_atomic(
         from dataclasses import replace
         from pathlib import Path
 
+        from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
         from rapido.routing import baseline_route
         from rapido.state import StateStore
 
@@ -455,12 +476,30 @@ def test_private_verification_crash_boundary_is_atomic(
         store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
         store.start_control_wave(run_id, 1, 0)
         store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+        evidence = RunEvidence.open(store, run_id)
+        fingerprint = __import__("hashlib").sha256(candidate.encode()).hexdigest()
+        evidence.commit(
+            "producer",
+            EvidenceBatch((HostObservation("inspect_file", True, True,
+                candidate_sha256s=(fingerprint,)),)),
+        )
+        assert evidence.attest_candidate(
+            "producer", candidate_sha256=fingerprint
+        ) is not None
         store.finish_attempt(
             "producer", "candidate", candidate=candidate, retain_private_candidate=True
         )
         store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
         store.start_control_wave(run_id, 1, 1)
         store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+        evidence.commit(
+            "verifier",
+            EvidenceBatch((HostObservation("inspect_file", True, True,
+                candidate_sha256s=(fingerprint,)),)),
+        )
+        assert evidence.attest_candidate(
+            "verifier", candidate_sha256=fingerprint
+        ) is not None
         if crash_before_commit:
             store._connection.create_function("crash_now", 0, lambda: os._exit(31))
             store._connection.execute(
@@ -500,6 +539,100 @@ def test_private_verification_crash_boundary_is_atomic(
         assert proposal_count == 2
         assert verification_count == 1
     reopened.close()
+
+
+def test_interrupted_checkpoint_candidate_cannot_be_verified(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.acquire_supervisor()
+    run_id = "interrupted-proof-run"
+    candidate = "INCYPHER{interrupted_proof_is_not_complete}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    store.checkpoint_attempt("producer", summary="qualified", candidate=candidate)
+    evidence = RunEvidence.open(store, run_id)
+    evidence.commit("producer", EvidenceBatch(complete=False, gap="process_interrupted"))
+    assert store.recover_interrupted() == 1
+
+    store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+
+    assert store.verified_candidate(run_id, 1) is None
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    assert store.candidate_counts(run_id) == (1, 0)
+    store.close()
+
+
+def test_empty_manifest_candidate_cannot_be_verified(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "empty-proof-run"
+    candidate = "INCYPHER{empty_is_not_source_proof}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    evidence = RunEvidence.open(store, run_id)
+    evidence.commit("producer", EvidenceBatch())
+    assert (
+        evidence.attest_candidate(
+            "producer", candidate_sha256=hashlib.sha256(candidate.encode()).hexdigest()
+        )
+        is None
+    )
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    candidate_key = hashlib.sha256(candidate.encode()).digest()
+    store._connection.execute(
+        """
+        INSERT INTO candidate_verifications(
+            run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
+            verifier_attempt_id, verifier_role, recipe_kind, verified_at
+        ) VALUES (?, 1, ?, 'producer', 'specialist', 'verifier', 'verifier',
+                  'fresh_source_reobservation_v1', ?)
+        """,
+        (run_id, candidate_key, store._now()),
+    )
+
+    assert store.verified_candidate(run_id, 1) is None
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    assert store.candidate_counts(run_id) == (1, 0)
+    context = store.private_candidate_context_sources(run_id, 1, before_episode=2)
+    assert context[0]["verifier_attempt_id"] is None
+    store.close()
 
 
 def test_event_sequence_is_monotonic(tmp_path: Path) -> None:
@@ -774,12 +907,15 @@ def test_private_memory_verification_is_visible_only_after_its_episode(tmp_path:
     store.admit_control_wave(run_id, 1, 0, 0, 1, producer)
     store.start_control_wave(run_id, 1, 0)
     store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    evidence = RunEvidence.open(store, run_id)
+    _attest_candidate(evidence, "producer", candidate)
     store.finish_attempt(
         "producer", "candidate", candidate=candidate, retain_private_candidate=True
     )
     store.admit_control_wave(run_id, 1, 1, 1, 1, verifier)
     store.start_control_wave(run_id, 1, 1)
     store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
     store.finish_attempt(
         "verifier", "candidate", candidate=candidate, retain_private_candidate=True
     )

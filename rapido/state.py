@@ -330,6 +330,21 @@ class StateStore:
             );
             CREATE INDEX IF NOT EXISTS candidate_proposals_scope
               ON candidate_proposals(run_id, challenge_id, role, candidate_key);
+            CREATE TABLE IF NOT EXISTS candidate_evidence_proofs (
+                source_attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
+                manifest_digest TEXT NOT NULL CHECK(length(manifest_digest) = 64),
+                attested_at TEXT NOT NULL,
+                UNIQUE(source_attempt_id, run_id, challenge_id, candidate_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS candidate_evidence_proofs_no_update
+            BEFORE UPDATE ON candidate_evidence_proofs
+            BEGIN SELECT RAISE(ABORT, 'candidate evidence proofs are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS candidate_evidence_proofs_no_delete
+            BEFORE DELETE ON candidate_evidence_proofs
+            BEGIN SELECT RAISE(ABORT, 'candidate evidence proofs are immutable'); END;
             CREATE TABLE IF NOT EXISTS candidate_verifications (
                 run_id TEXT NOT NULL REFERENCES runs(id),
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
@@ -353,7 +368,24 @@ class StateStore:
             );
             """
         )
+        self._connection.execute(
+            "DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity"
+        )
         self._migrate_attempts()
+        self._connection.execute(
+            """
+            CREATE TRIGGER candidate_evidence_proofs_attempt_identity
+            BEFORE INSERT ON candidate_evidence_proofs
+            WHEN NOT EXISTS (
+                SELECT 1 FROM attempts
+                WHERE id=NEW.source_attempt_id
+                  AND run_id=NEW.run_id
+                  AND challenge_id=NEW.challenge_id
+                  AND status='running'
+            )
+            BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END
+            """
+        )
         attempt_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(attempts)").fetchall()
@@ -1210,18 +1242,68 @@ class StateStore:
             raise ValueError("checkpoint candidate changed before attempt completion")
         if role != "verifier":
             return
+        evidence_schema = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_manifests'"
+        ).fetchone()
+        if evidence_schema is None:
+            return
         producer = connection.execute(
             """
-            SELECT source_attempt_id, role
-            FROM candidate_proposals
-            WHERE run_id=? AND challenge_id=? AND role IN ('specialist', 'recovery')
-              AND candidate_key=? AND candidate=?
-            ORDER BY episode, source_attempt_id
+            SELECT proposal.source_attempt_id, proposal.role
+            FROM candidate_proposals AS proposal
+            JOIN attempts AS attempt ON attempt.id=proposal.source_attempt_id
+            JOIN candidate_evidence_proofs AS producer_proof
+              ON producer_proof.source_attempt_id=proposal.source_attempt_id
+             AND producer_proof.run_id=proposal.run_id
+             AND producer_proof.challenge_id=proposal.challenge_id
+             AND producer_proof.candidate_key=proposal.candidate_key
+            JOIN candidate_evidence_proofs AS verifier_proof
+              ON verifier_proof.source_attempt_id=?
+             AND verifier_proof.run_id=proposal.run_id
+             AND verifier_proof.challenge_id=proposal.challenge_id
+             AND verifier_proof.candidate_key=proposal.candidate_key
+            JOIN evidence_manifests AS producer_manifest
+              ON producer_manifest.run_id=proposal.run_id
+             AND producer_manifest.attempt_id=proposal.source_attempt_id
+             AND producer_manifest.digest=producer_proof.manifest_digest
+            JOIN evidence_manifests AS verifier_manifest
+              ON verifier_manifest.run_id=proposal.run_id
+             AND verifier_manifest.attempt_id=verifier_proof.source_attempt_id
+             AND verifier_manifest.digest=verifier_proof.manifest_digest
+            WHERE proposal.run_id=? AND proposal.challenge_id=?
+              AND proposal.role IN ('specialist', 'recovery')
+              AND proposal.candidate_key=? AND proposal.candidate=?
+              AND attempt.status='candidate'
+              AND producer_manifest.complete=1 AND producer_manifest.gap IS NULL
+              AND producer_manifest.omitted_count=0
+              AND verifier_manifest.complete=1 AND verifier_manifest.gap IS NULL
+              AND verifier_manifest.omitted_count=0
+            ORDER BY proposal.episode, proposal.source_attempt_id
             LIMIT 1
             """,
-            (run_id, challenge_id, candidate_key, encoded),
+            (attempt_id, run_id, challenge_id, candidate_key, encoded),
         ).fetchone()
         if producer is not None:
+            connection.execute(
+                """
+                DELETE FROM candidate_verifications
+                WHERE run_id=? AND challenge_id=? AND candidate_key=?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM candidate_evidence_proofs AS producer_proof
+                    JOIN candidate_evidence_proofs AS verifier_proof
+                      ON verifier_proof.source_attempt_id=verifier_attempt_id
+                     AND verifier_proof.run_id=candidate_verifications.run_id
+                     AND verifier_proof.challenge_id=candidate_verifications.challenge_id
+                     AND verifier_proof.candidate_key=candidate_verifications.candidate_key
+                    WHERE producer_proof.source_attempt_id=producer_attempt_id
+                      AND producer_proof.run_id=candidate_verifications.run_id
+                      AND producer_proof.challenge_id=candidate_verifications.challenge_id
+                      AND producer_proof.candidate_key=candidate_verifications.candidate_key
+                  )
+                """,
+                (run_id, challenge_id, candidate_key),
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO candidate_verifications(
@@ -1253,6 +1335,16 @@ class StateStore:
                       WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
                         AND NOT EXISTS (
                           SELECT 1 FROM candidate_verifications AS verification
+                          JOIN candidate_evidence_proofs AS producer_proof
+                            ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                           AND producer_proof.run_id=verification.run_id
+                           AND producer_proof.challenge_id=verification.challenge_id
+                           AND producer_proof.candidate_key=verification.candidate_key
+                          JOIN candidate_evidence_proofs AS verifier_proof
+                            ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                           AND verifier_proof.run_id=verification.run_id
+                           AND verifier_proof.challenge_id=verification.challenge_id
+                           AND verifier_proof.candidate_key=verification.candidate_key
                           WHERE verification.run_id=proposal.run_id
                             AND verification.challenge_id=proposal.challenge_id
                             AND verification.candidate_key=proposal.candidate_key
@@ -1265,7 +1357,22 @@ class StateStore:
             )
             verified = int(
                 self._connection.execute(
-                    "SELECT COUNT(*) FROM candidate_verifications WHERE run_id=?", (run_id,)
+                    """
+                    SELECT COUNT(*)
+                    FROM candidate_verifications AS verification
+                    JOIN candidate_evidence_proofs AS producer_proof
+                      ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                     AND producer_proof.run_id=verification.run_id
+                     AND producer_proof.challenge_id=verification.challenge_id
+                     AND producer_proof.candidate_key=verification.candidate_key
+                    JOIN candidate_evidence_proofs AS verifier_proof
+                      ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                     AND verifier_proof.run_id=verification.run_id
+                     AND verifier_proof.challenge_id=verification.challenge_id
+                     AND verifier_proof.candidate_key=verification.candidate_key
+                    WHERE verification.run_id=?
+                    """,
+                    (run_id,),
                 ).fetchone()[0]
             )
         return pending, verified
@@ -1281,6 +1388,16 @@ class StateStore:
                       AND proposal.role IN ('specialist', 'recovery')
                       AND NOT EXISTS (
                         SELECT 1 FROM candidate_verifications AS verification
+                        JOIN candidate_evidence_proofs AS producer_proof
+                          ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                         AND producer_proof.run_id=verification.run_id
+                         AND producer_proof.challenge_id=verification.challenge_id
+                         AND producer_proof.candidate_key=verification.candidate_key
+                        JOIN candidate_evidence_proofs AS verifier_proof
+                          ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                         AND verifier_proof.run_id=verification.run_id
+                         AND verifier_proof.challenge_id=verification.challenge_id
+                         AND verifier_proof.candidate_key=verification.candidate_key
                         WHERE verification.run_id=proposal.run_id
                           AND verification.challenge_id=proposal.challenge_id
                           AND verification.candidate_key=proposal.candidate_key
@@ -1299,6 +1416,16 @@ class StateStore:
                 FROM candidate_verifications AS verification
                 JOIN candidate_proposals AS proposal
                   ON proposal.source_attempt_id=verification.producer_attempt_id
+                JOIN candidate_evidence_proofs AS producer_proof
+                  ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                 AND producer_proof.run_id=verification.run_id
+                 AND producer_proof.challenge_id=verification.challenge_id
+                 AND producer_proof.candidate_key=verification.candidate_key
+                JOIN candidate_evidence_proofs AS verifier_proof
+                  ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                 AND verifier_proof.run_id=verification.run_id
+                 AND verifier_proof.challenge_id=verification.challenge_id
+                 AND verifier_proof.candidate_key=verification.candidate_key
                 WHERE verification.run_id=? AND verification.challenge_id=?
                 ORDER BY verification.verified_at, verification.candidate_key
                 """,
@@ -1328,6 +1455,16 @@ class StateStore:
                 FROM candidate_verifications AS verification
                 JOIN candidate_proposals AS producer
                   ON producer.source_attempt_id=verification.producer_attempt_id
+                JOIN candidate_evidence_proofs AS producer_proof
+                  ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                 AND producer_proof.run_id=verification.run_id
+                 AND producer_proof.challenge_id=verification.challenge_id
+                 AND producer_proof.candidate_key=verification.candidate_key
+                JOIN candidate_evidence_proofs AS verifier_proof
+                  ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                 AND verifier_proof.run_id=verification.run_id
+                 AND verifier_proof.challenge_id=verification.challenge_id
+                 AND verifier_proof.candidate_key=verification.candidate_key
                 WHERE verification.run_id=? AND verification.challenge_id=?
                 """,
                 (candidate_key, encoded, run_id, challenge_id),
@@ -2551,6 +2688,16 @@ class StateStore:
                   AND proposal.role IN ('specialist', 'recovery')
                   AND NOT EXISTS (
                     SELECT 1 FROM candidate_verifications AS verification
+                    JOIN candidate_evidence_proofs AS producer_proof
+                      ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                     AND producer_proof.run_id=verification.run_id
+                     AND producer_proof.challenge_id=verification.challenge_id
+                     AND producer_proof.candidate_key=verification.candidate_key
+                    JOIN candidate_evidence_proofs AS verifier_proof
+                      ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                     AND verifier_proof.run_id=verification.run_id
+                     AND verifier_proof.challenge_id=verification.challenge_id
+                     AND verifier_proof.candidate_key=verification.candidate_key
                     WHERE verification.run_id=proposal.run_id
                       AND verification.challenge_id=proposal.challenge_id
                       AND verification.candidate_key=proposal.candidate_key
@@ -2971,6 +3118,19 @@ class StateStore:
                   ON verification.run_id=proposal.run_id
                  AND verification.challenge_id=proposal.challenge_id
                  AND verification.producer_attempt_id=proposal.source_attempt_id
+                 AND EXISTS (
+                    SELECT 1
+                    FROM candidate_evidence_proofs AS producer_proof
+                    JOIN candidate_evidence_proofs AS verifier_proof
+                      ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                     AND verifier_proof.run_id=verification.run_id
+                     AND verifier_proof.challenge_id=verification.challenge_id
+                     AND verifier_proof.candidate_key=verification.candidate_key
+                    WHERE producer_proof.source_attempt_id=verification.producer_attempt_id
+                      AND producer_proof.run_id=verification.run_id
+                      AND producer_proof.challenge_id=verification.challenge_id
+                      AND producer_proof.candidate_key=verification.candidate_key
+                 )
                 LEFT JOIN candidate_proposals AS verifier
                   ON verifier.source_attempt_id=verification.verifier_attempt_id
                  AND verifier.run_id=proposal.run_id
