@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,31 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "issue19_tool_pressure.py"
+
+
+def test_pressure_protocol_requires_registered_12_cpu_envelope() -> None:
+    namespace = runpy.run_path(str(SCRIPT))
+    expected = namespace["EXPECTED_LIMITS"]
+    matches = namespace["_resource_envelope_matches"]
+    assert expected["cpu_cores"] == 12.0
+    assert matches(
+        {
+            "cpu_cores": 12.0,
+            "memory_max": expected["memory_bytes"],
+            "memory_swap_max": expected["swap_bytes"],
+            "pids_max": expected["pids"],
+            "uid": expected["uid"],
+        }
+    )
+    assert not matches(
+        {
+            "cpu_cores": 8.0,
+            "memory_max": expected["memory_bytes"],
+            "memory_swap_max": expected["swap_bytes"],
+            "pids_max": expected["pids"],
+            "uid": expected["uid"],
+        }
+    )
 
 
 @pytest.mark.parametrize(
