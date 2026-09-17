@@ -281,6 +281,162 @@ def test_finishing_attempt_is_single_transition(tmp_path: Path) -> None:
     store.close()
 
 
+def test_productive_timeout_preserves_checkpoint_and_admits_daybreak_heavy_recovery(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "timeout-run"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=800)
+    assignments = (
+        ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+        ("lead", "gpt-daybreak-blue-latest", "xhigh"),
+        ("specialist", "gpt-5.6-luna", "max"),
+        ("specialist", "gpt-5.6-luna", "xhigh"),
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 4, route, assignments)
+    store.start_control_wave(run_id, 1, 0)
+    evidence = RunEvidence.open(store, run_id)
+    for lane, (_, model, effort) in enumerate(assignments):
+        attempt_id = f"timeout-{lane}"
+        store.start_attempt(attempt_id, run_id, 1, 0, lane, model, effort)
+        if lane == 0:
+            store.checkpoint_attempt(
+                attempt_id,
+                summary="archive structure mapped",
+                evidence=("header parsed",),
+                next_steps=("try alternate decompressor",),
+                observations=(
+                    {
+                        "ordinal": 0,
+                        "complete": True,
+                        "gap": None,
+                        "tool": "inspect_file",
+                        "success": True,
+                        "source_bound": True,
+                        "facts": {"format": "zip"},
+                    },
+                ),
+                tool_count=1,
+            )
+        evidence.commit(
+            attempt_id,
+            EvidenceBatch(
+                (HostObservation("inspect_file", True, True),),
+                complete=False,
+                gap="turn_timeout",
+            ),
+        )
+        store.finish_attempt(
+            attempt_id,
+            "timeout",
+            summary="native turn exceeded deadline",
+            tool_count=1,
+            failure_class="timeout",
+        )
+
+    decision = store.finish_and_decide_control_wave(
+        run_id=run_id,
+        challenge_id=1,
+        source_episode=0,
+        next_episode=1,
+        catalogue_rank=0,
+        lanes=4,
+        terminal="error",
+        attempts_remaining=True,
+        remaining_milliseconds=10_000,
+    )
+    assert decision is not None and decision.rule_id == "typed_timeout_recovery_v1"
+    rows = store._connection.execute(
+        "SELECT agent_role, model, effort FROM control_jobs "
+        "WHERE run_id=? AND challenge_id=1 AND episode=1 ORDER BY lane",
+        (run_id,),
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("recovery", "gpt-daybreak-blue-latest", "xhigh"),
+        ("recovery", "gpt-daybreak-blue-latest", "xhigh"),
+        ("recovery", "gpt-daybreak-blue-latest", "xhigh"),
+        ("recovery", "gpt-5.6-luna", "max"),
+    ]
+    memory = store.same_run_memory_sources(run_id, 1, target_lane=0, before_episode=1)
+    assert memory[0]["summary"] == "archive structure mapped"
+    assert memory[0]["next_steps"] == ["try alternate decompressor"]
+    assert memory[0]["checkpoint_observations"][0]["facts"] == {"format": "zip"}
+
+    store.start_control_wave(run_id, 1, 1)
+    for lane, row in enumerate(rows):
+        attempt_id = f"interleaved-{lane}"
+        store.start_attempt(attempt_id, run_id, 1, 1, lane, row["model"], row["effort"])
+        evidence.commit(
+            attempt_id,
+            EvidenceBatch((HostObservation("inspect_file", True, True),)),
+        )
+        store.finish_attempt(
+            attempt_id,
+            "failed",
+            tool_count=1,
+            failure_class="solver_output",
+        )
+    interleaved = store.finish_and_decide_control_wave(
+        run_id=run_id,
+        challenge_id=1,
+        source_episode=1,
+        next_episode=2,
+        catalogue_rank=0,
+        lanes=4,
+        terminal="error",
+        attempts_remaining=True,
+        remaining_milliseconds=10_000,
+    )
+    assert interleaved is not None and interleaved.rule_id == "tool_alternate_representation_v1"
+
+    store.start_control_wave(run_id, 1, 2)
+    rows = store._connection.execute(
+        "SELECT model, effort FROM control_jobs "
+        "WHERE run_id=? AND challenge_id=1 AND episode=2 ORDER BY lane",
+        (run_id,),
+    ).fetchall()
+    for lane, row in enumerate(rows):
+        attempt_id = f"second-timeout-{lane}"
+        store.start_attempt(attempt_id, run_id, 1, 2, lane, row["model"], row["effort"])
+        evidence.commit(
+            attempt_id,
+            EvidenceBatch(
+                (HostObservation("inspect_file", True, True),),
+                complete=False,
+                gap="turn_timeout",
+            ),
+        )
+        store.finish_attempt(
+            attempt_id,
+            "timeout",
+            tool_count=1,
+            failure_class="timeout",
+        )
+    repeated = store.finish_and_decide_control_wave(
+        run_id=run_id,
+        challenge_id=1,
+        source_episode=2,
+        next_episode=3,
+        catalogue_rank=0,
+        lanes=4,
+        terminal="error",
+        attempts_remaining=True,
+        remaining_milliseconds=10_000,
+    )
+    assert repeated is not None and repeated.rule_id == "timeout_recovery_exhausted"
+    assert repeated.disposition == "contain"
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM control_jobs WHERE run_id=? AND episode=3", (run_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    store.close()
+
+
 def test_private_candidate_and_attempt_close_roll_back_together(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

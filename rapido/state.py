@@ -1055,33 +1055,64 @@ class StateStore:
         stored_candidate = None if retain_private_candidate else candidate
         with self.transaction() as connection:
             attempt = connection.execute(
-                "SELECT run_id, challenge_id, episode, lane FROM attempts "
+                "SELECT run_id, challenge_id, episode, lane, checkpoint_observations_json "
+                "FROM attempts "
                 "WHERE id=? AND status='running'",
                 (attempt_id,),
             ).fetchone()
             if attempt is None:
                 raise ValueError("attempt is absent or not running")
-            changed = connection.execute(
-                """
-                UPDATE attempts
-                SET finished_at=?, status=?, summary=?, candidate=?, confidence=?,
-                    evidence_json=?, next_steps_json=?, checkpoint_observations_json='[]',
-                    tool_count=?, failure_class=?
-                WHERE id=? AND status='running'
-                """,
-                (
-                    self._now(),
-                    status,
-                    summary[:4000],
-                    stored_candidate,
-                    confidence,
-                    evidence_json,
-                    next_steps_json,
-                    tool_count,
-                    failure_class,
-                    attempt_id,
-                ),
-            ).rowcount
+            has_private_candidate = (
+                connection.execute(
+                    "SELECT 1 FROM candidate_proposals WHERE source_attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()
+                is not None
+            )
+            preserve_timeout_checkpoint = (
+                status == "timeout"
+                and not has_private_candidate
+                and str(attempt["checkpoint_observations_json"]) != "[]"
+            )
+            if preserve_timeout_checkpoint:
+                changed = connection.execute(
+                    """
+                    UPDATE attempts
+                    SET finished_at=?, status=?, candidate=NULL, confidence=?,
+                        tool_count=?, failure_class=?
+                    WHERE id=? AND status='running'
+                    """,
+                    (
+                        self._now(),
+                        status,
+                        confidence,
+                        tool_count,
+                        failure_class,
+                        attempt_id,
+                    ),
+                ).rowcount
+            else:
+                changed = connection.execute(
+                    """
+                    UPDATE attempts
+                    SET finished_at=?, status=?, summary=?, candidate=?, confidence=?,
+                        evidence_json=?, next_steps_json=?, checkpoint_observations_json='[]',
+                        tool_count=?, failure_class=?
+                    WHERE id=? AND status='running'
+                    """,
+                    (
+                        self._now(),
+                        status,
+                        summary[:4000],
+                        stored_candidate,
+                        confidence,
+                        evidence_json,
+                        next_steps_json,
+                        tool_count,
+                        failure_class,
+                        attempt_id,
+                    ),
+                ).rowcount
             if changed != 1:
                 raise ValueError("attempt is absent or not running")
             if retain_private_candidate:
@@ -2770,6 +2801,34 @@ class StateStore:
             )
             == 0
         )
+        durable_observation_count = 0
+        timeout_recovery_used = False
+        if (
+            signal.kind == "timeout"
+            and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_manifests'"
+            ).fetchone()
+            is not None
+        ):
+            durable_observation_count = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(committed_count), 0)
+                    FROM evidence_manifests
+                    WHERE run_id=? AND challenge_id=? AND episode=?
+                    """,
+                    (run_id, challenge_id, source_episode),
+                ).fetchone()[0]
+            )
+            timeout_recovery_used = (
+                connection.execute(
+                    "SELECT 1 FROM control_route_decisions "
+                    "WHERE run_id=? AND challenge_id=? "
+                    "AND rule_id='typed_timeout_recovery_v1' AND disposition='dispatch'",
+                    (run_id, challenge_id),
+                ).fetchone()
+                is not None
+            )
         decision = route_failure(
             RouteRequest(
                 failure=signal,
@@ -2779,6 +2838,8 @@ class StateStore:
                 remaining_milliseconds=remaining_milliseconds,
                 effects_safe=effects_safe,
                 instances_safe=instances_safe,
+                durable_observation_count=durable_observation_count,
+                timeout_recovery_used=timeout_recovery_used,
             )
         )
         successor_fingerprint = (
@@ -2834,13 +2895,47 @@ class StateStore:
                 successor_lanes = 1
             elif decision.successor.role == "recovery":
                 assignment_rows = connection.execute(
-                    "SELECT model, effort FROM control_jobs "
+                    "SELECT agent_role, model, effort FROM control_jobs "
                     "WHERE run_id=? AND challenge_id=? AND episode=? ORDER BY lane",
                     (run_id, challenge_id, source_episode),
                 ).fetchall()
-                assignments = tuple(
-                    ("recovery", str(row["model"]), str(row["effort"])) for row in assignment_rows
-                )
+                if decision.rule_id == "typed_timeout_recovery_v1" and len(assignment_rows) == 4:
+                    lead = next(
+                        (
+                            row
+                            for row in assignment_rows
+                            if str(row["agent_role"]) == "lead"
+                            or (
+                                str(row["model"]) == current.model
+                                and str(row["effort"]) == current.effort
+                            )
+                        ),
+                        None,
+                    )
+                    specialist = next(
+                        (
+                            row
+                            for row in assignment_rows
+                            if str(row["agent_role"]) == "specialist"
+                            or str(row["model"]) != current.model
+                            or str(row["effort"]) != current.effort
+                        ),
+                        None,
+                    )
+                    if lead is not None and specialist is not None:
+                        assignments = (
+                            *(("recovery", str(lead["model"]), str(lead["effort"])),) * 3,
+                            (
+                                "recovery",
+                                str(specialist["model"]),
+                                str(specialist["effort"]),
+                            ),
+                        )
+                if assignments is None:
+                    assignments = tuple(
+                        ("recovery", str(row["model"]), str(row["effort"]))
+                        for row in assignment_rows
+                    )
                 successor_lanes = len(assignments)
             else:
                 assignment_rows = connection.execute(

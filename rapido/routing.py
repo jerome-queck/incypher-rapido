@@ -173,6 +173,8 @@ class RouteRequest:
     remaining_milliseconds: int
     effects_safe: bool = True
     instances_safe: bool = True
+    durable_observation_count: int = 0
+    timeout_recovery_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -285,6 +287,10 @@ def route_failure(request: RouteRequest) -> RouteDecision:
         raise ValueError("remaining_milliseconds is invalid")
     if type(request.effects_safe) is not bool or type(request.instances_safe) is not bool:
         raise TypeError("safety gates must be boolean")
+    if type(request.durable_observation_count) is not int or request.durable_observation_count < 0:
+        raise ValueError("durable_observation_count is invalid")
+    if type(request.timeout_recovery_used) is not bool:
+        raise TypeError("timeout_recovery_used must be boolean")
     if not request.attempts_remaining:
         return _terminal(request, "route_budget_exhausted", "no successor episode remains")
 
@@ -329,10 +335,37 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 verification_recipe="fresh_source_reobservation_v1",
             )
     if failure.kind == "timeout":
-        return _terminal(
-            request,
-            "timeout_without_checkpoint",
-            "no committed and restorable checkpoint fact exists",
+        if request.durable_observation_count == 0:
+            return _terminal(
+                request,
+                "timeout_without_checkpoint",
+                "no committed and restorable checkpoint fact exists",
+            )
+        if not request.effects_safe or not request.instances_safe:
+            return _terminal(
+                request,
+                "timeout_effect_fenced",
+                "pending effects or instances prevent timeout recovery",
+            )
+        if request.current.role == "verifier":
+            return _terminal(
+                request,
+                "verifier_timeout_unresolved",
+                "a verifier timeout cannot authorize a solving route",
+            )
+        if request.timeout_recovery_used or request.current.tactic == "typed_timeout_recovery":
+            return _terminal(
+                request,
+                "timeout_recovery_exhausted",
+                "the evidence-earned timeout recovery was already attempted",
+            )
+        rule_id = "typed_timeout_recovery_v1"
+        successor = replace(
+            request.current,
+            role="recovery",
+            tactic="typed_timeout_recovery",
+            context_profile="durable_timeout_facts_with_changed_strategy",
+            workspace_generation=request.current.workspace_generation + 1,
         )
     if failure.kind == "quota":
         if request.remaining_milliseconds < 61_000:
@@ -401,7 +434,11 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 else 1
             ),
         )
-    elif failure.kind not in {"disagreement", "quota"}:  # pragma: no cover - closed above
+    elif failure.kind not in {  # pragma: no cover - closed above
+        "disagreement",
+        "quota",
+        "timeout",
+    }:
         raise AssertionError("unreachable failure kind")
 
     assert successor is not None

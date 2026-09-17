@@ -95,6 +95,69 @@ def test_quota_failure_earns_one_bounded_wait_without_model_fallback() -> None:
     assert decision.successor.effort == "xhigh"
 
 
+def test_productive_timeout_earns_exactly_one_changed_recovery() -> None:
+    first = route_failure(_request("timeout", subreason="timeout", durable_observation_count=12))
+    assert first.disposition == "dispatch"
+    assert first.rule_id == "typed_timeout_recovery_v1"
+    assert first.successor is not None
+    assert first.successor.role == "recovery"
+    assert set(first.changed_axes) == {
+        "role",
+        "tactic",
+        "context_profile",
+        "workspace_generation",
+    }
+
+    interleaved = route_failure(
+        RouteRequest(
+            failure=FailureSignal("tool", "solver_output"),
+            current=first.successor,
+            used_fingerprints=frozenset({first.source_fingerprint, first.successor.fingerprint}),
+            attempts_remaining=True,
+            remaining_milliseconds=10_000,
+        )
+    )
+    assert interleaved.disposition == "dispatch"
+    assert interleaved.successor is not None
+
+    second = route_failure(
+        RouteRequest(
+            failure=FailureSignal("timeout", "timeout"),
+            current=interleaved.successor,
+            used_fingerprints=frozenset(
+                {
+                    first.source_fingerprint,
+                    first.successor.fingerprint,
+                    interleaved.successor.fingerprint,
+                }
+            ),
+            attempts_remaining=True,
+            remaining_milliseconds=10_000,
+            durable_observation_count=1,
+            timeout_recovery_used=True,
+        )
+    )
+    assert second.disposition == "contain"
+    assert second.rule_id == "timeout_recovery_exhausted"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"durable_observation_count": 0},
+        {"durable_observation_count": 1, "effects_safe": False},
+        {"durable_observation_count": 1, "instances_safe": False},
+        {"durable_observation_count": 1, "attempts_remaining": False},
+    ),
+)
+def test_timeout_without_safe_evidence_or_budget_is_contained(
+    changes: dict[str, object],
+) -> None:
+    assert route_failure(_request("timeout", subreason="timeout", **changes)).disposition == (
+        "contain"
+    )
+
+
 @pytest.mark.parametrize(
     "subreason", ("distinct_source_candidates", "retained_candidate_requires_verification")
 )

@@ -85,7 +85,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_PEER_PROFILE` | `mixed_v1` | Mixed direct-peer scheduler. `uniform_v1` exists for frozen historical replay. |
 | `RAPIDO_CONCURRENCY` | `20` | Lane admission bound; accepted range 2–32. |
 | `RAPIDO_ACTIVE_CHALLENGES` | `5` | Active challenge engagements; auxiliary Recovery/Verifier agents do not consume these slots. |
-| `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, recovery or shared-instance, then bounded verification; accepted range 1–4. |
+| `RAPIDO_EPISODES_PER_CHALLENGE` | `3` | Local/initial, shared-instance or one evidence-earned changed Recovery, then bounded verification; accepted range 1–4. |
 | `RAPIDO_DYNAMIC_CONCURRENCY` | `1` | Configured dynamic bound; currently fixed at 1. |
 | `RAPIDO_ATTEMPTS_PER_CHALLENGE` | `4` | Independent peer count: two Daybreak Leads plus two Luna Specialists by default; accepted range 2–8. |
 | `RAPIDO_ATTEMPT_SECONDS` | `800` | Cumulative per-lane deadline across same-chat continuations. |
@@ -130,8 +130,9 @@ authorities, paths, credentials, and candidate fingerprints are never carried in
 `RAPIDO_CONCURRENCY` must cover
 `RAPIDO_ACTIVE_CHALLENGES × RAPIDO_ATTEMPTS_PER_CHALLENGE`, so a lane wave is never split.
 The controller runs peers directly as ephemeral exact-model threads; peers are not nested agents.
-Initial and Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh for each challenge;
-a Verifier is one fresh Daybreak/xhigh lane. Dynamic challenges analyze locally first, then queue
+Initial and ordinary Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh. A productive
+timeout may earn one changed Recovery with three Daybreak/xhigh plus one Luna/max; repeated or
+zero-evidence timeouts stop. A Verifier is one fresh Daybreak/xhigh lane. Dynamic challenges analyze locally first, then queue
 for the measured single Board instance slot. All four peers share that challenge's one live
 instance, which is removed before the lease passes to another challenge.
 
