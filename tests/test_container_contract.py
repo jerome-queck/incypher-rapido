@@ -146,7 +146,9 @@ def test_both_architectures_run_hardened_offline_tooling_acceptance() -> None:
         "load: true",
     ):
         assert value in text
-    assert "matrix:\n        platform: [linux/amd64, linux/arm64]" in text
+    assert "platform: linux/amd64\n            runner: ubuntu-24.04" in text
+    assert "platform: linux/arm64\n            runner: ubuntu-24.04-arm" in text
+    assert "setup-qemu-action" not in text
     assert not re.search(r"if: matrix\.platform.*tooling_acceptance", text, re.DOTALL)
 
 
