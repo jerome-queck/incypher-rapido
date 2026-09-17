@@ -1337,6 +1337,16 @@ class Orchestrator:
                     gap=gap,
                 ),
             )
+            if self._adaptive_control and status == "candidate":
+                candidate = fields.get("candidate")
+                if not isinstance(candidate, str):
+                    raise CandidateProvenanceError("candidate_evidence_incomplete")
+                proof = run_evidence.attest_candidate(
+                    attempt_id,
+                    candidate_sha256=hashlib.sha256(candidate.encode()).hexdigest(),
+                )
+                if proof is None:
+                    raise CandidateProvenanceError("candidate_evidence_incomplete")
             try:
                 self.state.finish_attempt(
                     attempt_id,

@@ -173,6 +173,16 @@ class DurableJobControl:
                           WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
                             AND NOT EXISTS (
                               SELECT 1 FROM candidate_verifications AS verification
+                              JOIN candidate_evidence_proofs AS producer_proof
+                                ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                               AND producer_proof.run_id=verification.run_id
+                               AND producer_proof.challenge_id=verification.challenge_id
+                               AND producer_proof.candidate_key=verification.candidate_key
+                              JOIN candidate_evidence_proofs AS verifier_proof
+                                ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                               AND verifier_proof.run_id=verification.run_id
+                               AND verifier_proof.challenge_id=verification.challenge_id
+                               AND verifier_proof.candidate_key=verification.candidate_key
                               WHERE verification.run_id=proposal.run_id
                                 AND verification.challenge_id=proposal.challenge_id
                                 AND verification.candidate_key=proposal.candidate_key
@@ -185,7 +195,21 @@ class DurableJobControl:
                 )
                 verified_candidate_count = int(
                     connection.execute(
-                        "SELECT COUNT(*) FROM candidate_verifications WHERE run_id=?",
+                        """
+                        SELECT COUNT(*)
+                        FROM candidate_verifications AS verification
+                        JOIN candidate_evidence_proofs AS producer_proof
+                          ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                         AND producer_proof.run_id=verification.run_id
+                         AND producer_proof.challenge_id=verification.challenge_id
+                         AND producer_proof.candidate_key=verification.candidate_key
+                        JOIN candidate_evidence_proofs AS verifier_proof
+                          ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                         AND verifier_proof.run_id=verification.run_id
+                         AND verifier_proof.challenge_id=verification.challenge_id
+                         AND verifier_proof.candidate_key=verification.candidate_key
+                        WHERE verification.run_id=?
+                        """,
                         (selected_run_id,),
                     ).fetchone()[0]
                 )

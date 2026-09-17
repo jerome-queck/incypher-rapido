@@ -807,6 +807,52 @@ image; it is not a live solve or a substitute for the 19,800-second acceptance r
 After this sanitized record was pushed, the exact rehearsal volume and container names were absent;
 the image was retained, and no authentication state existed to preserve or remove.
 
+### Current local launch readiness
+
+Before further live work on 2026-09-17, the local `rapido:local` tag still referenced the older
+pre-fix image even though the merged `2810059` image was already present. The tag was moved to that
+existing image (`sha256:078c81376f391504d72d6f9f0775ff76e942c05bbade4701f4f78e638241b23e`)
+without rebuilding. A containerized configuration assertion then confirmed the selected competition
+profile: five active challenges, four peers each, P20, 800-second lanes, three episodes, and a
+19,800-second run ceiling. A separate authenticated preflight returned all 15 challenges with zero
+Board writes. This is local readiness evidence, not final preregistration: the final run must still
+name an immutable image digest and merged source before its fresh state exists.
+
+### `ctf-workspace` solving-framework audit
+
+The public framework was inspected read-only at commit
+[`4631053`](https://github.com/jerome-queck/ctf-workspace/tree/463105313f82817d74cc0df67a648b3e698d3b10).
+Its strongest supported mechanism is structural persistence: prompt-only attempts exited early,
+whereas the launcher resumes the exact native Codex session under one ceiling
+([ADR 0037](https://github.com/jerome-queck/ctf-workspace/blob/463105313f82817d74cc0df67a648b3e698d3b10/docs/adr/0037-persistent-attempt-launcher-resume.md)).
+Per-challenge attempt trees preserve scripts, findings, and dead ends. Workload-specific native
+tools also mattered in individual solve histories. Conversely, the standard launcher prompt is
+long, broad tool count has no controlled solve-rate evidence, and the framework recommends agent
+fan-out mainly for the hardest tiers. Therefore Rapido will not import its prompt, agent mesh,
+sweep state, or wholesale image.
+
+Autonomous derivation was assessed separately from manual platform submission: retained scripts and
+attempt histories support autonomous solver contribution even where a status board says
+`solved_by: user`. The defensible transfer is a thin controller, a short outcome-first initial task,
+exact-session continuation, durable challenge-local work, selective typed context, and targeted
+tools proved against fixtures. The initial prompt and capability context will be varied separately;
+the framework does not establish that an instruction-free first pass is superior. Full hypotheses
+and experiments are recorded in
+[`issue-19-long-horizon-agent-research-2026-09-17.md`](issue-19-long-horizon-agent-research-2026-09-17.md).
+
+### Candidate evidence authority repair
+
+The recovery path had retained a candidate before its producer evidence was known complete. A
+Verifier could later match that identity even when the producer manifest was interrupted or empty.
+The repair adds an immutable, candidate-specific proof binding each running attempt to the exact
+committed manifest digest only after a successful source-bound observation contains that candidate,
+with no supplied occurrence, omission, or gap. Verification now requires matching producer and
+Verifier proofs and manifests. Every public/private candidate-authority read ignores legacy rows
+without both proofs; a later valid verification removes a stale same-candidate row first. Regressions
+cover interrupted checkpoints, empty manifests, legacy invalid rows, and observations dropped by
+post-normalization quota. Independent Daybreak/xhigh review was clean; Ruff and format are clean,
+and the full local suite passes 799 with one skip. Container/CI evidence remains pending.
+
 ## Model/effort ledger
 
 | Work | Effective selection | Result |
@@ -871,6 +917,8 @@ the image was retained, and no authentication state existed to preserve or remov
 | Persistent-primary independent review | `gpt-daybreak-blue-latest` / `xhigh` | found provenance-subreason collapse and undeclared runtime callback; both fixed before release; no fallback |
 | Same-run recovery interface comparison and review | three independent `gpt-daybreak-blue-latest` / `xhigh` lanes | selected existing-journal reuse; found and drove fixes for correct reconciliation, initial-before-retry order, atomic admission, stable catalogue order, exact binary config, bounded cleanup, scoped Board failures, restart-only allowance, and receipt mismatch; no fallback |
 | Same-run recovery edge review | `gpt-daybreak-blue-latest` / `xhigh` | code paths clean; two P2 proof gaps closed with real qualified-candidate process loss and current-run receiptless-instance fencing tests; no fallback |
+| Long-horizon solver research and `ctf-workspace` audit | `gpt-daybreak-blue-latest` / `xhigh` | complete; read-only evidence selects structural persistence and controlled short-prompt/tool-context tests, not framework import or broad fan-out |
+| Candidate-proof repair review | `gpt-daybreak-blue-latest` / `xhigh` | clean; exact candidate/source/non-supplied manifest binding, legacy-row fencing, and quota-omission path independently verified; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
