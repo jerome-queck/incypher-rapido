@@ -428,7 +428,10 @@ def test_verification_is_retired_when_material_identity_changes_in_place(tmp_pat
     store.close()
 
 
-def test_dynamic_verifier_without_owned_generation_cannot_verify(tmp_path: Path) -> None:
+@pytest.mark.parametrize("invalid_producer_receipt", (None, "A" * 64, "a" * 63))
+def test_dynamic_verifier_requires_valid_producer_generation(
+    tmp_path: Path, invalid_producer_receipt: str | None
+) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     run_id = "dynamic-scope-run"
     candidate = "INCYPHER{dynamic_requires_receipt}"
@@ -451,12 +454,21 @@ def test_dynamic_verifier_without_owned_generation_cannot_verify(tmp_path: Path)
         {1: "a" * 64},
     )
     evidence = RunEvidence.open(store, run_id)
+    if invalid_producer_receipt is not None:
+        store.mark_instance(run_id, 1, "owned", receipt_sha256="a" * 64)
     store.start_control_wave(run_id, 1, 0)
     store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
     _attest_candidate(evidence, "producer", candidate)
     store.finish_attempt(
         "producer", "candidate", candidate=candidate, retain_private_candidate=True
     )
+    if invalid_producer_receipt is not None:
+        store._connection.execute(
+            "UPDATE candidate_proposals SET instance_receipt_sha256=? "
+            "WHERE source_attempt_id='producer'",
+            (invalid_producer_receipt,),
+        )
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="b" * 64)
     store.admit_control_wave(run_id, 1, 1, 0, 1, verifier)
     store.start_control_wave(run_id, 1, 1)
     store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
@@ -470,6 +482,60 @@ def test_dynamic_verifier_without_owned_generation_cannot_verify(tmp_path: Path)
     )
     assert not store.candidate_is_verified(run_id, 1, candidate)
     assert store.pending_candidate_count(run_id, 1) == 1
+    store.close()
+
+
+def test_dynamic_verifier_requires_owned_generation_receipt(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "dynamic-verifier-receipt-run"
+    candidate = "INCYPHER{dynamic_verifier_requires_receipt}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "pwn", "dynamic_iac", 100)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, 1, True)],
+        1,
+        producer,
+        (("specialist", producer.model, producer.effort),),
+        {1: "a" * 64},
+    )
+    evidence = RunEvidence.open(store, run_id)
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="a" * 64)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    _attest_candidate(evidence, "producer", candidate)
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.mark_instance(run_id, 1, "cleanup_pending")
+    store.mark_instance(run_id, 1, "removed")
+    store.admit_control_wave(run_id, 1, 1, 0, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+
+    proposals = store._connection.execute(
+        "SELECT role, instance_receipt_sha256 FROM candidate_proposals ORDER BY episode"
+    ).fetchall()
+    assert [tuple(row) for row in proposals] == [
+        ("specialist", "a" * 64),
+        ("verifier", None),
+    ]
+    assert (
+        store._connection.execute("SELECT COUNT(*) FROM candidate_verifications").fetchone()[0] == 0
+    )
+    assert not store.candidate_is_verified(run_id, 1, candidate)
     store.close()
 
 
@@ -506,14 +572,45 @@ def test_dynamic_verification_rotates_with_instance_generation(tmp_path: Path) -
             attempt_id, "candidate", candidate=candidate, retain_private_candidate=True
         )
 
-    store.mark_instance(run_id, 1, "owned", receipt_sha256="b" * 64)
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="a" * 64)
     store.start_control_wave(run_id, 1, 0)
-    store.start_attempt("producer-b", run_id, 1, 0, 0, producer.model, producer.effort)
-    _attest_candidate(evidence, "producer-b", candidate)
+    store.start_attempt("producer-a", run_id, 1, 0, 0, producer.model, producer.effort)
+    _attest_candidate(evidence, "producer-a", candidate)
     store.finish_attempt(
-        "producer-b", "candidate", candidate=candidate, retain_private_candidate=True
+        "producer-a", "candidate", candidate=candidate, retain_private_candidate=True
     )
+    store.mark_instance(run_id, 1, "cleanup_pending")
+    store.mark_instance(run_id, 1, "removed")
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="b" * 64)
     retain("verifier-b", 1, verifier)
+    receipts = store._connection.execute(
+        "SELECT role, instance_receipt_sha256 FROM candidate_proposals ORDER BY episode"
+    ).fetchall()
+    assert [tuple(row) for row in receipts] == [
+        ("specialist", "a" * 64),
+        ("verifier", "b" * 64),
+    ]
+    current = store._connection.execute(
+        "SELECT instance_receipt_sha256 FROM current_candidate_verifications"
+    ).fetchone()
+    assert current[0] == "b" * 64
+    assert store.candidate_is_verified(run_id, 1, candidate)
+    store._connection.execute(
+        "UPDATE candidate_proposals SET instance_receipt_sha256=NULL "
+        "WHERE source_attempt_id='producer-a'"
+    )
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM current_candidate_verifications"
+        ).fetchone()[0]
+        == 0
+    )
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    store._connection.execute(
+        "UPDATE candidate_proposals SET instance_receipt_sha256=? "
+        "WHERE source_attempt_id='producer-a'",
+        ("a" * 64,),
+    )
     assert store.candidate_is_verified(run_id, 1, candidate)
 
     store.mark_instance(run_id, 1, "creating")
@@ -532,7 +629,88 @@ def test_dynamic_verification_rotates_with_instance_generation(tmp_path: Path) -
         "SELECT instance_receipt_sha256 FROM current_candidate_verifications"
     ).fetchone()
     assert current[0] == "c" * 64
+    same_generation_receipts = store._connection.execute(
+        "SELECT role, instance_receipt_sha256 FROM candidate_proposals "
+        "WHERE episode>=2 ORDER BY episode"
+    ).fetchall()
+    assert [tuple(row) for row in same_generation_receipts] == [
+        ("specialist", "c" * 64),
+        ("verifier", "c" * 64),
+    ]
     assert store.candidate_is_verified(run_id, 1, candidate)
+    store.close()
+
+
+@pytest.mark.parametrize("producer_episode", (1, 2))
+def test_dynamic_verifier_rejects_nonprior_producer_episode(
+    tmp_path: Path, producer_episode: int
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = f"dynamic-order-run-{producer_episode}"
+    candidate = "INCYPHER{producer_must_precede_verifier}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "pwn", "dynamic_iac", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="b" * 64)
+    store.admit_control_wave(run_id, 1, producer_episode, 0, 1, producer)
+    if producer_episode == 1:
+        store.admit_control_wave(run_id, 1, 1, 0, 2, verifier)
+        store.start_control_wave(run_id, 1, 1)
+        store._connection.execute(
+            "UPDATE control_jobs SET state='cancelled' "
+            "WHERE run_id=? AND challenge_id=1 AND episode=1 "
+            "AND role='verifier' AND lane=0",
+            (run_id,),
+        )
+        verifier_lane = 1
+    else:
+        store.start_control_wave(run_id, 1, producer_episode)
+        store.admit_control_wave(run_id, 1, 1, 0, 1, verifier)
+        store.start_control_wave(run_id, 1, 1)
+        verifier_lane = 0
+    evidence = RunEvidence.open(store, run_id)
+    store.start_attempt("producer", run_id, 1, producer_episode, 0, producer.model, producer.effort)
+    _attest_candidate(evidence, "producer", candidate)
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.start_attempt("verifier", run_id, 1, 1, verifier_lane, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+
+    assert (
+        store._connection.execute("SELECT COUNT(*) FROM candidate_verifications").fetchone()[0] == 0
+    )
+    candidate_key = hashlib.sha256(candidate.encode()).digest()
+    store._connection.execute(
+        """
+        INSERT INTO candidate_verifications(
+          run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
+          verifier_attempt_id, verifier_role, recipe_kind, verification_scope,
+          context_identity, instance_receipt_sha256, verified_at
+        ) VALUES (?, 1, ?, 'producer', 'specialist', 'verifier', 'verifier',
+                  'fresh_source_reobservation_v1', 'dynamic_instance',
+                  'episode:0', ?, ?)
+        """,
+        (run_id, candidate_key, "b" * 64, store._now()),
+    )
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM current_candidate_verifications"
+        ).fetchone()[0]
+        == 0
+    )
+    assert not store.candidate_is_verified(run_id, 1, candidate)
     store.close()
 
 

@@ -559,18 +559,22 @@ class StateStore:
                   )
                   AND producer.context_identity=verification.context_identity
                   AND verifier.context_identity=verification.context_identity
+                  AND producer.episode < verifier.episode
                   AND (
                     (challenge.challenge_type!='dynamic_iac'
                      AND verification.verification_scope='static_material'
-                     AND verification.instance_receipt_sha256 IS NULL)
+                     AND verification.instance_receipt_sha256 IS NULL
+                     AND producer.instance_receipt_sha256 IS NULL
+                     AND verifier.instance_receipt_sha256 IS NULL)
                     OR
                     (challenge.challenge_type='dynamic_iac'
                      AND verification.verification_scope='dynamic_instance'
                      AND length(verification.instance_receipt_sha256)=64
                      AND verification.instance_receipt_sha256
                            NOT GLOB '*[^0-9a-f]*'
-                     AND producer.instance_receipt_sha256=
-                           verification.instance_receipt_sha256
+                     AND length(producer.instance_receipt_sha256)=64
+                     AND producer.instance_receipt_sha256
+                           NOT GLOB '*[^0-9a-f]*'
                      AND verifier.instance_receipt_sha256=
                            verification.instance_receipt_sha256
                      AND instance.status IN ('owned', 'cleanup_pending', 'removed')
@@ -1589,8 +1593,15 @@ class StateStore:
              AND verifier_manifest.digest=verifier_proof.manifest_digest
             WHERE proposal.run_id=? AND proposal.challenge_id=?
               AND proposal.episode>=catalogue.context_episode
+              AND proposal.episode < ?
               AND proposal.context_identity=?
-              AND proposal.instance_receipt_sha256 IS ?
+              AND (
+                (?='static_material' AND proposal.instance_receipt_sha256 IS NULL)
+                OR
+                (?='dynamic_instance'
+                 AND length(proposal.instance_receipt_sha256)=64
+                 AND proposal.instance_receipt_sha256 NOT GLOB '*[^0-9a-f]*')
+              )
               AND proposal.role IN ('specialist', 'recovery')
               AND proposal.candidate_key=? AND proposal.candidate=?
               AND attempt.status='candidate'
@@ -1605,8 +1616,10 @@ class StateStore:
                 attempt_id,
                 run_id,
                 challenge_id,
+                episode,
                 context_identity,
-                instance_receipt,
+                verification_scope,
+                verification_scope,
                 candidate_key,
                 encoded,
             ),

@@ -120,6 +120,34 @@ class ManagedInstanceBoundaryBoard(BoundaryBoard):
         return {"success": False, "status": 404, "connection_info": "", "until": None}
 
 
+class RotatingInstanceBoundaryBoard(ManagedInstanceBoundaryBoard):
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.generation = 0
+        self.current_generation: dict[int, int] = {}
+        self.instance_results: list[tuple[str, int, bool, int, int | None]] = []
+
+    def instance(self, method: str, challenge_id: int) -> dict[str, object]:
+        if method == "POST":
+            self.generation += 1
+            self.current_generation[challenge_id] = self.generation
+        result = super().instance(method, challenge_id)
+        if challenge_id in self.active:
+            generation = self.current_generation[challenge_id]
+            result["since"] = generation
+            result["until"] = 100 + generation
+        self.instance_results.append(
+            (
+                method,
+                challenge_id,
+                result.get("success") is True,
+                int(result["status"]),
+                int(result["until"]) if isinstance(result.get("until"), int) else None,
+            )
+        )
+        return result
+
+
 class FailedCreateBoundaryBoard(ManagedInstanceBoundaryBoard):
     def __init__(self, challenges: list[Challenge], *, invalid_connection: bool) -> None:
         super().__init__(challenges)
@@ -479,16 +507,22 @@ class CandidateVerifierRuntime(BoundaryRuntime):
         self.verifier_candidate = verifier_candidate
         self.prompts: list[tuple[dict[str, object], dict[str, object]]] = []
 
+    def candidate_for_role(self, role: str) -> str | None:
+        return self._candidate if role == "specialist" else self.verifier_candidate
+
     async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
         document = json.loads(prompt)
         self.prompts.append((document, dict(kwargs)))
         role = document["control_route"]["role"]
-        selected = self._candidate if role == "specialist" else self.verifier_candidate
+        selected = self.candidate_for_role(role)
         if document["lane"] != 0 or selected is None:
             return await UnsolvedBoundaryRuntime.solve(self, workspace, prompt, **kwargs)
         candidate_digest = hashlib.sha256(selected.encode()).hexdigest()
+        tool_name = (
+            "run_target_script" if kwargs.get("tool_registry") is not None else "inspect_file"
+        )
         observation = project_tool_observation(
-            "inspect_file",
+            tool_name,
             success=True,
             source_bound=True,
             candidate_sensitive=True,
@@ -515,7 +549,7 @@ class CandidateVerifierRuntime(BoundaryRuntime):
                 ),
                 "tool_calls": [
                     {
-                        "name": "inspect_file",
+                        "name": tool_name,
                         "success": True,
                         "source_bound": True,
                         "candidate_sensitive": True,
@@ -526,6 +560,11 @@ class CandidateVerifierRuntime(BoundaryRuntime):
                 ],
             },
         )()
+
+
+class DynamicCandidateVerifierRuntime(CandidateVerifierRuntime):
+    def candidate_for_role(self, role: str) -> str | None:
+        return self._candidate if role == "recovery" else super().candidate_for_role(role)
 
 
 class ReflectedCandidateRuntime(BoundaryRuntime):
@@ -2439,14 +2478,18 @@ def test_dynamic_local_failure_changes_local_strategy_without_wasting_an_instanc
     assert board.active == set()
 
 
-def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(tmp_path: Path) -> None:
+@pytest.mark.parametrize("matches", (True, False))
+def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(
+    tmp_path: Path, matches: bool
+) -> None:
     candidate = "INCYPHER{limited_dynamic_verified}"
+    verifier_candidate = candidate if matches else "INCYPHER{dynamic_verifier_mismatch}"
     dynamic = replace(
         _challenge(1, challenge_type="dynamic_iac"),
         max_attempts=3,
     )
-    board = ManagedInstanceBoundaryBoard([dynamic])
-    runtime = CandidateVerifierRuntime(candidate, candidate)
+    board = RotatingInstanceBoundaryBoard([dynamic])
+    runtime = DynamicCandidateVerifierRuntime(candidate, verifier_candidate)
     config = replace(
         _config(tmp_path),
         manage_dynamic_instances=True,
@@ -2457,8 +2500,11 @@ def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(tmp_path: 
     report = asyncio.run(DurableJobControl.drive(config, board=board, runtime=runtime))
     view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
 
-    assert report.solved == 1
-    assert board.submissions == [(1, candidate)]
+    assert report.solved == int(matches)
+    assert report.independently_verified == int(matches)
+    assert report.run_local_verified == int(matches)
+    assert report.unverified_challenges == int(not matches)
+    assert board.submissions == ([(1, candidate)] if matches else [])
     assert [call for call in board.instance_calls if call[0] == "POST"] == [
         ("POST", 1),
         ("POST", 1),
@@ -2467,6 +2513,22 @@ def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(tmp_path: 
         ("DELETE", 1),
         ("DELETE", 1),
     ]
+    assert board.peak_active == 1
+    assert board.active == set()
+    post_indexes = [
+        index
+        for index, (method, _, _, _, _) in enumerate(board.instance_results)
+        if method == "POST"
+    ]
+    assert len(post_indexes) == 2
+    between_generations = board.instance_results[post_indexes[0] + 1 : post_indexes[1]]
+    first_delete = next(
+        index for index, result in enumerate(between_generations) if result[0] == "DELETE"
+    )
+    assert any(
+        method == "GET" and not success and status == 404
+        for method, _, success, status, _ in between_generations[first_delete + 1 :]
+    )
     assert {job.role for job in view.jobs} == {"specialist", "recovery", "verifier"}
     auxiliary = [
         (document["control_route"]["role"], kwargs["tool_registry"] is not None)
@@ -2475,6 +2537,55 @@ def test_limited_dynamic_candidate_gets_a_fresh_instance_for_verifier(tmp_path: 
     ]
     assert {role for role, _ in auxiliary} == {"recovery", "verifier"}
     assert all(has_target for _, has_target in auxiliary)
+    encoded_view = json.dumps(asdict(view), sort_keys=True)
+    assert candidate not in encoded_view
+    assert hashlib.sha256(candidate.encode()).hexdigest() not in encoded_view
+    with sqlite3.connect(config.state_path) as connection:
+        receipt_rows = connection.execute(
+            "SELECT role, instance_receipt_sha256 FROM candidate_proposals "
+            "WHERE instance_receipt_sha256 IS NOT NULL ORDER BY episode"
+        ).fetchall()
+        assert [role for role, _ in receipt_rows] == ["recovery", "verifier"]
+        producer_receipt, verifier_receipt = (row[1] for row in receipt_rows)
+        assert producer_receipt != verifier_receipt
+        proof_rows = connection.execute(
+            """
+            SELECT proposal.role, manifest.complete, manifest.gap,
+                   manifest.omitted_count, object.tool, object.payload_json
+            FROM candidate_proposals AS proposal
+            JOIN candidate_evidence_proofs AS proof
+              ON proof.source_attempt_id=proposal.source_attempt_id
+            JOIN evidence_manifests AS manifest
+              ON manifest.run_id=proof.run_id
+             AND manifest.attempt_id=proof.source_attempt_id
+             AND manifest.digest=proof.manifest_digest
+            JOIN evidence_items AS item
+              ON item.run_id=manifest.run_id
+             AND item.manifest_digest=manifest.digest
+            JOIN evidence_objects AS object
+              ON object.run_id=item.run_id AND object.digest=item.object_digest
+            WHERE proposal.role IN ('recovery', 'verifier')
+            ORDER BY proposal.episode, item.ordinal
+            """
+        ).fetchall()
+        assert [tuple(row[:5]) for row in proof_rows] == [
+            ("recovery", 1, None, 0, "run_target_script"),
+            ("verifier", 1, None, 0, "run_target_script"),
+        ]
+        expected_candidate_sha256s = {
+            "recovery": hashlib.sha256(candidate.encode()).hexdigest(),
+            "verifier": hashlib.sha256(verifier_candidate.encode()).hexdigest(),
+        }
+        for role, _, _, _, _, encoded_payload in proof_rows:
+            payload = json.loads(encoded_payload)
+            assert payload["success"] is True
+            assert payload["source_bound"] is True
+            assert payload["candidate_sha256s"] == [expected_candidate_sha256s[role]]
+            assert payload["supplied_candidate_sha256s"] == []
+        verification_receipts = connection.execute(
+            "SELECT instance_receipt_sha256 FROM current_candidate_verifications"
+        ).fetchall()
+        assert verification_receipts == ([(verifier_receipt,)] if matches else [])
 
 
 @pytest.mark.parametrize(

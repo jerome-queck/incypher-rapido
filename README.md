@@ -125,6 +125,11 @@ evidence from a crash-reconciled outcome whose HTTP status is unknowable;
 evidence. The legacy `solved` field remains a scheduler/lifecycle count, not a benchmark score.
 Submission outcome and provenance commit in one transaction. Independent verification counts only
 for the current material; dynamic verification also records the owned instance-generation receipt.
+For dynamic work, a fresh Verifier may confirm the same exact privately retained candidate on a
+new instance generation. Both attempts need their own complete source-bound evidence proofs;
+the Verifier receipt must match that generation's durable instance record. Different
+instance-specific candidate values are not treated as equivalent by the live controller;
+method replay is graded separately after the run.
 Legacy or unscoped verification rows never qualify.
 
 A Board-description literal is not a guess: the controller submits only one exact unique flag-shaped
