@@ -1859,33 +1859,107 @@ def test_semantic_board_error_is_not_retried(tmp_path: Path) -> None:
 def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class AdaptiveOrchestrator(Orchestrator):
-        _adaptive_control = True
-
     monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
     monkeypatch.setattr(
         orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
     )
-    board = RecoveringWatchBoard([challenge(1)], {5, 6, 7})
+    real_time = orchestrator_module.time
+
+    class ControlledClock:
+        expired = False
+
+        def monotonic(self) -> float:
+            return real_time.monotonic() + (120 if self.expired else 0)
+
+        def __getattr__(self, name: str):
+            return getattr(real_time, name)
+
+    clock = ControlledClock()
+    monkeypatch.setattr(orchestrator_module, "time", clock)
+
+    class CoordinatedWatchBoard(RecoveringWatchBoard):
+        def __init__(self) -> None:
+            super().__init__([challenge(1)], {5, 6, 7})
+            self.solve_started = threading.Event()
+
+        def list_challenges(self):
+            if self.list_calls + 1 == 5:
+                assert self.solve_started.wait(timeout=1)
+            return super().list_challenges()
+
+    board = CoordinatedWatchBoard()
     cfg = replace(
         config(tmp_path, submit=False),
         active_challenges=1,
         attempts_per_challenge=1,
         concurrency=1,
         attempt_seconds=1,
-        run_seconds=0.3,
+        run_seconds=60,
         watch_board=True,
         board_watch_seconds=0.001,
         board_full_refresh_seconds=0.02,
     )
-    store = StateStore(cfg.state_path)
-    runtime = FakeRuntime({})
 
-    report = asyncio.run(AdaptiveOrchestrator(cfg, board, store, runtime).run())
+    async def exercise_watch_recovery():
+        recovered = asyncio.Event()
+
+        class ExpireAfterWatchRecovery(FakeRuntime):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.entries = 0
+                self.cancellations = 0
+                self.in_solve = False
+                self.recovered_while_solving = False
+
+            async def solve(self, workspace, prompt, **kwargs):
+                self.entries += 1
+                self.in_solve = True
+                board.solve_started.set()
+                try:
+                    await recovered.wait()
+                    self.recovered_while_solving = True
+                    result = await super().solve(workspace, prompt, **kwargs)
+                    clock.expired = True
+                    return result
+                except asyncio.CancelledError:
+                    self.cancellations += 1
+                    raise
+                finally:
+                    self.in_solve = False
+
+        runtime = ExpireAfterWatchRecovery()
+
+        class AdaptiveOrchestrator(Orchestrator):
+            _adaptive_control = True
+
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.outage_saw_active_solve = False
+
+            def _record_board_watch_transport_outage(self, *args, **kwargs):
+                self.outage_saw_active_solve = runtime.in_solve
+                return super()._record_board_watch_transport_outage(*args, **kwargs)
+
+            def _record_board_watch_transport_recovered(self, *args, **kwargs):
+                result = super()._record_board_watch_transport_recovered(*args, **kwargs)
+                if kwargs["consecutive_failures"]:
+                    recovered.set()
+                return result
+
+        store = StateStore(cfg.state_path)
+        orchestrator = AdaptiveOrchestrator(cfg, board, store, runtime)
+        report = await asyncio.wait_for(orchestrator.run(), timeout=2)
+        return report, runtime, orchestrator, store
+
+    report, runtime, orchestrator, store = asyncio.run(exercise_watch_recovery())
 
     assert report.status == "deadline"
     assert board.list_calls >= 9
-    assert len(runtime.solve_kwargs) > 1
+    assert orchestrator.outage_saw_active_solve
+    assert runtime.recovered_while_solving
+    assert runtime.entries == 1
+    assert runtime.cancellations == 0
+    assert len(runtime.solve_kwargs) == 1
     rows = store._connection.execute(
         "SELECT kind, data_json FROM events "
         "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
