@@ -1193,7 +1193,7 @@ requires later owner authorization and a fresh unattended 19,800-second acceptan
 | Exact merged-image preflight | no inference | 15/15 authenticated catalogue, `writes=0`, temporary container/state removed |
 | Replacement two-hour diagnostic live roster | `gpt-daybreak-blue-latest` / `xhigh`; `gpt-5.6-luna` / `max` and `xhigh` | 73 Daybreak and 71 Luna attempts on the registered mixed roster; no model fallback |
 | Replacement diagnostic lifecycle/result audit | `gpt-daybreak-blue-latest` / `xhigh` | exact stopped state, database, candidates, instances, resources, and private exports audited; no new verified solve, no fallback |
-| Main-CI failure diagnosis and test review | `gpt-daybreak-blue-latest` / `xhigh` | two real-time test races isolated; production change rejected, event-synchronized test-only repair reviewed independently; no fallback |
+| Main-CI failure diagnosis and test review | `gpt-daybreak-blue-latest` / `xhigh` | three real-time test races isolated; production change rejected, event-synchronized test-only repair reviewed independently; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1301,12 +1301,16 @@ watch recovery on Python 3.11, so the run completed before the test's expected d
 opposite-version passes and repeated local passes identify test timing races, not production
 scheduler regressions.
 
-The repair changes tests only. The persistent-scheduler test now waits until episode three enters,
-then deliberately cancels and checks the durable interrupted state. The watch-recovery test holds
+The first PR #56 CI run then exposed the same defect in a third active-watch test: its 0.3-second
+deadline expired after the simulated detail outage and before the material-retry cycle. The repair
+changes tests only. The persistent-scheduler test now waits until episode three enters, then
+deliberately cancels and checks the durable interrupted state. The first watch-recovery test holds
 one solve across a coordinated outage, observes the recorded recovery, and proves one solve entry
-with zero cancellations. Independent short timeouts bound test failure without deciding test
-success. The final tree passed the pair 20/20, Ruff check/format, and 951 tests with four platform
-skips.
+with zero cancellations. The detail/material test waits until the newly admitted challenge starts,
+then cancels and validates both outage cycles and recovery. Independent short timeouts bound test
+failure without deciding test success. The three affected cases passed 20/20 repeated groups; Ruff
+check/format and the updated 951-test local suite were green. Updated CI evidence remains required
+before merge.
 
 ## Open decisions
 

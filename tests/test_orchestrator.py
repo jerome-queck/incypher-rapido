@@ -2018,14 +2018,19 @@ def test_active_watch_retries_whole_new_id_refresh_after_detail_and_material_tra
                 raise BoardTransportError("Board transport failed")
             return super().download(file_ref, destination, byte_limit=byte_limit)
 
-    class SlowUnsolvedRuntime(FakeRuntime):
+    class HoldAppendedWork(FakeRuntime):
         def __init__(self) -> None:
             super().__init__({})
             self.challenge_ids: list[int] = []
+            self.appended_started = asyncio.Event()
+            self.release_appended = asyncio.Event()
 
         async def solve(self, workspace, prompt, **kwargs):
-            self.challenge_ids.append(json.loads(prompt)["challenge"]["id"])
-            await asyncio.sleep(0.05)
+            challenge_id = json.loads(prompt)["challenge"]["id"]
+            self.challenge_ids.append(challenge_id)
+            if challenge_id == 2:
+                self.appended_started.set()
+                await self.release_appended.wait()
             return await super().solve(workspace, prompt, **kwargs)
 
     monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
@@ -2033,23 +2038,34 @@ def test_active_watch_retries_whole_new_id_refresh_after_detail_and_material_tra
         orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
     )
     board = GrowingRefreshTransportBoard()
-    runtime = SlowUnsolvedRuntime()
+    runtime = HoldAppendedWork()
     cfg = replace(
         config(tmp_path, submit=False),
         active_challenges=2,
         attempts_per_challenge=1,
         concurrency=2,
         attempt_seconds=1,
-        run_seconds=0.3,
+        run_seconds=60,
         watch_board=True,
         board_watch_seconds=0.001,
         board_full_refresh_seconds=0.02,
     )
     store = StateStore(cfg.state_path)
 
-    report = asyncio.run(AdaptiveOrchestrator(cfg, board, store, runtime).run())
+    async def observe_refresh_recovery() -> None:
+        task = asyncio.create_task(AdaptiveOrchestrator(cfg, board, store, runtime).run())
+        try:
+            await asyncio.wait_for(runtime.appended_started.wait(), timeout=5)
+        finally:
+            task.cancel()
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
+            assert isinstance(result[0], asyncio.CancelledError)
 
-    assert report.status == "deadline"
+    asyncio.run(observe_refresh_recovery())
+
+    assert (
+        store._connection.execute("SELECT status FROM runs").fetchone()["status"] == "interrupted"
+    )
     assert board.appended_detail_calls >= 7
     assert board.download_list_counts[:2] == [12, 17]
     assert 2 in runtime.challenge_ids
