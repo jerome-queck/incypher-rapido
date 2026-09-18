@@ -281,6 +281,43 @@ def test_operator_stop_preserves_pending_submission_intent(tmp_path: Path) -> No
     assert _record(state_path)["disposition"] == "operator_stopped"
 
 
+def test_operator_stop_from_blocked_reconciliation_never_restarts(tmp_path: Path) -> None:
+    import rapido.supervisor as supervisor_module
+
+    state_path = _private_state(tmp_path)
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.upsert_challenge(7, "fixture", "web", "standard", 100)
+    assert state.reserve_submission("same-run", 7, "INCYPHER{private-fixture}")
+    state.finalize_submission("same-run", 7, "INCYPHER{private-fixture}", "unread", 0)
+    state.close()
+    fingerprint = supervisor_module._reconciliation_fingerprint(state_path, "same-run")
+    assert fingerprint is not None
+    _write_supervisor_record(
+        state_path,
+        phase="blocked",
+        run_id="same-run",
+        replacement_count=1,
+        disposition="operator_reconciliation_required",
+        state_fingerprint=fingerprint,
+    )
+    supervisor = Supervisor(
+        state_path,
+        restart_backoffs=(30,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    supervisor._stop_signal = signal.SIGTERM
+    supervisor._stop_at = time.monotonic()
+    supervisor._stop_event.set()
+
+    assert supervisor.run() == 0
+    assert _record(state_path)["disposition"] == "operator_stopped"
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT status FROM runs").fetchone() == ("interrupted",)
+        assert connection.execute("SELECT status FROM submission_intents").fetchone() == ("unread",)
+
+
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
     state_path = _private_state(tmp_path)
     marker = tmp_path / "started"
@@ -298,6 +335,40 @@ def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> N
         reporter=stop_before_spawn,
     )
     holder["supervisor"] = supervisor
+
+    assert supervisor.run() == 128 + signal.SIGTERM
+    assert not marker.exists()
+    assert _record(state_path)["disposition"] == "operator_stopped"
+
+
+def test_signal_during_process_launch_cancels_gate_before_worker_exec(
+    monkeypatch, tmp_path: Path
+) -> None:
+    state_path = _private_state(tmp_path)
+    marker = tmp_path / "started"
+    supervisor = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    real_pipe = os.pipe
+    real_write = os.write
+    gate_write: list[int] = []
+
+    def tracked_pipe() -> tuple[int, int]:
+        read_fd, write_fd = real_pipe()
+        gate_write.append(write_fd)
+        return read_fd, write_fd
+
+    def stop_before_release(descriptor: int, payload: bytes) -> int:
+        if gate_write and descriptor == gate_write[0]:
+            supervisor._on_signal(signal.SIGTERM, None)
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(os, "pipe", tracked_pipe)
+    monkeypatch.setattr(os, "write", stop_before_release)
 
     assert supervisor.run() == 128 + signal.SIGTERM
     assert not marker.exists()

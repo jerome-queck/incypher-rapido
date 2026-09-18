@@ -654,13 +654,17 @@ class Supervisor:
         )
         if self._stop_signal is not None:
             return 128 + self._stop_signal
+        gate_read, gate_write = os.pipe()
         try:
             process = subprocess.Popen(
-                self.command,
+                (sys.executable, "-m", "rapido.spawn_gate", str(gate_read), "--", *self.command),
                 env=self.environ,
                 start_new_session=True,
+                pass_fds=(gate_read,),
             )
         except OSError:
+            os.close(gate_read)
+            os.close(gate_write)
             durable = _read_initially_recoverable_run(
                 self.state_path, initial_record=run_id is None
             )
@@ -673,8 +677,17 @@ class Supervisor:
                 return self._schedule_or_refuse(None, replacement_count + 1)
             self._write_terminal(active, run_id, "worker_launch_failed")
             return self._quiesce("worker_launch_failed", run_id)
+        os.close(gate_read)
         self._process = process
         self._forwarded = False
+        try:
+            if self._stop_signal is None:
+                os.write(gate_write, b"1")
+        except OSError:
+            if self._stop_signal is None:
+                self.reporter({"status": "refused", "reason": "worker start gate failed"})
+        finally:
+            os.close(gate_write)
         self._forward_if_requested()
         exit_code = self._wait_worker(process)
         self._process = None
