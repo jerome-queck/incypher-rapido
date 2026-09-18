@@ -387,6 +387,6 @@ COMMON_RUN=(
 printf '\n  %sLive run command (not started):%s\n  ' "$BOLD" "$RESET"
 printf '%q ' "${COMMON_RUN[@]}" --detach --restart unless-stopped --name rapido "$RAPIDO_IMAGE"
 printf '\n\n'
-note "Keep that command unattended. Stop with: docker stop --time 180 rapido"
+note "Keep that command unattended. Stop with: docker stop --time 190 rapido"
 
 finish

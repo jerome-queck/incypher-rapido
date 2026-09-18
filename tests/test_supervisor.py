@@ -281,6 +281,29 @@ def test_operator_stop_preserves_pending_submission_intent(tmp_path: Path) -> No
     assert _record(state_path)["disposition"] == "operator_stopped"
 
 
+def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
+    state_path = _private_state(tmp_path)
+    marker = tmp_path / "started"
+    holder: dict[str, Supervisor] = {}
+
+    def stop_before_spawn(document: dict[str, object]) -> None:
+        if document.get("status") == "worker_starting":
+            holder["supervisor"]._on_signal(signal.SIGTERM, None)
+
+    supervisor = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=stop_before_spawn,
+    )
+    holder["supervisor"] = supervisor
+
+    assert supervisor.run() == 128 + signal.SIGTERM
+    assert not marker.exists()
+    assert _record(state_path)["disposition"] == "operator_stopped"
+
+
 def test_failed_descendant_cleanup_terminalizes_without_replacement(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -934,6 +957,21 @@ def test_signal_is_forwarded_once_and_descendant_is_extinguished(tmp_path: Path)
         time.sleep(0.05)
     else:
         raise AssertionError("worker descendant survived supervisor shutdown")
+
+    restart_marker = tmp_path / "restart-started"
+    restarted = Supervisor(
+        state_path,
+        command=(
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(restart_marker)!r}).touch()",
+        ),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    assert restarted.run() == 0
+    assert not restart_marker.exists()
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper contract")

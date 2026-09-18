@@ -652,6 +652,8 @@ class Supervisor:
                 "initial": initial,
             }
         )
+        if self._stop_signal is not None:
+            return 128 + self._stop_signal
         try:
             process = subprocess.Popen(
                 self.command,

@@ -124,6 +124,8 @@ def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> Non
         'assert value["active_challenges"] == 5',
         'assert value["attempts_per_challenge"] == 4',
         'assert value["concurrency"] == 20',
+        "--stop-timeout=190",
+        "docker stop --time 190 rapido",
     ):
         assert value in text
 
