@@ -430,6 +430,61 @@ def test_transient_stop_write_failure_retries_without_worker_spawn(
         assert connection.execute("SELECT status FROM runs").fetchone() == ("interrupted",)
 
 
+def test_transient_stopping_sidecar_failure_still_terminalizes_run(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import rapido.supervisor as supervisor_module
+
+    state_path = _private_state(tmp_path)
+    marker = tmp_path / "started"
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.close()
+    _write_supervisor_record(
+        state_path,
+        phase="scheduled",
+        run_id="same-run",
+        replacement_count=1,
+        not_before=time.time() + 30,
+    )
+    real_write = supervisor_module._SupervisorFiles.write
+    failed = False
+
+    def fail_stopping_once(files, record) -> None:
+        nonlocal failed
+        if record.phase == "stopping" and not failed:
+            failed = True
+            raise OSError("transient sidecar failure")
+        real_write(files, record)
+
+    monkeypatch.setattr(supervisor_module._SupervisorFiles, "write", fail_stopping_once)
+    stopped = Supervisor(
+        state_path,
+        restart_backoffs=(30,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    stopped._stop_signal = signal.SIGTERM
+    stopped._stop_at = time.monotonic()
+    stopped._stop_event.set()
+
+    assert stopped.run() == 128 + signal.SIGTERM
+    assert failed
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT status FROM runs").fetchone() == ("interrupted",)
+    assert _record(state_path)["disposition"] == "operator_stopped"
+
+    restarted = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    assert restarted.run() == 0
+    assert not marker.exists()
+
+
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
     state_path = _private_state(tmp_path)
     marker = tmp_path / "started"

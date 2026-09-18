@@ -1030,7 +1030,12 @@ class Supervisor:
                 None,
                 time.time(),
             )
-            self._files.write(record)
+            try:
+                self._files.write(record)
+            except OSError as exc:
+                # The Run database is an independent durable fence. Continue so a
+                # transient sidecar failure cannot leave a running Run restartable.
+                self.reporter({"status": "refused", "reason": str(exc)})
         try:
             durable = _read_durable_run(self.state_path)
         except SupervisorRefused as exc:
