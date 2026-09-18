@@ -517,6 +517,7 @@ class Supervisor:
         self._files = _SupervisorFiles(state_path)
         self._process: subprocess.Popen[bytes] | None = None
         self._stop_signal: int | None = None
+        self._stop_at: float | None = None
         self._stop_event = threading.Event()
         self._forwarded = False
         self._previous_handlers: dict[int, Any] = {}
@@ -532,7 +533,11 @@ class Supervisor:
             try:
                 with self._files:
                     self._enable_child_adoption()
-                    return self._run_owned()
+                    try:
+                        return self._run_owned()
+                    finally:
+                        if self._stop_signal is not None:
+                            self._finalize_operator_stop()
             except (BlockingIOError, OSError, SupervisorRefused, sqlite3.Error) as exc:
                 self.reporter({"status": "refused", "reason": str(exc)})
                 return self._quiesce()
@@ -676,11 +681,11 @@ class Supervisor:
         except (OSError, SupervisorRefused) as exc:
             descendants_extinguished = False
             self.reporter({"status": "refused", "reason": str(exc)})
-        if self._stop_signal is not None:
-            return 128 + self._stop_signal
         if not descendants_extinguished:
             self._write_terminal(active, run_id, "descendant_cleanup_failed")
             return self._quiesce("descendant_cleanup_failed", run_id)
+        if self._stop_signal is not None:
+            return 128 + self._stop_signal
 
         try:
             durable = _read_initially_recoverable_run(
@@ -781,7 +786,7 @@ class Supervisor:
             self._reap_adopted_children(process.pid)
             if self._stop_signal is not None:
                 if stop_deadline is None:
-                    stop_deadline = time.monotonic() + self.stop_seconds
+                    stop_deadline = (self._stop_at or time.monotonic()) + self.stop_seconds
                 elif time.monotonic() >= stop_deadline and not killed:
                     self._signal_group(process.pid, signal.SIGKILL)
                     killed = True
@@ -799,6 +804,7 @@ class Supervisor:
         if self._stop_signal is not None:
             return
         self._stop_signal = signum
+        self._stop_at = time.monotonic()
         self._stop_event.set()
         self._forward_if_requested()
 
@@ -982,6 +988,40 @@ class Supervisor:
                 time.time(),
             )
         )
+
+    def _finalize_operator_stop(self) -> None:
+        """Persist stop intent after worker/descendant drain and before process exit."""
+        record = self._files.load()
+        if record is not None and record.phase == "terminal":
+            return
+        run_id = None if record is None else record.run_id
+        try:
+            durable = _read_durable_run(self.state_path)
+        except SupervisorRefused:
+            durable = None
+        if run_id is None and durable is not None:
+            run_id = durable.run_id
+        if durable is not None and durable.status != "running":
+            self._write_terminal(record, durable.run_id, durable.status)
+            return
+        disposition = "operator_stopped"
+        if run_id is not None and durable is not None and durable.status == "running":
+            from .state import StateStore
+
+            state: StateStore | None = None
+            try:
+                state = StateStore(self.state_path)
+                state.acquire_supervisor()
+                durable_status = state.finalize_operator_stop(run_id)
+                if durable_status not in {"interrupted", "completed", "deadline", "failed"}:
+                    raise RuntimeError("operator stop produced an invalid durable run state")
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                disposition = "operator_stop_persistence_failed"
+                self.reporter({"status": "refused", "reason": str(exc)})
+            finally:
+                if state is not None:
+                    state.close()
+        self._write_terminal(record, run_id, disposition)
 
     def _quiesce(self, disposition: str = "refused", run_id: str | None = None) -> int:
         self.reporter({"status": "quiescent", "run_id": run_id, "disposition": disposition})

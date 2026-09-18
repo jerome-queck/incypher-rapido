@@ -376,7 +376,7 @@ note "image and architecture smoke tests passed"
 stage "Read-only Board preflight"
 say "This authenticates to the Board and reads its catalogue. It does not start Codex, submit, or manage instances."
 COMMON_RUN=(
-  docker run --platform "$RAPIDO_PLATFORM" --stop-timeout=180 --read-only
+  docker run --platform "$RAPIDO_PLATFORM" --stop-timeout=190 --read-only
   --cpus=8 --memory=24g --pids-limit=256 --cap-drop=ALL
   --security-opt=no-new-privileges:true --env-file="$ENV_FILE"
   --mount "type=bind,src=$STATE_DIR,dst=/state"

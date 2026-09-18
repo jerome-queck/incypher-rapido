@@ -184,11 +184,12 @@ submissions, CPU, memory, PIDs, and sanitized restart state; it never calls the 
 candidate values, credentials, raw Board payloads, model prose, or Docker state. Recorded samples
 use `/state/rapido-monitor.jsonl` and mode `0600`.
 
-Use the 180-second grace period so bounded target drains, native shutdown, and instance cleanup can
+Use the 190-second outer grace period so the 180-second worker drain, descendant cleanup, durable
+terminal write, and instance cleanup can
 finish:
 
 ```sh
-docker stop --timeout 180 rapido
+docker stop --timeout 190 rapido
 ```
 
 Launch one named, detached container with `--restart unless-stopped`; keep Rapido as PID 1 without

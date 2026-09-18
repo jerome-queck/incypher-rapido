@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from rapido import cli
+from rapido.state import StateStore
 from rapido.supervisor import Supervisor
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -203,6 +204,81 @@ def test_restart_budget_is_durable_and_bounded(tmp_path: Path) -> None:
     )
     assert second.run() == 0
     assert counter.read_text() == "3"
+
+
+@pytest.mark.parametrize("backoff", [5, 30, 120])
+def test_operator_stop_during_restart_backoff_is_durable(tmp_path: Path, backoff: int) -> None:
+    state_path = _private_state(tmp_path)
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.close()
+    marker = tmp_path / "started"
+    _write_supervisor_record(
+        state_path,
+        phase="scheduled",
+        run_id="same-run",
+        replacement_count=1,
+        not_before=time.time() + backoff,
+    )
+    supervisor = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(float(backoff),),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    supervisor._stop_signal = signal.SIGTERM
+    supervisor._stop_at = time.monotonic()
+    supervisor._stop_event.set()
+
+    assert supervisor.run() == 128 + signal.SIGTERM
+    assert not marker.exists()
+    assert _record(state_path)["phase"] == "terminal"
+    assert _record(state_path)["disposition"] == "operator_stopped"
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT status FROM runs").fetchone() == ("interrupted",)
+
+    restarted = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    assert restarted.run() == 0
+    assert not marker.exists()
+
+
+def test_operator_stop_preserves_pending_submission_intent(tmp_path: Path) -> None:
+    state_path = _private_state(tmp_path)
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.upsert_challenge(7, "fixture", "web", "standard", 100)
+    assert state.reserve_submission("same-run", 7, "INCYPHER{private-fixture}")
+    state.close()
+    _write_supervisor_record(
+        state_path,
+        phase="scheduled",
+        run_id="same-run",
+        replacement_count=1,
+        not_before=time.time() + 30,
+    )
+    supervisor = Supervisor(
+        state_path,
+        restart_backoffs=(30,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    supervisor._stop_signal = signal.SIGTERM
+    supervisor._stop_at = time.monotonic()
+    supervisor._stop_event.set()
+
+    assert supervisor.run() == 128 + signal.SIGTERM
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT status FROM submission_intents").fetchone() == (
+            "pending",
+        )
+    assert _record(state_path)["disposition"] == "operator_stopped"
 
 
 def test_failed_descendant_cleanup_terminalizes_without_replacement(
@@ -846,6 +922,7 @@ def test_signal_is_forwarded_once_and_descendant_is_extinguished(tmp_path: Path)
     process.send_signal(signal.SIGTERM)
     assert process.wait(timeout=5) == 128 + signal.SIGTERM
     assert signals_path.read_text().splitlines() == [str(signal.SIGTERM)]
+    assert _record(state_path)["disposition"] == "operator_stopped"
 
     child_pid = int(child_pid_path.read_text())
     deadline = time.monotonic() + 5

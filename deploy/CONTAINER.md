@@ -88,8 +88,9 @@ candidate fingerprints and other operational records are intentionally not a pub
 After preserving approved sanitized repository evidence, remove each live run's exact state and
 workspace while retaining the dedicated auth home.
 
-The 180-second stop grace covers bounded TCP-open drain, the 45-second receipt-bound instance
-cleanup window, native-process termination, and scheduling margin. Rapido is PID 1 and supervises a
+The 190-second outer stop grace covers the 180-second worker drain, two bounded descendant-cleanup
+windows, durable terminal persistence, and the 45-second receipt-bound instance cleanup window.
+Rapido is PID 1 and supervises a
 disposable solver worker. It adopts detached descendants, persists restart intent, and uses bounded
 5/30/120-second replacements for the same running Run. An ambiguous submission blocks unchanged
 restart until explicit reconciliation. Terminal or refused state remains quiescent for evidence
@@ -97,13 +98,13 @@ inspection. `--restart unless-stopped` restarts the named container after the Do
 host or VM boot still needs to restore that daemon.
 
 The hardened live launch contract retains `--env-file=/path/to/rapido.env`, `--name rapido`,
-`--detach`, `--restart unless-stopped`, `--stop-timeout=180`, `--cpus=8` (or the pre-registered
+`--detach`, `--restart unless-stopped`, `--stop-timeout=190`, `--cpus=8` (or the pre-registered
 measured host override), `--memory=24g`, `--pids-limit=256`, `--read-only`,
 `--tmpfs /tmp:rw,noexec,nosuid,nodev`, `--cap-drop=ALL`,
 `--security-opt=no-new-privileges:true`,
 `--mount type=bind,src=/private/path/rapido-state,dst=/state`, and
-`--mount type=bind,src=/private/path/rapido-codex-home,dst=/auth/codex`. The 180 seconds cover the
-longest admitted TCP-open drain. Omit `--init`: Rapido must remain PID 1 to adopt and reap worker
+`--mount type=bind,src=/private/path/rapido-codex-home,dst=/auth/codex`. Omit `--init`: Rapido must
+remain PID 1 to adopt and reap worker
 descendants. Keep a single app-server central auth owner.
 
 Optional artifact parsers run in a killable descriptor-only worker. Linux Landlock restricts its
@@ -125,7 +126,7 @@ docker run --rm --entrypoint codex rapido:local --version
 ```
 
 `deploy/docker-compose.example.yml` mirrors the hardened flags, `restart: unless-stopped`,
-`user: "10001:10001"`, external bind mounts, and 180-second Compose stop grace. Replace its
+`user: "10001:10001"`, external bind mounts, and 190-second Compose stop grace. Replace its
 placeholder paths and env-file path; do not commit the resulting file. `docker compose down`
 leaves bind-mounted data in place. Avoid `down --volumes` unless deleting a named volume is
 deliberate and separately authorized.
