@@ -111,9 +111,10 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 Every live run starts with fresh solver state and a run-local 0/15, but the authenticated Board
 account persists. Board-solved challenges are still analyzed, and freshly derived qualified
 candidates are still submitted. A generic `already_solved` response proves only account history;
-it does not validate that run's candidate. Board-unsolved challenges are queued first. A fresh
-`already_solved` response closes immediately without wasting a Verifier and is not reported as a
-new HTTP `correct`.
+it does not validate that run's candidate. Board-unsolved challenges are queued first. An
+unverified `already_solved` candidate remains private and queued for a fresh Verifier without being
+resubmitted. Only same-run independent verification may close it, and it is never reported as a new
+HTTP `correct`.
 
 A Board-description literal is not a guess: the controller submits only one exact unique flag-shaped
 literal after a fresh same-challenge refresh confirms unlimited attempts. It never synthesizes

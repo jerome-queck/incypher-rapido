@@ -2605,11 +2605,16 @@ class Orchestrator:
             and source_context_episode == current_context_episode
             and (material_matches or same_generation_without_digests)
         )
-        outcome = {
-            "correct": "solved" if current_effect else "already_solved",
-            "incorrect": "unsolved",
-            "already_solved": "already_solved",
-        }[settled]
+        if settled == "correct":
+            outcome = "solved" if current_effect else "candidate"
+        elif settled == "incorrect":
+            outcome = "unsolved"
+        else:
+            outcome = (
+                "resolved"
+                if self.state.candidate_is_verified(run_id, challenge_id, candidate)
+                else "candidate"
+            )
         self.state.event(
             run_id,
             "candidate_effect_reused",
@@ -2621,7 +2626,7 @@ class Orchestrator:
         )
         self.state.set_challenge_status(
             challenge_id,
-            "candidate" if outcome == "already_solved" else outcome,
+            "candidate" if outcome == "resolved" else outcome,
         )
         return outcome
 
@@ -2734,15 +2739,14 @@ class Orchestrator:
             if verdict.outcome == "correct":
                 status = "solved"
             elif verdict.outcome == "already_solved":
-                # This candidate does not earn a run-local solve, but the Board has
-                # conclusively told us further work on this challenge is wasteful.
-                status = "already_solved"
+                # Account-wide solved state does not validate this candidate.
+                status = "resolved" if verified else "candidate"
             elif verdict.outcome in {"paused", "ratelimited", "unread"}:
                 status = "candidate"
             else:
                 status = "unsolved"
             self.state.set_challenge_status(
-                challenge.id, "candidate" if status == "already_solved" else status
+                challenge.id, "candidate" if status == "resolved" else status
             )
             return status
 
@@ -2826,7 +2830,7 @@ class Orchestrator:
         )
         if description_outcome == "solved":
             return "solved"
-        if description_outcome == "already_solved":
+        if description_outcome == "resolved":
             return "resolved"
         if description_outcome == "candidate":
             return "candidate"
@@ -2906,9 +2910,7 @@ class Orchestrator:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     results.append(task.result())
-                if any(
-                    result.submission_status in {"solved", "already_solved"} for result in results
-                ):
+                if any(result.submission_status in {"solved", "resolved"} for result in results):
                     winner_found = True
                     for task in pending:
                         task.cancel()
@@ -2990,7 +2992,7 @@ class Orchestrator:
         if any(result.submission_status == "solved" for result in results):
             self.state.set_challenge_status(challenge.id, "solved")
             return "solved"
-        if any(result.submission_status == "already_solved" for result in results):
+        if any(result.submission_status == "resolved" for result in results):
             self.state.set_challenge_status(challenge.id, "candidate")
             return "resolved"
         if (

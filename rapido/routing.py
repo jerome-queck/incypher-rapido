@@ -420,6 +420,16 @@ def route_failure(request: RouteRequest) -> RouteDecision:
                 context_profile="typed_facts_without_rejected_candidate",
                 workspace_generation=request.current.workspace_generation + 1,
             )
+        elif request.current.role == "verifier":
+            rule_id = "verifier_mismatch_recovery_v1"
+            successor = replace(
+                request.current,
+                role="recovery",
+                tactic="alternate_candidate_after_verifier_mismatch",
+                context_profile="typed_facts_without_unverified_candidate",
+                verification_recipe="none",
+                workspace_generation=request.current.workspace_generation + 1,
+            )
         else:
             rule_id = "private_source_reobservation_v1"
             successor = replace(

@@ -1592,7 +1592,9 @@ def test_historical_candidate_effect_does_not_suppress_a_fresh_submission(
     assert board.submissions == [(1, candidate)]
 
 
-def test_already_solved_candidate_closes_without_wasting_a_verifier(tmp_path: Path) -> None:
+def test_already_solved_candidate_requires_fresh_verification_before_closing(
+    tmp_path: Path,
+) -> None:
     candidate = "INCYPHER{fresh_candidate_for_solved_board_item}"
     board = AlreadySolvedBoundaryBoard([_challenge(1)])
     config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
@@ -1609,9 +1611,40 @@ def test_already_solved_candidate_closes_without_wasting_a_verifier(tmp_path: Pa
     assert report.solved == 0
     assert report.candidates == 1
     assert board.submissions == [(1, candidate)]
-    assert {job.role for job in view.jobs} == {"specialist"}
+    assert {job.role for job in view.jobs} == {"specialist", "verifier"}
     assert view.pending_candidate_count == 0
+    assert view.verified_candidate_count == 1
+    assert [(decision.failure_kind, decision.disposition) for decision in view.route_decisions] == [
+        ("disagreement", "dispatch")
+    ]
+
+
+def test_already_solved_verifier_mismatch_dispatches_recovery(tmp_path: Path) -> None:
+    candidate = "INCYPHER{fresh_candidate_for_solved_board_item}"
+    mismatch = "INCYPHER{independent_mismatch_for_solved_board_item}"
+    board = AlreadySolvedBoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=3, submit_candidates=True)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=CandidateVerifierRuntime(candidate, mismatch),
+        )
+    )
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+
+    assert report.solved == 0
+    assert report.candidates == 1
+    assert {job.role for job in view.jobs} == {"specialist", "verifier", "recovery"}
+    assert view.pending_candidate_count == 2
     assert view.verified_candidate_count == 0
+    assert board.submissions == [(1, candidate), (1, mismatch)]
+    assert [decision.rule_id for decision in view.route_decisions] == [
+        "private_source_reobservation_v1",
+        "verifier_mismatch_recovery_v1",
+        "route_budget_exhausted",
+    ]
 
 
 def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
