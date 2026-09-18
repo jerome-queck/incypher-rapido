@@ -6,12 +6,14 @@ import hashlib
 import importlib.util
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from rapido.codex_app import ModelValidationError
+from rapido.evidence import project_tool_observation
 from rapido.tools import ToolError, ToolRegistry
 
 SPEC = importlib.util.spec_from_file_location(
@@ -40,14 +42,137 @@ def _roots(tmp_path: Path) -> tuple[Path, Path, Path]:
     return codex_home, work_root, key_file
 
 
-def _patch_source_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch_source_observation(monkeypatch: pytest.MonkeyPatch, *, clean: bool = False) -> None:
     def completed(command: list[str], **_: object) -> SimpleNamespace:
         if command[1:3] == ["rev-parse", "--verify"]:
             return SimpleNamespace(stdout="c" * 40 + "\n")
         assert command[1:3] == ["status", "--porcelain=v1"]
-        return SimpleNamespace(stdout=" M rapido/example.py\n?? scripts/new.py\n")
+        return SimpleNamespace(stdout="" if clean else " M rapido/example.py\n?? scripts/new.py\n")
 
     monkeypatch.setattr(PILOT.subprocess, "run", completed)
+
+
+def _candidate_call(
+    name: str,
+    candidate: str,
+    *,
+    supplied: bool = False,
+) -> dict[str, object]:
+    digest = hashlib.sha256(candidate.encode()).hexdigest()
+    observation = project_tool_observation(
+        name,
+        success=True,
+        source_bound=True,
+        candidate_sha256s=(digest,),
+        supplied_candidate_sha256s=(digest,) if supplied else (),
+        candidate_sensitive=True,
+    )
+    return {
+        "name": name,
+        "success": True,
+        "source_bound": True,
+        "candidate_sensitive": True,
+        "candidate_sha256s": [digest],
+        "supplied_candidate_sha256s": [digest] if supplied else [],
+        "host_observation": observation,
+    }
+
+
+def _verifier_turn(
+    candidate: str,
+    calls: list[dict[str, object]],
+    *,
+    current_calls: list[dict[str, object]] | None = None,
+    thread_id: str = "thread-verifier",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        status="completed",
+        timed_out=False,
+        failure_class=None,
+        text=json.dumps(
+            {
+                "status": "candidate",
+                "candidate": candidate,
+                "confidence": 1.0,
+                "summary": f"derived {candidate} from the fixture",
+                "evidence": [f"fixture observation contained {candidate}"],
+                "next_steps": [],
+            }
+        ),
+        tool_calls=calls,
+        current_turn_tool_calls=calls if current_calls is None else current_calls,
+        raw={"usage": {"inputTokens": 10, "outputTokens": 2}},
+        thread_id=thread_id,
+    )
+
+
+def _passing_gate_inputs() -> tuple[
+    list[object], dict[str, object], dict[str, object], dict[str, object]
+]:
+    measurements: list[object] = []
+    for fixture in PILOT.fixture_catalogue():
+        for arm in PILOT.VERIFIER_ARMS:
+            verified = PILOT.VerifierTurnEvaluation("verified_correct", None)
+            first = (
+                PILOT.VerifierTurnEvaluation(
+                    "rejected_correct", "verifier_requires_fixed_observation"
+                )
+                if arm.continuation
+                else verified
+            )
+            measurements.append(
+                PILOT.VerifierMeasurement(
+                    task_id=fixture.id,
+                    family=fixture.family,
+                    arm=arm,
+                    first=first,
+                    final=verified,
+                    fixture_elapsed_seconds=0.001,
+                    first_turn_seconds=0.01,
+                    repair_turn_seconds=0.01 if arm.continuation else 0.0,
+                    repair_attempted=arm.continuation,
+                    continuation_count=1 if arm.continuation else 0,
+                    same_thread=True,
+                    continuation_prompt_candidate_free=True,
+                    first_tool_calls=1,
+                    final_tool_calls=1,
+                    cumulative_tool_calls=2 if arm.continuation else 1,
+                    tool_errors={
+                        "total": 0,
+                        "untyped": 0,
+                        "by_stage": {},
+                        "by_constraint": {},
+                    },
+                    first_native_usage={"status": "observed", "input_tokens": 1},
+                    final_native_usage={"status": "observed", "input_tokens": 1},
+                    failure_class=None,
+                )
+            )
+    runtime = {
+        arm.id: {
+            "model": "gpt-daybreak-blue-latest",
+            "effort": "xhigh",
+            "status": "completed",
+            "spans": {"cleanup": {"status": "completed"}},
+        }
+        for arm in PILOT.VERIFIER_ARMS
+    }
+    source = {
+        "observed": {
+            "head_sha": "c" * 40,
+            "worktree": "clean",
+            "tracked_change_count": 0,
+            "untracked_file_count": 0,
+        },
+        "declared": {"sha": "c" * 40},
+        "declared_matches_head": True,
+    }
+    image = {
+        "observed": {"status": "unavailable"},
+        "declared": {"status": "unavailable"},
+        "declared_matches_observed": None,
+    }
+    return measurements, runtime, source, image
 
 
 def test_catalogue_has_two_private_synthetic_fixtures_per_family() -> None:
@@ -62,6 +187,78 @@ def test_catalogue_has_two_private_synthetic_fixtures_per_family() -> None:
     answers = [PILOT.oracle_answer(key, fixture.id) for fixture in fixtures]
     assert len(set(answers)) == 12
     assert all(answer not in Path(__file__).read_text(encoding="utf-8") for answer in answers)
+
+
+def test_verifier_prompt_uses_production_route_with_empty_candidate_context() -> None:
+    document = json.loads(PILOT._verifier_prompt(PILOT.fixture_catalogue()[0]))
+
+    assert document["agent_role"] == "verifier"
+    assert document["control_route"]["role"] == "verifier"
+    assert document["control_route"]["tactic"] == "independent_source_reobservation"
+    assert document["control_route"]["context_profile"] == "fresh_source_only_no_candidate_carry"
+    assert document["control_route"]["verification_recipe"] == "fresh_source_reobservation_v1"
+    assert document["control_route"]["model"] == "gpt-daybreak-blue-latest"
+    assert document["control_route"]["effort"] == "xhigh"
+    assert document["prior_attempts"] == []
+    assert document["prior_observations"] is None
+    assert document["same_run_memory"] == []
+    assert "successful non-run_shell fixed source or target tool observation" in document["task"]
+
+
+def test_verifier_evaluation_uses_current_validation_and_durable_whole_attempt_taint() -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+    challenge = PILOT._challenge(fixture)
+    expected = PILOT.oracle_answer(b"e" * 32, fixture.id)
+    fixed = _candidate_call("read_text", expected)
+    shell = _candidate_call("run_shell", expected)
+    supplied = _candidate_call("inspect_file", expected, supplied=True)
+
+    assert (
+        PILOT._evaluate_verifier_turn(
+            _verifier_turn(expected, []), expected, challenge
+        ).rejection_reason
+        == "candidate_unobserved"
+    )
+    assert (
+        PILOT._evaluate_verifier_turn(
+            _verifier_turn(expected, [shell]), expected, challenge
+        ).rejection_reason
+        == "verifier_requires_fixed_observation"
+    )
+    assert (
+        PILOT._evaluate_verifier_turn(
+            _verifier_turn(expected, [supplied, fixed], current_calls=[fixed]),
+            expected,
+            challenge,
+        ).rejection_reason
+        == "candidate_supplied"
+    )
+    verified = PILOT._evaluate_verifier_turn(_verifier_turn(expected, [fixed]), expected, challenge)
+    assert verified.outcome == "verified_correct"
+    assert verified.rejection_reason is None
+
+    malformed = dict(fixed)
+    malformed.pop("host_observation")
+    assert (
+        PILOT._evaluate_verifier_turn(
+            _verifier_turn(expected, [malformed]), expected, challenge
+        ).rejection_reason
+        == "candidate_evidence_incomplete"
+    )
+
+
+def test_verifier_repair_prompt_is_candidate_free_and_rejects_tainted_routes() -> None:
+    candidate = PILOT.oracle_answer(b"p" * 32, "task-01")
+    prompt = PILOT.build_verifier_repair_prompt("verifier_requires_fixed_observation", 91.234)
+    document = json.loads(prompt)
+
+    assert document["label"] == "TRUSTED_VERIFIER_EVIDENCE_REPAIR"
+    assert document["continuation_round"] == 1
+    assert document["remaining_milliseconds"] == 91_234
+    assert all(form not in prompt for form in PILOT._candidate_forms(candidate))
+    for rejection in ("candidate_supplied", "candidate_evidence_incomplete"):
+        with pytest.raises(ValueError, match="not repairable"):
+            PILOT.build_verifier_repair_prompt(rejection, 10)
 
 
 def test_score_requires_source_proof_for_correct_and_wrong_answers() -> None:
@@ -213,6 +410,56 @@ class _FakeClient:
         self.closed = True
         if self.fail_close:
             raise RuntimeError("synthetic close failure")
+
+
+class _VerifierFakeClient:
+    def __init__(self, key: bytes, **kwargs: object) -> None:
+        self.key = key
+        self.arm = Path(str(kwargs["cwd"])).name
+        self.started = False
+        self.closed = False
+        self.validations: list[tuple[str, str]] = []
+        self.prompts: list[str] = []
+        self.follow_ups: list[str] = []
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+        self.validations.append((model, effort))
+        return SimpleNamespace(name=model, reasoning_efforts=(effort,))
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> SimpleNamespace:
+        self.prompts.append(prompt)
+        document = json.loads(prompt)
+        task_id = f"task-{int(document['challenge']['id']):02d}"
+        candidate = PILOT.oracle_answer(self.key, task_id)
+        thread_id = f"{self.arm}-{task_id}"
+        initial_call = _candidate_call(
+            "read_text" if self.arm == "one_shot" else "run_shell",
+            candidate,
+        )
+        initial = _verifier_turn(candidate, [initial_call], thread_id=thread_id)
+        callback = kwargs.get("continuation_callback")
+        if callback is None:
+            return initial
+        follow_up = callback(initial, 240.0)
+        if follow_up is None:
+            return initial
+        assert isinstance(follow_up, str)
+        self.follow_ups.append(follow_up)
+        fixed = _candidate_call("read_text", candidate)
+        final = _verifier_turn(
+            candidate,
+            [initial_call, fixed],
+            current_calls=[fixed],
+            thread_id=thread_id,
+        )
+        assert callback(final, 180.0) is None
+        return final
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _factory(
@@ -390,3 +637,334 @@ def test_model_mismatch_fails_only_affected_arm_without_fallback(
     assert receipt["summary"][PILOT.ARMS[1].id]["outcomes"]["correct"] == 12
     assert next(client for client in clients if client.model == mismatched.model).solves == []
     assert all(client.closed for client in clients)
+
+
+def test_fake_verifier_repair_pilot_reuses_thread_and_emits_candidate_free_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_source_observation(monkeypatch, clean=True)
+    codex_home, work_root, key_file = _roots(tmp_path)
+    key = key_file.read_bytes()
+    clients: list[_VerifierFakeClient] = []
+
+    def factory(**kwargs: object) -> _VerifierFakeClient:
+        client = _VerifierFakeClient(key, **kwargs)
+        clients.append(client)
+        return client
+
+    config = PILOT.PilotConfig("codex", codex_home, work_root, key_file, source_sha="c" * 40)
+    receipt = asyncio.run(PILOT.run_verifier_repair_pilot(config, client_factory=factory))
+
+    assert receipt["schema"] == "rapido-offline-verifier-repair-v1"
+    assert receipt["protocol"]["experiment"] == "verifier-repair"
+    assert receipt["protocol"]["whole_attempt_taint"] is True
+    assert receipt["protocol"]["fixed_non_run_shell_observation_required"] is True
+    assert receipt["protocol"]["prompt_parity"] == {
+        "offline_developer_authorization_preamble_differs_from_production": True,
+        "common_developer_rules_match_production": True,
+        "verifier_task_and_route_match_production": True,
+    }
+    assert receipt["protocol"]["source_identity_required"] is True
+    assert receipt["protocol"]["image_identity_required"] is False
+    assert receipt["gate"]["status"] == "passed"
+    assert receipt["gate"]["checks"]["source_identity"]["passed"] is True
+    assert receipt["gate"]["checks"]["image_identity"]["status"] == "not_required"
+    assert len(receipt["results"]) == 24
+    repair_rows = [row for row in receipt["results"] if row["arm"] == "evidence_repair"]
+    assert len(repair_rows) == 12
+    assert all(row["first"]["outcome"] == "rejected_correct" for row in repair_rows)
+    assert all(
+        row["first"]["rejection_reason"] == "verifier_requires_fixed_observation"
+        for row in repair_rows
+    )
+    assert all(row["final"]["outcome"] == "verified_correct" for row in repair_rows)
+    assert all(row["repair_attempted"] and row["continuation_count"] == 1 for row in repair_rows)
+    assert all(row["same_thread"] for row in repair_rows)
+    assert all(row["continuation_prompt_candidate_free"] for row in repair_rows)
+    assert len(clients) == 2
+    assert all(client.started and client.closed for client in clients)
+    assert all(client.validations == [("gpt-daybreak-blue-latest", "xhigh")] for client in clients)
+    repair_client = next(client for client in clients if client.arm == "evidence_repair")
+    one_shot_client = next(client for client in clients if client.arm == "one_shot")
+    assert one_shot_client.prompts == repair_client.prompts
+    assert len(repair_client.follow_ups) == 12
+
+    encoded = json.dumps(receipt, sort_keys=True)
+    for fixture in PILOT.fixture_catalogue():
+        candidate = PILOT.oracle_answer(key, fixture.id)
+        assert all(form not in encoded for form in PILOT._candidate_forms(candidate))
+        assert all(
+            form not in follow_up
+            for form in PILOT._candidate_forms(candidate)
+            for follow_up in repair_client.follow_ups
+        )
+    assert list(work_root.iterdir()) == []
+
+
+def test_verifier_repair_does_not_continue_supplied_candidate(tmp_path: Path) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+    candidate = PILOT.oracle_answer(b"s" * 32, fixture.id)
+
+    class SuppliedClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> SimpleNamespace:
+            del workspace, prompt
+            turn = _verifier_turn(
+                candidate, [_candidate_call("inspect_file", candidate, supplied=True)]
+            )
+            callback = kwargs["continuation_callback"]
+            assert callback(turn, 200.0) is None
+            return turn
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    measurement = asyncio.run(
+        PILOT._measure_verifier(
+            SuppliedClient(),
+            fixture,
+            next(arm for arm in PILOT.VERIFIER_ARMS if arm.id == "evidence_repair"),
+            workspace,
+            PILOT._verifier_prompt(fixture),
+            candidate,
+            PILOT.MAX_WORKSPACE_BYTES,
+            0.0,
+        )
+    )
+
+    assert measurement.first.rejection_reason == "candidate_supplied"
+    assert measurement.final.rejection_reason == "candidate_supplied"
+    assert measurement.repair_attempted is False
+    assert measurement.continuation_count == 0
+
+
+def test_parser_preserves_model_comparison_as_default() -> None:
+    arguments = PILOT.parser().parse_args(
+        [
+            "--codex-binary",
+            "codex",
+            "--codex-home",
+            "/tmp/auth",
+            "--work-root",
+            "/tmp/work",
+            "--oracle-key-file",
+            "/tmp/key",
+        ]
+    )
+    assert arguments.experiment == "model-comparison"
+    assert (
+        PILOT.parser()
+        .parse_args(
+            [
+                "--experiment",
+                "verifier-repair",
+                "--codex-binary",
+                "codex",
+                "--codex-home",
+                "/tmp/auth",
+                "--work-root",
+                "/tmp/work",
+                "--oracle-key-file",
+                "/tmp/key",
+            ]
+        )
+        .experiment
+        == "verifier-repair"
+    )
+
+
+def test_verifier_gate_rejects_duplicate_and_missing_fixture_arm_identity() -> None:
+    measurements, runtime, source, image = _passing_gate_inputs()
+    corrupted = [*measurements[:-1], measurements[0]]
+
+    gate = PILOT._verifier_gate(
+        corrupted,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+
+    assert gate["status"] == "failed"
+    identity = gate["checks"]["exact_fixture_arm_identities"]
+    assert identity["passed"] is False
+    assert len(identity["missing"]) == 1
+    assert len(identity["duplicates"]) == 1
+
+
+def test_verifier_gate_underpowered_is_inconclusive_only_when_otherwise_clean() -> None:
+    measurements, runtime, source, image = _passing_gate_inputs()
+    underpowered = [
+        replace(
+            row,
+            first=PILOT.VerifierTurnEvaluation("verified_correct", None),
+            repair_turn_seconds=0.0,
+            repair_attempted=False,
+            continuation_count=0,
+        )
+        if row.arm.id == "evidence_repair"
+        else row
+        for row in measurements
+    ]
+    clean_gate = PILOT._verifier_gate(
+        underpowered,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+    assert clean_gate["status"] == "inconclusive"
+
+    unsafe = list(underpowered)
+    unsafe[0] = replace(
+        unsafe[0],
+        first=PILOT.VerifierTurnEvaluation("verified_wrong", None),
+        final=PILOT.VerifierTurnEvaluation("verified_wrong", None),
+    )
+    unsafe_gate = PILOT._verifier_gate(
+        unsafe,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+    assert unsafe_gate["status"] == "failed"
+    assert unsafe_gate["checks"]["verified_wrong_task_arm_rows"]["actual"] == 1
+
+    timed_out = list(underpowered)
+    timed_out[-1] = replace(
+        timed_out[-1],
+        final=PILOT.VerifierTurnEvaluation("timeout", None),
+        failure_class="timeout",
+    )
+    timeout_gate = PILOT._verifier_gate(
+        timed_out,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+    assert timeout_gate["status"] == "failed"
+    assert timeout_gate["checks"]["provider_failures_or_timeouts"]["passed"] is False
+
+    unsafe_continuation = list(underpowered)
+    repair_index = next(
+        index for index, row in enumerate(unsafe_continuation) if row.arm.id == "evidence_repair"
+    )
+    unsafe_continuation[repair_index] = replace(
+        unsafe_continuation[repair_index],
+        first=PILOT.VerifierTurnEvaluation("rejected_correct", "candidate_supplied"),
+        repair_attempted=True,
+        continuation_count=1,
+        repair_turn_seconds=0.01,
+    )
+    continuation_gate = PILOT._verifier_gate(
+        unsafe_continuation,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+    assert continuation_gate["status"] == "failed"
+    assert continuation_gate["checks"]["unsafe_continuations"]["actual"] == 1
+
+
+def test_verifier_gate_counts_only_attempted_repairs_as_conversions() -> None:
+    measurements, runtime, source, image = _passing_gate_inputs()
+    unattempted = list(measurements)
+    repair_index = next(
+        index for index, row in enumerate(unattempted) if row.arm.id == "evidence_repair"
+    )
+    unattempted[repair_index] = replace(
+        unattempted[repair_index],
+        repair_attempted=False,
+        continuation_count=0,
+        repair_turn_seconds=0.0,
+    )
+
+    gate = PILOT._verifier_gate(
+        unattempted,
+        runtime,
+        source,
+        image,
+        image_required=False,
+    )
+
+    assert gate["checks"]["repair_conversion"]["eligible"] == 12
+    assert gate["checks"]["repair_conversion"]["actual"] == 11
+
+
+def test_verifier_gate_requires_clean_declared_source_and_required_image_match() -> None:
+    measurements, runtime, source, image = _passing_gate_inputs()
+    dirty_source = {
+        **source,
+        "observed": {
+            **source["observed"],
+            "worktree": "dirty",
+            "tracked_change_count": 1,
+        },
+    }
+    source_gate = PILOT._verifier_gate(
+        measurements,
+        runtime,
+        dirty_source,
+        image,
+        image_required=False,
+    )
+    assert source_gate["status"] == "failed"
+    assert source_gate["checks"]["source_identity"]["passed"] is False
+
+    source_mismatch = {**source, "declared_matches_head": False}
+    mismatch_gate = PILOT._verifier_gate(
+        measurements,
+        runtime,
+        source_mismatch,
+        image,
+        image_required=False,
+    )
+    assert mismatch_gate["status"] == "failed"
+    assert mismatch_gate["checks"]["source_identity"]["passed"] is False
+
+    required_image = {
+        "observed": {"status": "unavailable"},
+        "declared": {"id": "sha256:" + "a" * 64},
+        "declared_matches_observed": None,
+    }
+    image_gate = PILOT._verifier_gate(
+        measurements,
+        runtime,
+        source,
+        required_image,
+        image_required=True,
+    )
+    assert image_gate["status"] == "failed"
+    assert image_gate["checks"]["image_identity"]["status"] == "mismatch_or_unavailable"
+
+    matched_image = {
+        "observed": {"id": "sha256:" + "a" * 64},
+        "declared": {"id": "sha256:" + "a" * 64},
+        "declared_matches_observed": True,
+    }
+    matched_image_gate = PILOT._verifier_gate(
+        measurements,
+        runtime,
+        source,
+        matched_image,
+        image_required=True,
+    )
+    assert matched_image_gate["status"] == "passed"
+    assert matched_image_gate["checks"]["image_identity"]["status"] == "matched"
+
+    bad_runtime = {name: dict(row) for name, row in runtime.items()}
+    bad_runtime["evidence_repair"] = {
+        **bad_runtime["evidence_repair"],
+        "effort": "high",
+        "spans": {"cleanup": {"status": "failed"}},
+    }
+    runtime_gate = PILOT._verifier_gate(
+        measurements,
+        bad_runtime,
+        source,
+        image,
+        image_required=False,
+    )
+    assert runtime_gate["status"] == "failed"
+    assert runtime_gate["checks"]["exact_runtime_and_cleanup"]["passed"] is False
