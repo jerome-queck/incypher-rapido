@@ -10,6 +10,7 @@ import re
 import sqlite3
 import stat
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -111,7 +112,22 @@ class StateStore:
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._lease_files: list[int] = []
-        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA busy_timeout=30000")
+        wal_deadline = time.monotonic() + 30.0
+        wal_delay = 0.005
+        while True:
+            try:
+                journal_mode = self._connection.execute("PRAGMA journal_mode=WAL").fetchone()
+                if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+                    self._connection.close()
+                    raise RuntimeError("state database did not enter WAL mode")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= wal_deadline:
+                    self._connection.close()
+                    raise
+                time.sleep(wal_delay)
+                wal_delay = min(0.1, wal_delay * 2)
         self._connection.execute("PRAGMA foreign_keys=ON")
         for private_file in (path, *sidecars):
             try:
@@ -419,44 +435,10 @@ class StateStore:
             """
         )
         self._migrate_attempts()
-        self._refresh_attempt_contracts()
         self._migrate_control_jobs()
         self._migrate_additive_columns()
         self._migrate_submission_intents()
         self._refresh_candidate_verification_view()
-
-    def _refresh_attempt_contracts(self) -> None:
-        """Atomically refresh additive attempt state, identity index, and proof trigger."""
-
-        with self.transaction() as connection:
-            attempt_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
-            }
-            if "checkpoint_observations_json" not in attempt_columns:
-                connection.execute(
-                    "ALTER TABLE attempts ADD COLUMN checkpoint_observations_json "
-                    "TEXT NOT NULL DEFAULT '[]'"
-                )
-            connection.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
-                "ON attempts(id, run_id, challenge_id, episode, lane)"
-            )
-            connection.execute("DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity")
-            connection.execute(
-                """
-                CREATE TRIGGER candidate_evidence_proofs_attempt_identity
-                BEFORE INSERT ON candidate_evidence_proofs
-                WHEN NOT EXISTS (
-                    SELECT 1 FROM attempts
-                    WHERE id=NEW.source_attempt_id
-                      AND run_id=NEW.run_id
-                      AND challenge_id=NEW.challenge_id
-                      AND status='running'
-                )
-                BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END
-                """
-            )
 
     def _migrate_additive_columns(self) -> None:
         """Serialize additive upgrades and recheck every column under the write lock."""
@@ -796,71 +778,91 @@ class StateStore:
                 and legacy_unique not in unique_columns
             )
 
-        columns, unique_columns = inspect_schema()
-        if is_current(columns, unique_columns):
-            return
-
-        # The table is created by the schema script above, so a missing legacy
-        # column only matters for a database created by an older Rapido build.
         migration_table = f"attempts__rapido_migration_{id(self)}"
-        existing = self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (migration_table,)
-        ).fetchone()
-        if existing is not None:
-            raise RuntimeError("stale attempts migration table is present")
-
-        def source(column: str, fallback: str) -> str:
-            return column if column in columns else fallback
-
         with self.transaction() as connection:
-            # Re-read under the write lock so a concurrent opener cannot
-            # migrate a newer schema back to legacy defaults.
             columns, unique_columns = inspect_schema()
-            if is_current(columns, unique_columns):
-                return
+            if not is_current(columns, unique_columns):
+                existing = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (migration_table,),
+                ).fetchone()
+                if existing is not None:
+                    raise RuntimeError("stale attempts migration table is present")
 
-            connection.execute(
-                f"""
-                CREATE TABLE {migration_table} (
-                    id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL REFERENCES runs(id),
-                    challenge_id INTEGER NOT NULL REFERENCES challenges(id),
-                    episode INTEGER NOT NULL DEFAULT 0,
-                    lane INTEGER NOT NULL,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    status TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    effort TEXT NOT NULL,
-                    summary TEXT NOT NULL DEFAULT '',
-                    candidate TEXT,
-                    confidence REAL,
-                    evidence_json TEXT NOT NULL DEFAULT '[]',
-                    next_steps_json TEXT NOT NULL DEFAULT '[]',
-                    tool_count INTEGER NOT NULL DEFAULT 0,
-                    failure_class TEXT,
-                    UNIQUE(run_id, challenge_id, episode, lane)
+                def source(column: str, fallback: str) -> str:
+                    return column if column in columns else fallback
+
+                connection.execute(
+                    f"""
+                    CREATE TABLE {migration_table} (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES runs(id),
+                        challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                        episode INTEGER NOT NULL DEFAULT 0,
+                        lane INTEGER NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        status TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        effort TEXT NOT NULL,
+                        summary TEXT NOT NULL DEFAULT '',
+                        candidate TEXT,
+                        confidence REAL,
+                        evidence_json TEXT NOT NULL DEFAULT '[]',
+                        next_steps_json TEXT NOT NULL DEFAULT '[]',
+                        tool_count INTEGER NOT NULL DEFAULT 0,
+                        failure_class TEXT,
+                        UNIQUE(run_id, challenge_id, episode, lane)
+                    )
+                    """
                 )
+                connection.execute(
+                    f"""
+                    INSERT INTO {migration_table}(
+                        id, run_id, challenge_id, episode, lane, started_at, finished_at,
+                        status, model, effort, summary, candidate, confidence,
+                        evidence_json, next_steps_json, tool_count, failure_class
+                    )
+                    SELECT
+                        id, run_id, challenge_id, {source("episode", "0")}, lane, started_at,
+                        finished_at, status, model, effort, {source("summary", "''")}, candidate,
+                        {source("confidence", "NULL")}, {source("evidence_json", "'[]'")},
+                        {source("next_steps_json", "'[]'")}, {source("tool_count", "0")},
+                        {source("failure_class", "NULL")}
+                    FROM attempts
+                    """
+                )
+                connection.execute("DROP TABLE attempts")
+                connection.execute(f"ALTER TABLE {migration_table} RENAME TO attempts")
+
+            attempt_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
+            }
+            if "checkpoint_observations_json" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN checkpoint_observations_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
+                "ON attempts(id, run_id, challenge_id, episode, lane)"
+            )
+            connection.execute("DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity")
+            connection.execute(
+                """
+                CREATE TRIGGER candidate_evidence_proofs_attempt_identity
+                BEFORE INSERT ON candidate_evidence_proofs
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM attempts
+                    WHERE id=NEW.source_attempt_id
+                      AND run_id=NEW.run_id
+                      AND challenge_id=NEW.challenge_id
+                      AND status='running'
+                )
+                BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END
                 """
             )
-            connection.execute(
-                f"""
-                INSERT INTO {migration_table}(
-                    id, run_id, challenge_id, episode, lane, started_at, finished_at,
-                    status, model, effort, summary, candidate, confidence,
-                    evidence_json, next_steps_json, tool_count, failure_class
-                )
-                SELECT
-                    id, run_id, challenge_id, {source("episode", "0")}, lane, started_at,
-                    finished_at, status, model, effort, {source("summary", "''")}, candidate,
-                    {source("confidence", "NULL")}, {source("evidence_json", "'[]'")},
-                    {source("next_steps_json", "'[]'")}, {source("tool_count", "0")},
-                    {source("failure_class", "NULL")}
-                FROM attempts
-                """
-            )
-            connection.execute("DROP TABLE attempts")
-            connection.execute(f"ALTER TABLE {migration_table} RENAME TO attempts")
 
     def acquire_supervisor(
         self,

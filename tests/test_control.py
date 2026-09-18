@@ -2619,31 +2619,116 @@ def test_concurrent_openers_recheck_route_authority_migration(tmp_path: Path) ->
 def test_concurrent_openers_recheck_additive_migration(
     tmp_path: Path, legacy_additive_gap: bool
 ) -> None:
-    path = tmp_path / "private" / "state.sqlite3"
-    if legacy_additive_gap:
-        StateStore(path).close()
+    iterations = 3 if legacy_additive_gap else 20
+    for iteration in range(iterations):
+        path = tmp_path / f"private-{iteration}" / "state.sqlite3"
+        if legacy_additive_gap:
+            StateStore(path).close()
+            with sqlite3.connect(path) as connection:
+                connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def open_state(
+            *,
+            opener_barrier: threading.Barrier = barrier,
+            state_path: Path = path,
+            opener_errors: list[BaseException] = errors,
+        ) -> None:
+            opener_barrier.wait()
+            try:
+                StateStore(state_path).close()
+            except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+                opener_errors.append(exc)
+
+        threads = [threading.Thread(target=open_state) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
         with sqlite3.connect(path) as connection:
-            connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
-    barrier = threading.Barrier(8)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(submissions)")}
+        assert "provenance_class" in columns
+
+
+def test_attempt_rebuild_publishes_identity_trigger_in_same_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE runs (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                config_json TEXT NOT NULL
+            );
+            CREATE TABLE challenges (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                challenge_type TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE attempts (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                lane INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                candidate TEXT,
+                confidence REAL,
+                UNIQUE(run_id, challenge_id, lane)
+            );
+            """
+        )
+
+    migrated = threading.Event()
+    release = threading.Event()
     errors: list[BaseException] = []
+    original = StateStore._migrate_attempts
+
+    def pause_after_migration(store: StateStore) -> None:
+        original(store)
+        migrated.set()
+        if not release.wait(5):
+            raise TimeoutError("migration observer did not release constructor")
+
+    monkeypatch.setattr(StateStore, "_migrate_attempts", pause_after_migration)
 
     def open_state() -> None:
-        barrier.wait()
         try:
             StateStore(path).close()
         except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=open_state) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
+    thread = threading.Thread(target=open_state)
+    thread.start()
+    assert migrated.wait(5)
+    try:
+        with sqlite3.connect(path) as connection:
+            trigger = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='candidate_evidence_proofs_attempt_identity'"
+            ).fetchone()
+        assert trigger is not None
+        assert "status='running'" in str(trigger[0])
+    finally:
+        release.set()
         thread.join(timeout=5)
+    assert not thread.is_alive()
     assert not errors
-    assert all(not thread.is_alive() for thread in threads)
-    with sqlite3.connect(path) as connection:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(submissions)")}
-    assert "provenance_class" in columns
 
 
 def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) -> None:
