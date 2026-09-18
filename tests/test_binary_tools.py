@@ -91,6 +91,15 @@ def test_refuses_paths_outside_workspace(tmp_path, path):
     assert error.value.code == "path_outside_workspace"
 
 
+def test_binary_argument_type_failure_uses_shared_structural_schema(tmp_path):
+    with pytest.raises(ToolError) as caught:
+        binary_tools.inspect_elf(Workspace(tmp_path), [])
+    assert caught.value.details["schema_version"] == 1
+    assert caught.value.details["field_path"] == "arguments"
+    assert caught.value.details["constraint"] == "type"
+    assert caught.value.details["actual_kind"] == "array"
+
+
 @pytest.mark.parametrize(
     "operation", [binary_tools.inspect_elf, binary_tools.elf_symbols, binary_tools.disassemble_elf]
 )

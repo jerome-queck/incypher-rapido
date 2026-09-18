@@ -42,6 +42,7 @@ from .tools import (
     _bounded_int,
     _bounded_text,
     _error,
+    _value_kind,
     inspect_file,
 )
 
@@ -207,8 +208,16 @@ def solve_team_pow(
 
 def _encoded_payload(arguments: Mapping[str, Any]) -> bytes:
     encoding = arguments.get("encoding", "utf8")
-    if encoding not in {"utf8", "hex", "base64"}:
-        raise _error("invalid_argument", "encoding must be utf8, hex, or base64")
+    if not isinstance(encoding, str) or encoding not in {"utf8", "hex", "base64"}:
+        from .tools import _value_kind
+
+        raise _error(
+            "invalid_argument",
+            "encoding must be utf8, hex, or base64",
+            field_path="encoding",
+            constraint="enum",
+            actual_kind=_value_kind(encoding),
+        )
     value = _bounded_text(arguments.get("data", ""), "data", MAX_TARGET_REQUEST_BYTES * 2)
     try:
         if encoding == "utf8":
@@ -688,8 +697,31 @@ class _TargetScriptBroker:
         allowed: set[str],
         required: frozenset[str] = frozenset(),
     ) -> None:
-        if set(arguments) - allowed or not required <= set(arguments):
-            raise _error("invalid_argument", "target broker arguments are invalid")
+        if not isinstance(arguments, Mapping):
+            raise _error(
+                "invalid_argument",
+                "target broker arguments must be an object",
+                field_path="arguments",
+                constraint="type",
+                actual_kind=_value_kind(arguments),
+            )
+        fields = set(arguments)
+        if fields - allowed:
+            raise _error(
+                "invalid_argument",
+                "target broker arguments are invalid: unsupported fields",
+                field_path="arguments",
+                constraint="additional_properties",
+                actual_kind="object",
+            )
+        if not required <= fields:
+            raise _error(
+                "invalid_argument",
+                "target broker arguments are invalid: required field omitted",
+                field_path="arguments",
+                constraint="required",
+                actual_kind="object",
+            )
 
     def _http_session_open(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self._strict(arguments, {"endpoint_index"})
@@ -739,8 +771,21 @@ class _TargetScriptBroker:
             endpoint_value = arguments.get("endpoint_index")
         index, endpoint = self._endpoint(endpoint_value, {"http", "https"})
         method = arguments.get("method", "GET")
-        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
-            raise _error("invalid_argument", "HTTP method is not permitted")
+        if not isinstance(method, str) or method not in {
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
+            raise _error(
+                "invalid_argument",
+                "HTTP method is not permitted",
+                field_path="method",
+                constraint="enum",
+                actual_kind=_value_kind(method),
+            )
         path = self.registry._http_path(endpoint, arguments.get("path", "/"))
         headers_arg = arguments.get("headers", {})
         if not isinstance(headers_arg, Mapping) or len(headers_arg) > 20:
@@ -1596,8 +1641,21 @@ class TargetToolRegistry(ToolRegistry):
     def _http_request(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         index, endpoint = self._endpoint(arguments, {"http", "https"})
         method = arguments.get("method", "GET")
-        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
-            raise _error("invalid_argument", "HTTP method is not permitted")
+        if not isinstance(method, str) or method not in {
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
+            raise _error(
+                "invalid_argument",
+                "HTTP method is not permitted",
+                field_path="method",
+                constraint="enum",
+                actual_kind=_value_kind(method),
+            )
         path = self._http_path(endpoint, arguments.get("path", "/"))
         headers_arg = arguments.get("headers", {})
         if not isinstance(headers_arg, Mapping) or len(headers_arg) > 20:
@@ -1787,7 +1845,13 @@ class TargetToolRegistry(ToolRegistry):
             return super().dispatch(name, arguments)
         arguments = {} if arguments is None else arguments
         if not isinstance(arguments, Mapping):
-            raise _error("invalid_argument", "tool arguments must be an object")
+            raise _error(
+                "invalid_argument",
+                "tool arguments must be an object",
+                field_path="arguments",
+                constraint="type",
+                actual_kind=_value_kind(arguments),
+            )
         with self._dispatch_lock:
             if self._target_revoked.is_set():
                 raise _error("generation_revoked", "target generation is no longer active")

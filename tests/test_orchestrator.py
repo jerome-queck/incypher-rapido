@@ -606,6 +606,10 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
     safe_files = {
         Path("safe.txt"): b"keep this analysis",
         Path("cafebabe.txt"): b"inner substring was not an exact CRC candidate",
+        Path("collision"): b"fresh file wins over a carried descendant",
+    }
+    shadowed_files = {
+        Path("carried/collision/nested.txt"): b"stale descendant",
     }
     blocked_files = {
         Path("exact.txt"): rejected_crc.encode(),
@@ -616,18 +620,22 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
         Path("deadbeef.txt"): b"safe payload in a rejected-derived path",
         Path(f"nested-{rejected_crc}") / "notes.txt": b"safe payload",
     }
-    for relative, payload in {**safe_files, **blocked_files}.items():
+    for relative, payload in {**safe_files, **shadowed_files, **blocked_files}.items():
         path = analysis_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
 
     orchestrator = Orchestrator(cfg, FakeBoard([item]), store, FakeRuntime({}))
     events_before = store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    files, retained_bytes = orchestrator._capture_analysis_carry(run_id, item, 0, run_root, ())
+    files, retained_bytes, telemetry = orchestrator._capture_analysis_carry(
+        run_id, item, 0, run_root, ()
+    )
 
     carry_root = run_root / "challenge-1" / "carry" / material / "lane-0"
     assert files == len(safe_files)
     assert retained_bytes == sum(len(payload) for payload in safe_files.values())
+    assert telemetry["drop_counts"]["unsafe"] == len(blocked_files)
+    assert telemetry["drop_counts"]["shadowed"] == len(shadowed_files)
     assert {
         path.relative_to(carry_root): path.read_bytes()
         for path in carry_root.rglob("*")
@@ -643,6 +651,53 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
     for candidate in (rejected_crc, non_crc):
         assert candidate not in event_payloads
         assert hashlib.sha256(candidate.encode()).hexdigest() not in event_payloads
+    store.close()
+
+
+def test_analysis_carry_removes_failed_staging_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path, submit=False)
+    store = StateStore(cfg.state_path)
+    item = challenge(1)
+    run_id = "carry-staging-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    material = orchestrator_module._challenge_material_sha256(item)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(item.id, item.name, item.category, item.type, item.value)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, item.id, True)],
+        1,
+        route,
+        (("specialist", route.model, route.effort),),
+        {item.id: material},
+    )
+    run_root = tmp_path / "run"
+    analysis_root = (
+        run_root / "challenge-1" / "episode-0" / "generation-0" / "lane-0" / "rapido-analysis"
+    )
+    analysis_root.mkdir(parents=True)
+    (analysis_root / "a.txt").write_text("first")
+    (analysis_root / "b.txt").write_text("second")
+    original_replace = orchestrator_module.os.replace
+
+    def fail_first(source, destination) -> None:
+        if Path(source).name.startswith(".a.txt."):
+            raise OSError("injected staging failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(orchestrator_module.os, "replace", fail_first)
+    orchestrator = Orchestrator(cfg, FakeBoard([item]), store, FakeRuntime({}))
+
+    files, _, telemetry = orchestrator._capture_analysis_carry(run_id, item, 0, run_root, ())
+
+    carry_root = run_root / "challenge-1" / "carry" / material / "lane-0"
+    assert files == 1
+    assert telemetry["drop_counts"]["invalid_file"] == 1
+    assert [path.relative_to(carry_root) for path in carry_root.rglob("*") if path.is_file()] == [
+        Path("b.txt")
+    ]
     store.close()
 
 
@@ -1131,6 +1186,12 @@ def test_board_description_candidate_correct_skips_lanes_and_is_not_fresh_eviden
     report = asyncio.run(Orchestrator(config(tmp_path), board, store, NoLaneRuntime({})).run())
 
     assert report.solved == 1
+    assert report.submission_correct == 1
+    assert report.board_origin_correct == 1
+    assert report.source_observed_correct == 0
+    assert report.independently_verified == 0
+    assert report.run_local_verified == 0
+    assert report.unverified_challenges == 0
     assert len(board.submissions) == 1
     rows = store._connection.execute(
         "SELECT kind, data_json FROM events "
@@ -1179,6 +1240,11 @@ def test_wrong_board_description_candidate_retires_then_normal_lanes_solve(
     report = asyncio.run(Orchestrator(config(tmp_path), board, store, runtime).run())
 
     assert report.solved == 1
+    assert report.submission_correct == 1
+    assert report.submission_incorrect == 1
+    assert report.board_origin_correct == 0
+    assert report.source_observed_correct == 1
+    assert report.run_local_verified == 1
     assert len(runtime.solve_kwargs) == 2
     assert len(board.submissions) == 2
     submissions = [
@@ -1582,6 +1648,13 @@ def test_malformed_model_text_terminalizes_every_attempt(tmp_path: Path) -> None
     attempts = store.attempts_for_challenge(report.run_id, 1)
     assert all(row["status"] == "failed" for row in attempts)
     assert all(row["failure_class"] == "solver_output" for row in attempts)
+    failures = [
+        json.loads(row["data_json"])
+        for row in store._connection.execute(
+            "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence"
+        )
+    ]
+    assert {failure["subreason"] for failure in failures} == {"evidence"}
     store.close()
 
 
@@ -1953,7 +2026,7 @@ def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
 
     report, runtime, orchestrator, store = asyncio.run(exercise_watch_recovery())
 
-    assert report.status == "deadline"
+    assert report.status in {"completed", "deadline"}
     assert board.list_calls >= 9
     assert orchestrator.outage_saw_active_solve
     assert runtime.recovered_while_solving

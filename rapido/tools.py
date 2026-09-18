@@ -85,16 +85,79 @@ class ToolError(Exception):
 
 
 def _error(code: str, message: str, **details: Any) -> ToolError:
-    return ToolError(code, message, details=details)
+    stage = (
+        "arguments"
+        if code in {"invalid_argument", "input_too_large", "limit_exceeded"}
+        else "result"
+        if code in {"invalid_result", "output_too_large"}
+        else "execution"
+    )
+    diagnostic = {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": stage,
+        "constraint": code,
+        **details,
+    }
+    return ToolError(code, message, details=diagnostic)
+
+
+def _value_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, (bytes, bytearray)):
+        return "bytes"
+    return "other"
 
 
 def _bounded_text(value: Any, name: str, limit: int = MAX_INPUT_BYTES) -> str:
     if not isinstance(value, str):
-        raise _error("invalid_argument", f"{name} must be a string")
+        raise _error(
+            "invalid_argument",
+            f"{name} must be a string",
+            field_path=name,
+            constraint="type",
+            actual_kind=_value_kind(value),
+        )
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _error(
+            "invalid_argument",
+            f"{name} must contain valid Unicode text",
+            field_path=name,
+            constraint="unicode",
+            actual_kind="string",
+        ) from exc
     if "\x00" in value:
-        raise _error("invalid_argument", f"{name} contains a NUL byte")
-    if len(value.encode("utf-8")) > limit:
-        raise _error("input_too_large", f"{name} exceeds the input limit")
+        raise _error(
+            "invalid_argument",
+            f"{name} contains a NUL byte",
+            field_path=name,
+            constraint="nul_forbidden",
+            actual_kind="string",
+            actual_size=len(encoded),
+        )
+    if len(encoded) > limit:
+        raise _error(
+            "input_too_large",
+            f"{name} exceeds the input limit",
+            field_path=name,
+            constraint="max_bytes",
+            actual_kind="string",
+            actual_size=len(encoded),
+            limit=limit,
+        )
     return value
 
 
@@ -102,9 +165,21 @@ def _bounded_int(value: Any, name: str, low: int, high: int, default: int) -> in
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int):
-        raise _error("invalid_argument", f"{name} must be an integer")
+        raise _error(
+            "invalid_argument",
+            f"{name} must be an integer",
+            field_path=name,
+            constraint="type",
+            actual_kind=_value_kind(value),
+        )
     if not low <= value <= high:
-        raise _error("limit_exceeded", f"{name} must be between {low} and {high}")
+        raise _error(
+            "limit_exceeded",
+            f"{name} must be between {low} and {high}",
+            field_path=name,
+            constraint="range",
+            actual_kind="integer",
+        )
     return value
 
 
@@ -1717,7 +1792,13 @@ def call_tool(
     workspace: Workspace, name: str, arguments: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
     if not isinstance(name, str):
-        raise _error("invalid_argument", "tool name must be a string")
+        raise _error(
+            "invalid_argument",
+            "tool name must be a string",
+            field_path="name",
+            constraint="type",
+            actual_kind=_value_kind(name),
+        )
     canonical = ALIASES.get(name, name)
     entry = TOOLS.get(canonical)
     if not entry:
@@ -1725,7 +1806,13 @@ def call_tool(
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, Mapping):
-        raise _error("invalid_argument", "tool arguments must be an object")
+        raise _error(
+            "invalid_argument",
+            "tool arguments must be an object",
+            field_path="arguments",
+            constraint="type",
+            actual_kind=_value_kind(arguments),
+        )
     started = time.monotonic()
     try:
         result = entry[0](workspace, arguments)

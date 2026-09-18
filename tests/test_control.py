@@ -385,6 +385,93 @@ class PersistentPrimaryRuntime(BoundaryRuntime):
         return candidate
 
 
+class ParaphrasedUnsupportedPrimaryRuntime(BoundaryRuntime):
+    def __init__(self) -> None:
+        super().__init__("INCYPHER{unused}")
+        self.continuations: list[str] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        del workspace
+        callback = kwargs.get("continuation_callback")
+        progress = kwargs.get("progress_callback")
+        if kwargs.get("model") != "gpt-daybreak-blue-latest" or not callable(callback):
+            return await UnsolvedBoundaryRuntime.solve(self, Path(), prompt, **kwargs)
+        assert callable(progress)
+        successful = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "zip", "duration_milliseconds": 1},
+        )
+        duplicate = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "zip", "duration_milliseconds": 999},
+        )
+        failed = project_tool_observation(
+            "inspect_file",
+            success=False,
+            source_bound=True,
+            result={"error_code": "invalid_argument", "retryable": False},
+        )
+        calls: list[dict[str, object]] = []
+        for round_index, summary in enumerate(
+            (
+                "required decoder unavailable",
+                "the needed decoder is not installed",
+                "cannot access that decoding prerequisite",
+            )
+        ):
+            observation = successful if round_index == 0 else duplicate
+            progress(observation)
+            calls.append(
+                {
+                    "name": "inspect_file",
+                    "success": True,
+                    "source_bound": True,
+                    "candidate_sha256s": [],
+                    "supplied_candidate_sha256s": [],
+                    "host_observation": observation,
+                }
+            )
+            if round_index:
+                progress(failed)
+                calls.append(
+                    {
+                        "name": "inspect_file",
+                        "success": False,
+                        "source_bound": True,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": failed,
+                    }
+                )
+            checkpoint = type(
+                "UnsupportedCheckpoint",
+                (),
+                {
+                    "status": "completed",
+                    "text": json.dumps(
+                        {
+                            "status": "unsupported",
+                            "candidate": None,
+                            "confidence": 0,
+                            "summary": summary,
+                            "evidence": [],
+                            "next_steps": [summary],
+                        }
+                    ),
+                    "tool_calls": list(calls),
+                },
+            )()
+            follow_up = callback(checkpoint, float(kwargs["timeout"]) - round_index - 1)
+            if follow_up is None:
+                return checkpoint
+            self.continuations.append(follow_up)
+        raise AssertionError("stagnant primary continuation was not bounded")
+
+
 class CandidateVerifierRuntime(BoundaryRuntime):
     def __init__(self, candidate: str, verifier_candidate: str | None) -> None:
         super().__init__(candidate)
@@ -1208,6 +1295,40 @@ def test_daybreak_primary_continues_changed_same_session_until_source_bound_cand
         )
 
 
+def test_primary_paraphrases_and_failed_calls_do_not_reset_no_progress_bound(
+    tmp_path: Path,
+) -> None:
+    runtime = ParaphrasedUnsupportedPrimaryRuntime()
+    config = replace(
+        _config(tmp_path),
+        attempts_per_challenge=2,
+        concurrency=2,
+        lead_lanes=1,
+        episodes_per_challenge=1,
+        submit_candidates=False,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=runtime,
+        )
+    )
+
+    assert report.status == "completed"
+    assert len(runtime.continuations) == 2
+    with sqlite3.connect(config.state_path) as connection:
+        stopped = [
+            json.loads(row[0])
+            for row in connection.execute(
+                "SELECT data_json FROM events WHERE kind='primary_solver_stopped'"
+            )
+        ]
+        assert [row["reason"] for row in stopped] == ["repeated_checkpoint_without_novel_success"]
+        assert stopped[0]["novel_success_count"] == 1
+
+
 def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
     config = _config(tmp_path)
     report = asyncio.run(
@@ -1610,6 +1731,10 @@ def test_already_solved_candidate_requires_fresh_verification_before_closing(
 
     assert report.solved == 0
     assert report.candidates == 1
+    assert report.submission_already_solved == 1
+    assert report.independently_verified == 1
+    assert report.run_local_verified == 1
+    assert report.unverified_challenges == 0
     assert board.submissions == [(1, candidate)]
     assert {job.role for job in view.jobs} == {"specialist", "verifier"}
     assert view.pending_candidate_count == 0
@@ -1636,6 +1761,10 @@ def test_already_solved_verifier_mismatch_dispatches_recovery(tmp_path: Path) ->
 
     assert report.solved == 0
     assert report.candidates == 1
+    assert report.submission_already_solved == 2
+    assert report.independently_verified == 0
+    assert report.run_local_verified == 0
+    assert report.unverified_challenges == 1
     assert {job.role for job in view.jobs} == {"specialist", "verifier", "recovery"}
     assert view.pending_candidate_count == 2
     assert view.verified_candidate_count == 0
@@ -1914,7 +2043,7 @@ def test_active_watch_appends_new_work_while_prior_challenge_remains_unresolved(
 def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.5)
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 1.0)
     challenges = [_challenge(value, challenge_type="dynamic_iac") for value in (1, 2)]
     board = ManagedInstanceBoundaryBoard(challenges)
 
@@ -1922,7 +2051,7 @@ def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
         async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
             document = json.loads(prompt)
             if document["execution_phase"] == "shared_instance":
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(2.2)
             return await super().solve(workspace, prompt, **kwargs)
 
     config = replace(
@@ -1931,7 +2060,7 @@ def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
         attempts_per_challenge=2,
         concurrency=4,
         manage_dynamic_instances=True,
-        run_seconds=0.8,
+        run_seconds=3.0,
         watch_board=True,
     )
 
@@ -2484,6 +2613,153 @@ def test_concurrent_openers_recheck_route_authority_migration(tmp_path: Path) ->
             )
             == 3
         )
+
+
+@pytest.mark.parametrize("legacy_additive_gap", (False, True))
+def test_concurrent_openers_recheck_additive_migration(
+    tmp_path: Path, legacy_additive_gap: bool
+) -> None:
+    iterations = 3 if legacy_additive_gap else 20
+    for iteration in range(iterations):
+        path = tmp_path / f"private-{iteration}" / "state.sqlite3"
+        if legacy_additive_gap:
+            StateStore(path).close()
+            with sqlite3.connect(path) as connection:
+                connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def open_state(
+            *,
+            opener_barrier: threading.Barrier = barrier,
+            state_path: Path = path,
+            opener_errors: list[BaseException] = errors,
+        ) -> None:
+            opener_barrier.wait()
+            try:
+                StateStore(state_path).close()
+            except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+                opener_errors.append(exc)
+
+        threads = [threading.Thread(target=open_state) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        with sqlite3.connect(path) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(submissions)")}
+        assert "provenance_class" in columns
+
+
+def test_schema_and_attempt_rebuild_publish_identity_guard_in_one_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE runs (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                config_json TEXT NOT NULL
+            );
+            CREATE TABLE challenges (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                challenge_type TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE attempts (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+                lane INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                candidate TEXT,
+                confidence REAL,
+                UNIQUE(run_id, challenge_id, lane)
+            );
+            INSERT INTO runs VALUES ('run-1', '2026-01-01', NULL, 'running', '{}');
+            INSERT INTO runs VALUES ('run-2', '2026-01-01', NULL, 'running', '{}');
+            INSERT INTO challenges VALUES (
+                1, 'one', 'test', 'standard', 1, 'running', '2026-01-01'
+            );
+            INSERT INTO challenges VALUES (
+                2, 'two', 'test', 'standard', 1, 'running', '2026-01-01'
+            );
+            INSERT INTO attempts VALUES (
+                'legacy-running', 'run-1', 1, 0, '2026-01-01', NULL,
+                'running', 'old-model', 'high', '', NULL, NULL
+            );
+            """
+        )
+
+    migrated = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    original = StateStore._migrate_attempts
+
+    def pause_at_migration(store: StateStore, *, transaction_open: bool = False) -> None:
+        migrated.set()
+        if not release.wait(5):
+            raise TimeoutError("migration observer did not release constructor")
+        original(store, transaction_open=transaction_open)
+
+    monkeypatch.setattr(StateStore, "_migrate_attempts", pause_at_migration)
+
+    def open_state() -> None:
+        try:
+            StateStore(path).close()
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=open_state)
+    thread.start()
+    assert migrated.wait(5)
+    try:
+        with sqlite3.connect(path) as connection:
+            proof_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='candidate_evidence_proofs'"
+            ).fetchone()
+        assert proof_table is None
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='candidate_evidence_proofs_attempt_identity'"
+        ).fetchone()
+        assert trigger is not None
+        assert "status='running'" in str(trigger[0])
+        with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+            connection.execute(
+                "INSERT INTO candidate_evidence_proofs VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-running",
+                    "run-2",
+                    2,
+                    bytes(32),
+                    "0" * 64,
+                    "2026-01-01",
+                ),
+            )
 
 
 def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) -> None:

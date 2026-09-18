@@ -167,15 +167,25 @@ def _current_candidate_counts(connection: sqlite3.Connection, run_id: str) -> tu
                AND catalogue.challenge_id=proposal.challenge_id
               WHERE proposal.run_id=?
                 AND proposal.episode>=catalogue.context_episode
+                AND proposal.context_identity=(
+                  CASE WHEN catalogue.context_sha256 IS NOT NULL
+                       THEN catalogue.context_sha256
+                       ELSE 'episode:' || catalogue.context_episode END
+                )
                 AND proposal.role IN ('specialist', 'recovery')
                 AND NOT EXISTS (
                   SELECT 1 FROM submission_intents AS settled
                   WHERE settled.challenge_id=proposal.challenge_id
                     AND settled.candidate_sha256=lower(hex(proposal.candidate_key))
+                    AND settled.first_run_id=proposal.run_id
+                    AND ((catalogue.context_sha256 IS NOT NULL
+                      AND settled.context_sha256=catalogue.context_sha256) OR
+                      (settled.context_episode=catalogue.context_episode
+                       AND settled.context_sha256 IS catalogue.context_sha256))
                     AND settled.status IN ('correct', 'incorrect')
                 )
                 AND NOT EXISTS (
-                  SELECT 1 FROM candidate_verifications AS verification
+                  SELECT 1 FROM current_candidate_verifications AS verification
                   JOIN candidate_evidence_proofs AS producer_proof
                     ON producer_proof.source_attempt_id=verification.producer_attempt_id
                    AND producer_proof.run_id=verification.run_id
@@ -200,7 +210,7 @@ def _current_candidate_counts(connection: sqlite3.Connection, run_id: str) -> tu
         connection.execute(
             """
             SELECT COUNT(*)
-            FROM candidate_verifications AS verification
+            FROM current_candidate_verifications AS verification
             JOIN candidate_proposals AS proposal
               ON proposal.source_attempt_id=verification.producer_attempt_id
             JOIN control_catalogue AS catalogue

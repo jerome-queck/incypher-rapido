@@ -95,6 +95,26 @@ class ToolFixture(unittest.TestCase):
         self.assertEqual(filesystem_schema["oneOf"][1]["required"], ["action", "filesystem_path"])
         self.assertEqual(registry.dispatch("hash", {"path": "note.txt"})["path"], "note.txt")
 
+    def test_validation_error_has_bounded_structural_attribution(self) -> None:
+        with self.assertRaises(ToolError) as caught:
+            call_tool(self.workspace, "read_text", {"path": 7})
+        self.assertEqual(
+            caught.exception.details,
+            {
+                "schema_version": 1,
+                "contract_version": 1,
+                "failure_stage": "arguments",
+                "constraint": "type",
+                "field_path": "path",
+                "actual_kind": "integer",
+            },
+        )
+
+        with self.assertRaises(ToolError) as invalid_unicode:
+            call_tool(self.workspace, "read_text", {"path": "bad-\ud800"})
+        self.assertEqual(invalid_unicode.exception.details["field_path"], "path")
+        self.assertEqual(invalid_unicode.exception.details["constraint"], "unicode")
+
     def test_shell_binds_command_to_hashed_challenge_sources(self) -> None:
         worker_result = {
             "returncode": 0,

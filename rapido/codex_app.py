@@ -142,6 +142,105 @@ _RETRYABLE_TOOL_ERRORS = frozenset(
         "tool_timeout",
     }
 )
+_TOOL_ERROR_CODES = frozenset(
+    {
+        "archive_password_rejected",
+        "archive_password_required",
+        "archive_too_large",
+        "command_cleanup_failed",
+        "command_failed",
+        "connection_limit",
+        "deadline_exceeded",
+        "generation_revoked",
+        "inconsistent_system",
+        "input_too_large",
+        "internal_error",
+        "invalid_archive",
+        "invalid_argument",
+        "invalid_artifact",
+        "invalid_audio",
+        "invalid_cursor",
+        "invalid_dicom",
+        "invalid_elf",
+        "invalid_encoding",
+        "invalid_integer",
+        "invalid_modulus",
+        "invalid_workspace",
+        "length_mismatch",
+        "limit_exceeded",
+        "not_a_directory",
+        "not_a_file",
+        "not_found",
+        "not_invertible",
+        "output_too_large",
+        "path_outside_target",
+        "path_outside_workspace",
+        "path_unavailable",
+        "pow_exhausted",
+        "pow_limit",
+        "pow_protocol",
+        "pow_timeout",
+        "protocol_mismatch",
+        "read_failed",
+        "resource_limit",
+        "root_domain",
+        "session_limit",
+        "source_changed",
+        "stale_cursor",
+        "symlink_or_invalid_path",
+        "target_transport",
+        "tcp_session",
+        "team_key_unavailable",
+        "tool_busy",
+        "tool_call_limit",
+        "tool_cleanup_failed",
+        "tool_failed",
+        "tool_timeout",
+        "tool_unavailable",
+        "transfer_limit",
+        "unknown_tool",
+        "unsafe_archive",
+        "unsupported_archive",
+        "unsupported_format",
+        "unsupported_operation",
+        "unsupported_platform",
+        "value_out_of_range",
+        "workspace_quota",
+        "write_conflict",
+        "write_failed",
+    }
+)
+_TOOL_FAILURE_STAGES = frozenset({"arguments", "execution", "result"})
+_TOOL_FAILURE_KINDS = frozenset(
+    {"array", "boolean", "bytes", "integer", "missing", "null", "object", "other", "string"}
+)
+_TOOL_FAILURE_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
+
+
+def _closed_tool_failure_details(details: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Retain only bounded structural diagnostics, never rejected argument values."""
+    source = {} if details is None else details
+    projected: dict[str, Any] = {}
+    if source.get("schema_version") == 1:
+        projected["schema_version"] = 1
+    if source.get("contract_version") == 1:
+        projected["contract_version"] = 1
+    stage = source.get("failure_stage")
+    if isinstance(stage, str) and stage in _TOOL_FAILURE_STAGES:
+        projected["failure_stage"] = stage
+    for key in ("field_path", "constraint"):
+        value = source.get(key)
+        if isinstance(value, str) and _TOOL_FAILURE_TOKEN.fullmatch(value):
+            projected[key] = value
+    actual_kind = source.get("actual_kind")
+    if isinstance(actual_kind, str) and actual_kind in _TOOL_FAILURE_KINDS:
+        projected["actual_kind"] = actual_kind
+    for key in ("actual_size", "count", "limit", "size"):
+        value = source.get(key)
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            projected[key] = value
+    return projected
+
 
 _ARTIFACT_TOOLS = {
     "audio_metadata",
@@ -1459,11 +1558,14 @@ class CodexAppClient:
         observation_result: Mapping[str, Any] | None = None
         tool_started_at = time.monotonic()
 
-        def failed_observation(error_code: str) -> dict[str, Any]:
+        def failed_observation(
+            error_code: str, details: Mapping[str, Any] | None = None
+        ) -> dict[str, Any]:
             return {
                 "error_code": error_code,
                 "retryable": error_code in _RETRYABLE_TOOL_ERRORS,
                 "duration_milliseconds": max(0, int((time.monotonic() - tool_started_at) * 1_000)),
+                **_closed_tool_failure_details(details),
             }
 
         try:
@@ -1593,10 +1695,16 @@ class CodexAppClient:
                     state.provenance_outputs.append(provenance_result)
                     state.provenance_bytes += encoded_bytes
         except ToolError as exc:
-            observation_result = failed_observation(exc.code)
-            error_payload = {"code": exc.code, "message": exc.message}
-            if exc.details:
-                error_payload["details"] = dict(exc.details)
+            code = (
+                exc.code
+                if isinstance(exc.code, str) and exc.code in _TOOL_ERROR_CODES
+                else "internal_error"
+            )
+            safe_details = _closed_tool_failure_details(exc.details)
+            observation_result = failed_observation(code, safe_details)
+            error_payload = {"code": code, "message": "tool call failed safely"}
+            if safe_details:
+                error_payload["details"] = safe_details
             payload = {
                 "success": False,
                 "contentItems": [
@@ -1608,15 +1716,28 @@ class CodexAppClient:
             }
             if call_record is not None:
                 call_record["success"] = False
-        except (ProtocolError, ValueError, TypeError) as exc:
-            observation_result = failed_observation("invalid_result")
+        except (ProtocolError, ValueError, TypeError):
+            observation_result = failed_observation(
+                "invalid_result",
+                {
+                    "schema_version": 1,
+                    "contract_version": 1,
+                    "failure_stage": "result",
+                    "constraint": "invalid_result",
+                },
+            )
             payload = {
                 "success": False,
                 "contentItems": [
                     {
                         "type": "inputText",
                         "text": _json_text(
-                            {"error": {"code": "invalid_result", "message": str(exc)}},
+                            {
+                                "error": {
+                                    "code": "invalid_result",
+                                    "message": "tool result was invalid",
+                                }
+                            },
                             limit=MAX_TOOL_RESULT_BYTES,
                         ),
                     }
@@ -1625,7 +1746,15 @@ class CodexAppClient:
             if call_record is not None:
                 call_record["success"] = False
         except Exception:  # noqa: BLE001 - dynamic tool boundary must never leak exceptions
-            observation_result = failed_observation("internal_error")
+            observation_result = failed_observation(
+                "internal_error",
+                {
+                    "schema_version": 1,
+                    "contract_version": 1,
+                    "failure_stage": "execution",
+                    "constraint": "internal_error",
+                },
+            )
             payload = {
                 "success": False,
                 "contentItems": [

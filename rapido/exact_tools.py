@@ -49,20 +49,34 @@ _OPERATIONS = (
 def _error(code: str, message: str, **details: Any) -> Exception:
     # Import lazily: tools.py imports optional tool modules while constructing
     # its registry, so importing ToolError at module import time would cycle.
-    from .tools import ToolError
+    from .tools import _error as tool_error
 
-    return ToolError(code, message, details=details)
+    return tool_error(code, message, **details)
 
 
 def _mapping(arguments: Any, name: str = "arguments") -> Mapping[str, Any]:
     if not isinstance(arguments, Mapping):
-        raise _error("invalid_argument", f"{name} must be an object")
+        from .tools import _value_kind
+
+        raise _error(
+            "invalid_argument",
+            f"{name} must be an object",
+            field_path=name,
+            constraint="type",
+            actual_kind=_value_kind(arguments),
+        )
     try:
         keys = tuple(arguments.keys())
     except Exception as exc:  # pragma: no cover - hostile custom Mapping
         raise _error("invalid_argument", f"{name} must be an object") from exc
     if any(type(key) is not str for key in keys):
-        raise _error("invalid_argument", f"{name} has invalid field names")
+        raise _error(
+            "invalid_argument",
+            f"{name} has invalid field names",
+            field_path=name,
+            constraint="property_names",
+            actual_kind="object",
+        )
     return arguments
 
 
@@ -72,19 +86,39 @@ def _keys(arguments: Mapping[str, Any], allowed: set[str]) -> None:
     except Exception as exc:  # pragma: no cover - hostile custom Mapping
         raise _error("invalid_argument", "arguments have invalid field names") from exc
     if unknown:
-        raise _error("invalid_argument", "unsupported exact-tool argument")
+        raise _error(
+            "invalid_argument",
+            "unsupported exact-tool argument",
+            field_path="arguments",
+            constraint="additional_properties",
+            actual_kind="object",
+        )
 
 
 def _required(arguments: Mapping[str, Any], name: str) -> Any:
     if name not in arguments:
-        raise _error("invalid_argument", f"{name} is required")
+        raise _error(
+            "invalid_argument",
+            f"{name} is required",
+            field_path=name,
+            constraint="required",
+            actual_kind="missing",
+        )
     return arguments[name]
 
 
 def _integer(value: Any, name: str) -> int:
     """Parse one bounded decimal/hex integer string."""
     if type(value) is not str:
-        raise _error("invalid_argument", f"{name} must be a decimal or 0x integer string")
+        from .tools import _value_kind
+
+        raise _error(
+            "invalid_argument",
+            f"{name} must be a decimal or 0x integer string",
+            field_path=name,
+            constraint="type",
+            actual_kind=_value_kind(value),
+        )
     match = _INTEGER_RE.fullmatch(value)
     if match is None:
         raise _error("invalid_integer", f"{name} is not a decimal or 0x integer")

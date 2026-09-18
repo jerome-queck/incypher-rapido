@@ -27,6 +27,19 @@ def error_code(arguments):
     return caught.value.code
 
 
+def test_argument_type_failure_uses_shared_structural_schema():
+    with pytest.raises(ToolError) as caught:
+        call([])
+    assert caught.value.details == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "type",
+        "field_path": "arguments",
+        "actual_kind": "array",
+    }
+
+
 def test_integer_operations_return_exact_json_safe_strings_and_provenance_flags():
     assert call({"operation": "gcd", "operands": ["84", "30", "0"]})["result"] == "6"
     xgcd = call({"operation": "xgcd", "a": "84", "b": "30"})["result"]

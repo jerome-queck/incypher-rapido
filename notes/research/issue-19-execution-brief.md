@@ -1339,7 +1339,85 @@ accepted two P3 centralization/type refactors as intentionally out of scope for 
 
 ## Open decisions
 
-- The evidence-driven `already_solved` lifecycle correction must pass PR CI and squash merge before
-  any future live run. Preserve the owner-only candidate exports; no candidate value belongs in Git.
-- The two-hour diagnostic does not replace the unchanged 19,800-second issue #19 acceptance. Await
-  owner direction after reporting it; close #19 only after the final contract passes.
+- PR #57 merged the evidence-driven `already_solved` correction with green CI. Preserve owner-only
+  candidate exports; no candidate value belongs in Git.
+- Complete the external-stop and post-run solver-audit repairs, independent review, merge, and one
+  fresh 1,800-second diagnostic under the amended completion contract below.
+
+### Owner amendment: completion gate moved out of this task
+
+On 2026-09-18, after reviewing the two-hour diagnostic, the owner explicitly moved the unattended
+19,800-second acceptance run to a different place. This is a post-observation amendment. It does
+not mean the original gate passed, and this task must not claim a 5.5-hour result.
+
+The amended completion contract for this task is:
+
+1. Fix every confirmed P1/P2 finding from the last-run GPT-6 Pro audit without weakening candidate,
+   target, credential, submission, instance, or cleanup controls.
+2. Obtain independent Daybreak/xhigh review, resolve findings, pass repository CI, and squash-merge
+   the focused repairs.
+3. Pre-register and run one fresh 1,800-second unattended diagnostic from the final merged image,
+   with empty state/workspace, all 15 challenges, submissions, managed instances, and Board watch.
+4. Require clean durable termination, settled effects, removed instances, no process/workspace leak,
+   no fallback, and private exports before exact run-state cleanup. The diagnostic tests the fixes;
+   it is not a substitute for the relocated 19,800-second gate.
+5. Merge sanitized evidence and close issue #19 honestly under this owner-amended task scope.
+
+### Last-run audit remediation
+
+The imported audit identified eight findings. PR #57 already resolves F03/F05's exact candidate
+re-entry and prose-equality cases. The remaining implementation is split into two focused releases:
+
+- F07/F08: an operator stop becomes durably terminal from active, scheduled, or blocked state;
+  pending/unread effects remain unresolved; a parent-controlled exec gate closes the final launch
+  race; the 190-second outer grace exceeds the 180-second worker drain and cleanup/persistence tail.
+- F01: run reports separate Board outcomes, correct-candidate provenance, independent verification,
+  and scheduler lifecycle. Outcome and provenance commit atomically. Verification is bound to the
+  current material and, for dynamic work, the owned instance-generation receipt; unscoped legacy
+  rows do not qualify. The historical two-hour run remains zero HTTP `correct` and zero same-run
+  independent verification; later private replay stays separately labelled.
+- F02: continuation progress is earned only by a novel successful host observation after removing
+  timing-only fields. Paraphrased prose, failed calls, and duplicate observations cannot reset the
+  bound; the no-progress watcher applies to 800-second attempts too.
+- F04: repeated carry round trips canonicalize imported paths instead of nesting `carried/`;
+  fresh files override imported same-path files; deterministic round-robin allocation prevents a
+  low-numbered lane from consuming the 64-file cap; narrow retries preserve untouched lanes while
+  an empty current lane retires stale same-lane carry; candidate-free telemetry accounts for drops.
+- F06: tool and solver contract failures retain only a closed, bounded diagnosis—stage, field,
+  constraint, actual kind/size, retryability, or parser category. Raw rejected values and model text
+  remain excluded.
+
+PR #58 passed independent Daybreak/xhigh review and four CI jobs, then squash-merged as `cd812bd`.
+Independent Daybreak/xhigh review of PR #59 then found seven reproducible boundary defects. The
+repair binds dynamic verification to the current instance receipt and archives it on generation
+rotation; persists submission provenance before the Board POST; records reconciled outcomes with
+unknown HTTP status; serializes additive migrations; resolves file/directory carry collisions;
+types malformed solver, target, and media inputs; and suppresses raw exception text at the model
+tool boundary. Direct HTTP-200 and reconciled-correct counts remain separate. The unrelated
+Python-3.12 PR failure was a sub-second test clock race; its window is widened while preserving the
+same production assertion. The next Python-3.11 failure was another test-only clock split: fake
+`time.monotonic()` expired while asyncio's real-clock watcher timer could still return either
+`deadline` or `completed`. The test now accepts both lawful terminal labels and retains its actual
+outage-recovery, single-entry, and zero-cancellation assertions.
+
+The next exact-head tool/carry review found three adjacent cases: untrusted tool error codes could
+still escape the closed boundary; prefix-conflict selection was quadratic before the 64-file cap;
+and a failed staging rename could leave a dot-prefixed temporary in retained carry. The follow-up
+projects error codes onto a fixed registry, resolves path prefixes in linear work over path depth,
+and unlinks failed staging temporaries before continuing.
+
+Integration review then reproduced constructor and publication races at the migration boundary.
+Each connection now tolerates bounded lock contention while establishing WAL mode. Base schema,
+the proof table and its identity guard, a legacy attempt rebuild, its additive checkpoint column,
+and the scope index all publish in one immediate write transaction; there is no committed table or
+trigger gap. The regressions exercise 20 rounds of eight simultaneous fresh openers, three
+eight-opener legacy gaps, and a paused pre-migration publication observed from a second connection;
+the proof table remains invisible until its guard is committed, after which mismatched insertion is
+rejected.
+
+Local validation after these review fixes is 995 passed / 4 platform skips, including 303 focused
+state/control/orchestration/evidence passes and 3 skips. Ruff check/format and diff checks are clean.
+Exact-head independent Daybreak/xhigh re-review is clean: 4,000 fresh concurrent constructors had
+zero failures; deterministic pauses before and after attempt migration exposed neither table nor
+trigger without the guard; a forced migration failure rolled back and released the writer lock.
+PR CI, final merged-image registration, and the 30-minute diagnostic remain pending.

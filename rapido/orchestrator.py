@@ -192,6 +192,17 @@ class RunReport:
     unsupported: int
     errors: int
     overlapping_waves: int
+    submission_correct: int = 0
+    submission_http_200_correct: int = 0
+    submission_reconciled_correct: int = 0
+    submission_already_solved: int = 0
+    submission_incorrect: int = 0
+    source_observed_correct: int = 0
+    board_origin_correct: int = 0
+    unknown_origin_correct: int = 0
+    independently_verified: int = 0
+    run_local_verified: int = 0
+    unverified_challenges: int = 0
 
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -203,6 +214,8 @@ _UNLIMITED_SUBMISSION_WRONG_THRESHOLD = 5
 _BOARD_READ_RETRY_DELAYS = (0.25, 0.5)
 _BOARD_READ_GUARD_MARGIN_SECONDS = 0.1
 _NO_PROGRESS_SECONDS = 900.0
+_MAX_STAGNANT_PRIMARY_CHECKPOINTS = 2
+_MAX_PRIMARY_CONTINUATIONS = 32
 _DYNAMIC_LOCAL_PREP_CAP_SECONDS = 1_800
 _LATE_STATIC_VERIFIER_WORK_SECONDS = 120
 _RUN_CLEANUP_RESERVE_SECONDS = 60
@@ -251,6 +264,19 @@ _DURABLE_TOOL_NAMES = frozenset(
         "wav_analyze",
     }
 )
+
+
+def _stable_progress_value(value: Any) -> Any:
+    """Remove timing-only fields before comparing successful host observations."""
+    if isinstance(value, dict):
+        return {
+            key: _stable_progress_value(child)
+            for key, child in sorted(value.items())
+            if key != "duration_milliseconds"
+        }
+    if isinstance(value, list):
+        return [_stable_progress_value(child) for child in value]
+    return value
 
 
 _CATEGORY_ORDER = {
@@ -552,6 +578,7 @@ class Orchestrator:
         for terminal in outcomes.values():
             if terminal in counts:
                 counts[terminal] += 1
+        evaluation = self.state.run_evaluation_counts(run_id)
         return RunReport(
             run_id=run_id,
             status=status,
@@ -562,6 +589,7 @@ class Orchestrator:
             unsupported=counts["unsupported"],
             errors=counts["error"],
             overlapping_waves=self.state.overlapping_wave_count(run_id),
+            **evaluation,
         )
 
     def _initial_peer_assignments(self) -> tuple[tuple[str, str, str], ...]:
@@ -1356,11 +1384,19 @@ class Orchestrator:
         episode: int,
         run_root: Path,
         target_endpoints: tuple[TargetEndpoint, ...],
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, dict[str, Any]]:
         """Retain bounded candidate/authority-free work for this run and material only."""
         material = self.state.control_catalogue_contexts(run_id).get(challenge.id)
         if material is None or re.fullmatch(r"[0-9a-f]{64}", material) is None:
-            return 0, 0
+            return (
+                0,
+                0,
+                {
+                    "drop_counts": {},
+                    "lane_counts": [],
+                    "origin_counts": {},
+                },
+            )
         episode_root = run_root / f"challenge-{challenge.id}" / f"episode-{episode}"
         carry_root = run_root / f"challenge-{challenge.id}" / "carry" / material
         forbidden = {
@@ -1376,61 +1412,200 @@ class Orchestrator:
         for endpoint in target_endpoints:
             forbidden.add(endpoint.host.encode())
             forbidden.add(f"{endpoint.host}:{endpoint.port}".encode())
-        files = 0
-        total = 0
-        latest_lane_roots: dict[str, tuple[int, Path]] = {}
+        latest_lane_roots: dict[int, tuple[int, Path]] = {}
         for lane_root in episode_root.glob("generation-*/lane-*"):
             try:
                 generation = int(lane_root.parent.name.removeprefix("generation-"))
+                lane = int(lane_root.name.removeprefix("lane-"))
             except ValueError:
                 continue
-            prior = latest_lane_roots.get(lane_root.name)
+            prior = latest_lane_roots.get(lane)
             if prior is None or generation > prior[0]:
-                latest_lane_roots[lane_root.name] = (generation, lane_root)
-        for _, lane_root in sorted(latest_lane_roots.values(), key=lambda item: item[1].name):
+                latest_lane_roots[lane] = (generation, lane_root)
+
+        drop_counts: dict[str, int] = {}
+
+        def dropped(reason: str, count: int = 1) -> None:
+            drop_counts[reason] = drop_counts.get(reason, 0) + count
+
+        lane_candidates: dict[int, list[tuple[Path, Path, str]]] = {}
+        lane_counts: dict[int, dict[str, int]] = {}
+        for lane, (_, lane_root) in sorted(latest_lane_roots.items()):
+            lane_candidates[lane] = []
+            lane_counts[lane] = {"eligible": 0, "retained": 0}
             if not lane_root.is_dir() or lane_root.is_symlink():
                 continue
             analysis_root = lane_root / "rapido-analysis"
             if not analysis_root.is_dir() or analysis_root.is_symlink():
                 continue
-            destination_root = carry_root / lane_root.name
-            # Retain the latest bounded same-lane work, not an ever-growing archive.
-            shutil.rmtree(destination_root, ignore_errors=True)
+            canonical: dict[Path, tuple[int, Path, str]] = {}
             for source in sorted(analysis_root.rglob("*")):
-                if files >= _MAX_CARRIED_ANALYSIS_FILES:
-                    break
                 try:
-                    metadata = source.lstat()
+                    source_metadata = source.lstat()
                 except OSError:
+                    dropped("invalid_file")
                     continue
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or metadata.st_size > _MAX_CARRIED_ANALYSIS_FILE_BYTES
-                    or total + metadata.st_size > _MAX_CARRIED_ANALYSIS_BYTES
-                ):
-                    continue
-                try:
-                    payload = source.read_bytes()
-                except OSError:
+                if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+                    if not stat.S_ISDIR(source_metadata.st_mode):
+                        dropped("invalid_file")
                     continue
                 relative = source.relative_to(analysis_root)
-                relative_bytes = os.fsencode(relative)
-                if (
-                    _CARRY_UNSAFE_BYTES.search(payload)
-                    or _CARRY_UNSAFE_BYTES.search(relative_bytes)
-                    or any(value in payload or value in relative_bytes for value in forbidden)
-                ):
+                parts = list(relative.parts)
+                imported = False
+                while parts and parts[0] == "carried":
+                    imported = True
+                    parts.pop(0)
+                if not parts:
+                    dropped("invalid_file")
                     continue
-                destination = destination_root / relative
-                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-                temporary.write_bytes(payload)
-                temporary.chmod(0o600)
-                os.replace(temporary, destination)
-                files += 1
-                total += len(payload)
-        return files, total
+                relative = Path(*parts)
+                priority = 0 if imported else 1
+                prior = canonical.get(relative)
+                if prior is not None:
+                    dropped("shadowed")
+                    if priority <= prior[0]:
+                        continue
+                canonical[relative] = (priority, source, "imported" if imported else "fresh")
+            selected_paths: set[Path] = set()
+            selected_ancestors: set[Path] = set()
+            selected_candidates: list[tuple[Path, Path, str]] = []
+            for relative, selected in sorted(
+                canonical.items(),
+                key=lambda item: (-item[1][0], len(item[0].parts), item[0].as_posix()),
+            ):
+                if relative in selected_ancestors or any(
+                    parent in selected_paths for parent in relative.parents
+                ):
+                    dropped("shadowed")
+                    continue
+                selected_paths.add(relative)
+                selected_ancestors.update(
+                    parent for parent in relative.parents if parent != Path(".")
+                )
+                selected_candidates.append((relative, selected[1], selected[2]))
+            lane_candidates[lane] = sorted(selected_candidates, key=lambda item: item[0].as_posix())
+
+        # A recovery wave may intentionally rerun only one lane. Preserve other
+        # lanes' safe carry, but make every lane present in this wave
+        # authoritative: an empty latest analysis retires stale same-lane files.
+        if carry_root.is_dir() and not carry_root.is_symlink():
+            for prior_lane_root in sorted(carry_root.glob("lane-*")):
+                try:
+                    lane = int(prior_lane_root.name.removeprefix("lane-"))
+                except ValueError:
+                    dropped("invalid_file")
+                    continue
+                if lane in latest_lane_roots:
+                    continue
+                if not prior_lane_root.is_dir() or prior_lane_root.is_symlink():
+                    dropped("invalid_file")
+                    continue
+                candidates: list[tuple[Path, Path, str]] = []
+                for source in sorted(prior_lane_root.rglob("*")):
+                    if source.is_file():
+                        candidates.append((source.relative_to(prior_lane_root), source, "prior"))
+                lane_candidates[lane] = candidates
+                lane_counts[lane] = {"eligible": 0, "retained": 0}
+
+        if not lane_candidates:
+            return (
+                0,
+                0,
+                {
+                    "drop_counts": dict(sorted(drop_counts.items())),
+                    "lane_counts": [],
+                    "origin_counts": {},
+                },
+            )
+
+        files = 0
+        total = 0
+        origin_counts = {"fresh": 0, "imported": 0, "prior": 0}
+        staging = carry_root.with_name(f".{carry_root.name}.{uuid.uuid4().hex}.tmp")
+        staging.mkdir(mode=0o700, parents=True)
+        positions = {lane: 0 for lane in lane_candidates}
+        try:
+            while True:
+                advanced = False
+                for lane in sorted(lane_candidates):
+                    position = positions[lane]
+                    candidates = lane_candidates[lane]
+                    if position >= len(candidates):
+                        continue
+                    advanced = True
+                    positions[lane] = position + 1
+                    relative, source, origin = candidates[position]
+                    if files >= _MAX_CARRIED_ANALYSIS_FILES:
+                        remaining = sum(
+                            len(lane_candidates[key]) - positions[key] for key in lane_candidates
+                        )
+                        dropped("file_cap", remaining + 1)
+                        advanced = False
+                        break
+                    try:
+                        metadata = source.lstat()
+                    except OSError:
+                        dropped("invalid_file")
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        dropped("invalid_file")
+                        continue
+                    if metadata.st_size > _MAX_CARRIED_ANALYSIS_FILE_BYTES:
+                        dropped("byte_cap")
+                        continue
+                    try:
+                        payload = source.read_bytes()
+                    except OSError:
+                        dropped("invalid_file")
+                        continue
+                    relative_bytes = os.fsencode(relative)
+                    if (
+                        _CARRY_UNSAFE_BYTES.search(payload)
+                        or _CARRY_UNSAFE_BYTES.search(relative_bytes)
+                        or any(value in payload or value in relative_bytes for value in forbidden)
+                    ):
+                        dropped("unsafe")
+                        continue
+                    lane_counts[lane]["eligible"] += 1
+                    if total + len(payload) > _MAX_CARRIED_ANALYSIS_BYTES:
+                        dropped("byte_cap")
+                        continue
+                    destination = staging / f"lane-{lane}" / relative
+                    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+                    try:
+                        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        temporary.write_bytes(payload)
+                        temporary.chmod(0o600)
+                        os.replace(temporary, destination)
+                    except OSError:
+                        try:
+                            temporary.unlink()
+                        except OSError:
+                            pass
+                        dropped("invalid_file")
+                        continue
+                    files += 1
+                    total += len(payload)
+                    lane_counts[lane]["retained"] += 1
+                    origin_counts[origin] += 1
+                if not advanced:
+                    break
+            shutil.rmtree(carry_root, ignore_errors=True)
+            if files:
+                os.replace(staging, carry_root)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        if not files:
+            try:
+                carry_root.parent.rmdir()
+            except OSError:
+                pass
+        telemetry = {
+            "drop_counts": dict(sorted(drop_counts.items())),
+            "lane_counts": [{"lane": lane, **lane_counts[lane]} for lane in sorted(lane_counts)],
+            "origin_counts": {key: value for key, value in origin_counts.items() if value},
+        }
+        return files, total, telemetry
 
     async def _remove_tree_before(self, root: Path, deadline: float) -> None:
         stack: list[tuple[Path, bool]] = [(root, False)]
@@ -2057,7 +2232,9 @@ class Orchestrator:
                     {
                         "tool": observation.tool,
                         "source_bound": observation.source_bound,
-                        "facts": public_facts if isinstance(public_facts, dict) else {},
+                        "facts": _stable_progress_value(
+                            public_facts if isinstance(public_facts, dict) else {}
+                        ),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -2070,8 +2247,8 @@ class Orchestrator:
 
             continuation_round = 0
             last_checkpoint_tool_count = 0
-            last_blocker_fingerprint: str | None = None
-            repeated_blocker_count = 0
+            last_checkpoint_progress_count = 0
+            stagnant_checkpoint_count = 0
 
             def validate_candidate(
                 finding: SolverFinding,
@@ -2106,7 +2283,7 @@ class Orchestrator:
 
             def continue_primary(turn: NativeTurn, remaining_seconds: float | None) -> str | None:
                 nonlocal continuation_round, last_checkpoint_tool_count
-                nonlocal last_blocker_fingerprint, repeated_blocker_count
+                nonlocal last_checkpoint_progress_count, stagnant_checkpoint_count
                 if not persistent_primary or turn.status != "completed":
                     return None
                 checkpoint: SolverFinding | None = None
@@ -2119,8 +2296,8 @@ class Orchestrator:
                     validate_candidate(checkpoint, checkpoint_calls, checkpoint_complete)
                 except CandidateProvenanceError as exc:
                     reason = str(exc)
-                except SolverOutputError:
-                    reason = "solver_output"
+                except SolverOutputError as exc:
+                    reason = f"solver_output_{exc.category}"
                 else:
                     if checkpoint.candidate is not None:
                         qualified_candidate = True
@@ -2140,6 +2317,13 @@ class Orchestrator:
                 )
                 tool_delta = max(0, checkpoint_tool_count - last_checkpoint_tool_count)
                 last_checkpoint_tool_count = max(last_checkpoint_tool_count, checkpoint_tool_count)
+                progress_count = len(progress_fingerprints)
+                novel_success_delta = max(0, progress_count - last_checkpoint_progress_count)
+                last_checkpoint_progress_count = max(last_checkpoint_progress_count, progress_count)
+                if novel_success_delta:
+                    stagnant_checkpoint_count = 0
+                else:
+                    stagnant_checkpoint_count += 1
                 checkpoint_observations = []
                 for ordinal, call in enumerate(checkpoint_calls[-_MAX_DURABLE_TOOL_CALLS:]):
                     facts = sanitize_public_value(call.observation.facts)
@@ -2164,21 +2348,6 @@ class Orchestrator:
                     and checkpoint.candidate is None
                     and not any(FLAG_RE.search(value) for value in checkpoint_text)
                 )
-                blocker_payload = json.dumps(
-                    {
-                        "reason": reason,
-                        "summary": checkpoint.summary if candidate_free_checkpoint else "",
-                        "next_steps": checkpoint.next_steps if candidate_free_checkpoint else (),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                blocker_fingerprint = hashlib.sha256(blocker_payload.encode()).hexdigest()
-                if blocker_fingerprint == last_blocker_fingerprint and tool_delta == 0:
-                    repeated_blocker_count += 1
-                else:
-                    last_blocker_fingerprint = blocker_fingerprint
-                    repeated_blocker_count = 1
                 self.state.checkpoint_attempt(
                     attempt_id,
                     summary=(
@@ -2224,7 +2393,9 @@ class Orchestrator:
                     in {"tool_call_limit", "limit_exceeded"}
                     for call in checkpoint_calls[-8:]
                 )
-                if target_exhausted or repeated_blocker_count >= 2 and tool_delta == 0:
+                continuation_exhausted = continuation_round >= _MAX_PRIMARY_CONTINUATIONS
+                no_novel_progress = stagnant_checkpoint_count >= _MAX_STAGNANT_PRIMARY_CHECKPOINTS
+                if target_exhausted or no_novel_progress or continuation_exhausted:
                     self.state.event(
                         run_id,
                         "primary_solver_stopped",
@@ -2235,9 +2406,12 @@ class Orchestrator:
                             "reason": (
                                 "target_registry_exhausted"
                                 if target_exhausted
-                                else "repeated_blocker_without_progress"
+                                else "continuation_budget_exhausted"
+                                if continuation_exhausted
+                                else "repeated_checkpoint_without_novel_success"
                             ),
                             "tool_call_count": checkpoint_tool_count,
+                            "novel_success_count": progress_count,
                         },
                     )
                     return None
@@ -2252,6 +2426,7 @@ class Orchestrator:
                         "reason": reason,
                         "tool_call_count": checkpoint_tool_count,
                         "tool_call_delta": tool_delta,
+                        "novel_success_delta": novel_success_delta,
                         "remaining_milliseconds": (
                             None
                             if remaining_seconds is None
@@ -2284,39 +2459,51 @@ class Orchestrator:
                     progress_callback=note_progress,
                     continuation_callback=continue_primary if persistent_primary else None,
                 )
-                if timeout_seconds <= _NO_PROGRESS_SECONDS:
-                    turn = await solve_call
-                else:
-                    solve_task = asyncio.create_task(solve_call)
+                cancelled_solve_results: list[Any] = []
+
+                async def tracked_solve() -> NativeTurn:
                     try:
-                        while True:
-                            quiet_remaining = _NO_PROGRESS_SECONDS - (
-                                time.monotonic() - progress_at
-                            )
-                            done, _ = await asyncio.wait(
-                                {solve_task},
-                                timeout=max(0.0, quiet_remaining),
-                            )
-                            if done:
-                                turn = solve_task.result()
-                                break
-                            if time.monotonic() - progress_at < _NO_PROGRESS_SECONDS:
-                                continue
-                            solve_task.cancel()
-                            cancelled = (await asyncio.gather(solve_task, return_exceptions=True))[
-                                0
-                            ]
-                            error = NoProgressError(
-                                "native turn exceeded its no-tool-progress window"
-                            )
-                            result = getattr(cancelled, "result", None)
-                            if result is not None:
-                                error.result = result
-                            raise error
-                    finally:
-                        if not solve_task.done():
-                            solve_task.cancel()
-                            await asyncio.gather(solve_task, return_exceptions=True)
+                        return await solve_call
+                    except asyncio.CancelledError as exc:
+                        cancelled_solve_results.append(getattr(exc, "result", None))
+                        raise
+
+                solve_task = asyncio.create_task(tracked_solve())
+                try:
+                    while True:
+                        quiet_remaining = _NO_PROGRESS_SECONDS - (time.monotonic() - progress_at)
+                        done, _ = await asyncio.wait(
+                            {solve_task},
+                            timeout=max(0.0, quiet_remaining),
+                        )
+                        if done:
+                            turn = solve_task.result()
+                            break
+                        if time.monotonic() - progress_at < _NO_PROGRESS_SECONDS:
+                            continue
+                        solve_task.cancel()
+                        cancelled = (await asyncio.gather(solve_task, return_exceptions=True))[0]
+                        error = NoProgressError("native turn exceeded its no-tool-progress window")
+                        result = getattr(cancelled, "result", None)
+                        if result is not None:
+                            error.result = result
+                        raise error
+                except asyncio.CancelledError as exc:
+                    if not solve_task.done():
+                        solve_task.cancel()
+                    cancelled = (await asyncio.gather(solve_task, return_exceptions=True))[0]
+                    result = (
+                        cancelled_solve_results[-1]
+                        if cancelled_solve_results
+                        else getattr(cancelled, "result", None)
+                    )
+                    if result is not None:
+                        exc.result = result
+                    raise
+                finally:
+                    if not solve_task.done():
+                        solve_task.cancel()
+                        await asyncio.gather(solve_task, return_exceptions=True)
             tool_call_count, tool_calls, tool_evidence_complete = _normalize_tool_calls(
                 turn.tool_calls
             )
@@ -2429,7 +2616,7 @@ class Orchestrator:
                     "subreason": subreason,
                 },
             )
-        except SolverOutputError:
+        except SolverOutputError as exc:
             finding = None
             terminal = "failed"
             finish_attempt(
@@ -2446,6 +2633,7 @@ class Orchestrator:
                     "episode": episode,
                     "lane": lane,
                     "reason": "solver_output",
+                    "subreason": exc.category,
                 },
             )
         except NativeTurnIncompleteError as exc:
@@ -2701,7 +2889,12 @@ class Orchestrator:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "board_limit")
             if deadline - time.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
-            if not self.state.reserve_submission(run_id, challenge.id, candidate):
+            if not self.state.reserve_submission(
+                run_id,
+                challenge.id,
+                candidate,
+                provenance_class=provenance_class,
+            ):
                 settled_outcome = self._reuse_settled_candidate(run_id, challenge.id, candidate)
                 if settled_outcome is not None:
                     return settled_outcome
@@ -2720,7 +2913,12 @@ class Orchestrator:
                     "submission_pending_reconciliation",
                 )
             self.state.finalize_submission(
-                run_id, challenge.id, candidate, verdict.outcome, verdict.http_status
+                run_id,
+                challenge.id,
+                candidate,
+                verdict.outcome,
+                verdict.http_status,
+                provenance_class=provenance_class,
             )
             self.state.event(
                 run_id,
@@ -3401,7 +3599,7 @@ class Orchestrator:
             finally:
                 challenge_root = run_root / f"challenge-{challenge.id}"
                 if route.role != "verifier":
-                    carried_files, carried_bytes = await asyncio.to_thread(
+                    carried_files, carried_bytes, carry_telemetry = await asyncio.to_thread(
                         self._capture_analysis_carry,
                         run_id,
                         challenge,
@@ -3417,6 +3615,7 @@ class Orchestrator:
                             "episode": episode,
                             "file_count": carried_files,
                             "byte_count": carried_bytes,
+                            **carry_telemetry,
                         },
                     )
                 await self._drain_rmtree(challenge_root / f"episode-{episode}")

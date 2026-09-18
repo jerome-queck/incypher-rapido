@@ -221,7 +221,19 @@ class ToolStub:
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bad":
-            raise ToolError("bad_tool", "nope", details={"field": "x"})
+            raise ToolError(
+                "INCYPHER{raw-rejected-code}",
+                "INCYPHER{raw-rejected-tool-message}",
+                details={
+                    "contract_version": 1,
+                    "failure_stage": "arguments",
+                    "field_path": "command",
+                    "constraint": "type",
+                    "actual_kind": "integer",
+                    "actual_size": 1,
+                    "raw_value": "must-not-survive",
+                },
+            )
         return {"name": name, "arguments": arguments}
 
 
@@ -1267,14 +1279,28 @@ async def test_tool_call_and_structured_tool_error(
     responses = {item["id"]: item for item in fake_process.responses}
     assert responses[90]["result"]["success"] is True
     assert responses[91]["result"]["success"] is False
-    assert '"bad_tool"' in responses[91]["result"]["contentItems"][0]["text"]
+    assert '"internal_error"' in responses[91]["result"]["contentItems"][0]["text"]
     assert len(state.tool_calls) == 2
     assert all(isinstance(call["host_observation"], HostObservation) for call in state.tool_calls)
     assert state.tool_calls[0]["host_observation"].success is True
     assert state.tool_calls[1]["host_observation"].success is False
-    assert state.tool_calls[1]["host_observation"].facts["error_code"] == "bad_tool"
+    assert state.tool_calls[1]["host_observation"].facts["error_code"] == "internal_error"
     assert state.tool_calls[1]["host_observation"].facts["retryable"] is False
     assert state.tool_calls[1]["host_observation"].facts["duration_milliseconds"] >= 0
+    assert (
+        dict(state.tool_calls[1]["host_observation"].facts).items()
+        >= {
+            "actual_kind": "integer",
+            "actual_size": 1,
+            "constraint": "type",
+            "contract_version": 1,
+            "failure_stage": "arguments",
+            "field_path": "command",
+        }.items()
+    )
+    assert "must-not-survive" not in responses[91]["result"]["contentItems"][0]["text"]
+    assert "raw-rejected-tool-message" not in responses[91]["result"]["contentItems"][0]["text"]
+    assert "raw-rejected-code" not in responses[91]["result"]["contentItems"][0]["text"]
     await client.close()
 
 
@@ -2212,6 +2238,49 @@ async def test_malformed_unicode_tool_result_returns_bounded_error(
     assert response["result"]["success"] is False
     assert "invalid_result" in text
     assert len(text) < 256
+    assert state.tool_calls[0]["success"] is False
+    await client.close()
+
+
+@run_async
+async def test_tool_exception_message_is_not_reflected(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    class RejectingRegistry(ToolStub):
+        def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del name, arguments
+            raise ValueError("INCYPHER{raw-rejected-value}")
+
+    registry = RejectingRegistry()
+    client = make_client(fake_process, tmp_path, tool_registry=registry)
+    await client.start()
+    client._thread_registries["thread-1"] = registry
+    state = _TurnState(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        completion=asyncio.get_running_loop().create_future(),
+    )
+    client._thread_turns[("thread-1", "turn-1")] = state
+    await client._route_message(
+        {
+            "id": 134,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "rejected-result",
+                "tool": {"name": "http_request"},
+                "arguments": {"path": "/ordinary"},
+            },
+        }
+    )
+    await asyncio.gather(*client._server_tasks)
+
+    response = next(item for item in fake_process.responses if item["id"] == 134)
+    text = response["result"]["contentItems"][0]["text"]
+    assert response["result"]["success"] is False
+    assert "invalid_result" in text
+    assert "raw-rejected-value" not in text
     assert state.tool_calls[0]["success"] is False
     await client.close()
 

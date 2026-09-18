@@ -85,10 +85,41 @@ _FIXED_TESSERACT = (
 )
 
 
-def _error(code: str, message: str) -> Exception:
+def _error(code: str, message: str, **details: Any) -> Exception:
     from .tools import ToolError
 
-    return ToolError(code, message)
+    stage = (
+        "arguments"
+        if code in {"invalid_argument", "invalid_cursor", "input_too_large"}
+        else ("result" if code in {"output_too_large", "internal_error"} else "execution")
+    )
+    return ToolError(
+        code,
+        message,
+        details={
+            "schema_version": 1,
+            "contract_version": 1,
+            "failure_stage": stage,
+            "constraint": code,
+            **details,
+        },
+    )
+
+
+def _value_kind(value: Any) -> str:
+    if value is None:
+        return "missing"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    return "other"
 
 
 def _json_size(value: Any) -> int:
@@ -112,31 +143,80 @@ def _arguments(arguments: Mapping[str, Any]) -> tuple[str, str, str | None, str 
         "selection",
         "cursor",
     }:
-        raise _error("invalid_argument", "unsupported artifact-inspector arguments")
+        raise _error(
+            "invalid_argument",
+            "unsupported artifact-inspector arguments",
+            field_path="arguments",
+            constraint="additional_properties",
+            actual_kind=_value_kind(arguments),
+        )
     path = arguments.get("path")
     if not isinstance(path, str) or not path or "\x00" in path:
-        raise _error("invalid_argument", "path is required and must be nonempty relative text")
+        raise _error(
+            "invalid_argument",
+            "path is required and must be nonempty relative text",
+            field_path="path",
+            constraint="required_text",
+            actual_kind=_value_kind(path),
+        )
     try:
         encoded_path = path.encode("utf-8")
     except UnicodeError as exc:
-        raise _error("invalid_argument", "path must contain valid Unicode text") from exc
+        raise _error(
+            "invalid_argument",
+            "path must contain valid Unicode text",
+            field_path="path",
+            constraint="unicode",
+            actual_kind="string",
+        ) from exc
     if len(encoded_path) > 4096:
-        raise _error("input_too_large", "path exceeds the input limit")
+        raise _error(
+            "input_too_large",
+            "path exceeds the input limit",
+            field_path="path",
+            constraint="max_bytes",
+            actual_kind="string",
+            actual_size=len(encoded_path),
+        )
     view = arguments.get("view", "summary")
-    if view not in {"summary", "text", "structure", "bytes"}:
-        raise _error("invalid_argument", "view must be summary, text, structure, or bytes")
+    if not isinstance(view, str) or view not in {"summary", "text", "structure", "bytes"}:
+        raise _error(
+            "invalid_argument",
+            "view must be summary, text, structure, or bytes",
+            field_path="view",
+            constraint="enum",
+            actual_kind=_value_kind(view),
+        )
     selection = arguments.get("selection")
     if selection is not None and (
         not isinstance(selection, str) or not _SELECTION.fullmatch(selection)
     ):
-        raise _error("invalid_argument", "selection must be a bounded identifier")
+        raise _error(
+            "invalid_argument",
+            "selection must be a bounded identifier",
+            field_path="selection",
+            constraint="bounded_identifier",
+            actual_kind=_value_kind(selection),
+        )
     cursor = arguments.get("cursor")
     if cursor is not None and (
         not isinstance(cursor, str) or len(cursor) > 1024 or not cursor.isascii()
     ):
-        raise _error("invalid_cursor", "cursor must be bounded ASCII text")
+        raise _error(
+            "invalid_cursor",
+            "cursor must be bounded ASCII text",
+            field_path="cursor",
+            constraint="bounded_ascii",
+            actual_kind=_value_kind(cursor),
+        )
     if view == "summary" and cursor is not None:
-        raise _error("invalid_argument", "summary view does not accept a cursor")
+        raise _error(
+            "invalid_argument",
+            "summary view does not accept a cursor",
+            field_path="cursor",
+            constraint="forbidden",
+            actual_kind="string",
+        )
     return path, view, selection, cursor
 
 
