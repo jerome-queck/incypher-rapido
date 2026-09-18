@@ -418,41 +418,45 @@ class StateStore:
             BEGIN SELECT RAISE(ABORT, 'candidate verification history is immutable'); END;
             """
         )
-        self._connection.execute(
-            "DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity"
-        )
         self._migrate_attempts()
-        self._connection.execute(
-            """
-            CREATE TRIGGER candidate_evidence_proofs_attempt_identity
-            BEFORE INSERT ON candidate_evidence_proofs
-            WHEN NOT EXISTS (
-                SELECT 1 FROM attempts
-                WHERE id=NEW.source_attempt_id
-                  AND run_id=NEW.run_id
-                  AND challenge_id=NEW.challenge_id
-                  AND status='running'
-            )
-            BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END
-            """
-        )
-        attempt_columns = {
-            str(row["name"])
-            for row in self._connection.execute("PRAGMA table_info(attempts)").fetchall()
-        }
-        if "checkpoint_observations_json" not in attempt_columns:
-            self._connection.execute(
-                "ALTER TABLE attempts ADD COLUMN checkpoint_observations_json "
-                "TEXT NOT NULL DEFAULT '[]'"
-            )
-        self._connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
-            "ON attempts(id, run_id, challenge_id, episode, lane)"
-        )
+        self._refresh_attempt_contracts()
         self._migrate_control_jobs()
         self._migrate_additive_columns()
         self._migrate_submission_intents()
         self._refresh_candidate_verification_view()
+
+    def _refresh_attempt_contracts(self) -> None:
+        """Atomically refresh additive attempt state, identity index, and proof trigger."""
+
+        with self.transaction() as connection:
+            attempt_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
+            }
+            if "checkpoint_observations_json" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN checkpoint_observations_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS attempts_scope_identity "
+                "ON attempts(id, run_id, challenge_id, episode, lane)"
+            )
+            connection.execute("DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity")
+            connection.execute(
+                """
+                CREATE TRIGGER candidate_evidence_proofs_attempt_identity
+                BEFORE INSERT ON candidate_evidence_proofs
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM attempts
+                    WHERE id=NEW.source_attempt_id
+                      AND run_id=NEW.run_id
+                      AND challenge_id=NEW.challenge_id
+                      AND status='running'
+                )
+                BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END
+                """
+            )
 
     def _migrate_additive_columns(self) -> None:
         """Serialize additive upgrades and recheck every column under the write lock."""

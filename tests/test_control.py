@@ -2615,12 +2615,16 @@ def test_concurrent_openers_recheck_route_authority_migration(tmp_path: Path) ->
         )
 
 
-def test_concurrent_openers_recheck_additive_migration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_additive_gap", (False, True))
+def test_concurrent_openers_recheck_additive_migration(
+    tmp_path: Path, legacy_additive_gap: bool
+) -> None:
     path = tmp_path / "private" / "state.sqlite3"
-    StateStore(path).close()
-    with sqlite3.connect(path) as connection:
-        connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
-    barrier = threading.Barrier(2)
+    if legacy_additive_gap:
+        StateStore(path).close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
+    barrier = threading.Barrier(8)
     errors: list[BaseException] = []
 
     def open_state() -> None:
@@ -2630,7 +2634,7 @@ def test_concurrent_openers_recheck_additive_migration(tmp_path: Path) -> None:
         except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=open_state) for _ in range(2)]
+    threads = [threading.Thread(target=open_state) for _ in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:

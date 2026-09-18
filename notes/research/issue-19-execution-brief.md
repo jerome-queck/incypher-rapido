@@ -1406,6 +1406,11 @@ and a failed staging rename could leave a dot-prefixed temporary in retained car
 projects error codes onto a fixed registry, resolves path prefixes in linear work over path depth,
 and unlinks failed staging temporaries before continuing.
 
+Integration review then reproduced an eight-opener trigger race left outside the serialized schema
+phase. Attempt-column/index/verification-trigger refresh now commits under one immediate write
+transaction, so readers never observe a trigger-absent state and concurrent constructors cannot
+double-create it. The regression covers eight simultaneous fresh and legacy-gap openers.
+
 Local validation after these review fixes is 992 passed / 4 platform skips, plus 426 focused passes
 and 3 skips. Ruff check/format and diff checks are clean. Exact-head independent re-review, PR CI,
 final merged-image registration, and the 30-minute diagnostic remain pending.
