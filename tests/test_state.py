@@ -547,8 +547,10 @@ def test_old_material_submission_does_not_hide_current_unverified_candidate(
     store.start_run(run_id, {})
     store.upsert_challenge(1, "A", "crypto", "standard", 100)
     store.initialize_control_catalogue(run_id, [(0, 1, True)], 1, route, assignment, {1: "a" * 64})
+    evidence = RunEvidence.open(store, run_id)
     store.start_control_wave(run_id, 1, 0)
     store.start_attempt("old", run_id, 1, 0, 0, route.model, route.effort)
+    _attest_candidate(evidence, "old", candidate)
     store.finish_attempt("old", "candidate", candidate=candidate, retain_private_candidate=True)
     store.record_submission(run_id, 1, candidate, "incorrect", 200)
     store.finish_control_wave(run_id, 1, 0, "unsolved")
@@ -568,6 +570,7 @@ def test_old_material_submission_does_not_hide_current_unverified_candidate(
     )
     store.start_control_wave(run_id, 1, episode)
     store.start_attempt("new", run_id, 1, episode, 0, route.model, route.effort)
+    _attest_candidate(evidence, "new", candidate)
     store.finish_attempt("new", "candidate", candidate=candidate, retain_private_candidate=True)
 
     counts = store.run_evaluation_counts(run_id)
@@ -971,6 +974,101 @@ def test_private_candidate_crash_boundary_is_atomic(
     reopened.close()
 
 
+def test_attested_checkpoint_crash_routes_recovery_instead_of_verifier(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    code = textwrap.dedent(
+        """
+        import hashlib
+        import os
+        import sys
+        from pathlib import Path
+
+        from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
+        from rapido.routing import baseline_route
+        from rapido.state import StateStore
+
+        path = Path(sys.argv[1])
+        store = StateStore(path)
+        store.acquire_supervisor()
+        run_id = "attested-checkpoint-crash"
+        candidate = "INCYPHER{attested_before_terminal_crash}"
+        candidate_sha256 = hashlib.sha256(candidate.encode()).hexdigest()
+        route = baseline_route(
+            model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15
+        )
+        store.start_run(run_id, {})
+        store.upsert_challenge(1, "A", "crypto", "standard", 100)
+        store.record_control_catalogue(run_id, [(0, 1, True)])
+        store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+        store.start_control_wave(run_id, 1, 0)
+        store.start_attempt("producer", run_id, 1, 0, 0, route.model, route.effort)
+        store.checkpoint_attempt("producer", summary="qualified", candidate=candidate)
+        evidence = RunEvidence.open(store, run_id)
+        evidence.commit(
+            "producer",
+            EvidenceBatch(
+                (
+                    HostObservation(
+                        "inspect_file",
+                        True,
+                        True,
+                        candidate_sha256s=(candidate_sha256,),
+                    ),
+                )
+            ),
+        )
+        assert evidence.attest_candidate(
+            "producer", candidate_sha256=candidate_sha256
+        ) is not None
+        os._exit(37)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        timeout=10,
+    )
+    assert completed.returncode == 37
+
+    reopened = StateStore(path)
+    reopened.acquire_supervisor()
+    assert reopened._connection.execute("SELECT status FROM attempts").fetchone()[0] == "running"
+    assert (
+        reopened._connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
+    )
+    assert (
+        reopened._connection.execute("SELECT COUNT(*) FROM candidate_evidence_proofs").fetchone()[0]
+        == 1
+    )
+    session = reopened.start_or_resume_run("unused", {})
+    assert session.run_id == "attested-checkpoint-crash" and session.resumed
+    assert (
+        reopened._connection.execute("SELECT status FROM attempts").fetchone()[0] == "interrupted"
+    )
+    assert reopened.candidate_counts("attested-checkpoint-crash") == (0, 0)
+    assert reopened.pending_candidate_count("attested-checkpoint-crash", 1) == 0
+
+    assert reopened.resume_control_waves("attested-checkpoint-crash", 10_000) == 1
+    decision_row = reopened._connection.execute(
+        "SELECT failure_kind, failure_subreason, rule_id "
+        "FROM control_route_decisions WHERE run_id=?",
+        ("attested-checkpoint-crash",),
+    ).fetchone()
+    assert tuple(decision_row) == (
+        "container",
+        "process_restart",
+        "container_fresh_workspace_v1",
+    )
+    successor_roles = reopened._connection.execute(
+        "SELECT DISTINCT role FROM control_jobs WHERE run_id=? AND episode=1",
+        ("attested-checkpoint-crash",),
+    ).fetchall()
+    assert [row[0] for row in successor_roles] == ["recovery"]
+    reopened.release_supervisor()
+    reopened.close()
+
+
 @pytest.mark.parametrize("crash_before_commit", (True, False))
 def test_private_verification_crash_boundary_is_atomic(
     tmp_path: Path, crash_before_commit: bool
@@ -1107,7 +1205,7 @@ def test_interrupted_checkpoint_candidate_cannot_be_verified(tmp_path: Path) -> 
 
     assert store.verified_candidate(run_id, 1) is None
     assert not store.candidate_is_verified(run_id, 1, candidate)
-    assert store.candidate_counts(run_id) == (1, 0)
+    assert store.candidate_counts(run_id) == (0, 0)
     store.close()
 
 
@@ -1161,7 +1259,7 @@ def test_empty_manifest_candidate_cannot_be_verified(tmp_path: Path) -> None:
 
     assert store.verified_candidate(run_id, 1) is None
     assert not store.candidate_is_verified(run_id, 1, candidate)
-    assert store.candidate_counts(run_id) == (1, 0)
+    assert store.candidate_counts(run_id) == (0, 0)
     context = store.private_candidate_context_sources(run_id, 1, before_episode=2)
     assert context[0]["verifier_attempt_id"] is None
     store.close()

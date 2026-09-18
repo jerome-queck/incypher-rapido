@@ -1368,6 +1368,58 @@ def test_failed_peer_cannot_discard_private_candidate(tmp_path: Path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
 
 
+def test_orphan_checkpoint_candidate_is_audit_only_and_does_not_route_verifier(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    state = StateStore(config.state_path)
+    run_id = "orphan-checkpoint-run"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    state.start_run(run_id, config.public_record())
+    state.upsert_challenge(1, "A", "crypto", "standard", 100)
+    state.record_control_catalogue(run_id, [(0, 1, True)])
+    state.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    state.start_control_wave(run_id, 1, 0)
+    state.start_attempt("producer", run_id, 1, 0, 0, route.model, route.effort)
+    state.checkpoint_attempt(
+        "producer",
+        summary="qualified checkpoint",
+        candidate="INCYPHER{orphan_checkpoint_candidate}",
+    )
+    state.finish_attempt("producer", "timeout", failure_class="timeout")
+
+    decision = state.finish_and_decide_control_wave(
+        run_id=run_id,
+        challenge_id=1,
+        source_episode=0,
+        next_episode=1,
+        catalogue_rank=0,
+        lanes=1,
+        terminal="candidate",
+        attempts_remaining=True,
+        remaining_milliseconds=10_000,
+    )
+
+    assert decision is None
+    assert state.candidate_counts(run_id) == (0, 0)
+    assert state.pending_candidate_count(run_id, 1) == 0
+    assert state.run_evaluation_counts(run_id)["unverified_challenges"] == 0
+    assert state._connection.execute("SELECT COUNT(*) FROM candidate_proposals").fetchone()[0] == 1
+    assert (
+        state._connection.execute("SELECT COUNT(*) FROM candidate_evidence_proofs").fetchone()[0]
+        == 0
+    )
+    assert (
+        state._connection.execute(
+            "SELECT COUNT(*) FROM control_jobs WHERE run_id=? AND episode=1", (run_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    state.close()
+
+    assert DurableJobControl.inspect(config.state_path, run_id=run_id).pending_candidate_count == 0
+
+
 def test_verifier_reobserves_without_candidate_in_prompt(tmp_path: Path) -> None:
     candidate = "INCYPHER{fresh_verifier_reobservation}"
     runtime = CandidateVerifierRuntime(candidate, candidate)
@@ -1559,6 +1611,20 @@ def test_limited_candidate_waits_for_one_fresh_verifier(tmp_path: Path) -> None:
     assert board.submissions == [(1, candidate)]
     assert {job.role for job in view.jobs} == {"specialist", "verifier"}
     assert sum(job.role == "verifier" for job in view.jobs) == 1
+    assert [(decision.failure_kind, decision.disposition) for decision in view.route_decisions] == [
+        ("disagreement", "dispatch")
+    ]
+    with sqlite3.connect(config.state_path) as connection:
+        proof_roles = connection.execute(
+            """
+            SELECT proposal.role, COUNT(*)
+            FROM candidate_evidence_proofs AS proof
+            JOIN candidate_proposals AS proposal
+              ON proposal.source_attempt_id=proof.source_attempt_id
+            GROUP BY proposal.role ORDER BY proposal.role
+            """
+        ).fetchall()
+        assert proof_roles == [("specialist", 2), ("verifier", 1)]
 
 
 def test_repeated_wrong_unlimited_candidates_keep_routing_recovery_until_correct(
@@ -3298,11 +3364,7 @@ def test_restart_closes_jobs_left_open_by_process_loss(
         (2, 0, 0, "unsolved"),
         (2, 0, 1, "unsolved"),
     ]
-    expected_jobs.extend(
-        [(1, 1, 0, "unsolved")]
-        if candidate_checkpoint
-        else [(1, 1, 0, "unsolved"), (1, 1, 1, "unsolved")]
-    )
+    expected_jobs.extend([(1, 1, 0, "unsolved"), (1, 1, 1, "unsolved")])
     assert [
         (job.challenge_id, job.episode, job.lane, job.state) for job in recovered.jobs
     ] == expected_jobs
@@ -3312,24 +3374,25 @@ def test_restart_closes_jobs_left_open_by_process_loss(
         for document in runtime.documents
         if document["challenge"]["id"] == 1 and document["episode"] == 1
     ]
-    assert len(recovery_documents) == (1 if candidate_checkpoint else 2)
-    expected_role = "verifier" if candidate_checkpoint else "recovery"
-    assert all(document["agent_role"] == expected_role for document in recovery_documents)
-    if not candidate_checkpoint:
-        assert all(document["same_run_memory"] for document in recovery_documents)
-        primary_recovery = next(
-            document for document in recovery_documents if document["lane"] == 0
-        )
-        assert any(
-            record.get("summary") == "primary checkpoint survived"
-            for record in primary_recovery["same_run_memory"]
-        )
-        assert any(
-            record.get("kind") == "host_observation"
-            and record.get("tool") == "inspect_file"
-            and record.get("facts", {}).get("format") == "text"
-            for record in primary_recovery["same_run_memory"]
-        )
+    assert len(recovery_documents) == 2
+    assert all(document["agent_role"] == "recovery" for document in recovery_documents)
+    assert all(document["same_run_memory"] for document in recovery_documents)
+    primary_recovery = next(document for document in recovery_documents if document["lane"] == 0)
+    expected_checkpoint_summary = (
+        "primary checkpoint retained a qualified private candidate"
+        if candidate_checkpoint
+        else "primary checkpoint survived"
+    )
+    assert any(
+        record.get("summary") == expected_checkpoint_summary
+        for record in primary_recovery["same_run_memory"]
+    )
+    assert any(
+        record.get("kind") == "host_observation"
+        and record.get("tool") == "inspect_file"
+        and record.get("facts", {}).get("format") == "text"
+        for record in primary_recovery["same_run_memory"]
+    )
     engagement_order: list[tuple[int, int]] = []
     for document in runtime.documents:
         key = (int(document["challenge"]["id"]), int(document["episode"]))
