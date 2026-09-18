@@ -829,6 +829,28 @@ class Supervisor:
         self._stop_signal = signum
         self._stop_at = time.monotonic()
         self._stop_event.set()
+        # Fence restart before forwarding the signal or waiting for any process
+        # tree to drain. If power is lost during cleanup, the next supervisor
+        # resumes stop finalization instead of launching another worker.
+        try:
+            record = self._files.load()
+            if record is None or record.phase not in {"stopping", "terminal"}:
+                self._files.write(
+                    SupervisorRecord(
+                        _RECORD_VERSION,
+                        "stopping",
+                        None if record is None else record.run_id,
+                        0 if record is None else record.replacement_count,
+                        0.0,
+                        "operator_stop_pending",
+                        None,
+                        time.time(),
+                    )
+                )
+        except (OSError, SupervisorRefused) as exc:
+            # Finalization retries this independent fence after the process tree
+            # is gone and still has the Run database as a second durable path.
+            self.reporter({"status": "refused", "reason": str(exc)})
         self._forward_if_requested()
 
     def _install_signal_handlers(self) -> None:

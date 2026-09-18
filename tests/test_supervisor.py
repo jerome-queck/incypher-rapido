@@ -552,6 +552,40 @@ def test_combined_transient_stop_fence_failures_retry_sidecar_without_worker_spa
     assert _record(state_path)["disposition"] == "operator_stopped"
 
 
+def test_signal_persists_stop_fence_before_process_cleanup(tmp_path: Path) -> None:
+    state_path = _private_state(tmp_path)
+    marker = tmp_path / "started"
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.close()
+    _write_supervisor_record(
+        state_path,
+        phase="active",
+        run_id="same-run",
+        replacement_count=1,
+    )
+    interrupted = Supervisor(
+        state_path,
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+
+    interrupted._on_signal(signal.SIGTERM, None)
+
+    assert _record(state_path)["phase"] == "stopping"
+    restarted = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    assert restarted.run() == 0
+    assert not marker.exists()
+    assert _record(state_path)["disposition"] == "operator_stopped"
+
+
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
     state_path = _private_state(tmp_path)
     marker = tmp_path / "started"
