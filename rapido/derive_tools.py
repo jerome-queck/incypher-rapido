@@ -19,10 +19,10 @@ MAX_DERIVE_OUTPUT_BYTES = 1024 * 1024
 _PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
-def _error(code: str, message: str) -> Exception:
-    from .tools import ToolError
+def _error(code: str, message: str, **details: Any) -> Exception:
+    from .tools import _error as tool_error
 
-    return ToolError(code, message)
+    return tool_error(code, message, **details)
 
 
 def _integer(value: Any, name: str, low: int, high: int, default: int) -> int:

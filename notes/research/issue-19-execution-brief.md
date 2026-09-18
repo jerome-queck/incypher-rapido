@@ -1420,8 +1420,8 @@ state/control/orchestration/evidence passes and 3 skips. Ruff check/format and d
 Exact-head independent Daybreak/xhigh re-review is clean: 4,000 fresh concurrent constructors had
 zero failures; deterministic pauses before and after attempt migration exposed neither table nor
 trigger without the guard; a forced migration failure rolled back and released the writer lock.
-PR #59 passed all four CI jobs and squash-merged as `9bbc767`. Post-merge main CI and the 30-minute
-diagnostic remain pending.
+PR #59 passed all four CI jobs and squash-merged as `9bbc767`. Post-merge main CI passed all four
+jobs. The 30-minute result follows.
 
 ### Pre-registration: owner-amended 30-minute diagnostic
 
@@ -1452,3 +1452,67 @@ owned instances, and zero process/workspace leaks may remain. The current-run ac
 is zero and the cumulative accepted-solve target remains three because this already-solved practice
 account cannot grant credit from a generic `already_solved` response. Any HTTP-200 `correct` or
 same-run independent deterministic verification is reported separately if observed.
+
+### Owner-amended 30-minute diagnostic result
+
+Run `46e0533bca63498d8d3e6d38f45224cd` used the registered image and newly empty state/workspace.
+It ran unattended for 1,800.125 seconds and terminated at its deadline. Submissions, managed
+instances, and Board watch were enabled; no operator steering or model fallback occurred.
+
+The diagnostic missed its registered 15/15 fresh-analysis target: 10 catalogue challenges entered
+episode zero and five remained untouched. Forty-nine attempts made 2,117 tool calls and 89 native
+thread continuations. Daybreak/xhigh produced all 11 source-proved proposals; the proposals reduced
+to six private identities. Six immediate submissions received HTTP-200 `already_solved`; none
+received `correct`, and no same-run Verifier independently established an identity. The run therefore
+earns zero current-run and cumulative acceptance solves. The corrected `already_solved` path worked:
+all six identities stayed unverified and no peer was cancelled or challenge closed on account
+history alone.
+
+The controller admitted 91 jobs. Forty-nine started and closed; the deadline durably interrupted the
+remaining 42 without starting them. All started attempts received a typed same-run-memory projection.
+Nine episode-one Recovery projections carried 168 bounded records; Verifier projections remained
+independent. Eleven carry operations retained 183 files and 7.21 MB with canonical paths and no
+nested `carried/` trees. The no-progress watcher stopped seven repeated checkpoints. All 2,117 tool
+observations committed; agent-written scripts and confined shell/artifact/target tools executed.
+
+Only one dynamic challenge obtained the shared instance lease. Its receipt-bound instance reached
+active, was deleted, and was independently absent in two post-run reads. SQLite integrity and foreign
+keys were clean; submissions had no pending or unread effects. The supervisor ended `deadline`, the
+container exited zero without restart or OOM, and no process leaked. Across 174 monitor samples,
+resource peaks were 4.328 of 12 CPU cores, 2.14 GB cgroup memory, and 146 of 256 PIDs. Remote model
+work, not local CPU, memory, or PID capacity, remained the measured bottleneck. Owner-only mode-0600
+30-line candidate projection and complete run archive were preserved in Downloads before audit;
+their contents remain outside Git.
+
+### Diagnostic audit and final repair
+
+Independent Daybreak/xhigh lifecycle review found no P0-P3 defect. It confirmed the deadline,
+settled effects, removed instance, database integrity, resource accounting, and absence of process
+leaks. A separate Daybreak/xhigh solve-quality review found two actionable gaps:
+
+1. Dynamic local analysis could transition directly into its target episode while retaining a
+   challenge residency, bypassing the queue's initial-before-retry rank. Near the deadline, an
+   inadmissible untouched first pass could also be discarded before a shorter Verifier retry.
+2. `derive_artifact` and the isolated artifact worker constructed bare `ToolError` values, leaving
+   16 observed failures without the closed `failure_stage` and `constraint` fields.
+
+The selected repair keeps one small invariant: `unstarted_initial_challenges` clears when episode
+zero reaches durable execution, or when it terminally settles before solver start. Same-episode
+instance deferral retains initial status behind other untouched first passes and ahead of every
+retry. A dynamic follow-on re-enters the durable queue while that set is nonempty. An untouched
+first pass that cannot receive the meaningful admission floor closes admission instead of exposing
+shorter retries. Once initial coverage is complete, immediate
+local-to-target continuation and instance utilization remain unchanged. Both tool modules now use
+the canonical closed error constructor, preserving the fixed stage/constraint taxonomy without raw
+exception text.
+
+The exact dynamic-one/static-one reproduction was red before the repair: dynamic episode one began
+before the static episode zero. Exact-diff review then exposed concurrent workspace-preparation,
+pre-execution instance-failure, capacity-deferral starvation, and post-coverage-yield boundaries.
+The final code gates every noninitial start on durable initial disposition, gives capacity-deferred
+initial work a separate queue tier, and applies the productive-work predicate by episode. The
+concurrent dynamic/Verifier order, failed-create exit, capacity-deferred initial, post-coverage
+static retry, late-Verifier fence, error shapes, dynamic rotation, and static-yield cases are green.
+Focused verification is 218 passed; the full suite is 1,001 passed with four platform skips. Ruff
+lint/format and diff checks are clean. Final independent Daybreak/xhigh review found no P0-P3
+issue. PR CI, evidence merge, exact private-state cleanup, and issue close remain pending.

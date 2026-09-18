@@ -1744,6 +1744,46 @@ def test_already_solved_candidate_requires_fresh_verification_before_closing(
     ]
 
 
+def test_late_verifier_cannot_bypass_inadmissible_initial_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.5)
+    monkeypatch.setattr(orchestrator_module, "_LATE_STATIC_VERIFIER_WORK_SECONDS", 0.05)
+    monkeypatch.setattr(orchestrator_module, "_RUN_CLEANUP_RESERVE_SECONDS", 0.01)
+    candidate = "INCYPHER{coverage_before_verification_retry}"
+
+    class SlowInitialCandidate(CandidateVerifierRuntime):
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            if document["control_route"]["role"] == "specialist":
+                await asyncio.sleep(0.55)
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = SlowInitialCandidate(candidate, candidate)
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        attempts_per_challenge=2,
+        concurrency=2,
+        episodes_per_challenge=2,
+        run_seconds=0.8,
+        submit_candidates=True,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=AlreadySolvedBoundaryBoard([_challenge(1), _challenge(2)]),
+            runtime=runtime,
+        )
+    )
+
+    assert report.status == "deadline"
+    assert {
+        (document["challenge"]["id"], document["episode"]) for document, _ in runtime.prompts
+    } == {(1, 0)}
+
+
 def test_already_solved_verifier_mismatch_dispatches_recovery(tmp_path: Path) -> None:
     candidate = "INCYPHER{fresh_candidate_for_solved_board_item}"
     mismatch = "INCYPHER{independent_mismatch_for_solved_board_item}"
@@ -1820,6 +1860,76 @@ def test_dynamic_challenges_analyze_locally_then_share_one_leased_instance(
         for phase, model, continued in runtime.continuations
         if phase == "shared_instance" and model == "gpt-daybreak-blue-latest"
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_role"), (("dynamic", "recovery"), ("verifier", "verifier"))
+)
+def test_retry_waits_for_concurrent_initial_workspace_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_role: str,
+) -> None:
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    prepare = orchestrator_module.Orchestrator._prepare_workspaces
+
+    async def gated_prepare(self, *args, **kwargs):
+        challenge = args[2]
+        episode = args[3]
+        if challenge.id == 2 and episode == 0:
+            blocked.set()
+            await release.wait()
+        return await prepare(self, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module.Orchestrator, "_prepare_workspaces", gated_prepare)
+    candidate = "INCYPHER{concurrent_initial_start_fence}"
+    if mode == "dynamic":
+        challenges = [_challenge(1, challenge_type="dynamic_iac"), _challenge(2)]
+        board = ManagedInstanceBoundaryBoard(challenges)
+        runtime = DynamicPhaseRuntime()
+    else:
+        challenges = [_challenge(1), _challenge(2)]
+        board = AlreadySolvedBoundaryBoard(challenges)
+        runtime = CandidateVerifierRuntime(candidate, candidate)
+    config = replace(
+        _config(tmp_path),
+        active_challenges=2,
+        attempts_per_challenge=2,
+        concurrency=4,
+        episodes_per_challenge=2,
+        manage_dynamic_instances=mode == "dynamic",
+        submit_candidates=mode == "verifier",
+    )
+
+    async def exercise():
+        task = asyncio.create_task(DurableJobControl.drive(config, board=board, runtime=runtime))
+        try:
+            await asyncio.wait_for(blocked.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+        finally:
+            release.set()
+        return await asyncio.wait_for(task, timeout=2)
+
+    report = asyncio.run(exercise())
+    view = DurableJobControl.inspect(config.state_path, run_id=report.run_id)
+    initial_starts = [
+        job.started_sequence
+        for job in view.jobs
+        if job.phase == "initial" and job.started_sequence is not None
+    ]
+    retry_starts = [
+        job.started_sequence
+        for job in view.jobs
+        if job.phase != "initial" and job.started_sequence is not None
+    ]
+
+    assert report.status == "completed"
+    assert {job.role for job in view.jobs if job.phase != "initial"} == {expected_role}
+    assert len(initial_starts) == 4
+    assert retry_starts
+    assert max(initial_starts) < min(retry_starts)
 
 
 def test_dynamic_waiters_stay_in_five_residencies_and_rotate_the_instance(tmp_path: Path) -> None:
@@ -2132,6 +2242,111 @@ def test_dynamic_create_failure_is_not_retried_unchanged(
 
     assert report.status == "completed"
     assert [call for call in board.instance_calls if call[0] == "POST"] == [("POST", 1)]
+    assert board.active == set()
+
+
+def test_initial_instance_failure_cannot_self_deadlock_coverage(tmp_path: Path) -> None:
+    challenge = _challenge(1, challenge_type="dynamic_iac")
+    board = FailedCreateBoundaryBoard([challenge], invalid_connection=False)
+    config = replace(
+        _config(tmp_path),
+        active_challenges=1,
+        attempts_per_challenge=2,
+        concurrency=2,
+        episodes_per_challenge=2,
+        manage_dynamic_instances=True,
+        run_seconds=1,
+    )
+    state = StateStore(config.state_path)
+    try:
+        report = asyncio.run(
+            orchestrator_module.Orchestrator(config, board, state, DynamicPhaseRuntime()).run()
+        )
+    finally:
+        state.close()
+
+    assert report.status == "completed"
+    assert board.active == set()
+
+
+def test_deferred_initial_instance_yields_to_queued_static_coverage(tmp_path: Path) -> None:
+    challenges = [
+        _challenge(1, challenge_type="dynamic_iac"),
+        _challenge(2, challenge_type="dynamic_iac"),
+        _challenge(3),
+    ]
+    board = ManagedInstanceBoundaryBoard(challenges)
+    runtime = DynamicPhaseRuntime()
+    config = replace(
+        _config(tmp_path),
+        active_challenges=2,
+        attempts_per_challenge=2,
+        concurrency=4,
+        episodes_per_challenge=1,
+        manage_dynamic_instances=True,
+        run_seconds=1,
+    )
+    state = StateStore(config.state_path)
+    try:
+        report = asyncio.run(orchestrator_module.Orchestrator(config, board, state, runtime).run())
+    finally:
+        state.close()
+
+    assert report.status == "completed"
+    assert any(document["challenge"]["id"] == 3 for document, _ in runtime.prompts)
+    assert board.peak_active == 1
+    assert board.active == set()
+
+
+def test_post_coverage_instance_waiter_yields_to_static_retry(tmp_path: Path) -> None:
+    challenges = [
+        _challenge(1, challenge_type="dynamic_iac"),
+        _challenge(2, challenge_type="dynamic_iac"),
+        _challenge(3),
+    ]
+    board = ManagedInstanceBoundaryBoard(challenges)
+
+    class HeldInstanceRuntime(DynamicPhaseRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.holder_started = asyncio.Event()
+            self.release_holder = asyncio.Event()
+            self.static_retry_started = asyncio.Event()
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            document = json.loads(prompt)
+            challenge_id = document["challenge"]["id"]
+            if challenge_id == 1 and document["execution_phase"] == "shared_instance":
+                self.holder_started.set()
+                await self.release_holder.wait()
+            elif challenge_id == 3 and document["episode"] == 1:
+                self.static_retry_started.set()
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = HeldInstanceRuntime()
+    config = replace(
+        _config(tmp_path),
+        active_challenges=2,
+        attempts_per_challenge=2,
+        concurrency=4,
+        episodes_per_challenge=2,
+        manage_dynamic_instances=True,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(DurableJobControl.drive(config, board=board, runtime=runtime))
+        try:
+            await asyncio.wait_for(runtime.holder_started.wait(), timeout=1)
+            await asyncio.wait_for(runtime.static_retry_started.wait(), timeout=1)
+        finally:
+            runtime.release_holder.set()
+            report = await asyncio.wait_for(task, timeout=2)
+        return report
+
+    report = asyncio.run(exercise())
+
+    assert report.status == "completed"
+    assert board.peak_active == 1
     assert board.active == set()
 
 

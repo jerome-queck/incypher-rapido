@@ -3001,6 +3001,7 @@ class Orchestrator:
         episode: int = 0,
         route: RouteSpec | None = None,
         lane_count: int | None = None,
+        on_wave_started: Callable[[], None] | None = None,
     ) -> str:
         self.state.set_challenge_status(challenge.id, "running")
         verifier_route = route is not None and route.role == "verifier"
@@ -3061,6 +3062,8 @@ class Orchestrator:
             if lane_count is not None and started_lanes != lane_count:
                 raise RuntimeError("control wave lane count changed before execution")
             lane_count = started_lanes
+        if on_wave_started is not None:
+            on_wave_started()
         remaining = max(0.0, work_deadline - time.monotonic())
         if (
             verifier_route
@@ -3326,6 +3329,8 @@ class Orchestrator:
             asyncio.PriorityQueue()
         )
         queued_routes: dict[int, tuple[Challenge, RouteSpec]] = {}
+        unstarted_initial_challenges: set[int] = set()
+        initial_coverage_started = asyncio.Event()
         active: set[int] = set()
         peak_active = 0
         admitted_episodes = 0
@@ -3378,12 +3383,26 @@ class Orchestrator:
             route: RouteSpec,
             *,
             initial: bool,
+            deferred_initial: bool = False,
         ) -> None:
             nonlocal queue_sequence
-            priority = catalogue_ranks[challenge.id] if initial else 2**30 + queue_sequence
+            if deferred_initial:
+                if not initial:
+                    raise ValueError("only initial work can use deferred-initial priority")
+                priority = 2**29 + queue_sequence
+            else:
+                priority = catalogue_ranks[challenge.id] if initial else 2**30 + queue_sequence
             queue_sequence += 1
             queued_routes[challenge.id] = (challenge, route)
+            if initial:
+                unstarted_initial_challenges.add(challenge.id)
+                initial_coverage_started.clear()
             queue.put_nowait((priority, challenge, queued_at, episode, route))
+
+        def settle_initial_start(challenge_id: int) -> None:
+            unstarted_initial_challenges.discard(challenge_id)
+            if not unstarted_initial_challenges:
+                initial_coverage_started.set()
 
         def route_needs_instance(challenge: Challenge, route: RouteSpec) -> bool:
             return challenge.type == "dynamic_iac" and (
@@ -3392,9 +3411,10 @@ class Orchestrator:
                 or route.role == "verifier"
             )
 
-        def productive_work_is_queued() -> bool:
+        def productive_work_is_queued(*, initial_waiter: bool) -> bool:
             return any(
                 not route_needs_instance(challenge, route)
+                and (not initial_waiter or challenge.id in unstarted_initial_challenges)
                 for challenge, route in queued_routes.values()
             )
 
@@ -3595,8 +3615,13 @@ class Orchestrator:
                     episode=episode,
                     route=route if self._adaptive_control else None,
                     lane_count=lane_count,
+                    on_wave_started=(lambda: settle_initial_start(challenge.id))
+                    if episode == 0
+                    else None,
                 )
             finally:
+                if episode == 0:
+                    settle_initial_start(challenge.id)
                 challenge_root = run_root / f"challenge-{challenge.id}"
                 if route.role != "verifier":
                     carried_files, carried_bytes, carry_telemetry = await asyncio.to_thread(
@@ -3697,7 +3722,9 @@ class Orchestrator:
                                     },
                                 )
                                 raise AdmissionDeferred
-                            if not capacity and productive_work_is_queued():
+                            if not capacity and productive_work_is_queued(
+                                initial_waiter=episode == 0
+                            ):
                                 self.state.event(
                                     run_id,
                                     "instance_lease_deferred",
@@ -3880,7 +3907,14 @@ class Orchestrator:
                                 raise AdmissionDeferred
                         except InstanceDeferred:
                             queued_at = record_queued(challenge, episode, "instance_capacity_yield")
-                            enqueue(challenge, queued_at, episode, route, initial=False)
+                            enqueue(
+                                challenge,
+                                queued_at,
+                                episode,
+                                route,
+                                initial=episode == 0,
+                                deferred_initial=episode == 0,
+                            )
                             requeued = True
                             break
                         except BoardError:
@@ -3973,6 +4007,10 @@ class Orchestrator:
                                 "state": "waiting_for_instance",
                             },
                         )
+                        if unstarted_initial_challenges:
+                            enqueue(challenge, queued_at, episode, route, initial=False)
+                            requeued = True
+                            break
                         continue
                     if self._adaptive_control:
                         continued_budget = adaptive_attempt_seconds(
@@ -4043,6 +4081,8 @@ class Orchestrator:
                     outcome = terminal
                     break
             finally:
+                if initial_episode == 0 and not (requeued and episode == 0):
+                    settle_initial_start(challenge.id)
                 clean = True
                 try:
                     clean = await release_instance()
@@ -4085,7 +4125,13 @@ class Orchestrator:
                 if admission_closed.is_set():
                     await shutdown_only.wait()
                 item = await queue.get()
-                _, challenge, queued_at, episode, route = item
+                priority, challenge, queued_at, episode, route = item
+                initial = priority < 2**30
+                if challenge is not None and not initial and unstarted_initial_challenges:
+                    queue.put_nowait(item)
+                    queue.task_done()
+                    await initial_coverage_started.wait()
+                    continue
                 if challenge is not None:
                     queued_routes.pop(challenge.id, None)
                 if (
@@ -4094,7 +4140,9 @@ class Orchestrator:
                     and deadline - time.monotonic() < threshold
                 ):
                     queue.task_done()
-                    if queue.empty():
+                    if initial:
+                        close_admission("initial_coverage_below_meaningful_attempt_budget")
+                    elif queue.empty():
                         close_admission("below_meaningful_attempt_budget")
                     if admission_closed.is_set():
                         await shutdown_only.wait()

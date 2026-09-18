@@ -255,6 +255,8 @@ def test_public_entry_rejects_arbitrary_operations_and_non_files(tmp_path):
     finally:
         os.close(descriptor)
     assert operation.value.code == "invalid_argument"
+    assert operation.value.details["failure_stage"] == "arguments"
+    assert operation.value.details["constraint"] == "invalid_argument"
     read_descriptor, write_descriptor = os.pipe()
     try:
         with pytest.raises(ToolError) as non_file:
@@ -269,6 +271,8 @@ def test_public_entry_rejects_arbitrary_operations_and_non_files(tmp_path):
         os.close(read_descriptor)
         os.close(write_descriptor)
     assert non_file.value.code == "not_a_file"
+    assert non_file.value.details["failure_stage"] == "execution"
+    assert non_file.value.details["constraint"] == "not_a_file"
 
 
 def test_public_protocol_never_sends_workspace_path(tmp_path, monkeypatch):
