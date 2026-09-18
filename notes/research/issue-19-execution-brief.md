@@ -1187,6 +1187,13 @@ requires later owner authorization and a fresh unattended 19,800-second acceptan
 | Selective analysis-carry tests | `gpt-5.6-luna` / `xhigh` | four focused tests cover safe carry, unsafe/link rejection, Verifier isolation, and latest-generation replacement |
 | Post-diagnostic scheduler audit | `gpt-daybreak-blue-latest` / `xhigh` | watcher starvation, FIFO ticket loss, stale waiter projection, late admission, and historical-effect scope found and repaired locally |
 | First exact two-hour diagnostic failure audits | two independent `gpt-daybreak-blue-latest` / `xhigh` lanes | writer/reader asymmetry for failed target-tool evidence confirmed against the immutable live database; no corruption, fallback, pending effect, or retained instance |
+| External supervisor implementation and review | `gpt-daybreak-blue-latest` / `xhigh` | same-Run recovery, Board reconciliation, PID-1 descendant cleanup, pre-Run fail-closed behavior, and monitor projection merged in PR #55; clean independent review, no fallback |
+| Board-literal provenance repair | `gpt-daybreak-blue-latest` / `xhigh` | one exact authenticated-description candidate under unlimited attempts; Board-origin success excluded from fresh verification and analysis coverage, no fallback |
+| Rejected-candidate carry containment | `gpt-daybreak-blue-latest` / `xhigh` | current-context settled-wrong bytes and strict eight-hex encodings excluded privately from recursive files/paths, no fallback |
+| Exact merged-image preflight | no inference | 15/15 authenticated catalogue, `writes=0`, temporary container/state removed |
+| Replacement two-hour diagnostic live roster | `gpt-daybreak-blue-latest` / `xhigh`; `gpt-5.6-luna` / `max` and `xhigh` | 73 Daybreak and 71 Luna attempts on the registered mixed roster; no model fallback |
+| Replacement diagnostic lifecycle/result audit | `gpt-daybreak-blue-latest` / `xhigh` | exact stopped state, database, candidates, instances, resources, and private exports audited; no new verified solve, no fallback |
+| Main-CI failure diagnosis and test review | `gpt-daybreak-blue-latest` / `xhigh` | two real-time test races isolated; production change rejected, event-synchronized test-only repair reviewed independently; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1225,15 +1232,88 @@ candidate, or immutability checks. Regression coverage round-trips every target 
 commit, reopen, and carry. A replacement diagnostic requires a new exact image, new protocol
 registration, and newly empty state/workspace.
 
+### Crash recovery and false-positive containment
+
+PR #55 (`461a205`) adds the smallest complete external recovery boundary: one PID-1 supervisor
+owns a disposable solver worker, one private state lock, and one sanitized sidecar record. An
+unexpected worker exit can replace only the same durable `running` Run after 5/30/120-second
+backoffs. The replacement keeps the original deadline and first reconciles Board state, unread
+submissions, instance receipts, and controller jobs. Terminal, ambiguous, non-pristine, or
+operator-stopped state stays quiescent instead of starting new work. Linux subreaper handling
+signals the process group plus recursively discovered descendants and continuously reaps adopted
+children while the worker lives; this prevents detached helpers or zombies from leaking across a
+5.5-hour run.
+
+Two narrow false-positive controls accompany recovery. Recursive carry now excludes any file or
+relative path containing a settled wrong candidate from the current Run, challenge, and material
+generation. Exact eight-hex candidates additionally exclude only their inner case variants and
+four-byte endian encodings; arbitrary substrings are not mined. Separately, an unsolved
+unlimited-attempt challenge may try one exact unique non-placeholder flag literal authored in a
+freshly refreshed authenticated Board description. It submits once through the normal durable
+reservation. Wrong retires the identity and analysis continues. Correct stops wasted work but is
+recorded as Board-origin score evidence with `run_local_verified=false`; it does not start an
+analysis job or satisfy fresh-derivation acceptance.
+
+Verification was 951 passed / 4 skipped locally, 4/4 isolated Linux reaper regressions, green
+Python 3.11/3.12 and amd64/arm64 CI, and a clean independent Daybreak/xhigh review with no P0-P3
+findings. Exact merged image `rapido:issue19-recovery-461a205` has local image ID
+`sha256:ff512ce2ddf761dde8d4d6ef9cf98aa9fd79d96be9be5231bb8c1f1c5698a090`. Its authenticated
+preflight read all 15 challenges with `writes=0`; its temporary container and state volume were
+deleted immediately afterward.
+
+### Replacement two-hour diagnostic result
+
+Run `82c928aff37148ea87e569f7c05c257d` used newly empty state on exact image
+`sha256:675da3227355458b89552e8b967afffc821a14ef9b1b0418be32de7fc6f12835`. It ran unattended
+from 00:11:49Z to 02:11:49Z on 2026-09-18 with submissions, instances, and Board watch enabled.
+The five challenge slots admitted the registered focus order, refilled solved slots, and reached
+all 15 challenges after 24 minutes 50 seconds. All work became quiescent after 78 minutes while
+the watcher remained alive until the exact 7,200-second deadline.
+
+The run completed 144 attempts and 5,035 model tool calls: 73 Daybreak/xhigh, 36 Luna/max, and 35
+Luna/xhigh. It retained 25 source-proved proposals representing 16 distinct candidate values over
+all 15 challenges. The Board returned 15 `already_solved` verdicts and one `incorrect` verdict;
+there was no HTTP-200 `correct` verdict and no independent deterministic candidate verification.
+Therefore this run contributes zero acceptance solves. In particular, a generic `already_solved`
+response does not validate the submitted candidate. The candidates were exported privately for a
+separate verification test; candidate bytes and raw logs remain outside Git.
+
+Lifecycle checks found SQLite integrity `ok`, zero foreign-key violations, 144/144 sealed
+attempts, all 16 submission intents settled, all nine owned instances `removed`, and no live
+container process. Sampled resource peaks were 4.311 CPU cores, 979,427,328 bytes RSS,
+1,112,322,048 bytes cgroup memory, and 140 PIDs, with no CPU, memory, or PID limit event. The
+12-CPU, 24-GiB, 256-PID envelope was not the measured bottleneck; model conversion and candidate
+verification were.
+
+The exact private archive contains 478 files and excludes authentication. Its SHA-256 is
+`750fa77413dae3b2a725952a6f36e4ed8e7368e2386a4b6b016bc75c3cc42166`. The private structured
+candidate export SHA-256 is `1ad7b9647c3a1128548fb44d8a1b7aad8be0cb7a6346d75fc1b6c90c0fa0c0e3`; the requested
+30-line challenge/flag projection SHA-256 is
+`a82bd3b109222578a628b46823ed3365efc4c4d0731e0ff8a23010456c12a157`. These files are owner-only
+evidence, not sanitized repository artifacts.
+
+### Main-CI failure diagnosis
+
+Two consecutive main pushes failed different Python jobs while the other Python version and both
+container jobs passed. Run 35277255396 let a 0.25-second wall-clock deadline expire before the
+second persistent episode on Python 3.12. Run 35296979507 let a 0.3-second deadline race the active
+watch recovery on Python 3.11, so the run completed before the test's expected deadline. The
+opposite-version passes and repeated local passes identify test timing races, not production
+scheduler regressions.
+
+The repair changes tests only. The persistent-scheduler test now waits until episode three enters,
+then deliberately cancels and checks the durable interrupted state. The watch-recovery test holds
+one solve across a coordinated outage, observes the recorded recovery, and proves one solve entry
+with zero cancellations. Independent short timeouts bound test failure without deciding test
+success. The final tree passed the pair 20/20, Ruff check/format, and 951 tests with four platform
+skips.
+
 ## Open decisions
 
-- Merge and exact-image verify the failed-target evidence symmetry repair. Preserve sanitized
-  failure evidence, then delete only the failed diagnostic's exact container/state/workspace while
-  retaining its private archive and authentication.
-- Pre-register and run a replacement fresh two-hour diagnostic: all 15, focus 15/94/42,
-  submissions/instances/watch enabled, no steering, exact merged image, durable monitor JSONL.
-- Audit solve conversion, park/wake order, context on requeue, productive time, CPU/RSS/PIDs,
-  effects, instances, and residue. Merge sanitized evidence and delete that exact diagnostic state
-  while preserving authentication.
+- Merge this sanitized diagnostic evidence and the deterministic main-CI regression repair. Then
+  delete only the replacement diagnostic's exact container and state volume; preserve
+  authentication and the owner-only private exports.
+- Independently verify the 15 exported candidates. Do not infer candidate validity from the
+  account-wide solved state or from a generic `already_solved` response.
 - The two-hour diagnostic does not replace the unchanged 19,800-second issue #19 acceptance. Await
   owner direction after reporting it; close #19 only after the final contract passes.
