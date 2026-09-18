@@ -267,7 +267,7 @@ class DurableJobControl:
             )
             pending_submission_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM submission_intents WHERE status='pending'"
+                    "SELECT COUNT(*) FROM submission_intents WHERE status IN ('pending', 'unread')"
                 ).fetchone()[0]
             )
             owned_instance_count = int(
@@ -415,7 +415,7 @@ class DurableJobControl:
             )
             pending_submission_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM submission_intents WHERE status='pending'"
+                    "SELECT COUNT(*) FROM submission_intents WHERE status IN ('pending', 'unread')"
                 ).fetchone()[0]
             )
             pending_candidate_count, verified_candidate_count = _current_candidate_counts(

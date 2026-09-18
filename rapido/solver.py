@@ -728,7 +728,7 @@ def build_primary_continuation_prompt(
 def admitted_candidate(
     findings: list[SolverFinding], challenge_description: str, *, agreement: int = 2
 ) -> str | None:
-    """Return a candidate only after independent exact agreement and decoy checks."""
+    """Return a candidate from lane-validated findings after independent exact agreement."""
     if agreement < 2:
         raise ValueError("candidate agreement must require at least two lanes")
     groups: dict[str, list[SolverFinding]] = {}
@@ -736,7 +736,11 @@ def admitted_candidate(
         if finding.status != "candidate" or finding.candidate is None:
             continue
         candidate = finding.candidate
-        if not candidate_is_eligible(candidate, challenge_description):
+        if not candidate_is_eligible(
+            candidate,
+            challenge_description,
+            source_observed=True,
+        ):
             continue
         groups.setdefault(candidate, []).append(finding)
     eligible = [
@@ -754,12 +758,22 @@ def admitted_candidate(
     return eligible[0][0]
 
 
-def candidate_is_eligible(candidate: str, challenge_description: str) -> bool:
-    """Reject unsupported shapes, placeholders, and values copied from challenge prose."""
+def candidate_is_eligible(
+    candidate: str,
+    challenge_description: str,
+    *,
+    source_observed: bool = False,
+    source_supplied: bool = False,
+) -> bool:
+    """Reject unsafe candidates; prose equality needs independent source observation."""
+    if type(source_observed) is not bool or type(source_supplied) is not bool:
+        return False
     if not isinstance(candidate, str) or FLAG_RE.fullmatch(candidate) is None:
         return False
     inner = candidate.partition("{")[2].removesuffix("}")
-    return candidate not in challenge_description and not _is_placeholder(inner)
+    if _is_placeholder(inner) or source_supplied:
+        return False
+    return candidate not in challenge_description or source_observed
 
 
 def challenge_candidate_prose(challenge: Challenge) -> str:

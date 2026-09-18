@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import rapido.state as state_module
 from rapido.evidence import EvidenceBatch, HostObservation, RunEvidence
 from rapido.routing import baseline_route
 from rapido.state import MAX_EVENT_BYTES, StateStore
@@ -32,6 +33,35 @@ def _attest_candidate(evidence: RunEvidence, attempt_id: str, candidate: str) ->
         ),
     )
     assert evidence.attest_candidate(attempt_id, candidate_sha256=fingerprint) is not None
+
+
+def _retain_private_wave_candidates(
+    store: StateStore,
+    run_id: str,
+    challenge_id: int,
+    episode: int,
+    candidates: tuple[str, ...],
+    *,
+    attempt_prefix: str,
+) -> None:
+    store.start_control_wave(run_id, challenge_id, episode)
+    for lane, candidate in enumerate(candidates):
+        attempt_id = f"{attempt_prefix}-{lane}"
+        store.start_attempt(
+            attempt_id,
+            run_id,
+            challenge_id,
+            episode,
+            lane,
+            "gpt-daybreak-blue-latest",
+            "xhigh",
+        )
+        store.finish_attempt(
+            attempt_id,
+            "candidate",
+            candidate=candidate,
+            retain_private_candidate=True,
+        )
 
 
 def test_state_database_and_journal_are_private(tmp_path: Path) -> None:
@@ -898,6 +928,161 @@ def test_empty_manifest_candidate_cannot_be_verified(tmp_path: Path) -> None:
     store.close()
 
 
+def test_private_incorrect_candidates_are_exactly_scoped_and_settled(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    main_candidates = (
+        "INCYPHER{wrong_b}",
+        "INCYPHER{wrong_a}",
+        "INCYPHER{pending}",
+        "INCYPHER{unread}",
+        "INCYPHER{correct}",
+        "INCYPHER{already_solved}",
+    )
+    assignments = tuple(("specialist", route.model, route.effort) for _ in main_candidates)
+    store.start_run("main-run", {})
+    store.start_run("other-run", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.upsert_challenge(2, "B", "crypto", "standard", 100)
+    store.initialize_control_catalogue(
+        "main-run",
+        [(0, 1, True), (1, 2, True)],
+        len(main_candidates),
+        route,
+        assignments,
+        {1: "a" * 64, 2: "b" * 64},
+    )
+    _retain_private_wave_candidates(store, "main-run", 1, 0, main_candidates, attempt_prefix="main")
+    other_challenge = "INCYPHER{other_challenge}"
+    _retain_private_wave_candidates(
+        store, "main-run", 2, 0, (other_challenge,), attempt_prefix="challenge-2"
+    )
+    store.initialize_control_catalogue(
+        "other-run",
+        [(0, 1, True)],
+        1,
+        route,
+        (("specialist", route.model, route.effort),),
+        {1: "a" * 64},
+    )
+    other_run = "INCYPHER{other_run}"
+    _retain_private_wave_candidates(
+        store, "other-run", 1, 0, (other_run,), attempt_prefix="other-run"
+    )
+
+    for candidate in main_candidates[:2]:
+        store.record_submission("main-run", 1, candidate, "incorrect", 200)
+    store.record_submission("main-run", 1, main_candidates[4], "correct", 200)
+    store.record_submission("main-run", 1, main_candidates[5], "already_solved", 200)
+    unretained = "INCYPHER{unretained_wrong}"
+    store.record_submission("main-run", 1, unretained, "incorrect", 200)
+    store.record_submission("main-run", 2, other_challenge, "incorrect", 200)
+    store.record_submission("other-run", 1, other_run, "incorrect", 200)
+
+    events_before = store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    expected = tuple(
+        candidate.encode()
+        for candidate in sorted(
+            main_candidates[:2], key=lambda value: hashlib.sha256(value.encode()).digest()
+        )
+    )
+    assert store.reserve_submission("main-run", 1, main_candidates[2])
+    assert store.private_incorrect_candidate_bytes("main-run", 1) == expected
+    store.finalize_submission("main-run", 1, main_candidates[2], "unread", 200)
+    assert store.private_incorrect_candidate_bytes("main-run", 1) == expected
+    assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == events_before
+    event_payloads = "".join(
+        str(row[0])
+        for row in store._connection.execute(
+            "SELECT data_json FROM events UNION ALL SELECT data_json FROM control_events"
+        ).fetchall()
+    )
+    assert all(candidate not in event_payloads for candidate in (*main_candidates, unretained))
+    store.close()
+
+
+def test_private_incorrect_candidates_exclude_stale_material(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "material-run"
+    old_candidate = "INCYPHER{old_material_wrong}"
+    current_candidate = "INCYPHER{current_material_wrong}"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    assignment = ("specialist", route.model, route.effort)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.initialize_control_catalogue(
+        run_id, [(0, 1, True)], 1, route, (assignment,), {1: "a" * 64}
+    )
+    _retain_private_wave_candidates(store, run_id, 1, 0, (old_candidate,), attempt_prefix="old")
+    store.record_submission(run_id, 1, old_candidate, "incorrect", 200)
+    store.finish_control_wave(run_id, 1, 0, "unsolved")
+    kind, episode, _ = store.admit_control_catalogue_revision(
+        run_id=run_id,
+        challenge_id=1,
+        name="A",
+        category="crypto",
+        challenge_type="standard",
+        value=100,
+        executable=True,
+        context_sha256="b" * 64,
+        new_catalogue_rank=1,
+        lanes=2,
+        route=route,
+        assignments=(assignment, assignment),
+    )
+    assert (kind, episode) == ("refreshed", 1)
+    _retain_private_wave_candidates(
+        store,
+        run_id,
+        1,
+        1,
+        (old_candidate, current_candidate),
+        attempt_prefix="current",
+    )
+    store.record_submission(run_id, 1, current_candidate, "incorrect", 200)
+
+    assert store.private_incorrect_candidate_bytes(run_id, 1) == (current_candidate.encode(),)
+    store.close()
+
+
+def test_private_incorrect_candidates_have_deterministic_count_and_byte_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "bounded-run"
+    candidates = tuple(f"INCYPHER{{bounded_{index}}}" for index in range(3))
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    assignments = tuple(("specialist", route.model, route.effort) for _ in candidates)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.initialize_control_catalogue(
+        run_id, [(0, 1, True)], len(candidates), route, assignments, {1: "a" * 64}
+    )
+    _retain_private_wave_candidates(store, run_id, 1, 0, candidates, attempt_prefix="bounded")
+    for candidate in candidates:
+        store.record_submission(run_id, 1, candidate, "incorrect", 200)
+    ordered = tuple(
+        candidate.encode()
+        for candidate in sorted(
+            candidates, key=lambda value: hashlib.sha256(value.encode()).digest()
+        )
+    )
+
+    monkeypatch.setattr(state_module, "MAX_PRIVATE_INCORRECT_CANDIDATES", 2)
+    monkeypatch.setattr(state_module, "MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES", 64 * 1024)
+    assert store.private_incorrect_candidate_bytes(run_id, 1) == ordered[:2]
+    monkeypatch.setattr(state_module, "MAX_PRIVATE_INCORRECT_CANDIDATES", 64)
+    monkeypatch.setattr(
+        state_module,
+        "MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES",
+        len(ordered[0]) + len(ordered[1]) - 1,
+    )
+    assert store.private_incorrect_candidate_bytes(run_id, 1) == ordered[:1]
+    store.close()
+
+
 def test_event_sequence_is_monotonic(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     store.start_run("run-1", {})
@@ -961,6 +1146,51 @@ def test_explicit_reconciliation_can_settle_or_release_ambiguous_effect(
     store.reconcile_submission_intent(1, fingerprint, "correct")
     assert store.submission_risk_count() == 0
     assert not store.reserve_submission("run-1", 1, candidate)
+    store.close()
+
+
+def test_unread_submission_blocks_recovery_until_explicit_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    config = {"run_seconds": 19_800}
+    store.start_run("run-1", config)
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("run-1", [(0, 1, True)])
+    route = baseline_route(model="model", effort="xhigh", attempt_seconds=800)
+    store.admit_control_wave(
+        "run-1",
+        1,
+        0,
+        0,
+        2,
+        route,
+        (("lead", "model", "xhigh"), ("specialist", "model", "xhigh")),
+    )
+    candidate = "INCYPHER{unread_board_effect}"
+    fingerprint = store._candidate_fingerprint(candidate)
+    assert store.reserve_submission("run-1", 1, candidate)
+    store.finalize_submission("run-1", 1, candidate, "unread", 200)
+    assert len(store.queued_control_waves("run-1")) == 1
+    assert store.queued_control_waves("run-1", exclude_pending_submissions=True) == ()
+    store.start_control_wave("run-1", 1, 0)
+    store.acquire_supervisor()
+
+    session = store.start_or_resume_run("unused", config)
+    unresolved = store.pending_submission_intents()
+    assert session.resumed
+    assert unresolved[0]["candidate_sha256"] == fingerprint
+    assert unresolved[0]["status"] == "unread"
+    assert store.resume_control_waves("run-1", 10_000) == 0
+    assert store.queued_control_waves("run-1") == ()
+    assert not store.reserve_submission("run-1", 1, "INCYPHER{different_candidate}")
+    with pytest.raises(ValueError, match="absent, settled, or owned"):
+        store.finalize_submission("run-1", 1, candidate, "correct", 200)
+
+    store.reconcile_submission_intent(1, fingerprint, "not_delivered")
+    assert store.pending_submission_intents() == []
+    assert store.resume_control_waves("run-1", 10_000) == 1
+    assert store.queued_control_waves("run-1")[0].route.role == "recovery"
     store.close()
 
 

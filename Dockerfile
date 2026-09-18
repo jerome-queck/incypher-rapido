@@ -164,4 +164,5 @@ ENV PATH="/opt/venv/bin:/opt/angr/bin:/opt/java/openjdk/bin:/opt/ghidra/support:
 VOLUME ["/state", "/auth/codex"]
 USER 10001:10001
 STOPSIGNAL SIGTERM
+# Rapido is PID 1: it adopts/reaps descendants and quiesces after terminal/refused runs.
 ENTRYPOINT ["rapido", "run"]
