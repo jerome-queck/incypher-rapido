@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import rapido.orchestrator as orchestrator_module
 from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.evidence import EvidenceError, EvidenceLimits, HostObservation, RunEvidence
@@ -374,6 +376,21 @@ class AlwaysFailingIdentityBoard(FakeBoard):
         raise self.error
 
 
+class RecoveringWatchBoard(FakeBoard):
+    timeout = 0.001
+
+    def __init__(self, challenges: list[Challenge], failed_reads: set[int]) -> None:
+        super().__init__(challenges)
+        self.failed_reads = failed_reads
+        self.list_calls = 0
+
+    def list_challenges(self):
+        self.list_calls += 1
+        if self.list_calls in self.failed_reads:
+            raise BoardTransportError("Board transport failed")
+        return super().list_challenges()
+
+
 class FlakyCreateTransportBoard(FakeBoard):
     timeout = 0.01
 
@@ -511,6 +528,121 @@ def test_every_lane_receives_source_bound_challenge_context(tmp_path: Path) -> N
         "type": "standard",
         "value": 100,
     }
+    store.close()
+
+
+def test_incorrect_candidate_carry_tokens_only_expand_exact_crc32_forms() -> None:
+    raw = b"Ab12cD34"
+    flagged = b"INCYPHER{0123aBcD}"
+    embedded = b"INCYPHER{prefix_cafebabe_suffix}"
+
+    tokens = orchestrator_module._incorrect_candidate_carry_tokens((raw, flagged, embedded))
+
+    assert {raw, flagged, embedded}.issubset(tokens)
+    for crc in (raw, b"0123aBcD"):
+        assert crc.lower() in tokens
+        assert crc.upper() in tokens
+        assert int(crc, 16).to_bytes(4, "big") in tokens
+        assert int(crc, 16).to_bytes(4, "little") in tokens
+    assert b"cafebabe" not in tokens
+    assert b"CAFEBABE" not in tokens
+    assert bytes.fromhex("cafebabe") not in tokens
+    assert bytes.fromhex("cafebabe")[::-1] not in tokens
+
+
+def test_incorrect_candidate_carry_tokens_fail_closed_on_unbounded_input() -> None:
+    with pytest.raises(ValueError, match="count"):
+        orchestrator_module._incorrect_candidate_carry_tokens(
+            (b"x",) * (orchestrator_module.MAX_PRIVATE_INCORRECT_CANDIDATES + 1)
+        )
+    oversized = b"x" * (
+        orchestrator_module.MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES
+        // orchestrator_module.MAX_PRIVATE_INCORRECT_CANDIDATES
+        + 1
+    )
+    with pytest.raises(ValueError, match="exceed"):
+        orchestrator_module._incorrect_candidate_carry_tokens(
+            (oversized,) * orchestrator_module.MAX_PRIVATE_INCORRECT_CANDIDATES
+        )
+
+
+def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: Path) -> None:
+    cfg = config(tmp_path, submit=False)
+    store = StateStore(cfg.state_path)
+    item = challenge(1)
+    run_id = "carry-filter-run"
+    rejected_crc = "INCYPHER{deadBEEF}"
+    non_crc = "INCYPHER{prefix_cafebabe_suffix}"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    assignments = tuple(("specialist", route.model, route.effort) for _ in range(2))
+    material = orchestrator_module._challenge_material_sha256(item)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(item.id, item.name, item.category, item.type, item.value)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, item.id, True)],
+        2,
+        route,
+        assignments,
+        {item.id: material},
+    )
+    store.start_control_wave(run_id, item.id, 0)
+    for lane, candidate in enumerate((rejected_crc, non_crc)):
+        attempt_id = f"candidate-{lane}"
+        store.start_attempt(attempt_id, run_id, item.id, 0, lane, route.model, route.effort)
+        store.finish_attempt(
+            attempt_id,
+            "candidate",
+            candidate=candidate,
+            retain_private_candidate=True,
+        )
+        store.record_submission(run_id, item.id, candidate, "incorrect", 200)
+
+    run_root = tmp_path / "run"
+    analysis_root = (
+        run_root / "challenge-1" / "episode-0" / "generation-0" / "lane-0" / "rapido-analysis"
+    )
+    analysis_root.mkdir(parents=True)
+    safe_files = {
+        Path("safe.txt"): b"keep this analysis",
+        Path("cafebabe.txt"): b"inner substring was not an exact CRC candidate",
+    }
+    blocked_files = {
+        Path("exact.txt"): rejected_crc.encode(),
+        Path("lower.txt"): b"deadbeef",
+        Path("upper.txt"): b"DEADBEEF",
+        Path("big-endian.bin"): bytes.fromhex("deadbeef"),
+        Path("little-endian.bin"): bytes.fromhex("deadbeef")[::-1],
+        Path("deadbeef.txt"): b"safe payload in a rejected-derived path",
+        Path(f"nested-{rejected_crc}") / "notes.txt": b"safe payload",
+    }
+    for relative, payload in {**safe_files, **blocked_files}.items():
+        path = analysis_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    orchestrator = Orchestrator(cfg, FakeBoard([item]), store, FakeRuntime({}))
+    events_before = store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    files, retained_bytes = orchestrator._capture_analysis_carry(run_id, item, 0, run_root, ())
+
+    carry_root = run_root / "challenge-1" / "carry" / material / "lane-0"
+    assert files == len(safe_files)
+    assert retained_bytes == sum(len(payload) for payload in safe_files.values())
+    assert {
+        path.relative_to(carry_root): path.read_bytes()
+        for path in carry_root.rglob("*")
+        if path.is_file()
+    } == safe_files
+    assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == events_before
+    event_payloads = "".join(
+        str(row[0])
+        for row in store._connection.execute(
+            "SELECT data_json FROM events UNION ALL SELECT data_json FROM control_events"
+        ).fetchall()
+    )
+    for candidate in (rejected_crc, non_crc):
+        assert candidate not in event_payloads
+        assert hashlib.sha256(candidate.encode()).hexdigest() not in event_payloads
     store.close()
 
 
@@ -937,11 +1069,12 @@ def test_candidate_is_withheld_when_transport_cannot_finish_before_deadline(
 
 def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> None:
     answer = "INCYPHER{fabricated}"
-    board = FakeBoard([challenge(1)])
+    item = replace(challenge(1), description="metadata mentions " + answer)
+    board = FakeBoard([item])
     store = StateStore(tmp_path / "state.sqlite3")
     report = asyncio.run(
         Orchestrator(
-            config(tmp_path),
+            config(tmp_path, submit=False),
             board,
             store,
             NoProvenanceRuntime({1: {0: answer, 1: answer}}),
@@ -954,6 +1087,201 @@ def test_candidate_requires_host_observed_tool_provenance(tmp_path: Path) -> Non
         "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence LIMIT 1"
     ).fetchone()
     assert '"reason":"candidate_provenance"' in failure["data_json"]
+    store.close()
+
+
+def test_source_observed_candidate_can_equal_visible_board_prose(tmp_path: Path) -> None:
+    class PromptCheckingRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            candidate = self.candidates[1][json.loads(prompt)["lane"]]
+            assert candidate in prompt
+            return await super().solve(workspace, prompt, **kwargs)
+
+    answer = "INCYPHER{" + "independently_observed" + "}"
+    item = replace(challenge(1), description="metadata mentions " + answer)
+    board = FakeBoard([item])
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    report = asyncio.run(
+        Orchestrator(
+            config(tmp_path, submit=False),
+            board,
+            store,
+            PromptCheckingRuntime({1: {0: answer, 1: answer}}),
+        ).run()
+    )
+
+    assert report.candidates == 1
+    assert board.submissions == []
+    store.close()
+
+
+def test_board_description_candidate_correct_skips_lanes_and_is_not_fresh_evidence(
+    tmp_path: Path,
+) -> None:
+    class NoLaneRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            raise AssertionError("correct Board-description candidate must skip model lanes")
+
+    answer = "INCYPHER{" + "trusted_board_literal" + "}"
+    item = replace(challenge(1), description="metadata mentions " + answer)
+    board = FakeBoard([item])
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    report = asyncio.run(Orchestrator(config(tmp_path), board, store, NoLaneRuntime({})).run())
+
+    assert report.solved == 1
+    assert len(board.submissions) == 1
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind IN ('board_description_candidate_selected', 'submission') "
+        "ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_description_candidate_selected",
+        "submission",
+    ]
+    selected, submitted = (json.loads(row["data_json"]) for row in rows)
+    assert selected == {
+        "candidate_sha256": hashlib.sha256(answer.encode()).hexdigest(),
+        "challenge_id": 1,
+        "provenance_class": "board_description_candidate",
+    }
+    assert submitted["provenance_class"] == "board_description_candidate"
+    assert submitted["run_local_verified"] is False
+    started_initial = store._connection.execute(
+        "SELECT COUNT(DISTINCT challenge_id) FROM control_jobs "
+        "WHERE run_id=? AND phase='initial' AND started_sequence IS NOT NULL",
+        (report.run_id,),
+    ).fetchone()[0]
+    assert started_initial == 0
+    all_events = store._connection.execute("SELECT data_json FROM events").fetchall()
+    assert answer not in "".join(row["data_json"] for row in all_events)
+    store.close()
+
+
+def test_wrong_board_description_candidate_retires_then_normal_lanes_solve(
+    tmp_path: Path,
+) -> None:
+    class WrongThenCorrectBoard(FakeBoard):
+        def submit(self, challenge_id: int, candidate: str) -> Verdict:
+            self.submissions.append((challenge_id, candidate))
+            outcome = "incorrect" if len(self.submissions) == 1 else "correct"
+            return Verdict(outcome, "ok", 200)
+
+    literal = "INCYPHER{" + "board_decoy" + "}"
+    derived = "INCYPHER{" + "source_derived" + "}"
+    item = replace(challenge(1), description="metadata mentions " + literal)
+    board = WrongThenCorrectBoard([item])
+    runtime = FakeRuntime({1: {0: derived, 1: derived}})
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    report = asyncio.run(Orchestrator(config(tmp_path), board, store, runtime).run())
+
+    assert report.solved == 1
+    assert len(runtime.solve_kwargs) == 2
+    assert len(board.submissions) == 2
+    submissions = [
+        json.loads(row["data_json"])
+        for row in store._connection.execute(
+            "SELECT data_json FROM events WHERE kind='submission' ORDER BY sequence"
+        )
+    ]
+    assert [row["provenance_class"] for row in submissions] == [
+        "board_description_candidate",
+        "source_observed_candidate",
+    ]
+    assert [row["run_local_verified"] for row in submissions] == [False, True]
+    store.close()
+
+
+def test_wrong_board_description_candidate_is_not_reselected_on_retry(tmp_path: Path) -> None:
+    class WrongBoard(FakeBoard):
+        def submit(self, challenge_id: int, candidate: str) -> Verdict:
+            self.submissions.append((challenge_id, candidate))
+            return Verdict("incorrect", "ok", 200)
+
+    literal = "INCYPHER{" + "retired_board_literal" + "}"
+    item = replace(challenge(1), description="metadata mentions " + literal)
+    board = WrongBoard([item])
+    runtime = FakeRuntime({1: {0: None, 1: None}})
+    cfg = replace(config(tmp_path), episodes_per_challenge=2)
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    report = asyncio.run(Orchestrator(cfg, board, store, runtime).run())
+
+    assert report.unsolved == 1
+    assert len(runtime.solve_kwargs) == 4
+    assert len(board.submissions) == 1
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='board_description_candidate_selected'"
+        ).fetchone()[0]
+        == 1
+    )
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "item",
+    (
+        replace(
+            challenge(1),
+            description="metadata mentions INCYPHER{capped_literal}",
+            max_attempts=3,
+        ),
+        replace(
+            challenge(1),
+            description=("metadata mentions INCYPHER{first_literal} and INCYPHER{second_literal}"),
+        ),
+        replace(
+            challenge(1),
+            description="metadata mentions INCYPHER{answer}",
+        ),
+    ),
+)
+def test_board_description_candidate_skips_capped_multiple_or_placeholder(
+    tmp_path: Path,
+    item: Challenge,
+) -> None:
+    board = FakeBoard([item])
+    runtime = FakeRuntime({1: {0: None, 1: None}})
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    asyncio.run(Orchestrator(config(tmp_path), board, store, runtime).run())
+
+    assert len(runtime.solve_kwargs) == 2
+    assert board.submissions == []
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='board_description_candidate_selected'"
+        ).fetchone()[0]
+        == 0
+    )
+    store.close()
+
+
+def test_board_description_candidate_skips_changed_refresh(tmp_path: Path) -> None:
+    class ChangedDescriptionBoard(FakeBoard):
+        def challenge(self, challenge_id: int) -> Challenge:
+            return replace(super().challenge(challenge_id), description="changed material")
+
+    literal = "INCYPHER{" + "stale_board_literal" + "}"
+    item = replace(challenge(1), description="metadata mentions " + literal)
+    board = ChangedDescriptionBoard([item])
+    runtime = FakeRuntime({1: {0: None, 1: None}})
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    asyncio.run(Orchestrator(config(tmp_path), board, store, runtime).run())
+
+    assert len(runtime.solve_kwargs) == 2
+    assert board.submissions == []
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='board_description_candidate_selected'"
+        ).fetchone()[0]
+        == 0
+    )
     store.close()
 
 
@@ -1278,6 +1606,75 @@ def test_restart_seals_interrupted_attempt_as_explicit_unavailable_evidence(tmp_
     store.close()
 
 
+def test_restart_reconciles_changed_material_before_resuming_interrupted_wave(
+    tmp_path: Path,
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+        async def _wait_for_catalogue_revision(self, *args, **kwargs):
+            return None
+
+    previous = challenge(1)
+    current = replace(previous, description="changed solver material")
+    cfg = replace(
+        config(tmp_path, submit=False),
+        active_challenges=1,
+        attempts_per_challenge=1,
+        concurrency=1,
+        watch_board=True,
+    )
+    store = StateStore(cfg.state_path)
+    run_id = "material-recovery-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    orchestrator = AdaptiveOrchestrator(cfg, FakeBoard([current]), store, FakeRuntime({}))
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(
+        previous.id,
+        previous.name,
+        previous.category,
+        previous.type,
+        previous.value,
+    )
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, previous.id, True)],
+        1,
+        route,
+        orchestrator._initial_peer_assignments(),
+        {previous.id: orchestrator_module._challenge_material_sha256(previous)},
+    )
+    store.start_control_wave(run_id, previous.id, 0)
+    original_resume = store.resume_control_waves
+    resume_observations: list[tuple[str, tuple[int, ...]]] = []
+
+    def observe_resume(active_run_id: str, remaining_milliseconds: int) -> int:
+        resume_observations.append(
+            (
+                store.control_catalogue_contexts(active_run_id)[previous.id],
+                tuple(wave.episode for wave in store.queued_control_waves(active_run_id)),
+            )
+        )
+        return original_resume(active_run_id, remaining_milliseconds)
+
+    store.resume_control_waves = observe_resume  # type: ignore[method-assign]
+
+    report = asyncio.run(orchestrator.run())
+
+    current_context = orchestrator_module._challenge_material_sha256(current)
+    assert report.status == "completed"
+    assert resume_observations == [(current_context, (1,))]
+    assert store.control_catalogue_context_episode(run_id, previous.id) == 1
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM control_route_decisions WHERE run_id=? AND source_episode=0",
+            (run_id,),
+        ).fetchone()[0]
+        == 0
+    )
+    store.close()
+
+
 def test_oversized_prior_attempt_is_compacted_before_successor(tmp_path: Path) -> None:
     board = FakeBoard([challenge(1)])
     runtime = FakeRuntime({1: {0: None}})
@@ -1365,11 +1762,12 @@ def test_failed_native_turn_persists_closed_class_and_tool_evidence(tmp_path: Pa
 
 def test_candidate_rejects_model_supplied_value_reflected_by_tool(tmp_path: Path) -> None:
     answer = "INCYPHER{reflected_input}"
-    board = FakeBoard([challenge(1)])
+    item = replace(challenge(1), description="metadata mentions " + answer)
+    board = FakeBoard([item])
     store = StateStore(tmp_path / "state.sqlite3")
     report = asyncio.run(
         Orchestrator(
-            config(tmp_path),
+            config(tmp_path, submit=False),
             board,
             store,
             ReflectedCandidateRuntime({1: {0: answer, 1: answer}}),
@@ -1455,6 +1853,380 @@ def test_semantic_board_error_is_not_retried(tmp_path: Path) -> None:
     with pytest.raises(BoardError, match="invalid response"):
         asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
     assert board.identity_calls == 1
+    store.close()
+
+
+def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
+    )
+    board = RecoveringWatchBoard([challenge(1)], {5, 6, 7})
+    cfg = replace(
+        config(tmp_path, submit=False),
+        active_challenges=1,
+        attempts_per_challenge=1,
+        concurrency=1,
+        attempt_seconds=1,
+        run_seconds=0.3,
+        watch_board=True,
+        board_watch_seconds=0.001,
+        board_full_refresh_seconds=0.02,
+    )
+    store = StateStore(cfg.state_path)
+    runtime = FakeRuntime({})
+
+    report = asyncio.run(AdaptiveOrchestrator(cfg, board, store, runtime).run())
+
+    assert report.status == "deadline"
+    assert board.list_calls >= 9
+    assert len(runtime.solve_kwargs) > 1
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_watch_transport_outage",
+        "board_watch_transport_recovered",
+    ]
+    outage, recovered = (json.loads(row["data_json"]) for row in rows)
+    assert outage == {
+        "consecutive_failures": 1,
+        "next_delay_milliseconds": 2,
+        "operation": "catalogue_cycle",
+        "watcher": "active",
+    }
+    assert recovered == {
+        "consecutive_failures": 1,
+        "operation": "catalogue_cycle",
+        "watcher": "active",
+    }
+    store.close()
+
+
+def test_active_watch_retries_whole_new_id_refresh_after_detail_and_material_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class GrowingRefreshTransportBoard(FakeBoard):
+        timeout = 0.001
+
+        def __init__(self) -> None:
+            super().__init__([challenge(1)])
+            self.appended = challenge(2, files=("/files/new-material",))
+            self.appended_detail_calls = 0
+            self.download_list_counts: list[int] = []
+            self.list_calls = 0
+
+        def list_challenges(self):
+            self.list_calls += 1
+            if self.list_calls >= 4:
+                self.challenges[self.appended.id] = self.appended
+            return super().list_challenges()
+
+        def challenge(self, challenge_id: int) -> Challenge:
+            if challenge_id == self.appended.id:
+                self.appended_detail_calls += 1
+                if self.appended_detail_calls <= 3:
+                    raise BoardTransportError("Board transport failed")
+            return super().challenge(challenge_id)
+
+        def download(self, file_ref: str, destination: Path, *, byte_limit: int):
+            self.download_list_counts.append(self.list_calls)
+            if len(self.download_list_counts) == 1:
+                raise BoardTransportError("Board transport failed")
+            return super().download(file_ref, destination, byte_limit=byte_limit)
+
+    class SlowUnsolvedRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.challenge_ids: list[int] = []
+
+        async def solve(self, workspace, prompt, **kwargs):
+            self.challenge_ids.append(json.loads(prompt)["challenge"]["id"])
+            await asyncio.sleep(0.05)
+            return await super().solve(workspace, prompt, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
+    )
+    board = GrowingRefreshTransportBoard()
+    runtime = SlowUnsolvedRuntime()
+    cfg = replace(
+        config(tmp_path, submit=False),
+        active_challenges=2,
+        attempts_per_challenge=1,
+        concurrency=2,
+        attempt_seconds=1,
+        run_seconds=0.3,
+        watch_board=True,
+        board_watch_seconds=0.001,
+        board_full_refresh_seconds=0.02,
+    )
+    store = StateStore(cfg.state_path)
+
+    report = asyncio.run(AdaptiveOrchestrator(cfg, board, store, runtime).run())
+
+    assert report.status == "deadline"
+    assert board.appended_detail_calls >= 7
+    assert board.download_list_counts[:2] == [12, 17]
+    assert 2 in runtime.challenge_ids
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_watch_transport_outage",
+        "board_watch_transport_outage",
+        "board_watch_transport_recovered",
+    ]
+    assert [json.loads(row["data_json"])["consecutive_failures"] for row in rows] == [
+        1,
+        2,
+        2,
+    ]
+    assert all(json.loads(row["data_json"])["operation"] == "catalogue_cycle" for row in rows)
+    store.close()
+
+
+def test_idle_watch_transport_outage_restarts_pair_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
+    )
+    board = RecoveringWatchBoard([challenge(1)], {2, 3, 4})
+    cfg = replace(
+        config(tmp_path, submit=False),
+        watch_board=True,
+        board_watch_seconds=0.001,
+        board_full_refresh_seconds=1.0,
+    )
+    store = StateStore(cfg.state_path)
+    store.start_run("run-1", cfg.public_record())
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    orchestrator = Orchestrator(cfg, board, store, FakeRuntime({}))
+
+    result = asyncio.run(
+        orchestrator._wait_for_catalogue_revision(
+            "run-1",
+            run_root,
+            time.monotonic() + 0.2,
+            (1, 2),
+            [challenge(1)],
+        )
+    )
+
+    assert result is None
+    assert board.list_calls >= 6
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_watch_transport_outage",
+        "board_watch_transport_recovered",
+    ]
+    assert json.loads(rows[0]["data_json"])["watcher"] == "idle"
+    assert json.loads(rows[1]["data_json"])["watcher"] == "idle"
+    store.close()
+
+
+def test_idle_watch_retries_whole_cycle_after_identity_transport_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecoveringIdentityBoard(FakeBoard):
+        timeout = 0.001
+
+        def __init__(self) -> None:
+            super().__init__([challenge(1)])
+            self.identity_calls = 0
+            self.list_calls = 0
+
+        def list_challenges(self):
+            self.list_calls += 1
+            return super().list_challenges()
+
+        def identity(self):
+            self.identity_calls += 1
+            if self.identity_calls <= 3:
+                raise BoardTransportError("Board transport failed")
+            return super().identity()
+
+    monkeypatch.setattr(
+        orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
+    )
+    board = RecoveringIdentityBoard()
+    cfg = replace(
+        config(tmp_path, submit=False),
+        watch_board=True,
+        board_watch_seconds=0.001,
+        board_full_refresh_seconds=1.0,
+    )
+    store = StateStore(cfg.state_path)
+    store.start_run("run-1", cfg.public_record())
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+
+    result = asyncio.run(
+        Orchestrator(cfg, board, store, FakeRuntime({}))._wait_for_catalogue_revision(
+            "run-1",
+            run_root,
+            time.monotonic() + 0.2,
+            (1, 2),
+            [challenge(1)],
+        )
+    )
+
+    assert result is None
+    assert board.identity_calls >= 4
+    assert board.list_calls >= 4
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_watch_transport_outage",
+        "board_watch_transport_recovered",
+    ]
+    assert json.loads(rows[0]["data_json"])["operation"] == "catalogue_cycle"
+    assert json.loads(rows[1]["data_json"])["operation"] == "catalogue_cycle"
+    store.close()
+
+
+def test_idle_watch_retries_whole_cycle_after_material_refresh_transport_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecoveringMaterialBoard(FakeBoard):
+        timeout = 0.001
+
+        def __init__(self, item: Challenge) -> None:
+            super().__init__([item])
+            self.download_calls = 0
+            self.identity_calls = 0
+            self.list_calls = 0
+
+        def list_challenges(self):
+            self.list_calls += 1
+            return super().list_challenges()
+
+        def identity(self):
+            self.identity_calls += 1
+            return super().identity()
+
+        def download(self, file_ref: str, destination: Path, *, byte_limit: int):
+            self.download_calls += 1
+            if self.download_calls == 1:
+                raise BoardTransportError("Board transport failed")
+            return super().download(file_ref, destination, byte_limit=byte_limit)
+
+    monkeypatch.setattr(
+        orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
+    )
+    item = challenge(1, files=("/files/material",))
+    board = RecoveringMaterialBoard(item)
+    cfg = replace(
+        config(tmp_path, submit=False),
+        attempts_per_challenge=1,
+        watch_board=True,
+        board_watch_seconds=0.001,
+        board_full_refresh_seconds=0.001,
+    )
+    store = StateStore(cfg.state_path)
+    store.start_run("run-1", cfg.public_record())
+    store.upsert_challenge(item.id, item.name, item.category, item.type, item.value)
+    orchestrator = Orchestrator(cfg, board, store, FakeRuntime({}))
+    store.initialize_control_catalogue(
+        "run-1",
+        [(0, item.id, True)],
+        1,
+        baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15),
+        orchestrator._initial_peer_assignments(),
+        {item.id: orchestrator_module._challenge_material_sha256(item)},
+    )
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+
+    result = asyncio.run(
+        orchestrator._wait_for_catalogue_revision(
+            "run-1",
+            run_root,
+            time.monotonic() + 0.2,
+            (1, 2),
+            [item],
+        )
+    )
+
+    assert result is not None
+    assert board.download_calls == 2
+    assert board.list_calls == 10
+    assert board.identity_calls == 4
+    rows = store._connection.execute(
+        "SELECT kind, data_json FROM events "
+        "WHERE kind LIKE 'board_watch_transport_%' ORDER BY sequence"
+    ).fetchall()
+    assert [row["kind"] for row in rows] == [
+        "board_watch_transport_outage",
+        "board_watch_transport_recovered",
+    ]
+    assert json.loads(rows[0]["data_json"])["operation"] == "catalogue_cycle"
+    assert json.loads(rows[1]["data_json"])["operation"] == "catalogue_cycle"
+    store.close()
+
+
+def test_active_watch_semantic_board_error_still_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class SemanticWatchBoard(FakeBoard):
+        timeout = 0.001
+
+        def __init__(self) -> None:
+            super().__init__([challenge(1)])
+            self.list_calls = 0
+
+        def list_challenges(self):
+            self.list_calls += 1
+            if self.list_calls >= 4:
+                raise BoardError("semantic watch failure")
+            return super().list_challenges()
+
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
+    monkeypatch.setattr(orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002))
+    board = SemanticWatchBoard()
+    cfg = replace(
+        config(tmp_path, submit=False),
+        active_challenges=1,
+        attempts_per_challenge=1,
+        concurrency=1,
+        attempt_seconds=1,
+        run_seconds=0.3,
+        watch_board=True,
+        board_watch_seconds=0.001,
+    )
+    store = StateStore(cfg.state_path)
+
+    with pytest.raises(BoardError, match="semantic watch failure"):
+        asyncio.run(AdaptiveOrchestrator(cfg, board, store, FakeRuntime({})).run())
+
+    assert store._connection.execute("SELECT status FROM runs").fetchone()["status"] == "failed"
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE kind LIKE 'board_watch_transport_%'"
+        ).fetchone()[0]
+        == 0
+    )
     store.close()
 
 

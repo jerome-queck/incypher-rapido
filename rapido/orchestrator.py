@@ -66,7 +66,11 @@ from .solver import (
     challenge_candidate_prose,
     project_attempt_carry,
 )
-from .state import StateStore
+from .state import (
+    MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES,
+    MAX_PRIVATE_INCORRECT_CANDIDATES,
+    StateStore,
+)
 from .target import TargetEndpoint, TargetToolRegistry, parse_connection_info
 
 
@@ -196,6 +200,8 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DURABLE_TOOL_CALLS = 10
 _MAX_DURABLE_TOOL_HASHES = 2
 _UNLIMITED_SUBMISSION_WRONG_THRESHOLD = 5
+_BOARD_READ_RETRY_DELAYS = (0.25, 0.5)
+_BOARD_READ_GUARD_MARGIN_SECONDS = 0.1
 _NO_PROGRESS_SECONDS = 900.0
 _DYNAMIC_LOCAL_PREP_CAP_SECONDS = 1_800
 _LATE_STATIC_VERIFIER_WORK_SECONDS = 120
@@ -207,6 +213,8 @@ _CARRY_UNSAFE_BYTES = re.compile(
     rb"(?:INCYPHER\{|https?://|[A-Za-z0-9.-]+:[0-9]{2,5}|(?:token|password|secret|api[_-]?key)\s*[:=])",
     re.IGNORECASE,
 )
+_RAW_CRC32_BYTES = re.compile(rb"[0-9A-Fa-f]{8}")
+_FLAG_CRC32_BYTES = re.compile(rb"INCYPHER\{([0-9A-Fa-f]{8})\}")
 _DURABLE_TOOL_NAMES = frozenset(
     {
         "audio_metadata",
@@ -443,6 +451,18 @@ def _challenge_coherence_key(challenge: Challenge) -> tuple[object, ...]:
     )
 
 
+def _board_description_candidate(challenge: Challenge) -> str | None:
+    """Return one exact, non-placeholder Board-authored literal, never a model guess."""
+    candidates = {
+        match.group(0)
+        for match in FLAG_RE.finditer(challenge.description)
+        if candidate_is_eligible(match.group(0), "")
+    }
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
 def _challenge_material_sha256(
     challenge: Challenge, file_sha256s: tuple[str, ...] | None = None
 ) -> str:
@@ -466,6 +486,30 @@ def _challenge_material_sha256(
         separators=(",", ":"),
     )
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _incorrect_candidate_carry_tokens(candidates: tuple[bytes, ...]) -> frozenset[bytes]:
+    """Expand only exact rejected CRC32 forms for private recursive carry filtering."""
+    if type(candidates) is not tuple or len(candidates) > MAX_PRIVATE_INCORRECT_CANDIDATES:
+        raise ValueError("private incorrect candidate count is invalid")
+    if any(type(candidate) is not bytes or not candidate for candidate in candidates):
+        raise ValueError("private incorrect candidate bytes are invalid")
+    if sum(len(candidate) for candidate in candidates) > MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES:
+        raise ValueError("private incorrect candidate bytes exceed their limit")
+    tokens = set(candidates)
+    for candidate in candidates:
+        crc = candidate if _RAW_CRC32_BYTES.fullmatch(candidate) else None
+        if crc is None:
+            match = _FLAG_CRC32_BYTES.fullmatch(candidate)
+            crc = None if match is None else match.group(1)
+        if crc is None:
+            continue
+        tokens.add(crc.lower())
+        tokens.add(crc.upper())
+        value = int(crc, 16)
+        tokens.add(value.to_bytes(4, "big"))
+        tokens.add(value.to_bytes(4, "little"))
+    return frozenset(tokens)
 
 
 def _file_sha256(path: Path) -> str:
@@ -589,17 +633,79 @@ class Orchestrator:
     ) -> Any:
         """Retry only idempotent Board reads after transport-level failures."""
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
-        for attempt in range(3):
+        retry_delays = tuple(min(transport_timeout, delay) for delay in _BOARD_READ_RETRY_DELAYS)
+        for attempt in range(len(retry_delays) + 1):
             try:
                 return await self._board_call(deadline, function, *args, **kwargs)
             except BoardTransportError:
-                if attempt == 2:
+                if attempt == len(retry_delays):
                     raise
-                delay = 0.25 * (2**attempt)
+                delay = retry_delays[attempt]
                 if deadline - time.monotonic() <= transport_timeout + delay:
                     raise
                 await asyncio.sleep(delay)
         raise AssertionError("unreachable Board read retry state")
+
+    def _board_watch_read_guard(self) -> float:
+        """Reserve enough deadline for both retried reads in one coherence pair."""
+        transport_timeout = float(getattr(self.board, "timeout", 15.0))
+        retry_delays = tuple(min(transport_timeout, delay) for delay in _BOARD_READ_RETRY_DELAYS)
+        one_read = transport_timeout * (len(retry_delays) + 1) + sum(retry_delays)
+        return 2 * one_read + _BOARD_READ_GUARD_MARGIN_SECONDS
+
+    def _board_watch_transport_backoff(self, consecutive_failures: int) -> float:
+        base = float(self.config.board_watch_seconds)
+        ceiling = max(base, float(self.config.board_full_refresh_seconds))
+        return min(ceiling, base * (2 ** min(consecutive_failures, 4)))
+
+    def _record_board_watch_transport_outage(
+        self,
+        run_id: str,
+        *,
+        watcher: str,
+        operation: str,
+        consecutive_failures: int,
+    ) -> tuple[int, float]:
+        if watcher not in {"active", "idle"}:
+            raise ValueError("Board watcher kind is invalid")
+        consecutive_failures += 1
+        delay = self._board_watch_transport_backoff(consecutive_failures)
+        payload: dict[str, object] = {
+            "consecutive_failures": consecutive_failures,
+            "next_delay_milliseconds": max(1, round(delay * 1_000)),
+            "operation": operation,
+            "watcher": watcher,
+        }
+        self.state.event(run_id, "board_watch_transport_outage", payload)
+        return consecutive_failures, delay
+
+    def _record_board_watch_transport_recovered(
+        self,
+        run_id: str,
+        *,
+        watcher: str,
+        operation: str,
+        consecutive_failures: int,
+    ) -> tuple[int, float]:
+        if consecutive_failures:
+            self.state.event(
+                run_id,
+                "board_watch_transport_recovered",
+                {
+                    "consecutive_failures": consecutive_failures,
+                    "operation": operation,
+                    "watcher": watcher,
+                },
+            )
+        return 0, float(self.config.board_watch_seconds)
+
+    async def _board_watch_challenge_pair(
+        self, deadline: float
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Read both halves of one catalogue-list coherence pair."""
+        first = await self._board_read(deadline, self.board.list_challenges)
+        second = await self._board_read(deadline, self.board.list_challenges)
+        return first, second
 
     async def _cleanup_owned_instances(self, deadline: float) -> None:
         clean = True
@@ -1005,45 +1111,63 @@ class Orchestrator:
             "board_watch_started",
             {"known_challenges": len(known_ids)},
         )
-        read_guard = float(getattr(self.board, "timeout", 15.0)) * 3 + 0.1
+        read_guard = self._board_watch_read_guard()
+        next_read_delay = float(self.config.board_watch_seconds)
+        transport_failures = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= read_guard:
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 return None
-            await asyncio.sleep(min(float(self.config.board_watch_seconds), remaining - read_guard))
+            await asyncio.sleep(min(next_read_delay, remaining - read_guard))
             remaining = deadline - time.monotonic()
             if remaining <= read_guard:
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 return None
-            first = await self._board_read(deadline, self.board.list_challenges)
-            second = await self._board_read(deadline, self.board.list_challenges)
-            first_ids = [row.get("id") for row in first]
-            second_ids = [row.get("id") for row in second]
-            if (
-                not first_ids
-                or any(type(value) is not int or value <= 0 for value in first_ids + second_ids)
-                or len(first_ids) != len(set(first_ids))
-                or len(second_ids) != len(set(second_ids))
-                or sorted(first_ids) != sorted(second_ids)
-            ):
-                raise BoardError("Board watch observed an incoherent challenge list")
-            final_identity = await self._board_read(deadline, self.board.identity)
-            if (
-                final_identity.get("id") != identity[0]
-                or final_identity.get("team_id") != identity[1]
-            ):
-                raise BoardError("Board identity changed during idle watch")
-            id_changed = not self.config.challenge_ids and set(first_ids) != known_ids
-            if id_changed or time.monotonic() >= next_full_refresh:
-                refreshed = await self._challenge_catalogue(deadline, identity)
-                refreshed_contexts = await self._probe_material_contexts(
-                    run_root,
-                    refreshed,
-                    deadline,
+            try:
+                first, second = await self._board_watch_challenge_pair(deadline)
+                first_ids = [row.get("id") for row in first]
+                second_ids = [row.get("id") for row in second]
+                if (
+                    not first_ids
+                    or any(type(value) is not int or value <= 0 for value in first_ids + second_ids)
+                    or len(first_ids) != len(set(first_ids))
+                    or len(second_ids) != len(set(second_ids))
+                    or sorted(first_ids) != sorted(second_ids)
+                ):
+                    raise BoardError("Board watch observed an incoherent challenge list")
+                final_identity = await self._board_read(deadline, self.board.identity)
+                if (
+                    final_identity.get("id") != identity[0]
+                    or final_identity.get("team_id") != identity[1]
+                ):
+                    raise BoardError("Board identity changed during idle watch")
+                id_changed = not self.config.challenge_ids and set(first_ids) != known_ids
+                refresh_due = id_changed or time.monotonic() >= next_full_refresh
+                if refresh_due:
+                    refreshed = await self._challenge_catalogue(deadline, identity)
+                    refreshed_contexts = await self._probe_material_contexts(
+                        run_root,
+                        refreshed,
+                        deadline,
+                    )
+            except BoardTransportError:
+                transport_failures, next_read_delay = self._record_board_watch_transport_outage(
+                    run_id,
+                    watcher="idle",
+                    operation="catalogue_cycle",
+                    consecutive_failures=transport_failures,
                 )
+                continue
+            transport_failures, next_read_delay = self._record_board_watch_transport_recovered(
+                run_id,
+                watcher="idle",
+                operation="catalogue_cycle",
+                consecutive_failures=transport_failures,
+            )
+            if refresh_due:
                 prior_material = self.state.control_catalogue_contexts(run_id)
                 revised = [
                     challenge
@@ -1244,6 +1368,11 @@ class Orchestrator:
             for value in (self.config.board_token, self.config.team_key)
             if isinstance(value, str) and value
         }
+        forbidden.update(
+            _incorrect_candidate_carry_tokens(
+                self.state.private_incorrect_candidate_bytes(run_id, challenge.id)
+            )
+        )
         for endpoint in target_endpoints:
             forbidden.add(endpoint.host.encode())
             forbidden.add(f"{endpoint.host}:{endpoint.port}".encode())
@@ -1285,11 +1414,14 @@ class Orchestrator:
                     payload = source.read_bytes()
                 except OSError:
                     continue
-                if _CARRY_UNSAFE_BYTES.search(payload) or any(
-                    value in payload for value in forbidden
+                relative = source.relative_to(analysis_root)
+                relative_bytes = os.fsencode(relative)
+                if (
+                    _CARRY_UNSAFE_BYTES.search(payload)
+                    or _CARRY_UNSAFE_BYTES.search(relative_bytes)
+                    or any(value in payload or value in relative_bytes for value in forbidden)
                 ):
                     continue
-                relative = source.relative_to(analysis_root)
                 destination = destination_root / relative
                 destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
@@ -1950,9 +2082,7 @@ class Orchestrator:
                     return
                 if self._adaptive_control and not complete:
                     raise CandidateProvenanceError("candidate_evidence_incomplete")
-                if not candidate_is_eligible(
-                    finding.candidate, challenge_candidate_prose(challenge)
-                ):
+                if not candidate_is_eligible(finding.candidate, ""):
                     raise CandidateProvenanceError("candidate_ineligible")
                 candidate_fingerprint = hashlib.sha256(finding.candidate.encode()).hexdigest()
                 candidate_observed = False
@@ -1966,6 +2096,13 @@ class Orchestrator:
                     raise CandidateProvenanceError("candidate_supplied")
                 if not candidate_observed:
                     raise CandidateProvenanceError("candidate_unobserved")
+                if not candidate_is_eligible(
+                    finding.candidate,
+                    challenge_candidate_prose(challenge),
+                    source_observed=candidate_observed,
+                    source_supplied=candidate_supplied,
+                ):
+                    raise CandidateProvenanceError("candidate_ineligible")
 
             def continue_primary(turn: NativeTurn, remaining_seconds: float | None) -> str | None:
                 nonlocal continuation_round, last_checkpoint_tool_count
@@ -2494,8 +2631,15 @@ class Orchestrator:
         challenge: Challenge,
         candidate: str,
         deadline: float,
+        *,
+        provenance_class: str = "source_observed_candidate",
     ) -> str:
         """Serialize eligibility, reservation, Board effect, and finalization."""
+        if provenance_class not in {
+            "board_description_candidate",
+            "source_observed_candidate",
+        }:
+            raise ValueError("candidate provenance class is invalid")
         fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
         async with self._submission_lock:
             if self.state.challenge_has_correct_submission(run_id, challenge.id):
@@ -2580,7 +2724,11 @@ class Orchestrator:
                     "challenge_id": challenge.id,
                     "outcome": verdict.outcome,
                     "http_status": verdict.http_status,
-                    "run_local_verified": verdict.outcome == "correct",
+                    "provenance_class": provenance_class,
+                    "run_local_verified": (
+                        verdict.outcome == "correct"
+                        and provenance_class == "source_observed_candidate"
+                    ),
                 },
             )
             if verdict.outcome == "correct":
@@ -2597,6 +2745,48 @@ class Orchestrator:
                 challenge.id, "candidate" if status == "already_solved" else status
             )
             return status
+
+    async def _try_board_description_candidate(
+        self,
+        run_id: str,
+        challenge: Challenge,
+        deadline: float,
+    ) -> str | None:
+        """Try one trusted Board literal only under a freshly confirmed unlimited policy."""
+        if not self.config.submit_candidates or challenge.solved:
+            return None
+        candidate = _board_description_candidate(challenge)
+        if candidate is None:
+            return None
+        if self.state.candidate_submission_status(run_id, challenge.id, candidate) is not None:
+            return None
+        try:
+            current = await self._board_read(deadline, self.board.challenge, challenge.id)
+        except (BoardError, RunDeadlineReached):
+            return None
+        if (
+            _challenge_coherence_key(current) != _challenge_coherence_key(challenge)
+            or current.solved
+            or current.max_attempts not in (None, 0)
+        ):
+            return None
+        fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
+        self.state.event(
+            run_id,
+            "board_description_candidate_selected",
+            {
+                "candidate_sha256": fingerprint,
+                "challenge_id": challenge.id,
+                "provenance_class": "board_description_candidate",
+            },
+        )
+        return await self._submit_candidate(
+            run_id,
+            current,
+            candidate,
+            deadline,
+            provenance_class="board_description_candidate",
+        )
 
     async def _solve_challenge(
         self,
@@ -2629,6 +2819,17 @@ class Orchestrator:
         if work_deadline <= now:
             self.state.set_challenge_status(challenge.id, "unsolved")
             return "unsolved"
+        description_outcome = await self._try_board_description_candidate(
+            run_id,
+            challenge,
+            work_deadline,
+        )
+        if description_outcome == "solved":
+            return "solved"
+        if description_outcome == "already_solved":
+            return "resolved"
+        if description_outcome == "candidate":
+            return "candidate"
         try:
             workspaces = await self._prepare_workspaces(
                 run_id,
@@ -3053,7 +3254,9 @@ class Orchestrator:
             known_ids = {
                 challenge_id for _, challenge_id, _ in self.state.control_catalogue_entries(run_id)
             }
-            read_guard = float(getattr(self.board, "timeout", 15.0)) * 3 + 0.1
+            read_guard = self._board_watch_read_guard()
+            next_read_delay = float(self.config.board_watch_seconds)
+            transport_failures = 0
             self.state.event(
                 run_id,
                 "board_active_watch_started",
@@ -3063,35 +3266,50 @@ class Orchestrator:
                 remaining = deadline - time.monotonic()
                 if remaining <= read_guard:
                     await asyncio.Event().wait()
-                await asyncio.sleep(
-                    min(float(self.config.board_watch_seconds), remaining - read_guard)
+                await asyncio.sleep(min(next_read_delay, remaining - read_guard))
+                try:
+                    first, second = await self._board_watch_challenge_pair(deadline)
+                    first_ids = [row.get("id") for row in first]
+                    second_ids = [row.get("id") for row in second]
+                    if (
+                        not first_ids
+                        or any(
+                            type(value) is not int or value <= 0 for value in first_ids + second_ids
+                        )
+                        or len(first_ids) != len(set(first_ids))
+                        or sorted(first_ids) != sorted(second_ids)
+                    ):
+                        raise BoardError("active Board watch observed an incoherent challenge list")
+                    observed_ids = set(first_ids)
+                    if known_ids - observed_ids:
+                        raise BoardError("active Board watch observed a removed challenge")
+                    new_ids = observed_ids - known_ids
+                    if new_ids:
+                        final_identity = await self._board_read(deadline, self.board.identity)
+                        if (
+                            final_identity.get("id") != identity[0]
+                            or final_identity.get("team_id") != identity[1]
+                        ):
+                            raise BoardError("Board identity changed during active watch")
+                        refreshed = await self._challenge_catalogue(deadline, identity)
+                        appended = [challenge for challenge in refreshed if challenge.id in new_ids]
+                        contexts = await self._probe_material_contexts(run_root, appended, deadline)
+                except BoardTransportError:
+                    transport_failures, next_read_delay = self._record_board_watch_transport_outage(
+                        run_id,
+                        watcher="active",
+                        operation="catalogue_cycle",
+                        consecutive_failures=transport_failures,
+                    )
+                    continue
+                transport_failures, next_read_delay = self._record_board_watch_transport_recovered(
+                    run_id,
+                    watcher="active",
+                    operation="catalogue_cycle",
+                    consecutive_failures=transport_failures,
                 )
-                first = await self._board_read(deadline, self.board.list_challenges)
-                second = await self._board_read(deadline, self.board.list_challenges)
-                first_ids = [row.get("id") for row in first]
-                second_ids = [row.get("id") for row in second]
-                if (
-                    not first_ids
-                    or any(type(value) is not int or value <= 0 for value in first_ids + second_ids)
-                    or len(first_ids) != len(set(first_ids))
-                    or sorted(first_ids) != sorted(second_ids)
-                ):
-                    raise BoardError("active Board watch observed an incoherent challenge list")
-                observed_ids = set(first_ids)
-                if known_ids - observed_ids:
-                    raise BoardError("active Board watch observed a removed challenge")
-                new_ids = observed_ids - known_ids
                 if not new_ids:
                     continue
-                final_identity = await self._board_read(deadline, self.board.identity)
-                if (
-                    final_identity.get("id") != identity[0]
-                    or final_identity.get("team_id") != identity[1]
-                ):
-                    raise BoardError("Board identity changed during active watch")
-                refreshed = await self._challenge_catalogue(deadline, identity)
-                appended = [challenge for challenge in refreshed if challenge.id in new_ids]
-                contexts = await self._probe_material_contexts(run_root, appended, deadline)
                 admitted = self._admit_catalogue_revisions(
                     run_id,
                     appended,
@@ -3811,11 +4029,6 @@ class Orchestrator:
                         "Board recovery reconciliation remained indeterminate"
                     ) from exc
 
-                if deadline - time.monotonic() > 0:
-                    self.state.resume_control_waves(
-                        run_id,
-                        max(0, int((deadline - time.monotonic()) * 1000)),
-                    )
                 durable_catalogue = self.state.control_catalogue_entries(run_id)
                 outcomes.update(self.state.run_terminal_outcomes(run_id))
                 challenge_count = len(durable_catalogue)
@@ -3825,6 +4038,7 @@ class Orchestrator:
                     and not pending_effects
                     and len(outcomes) == challenge_count
                     and not self.config.watch_board
+                    and not self.state.has_unrouted_control_failure(run_id)
                 ):
                     status = "completed"
                     self.state.finish_run(run_id, status)
@@ -3852,11 +4066,6 @@ class Orchestrator:
                 ),
                 run_root,
             )
-            if session.resumed:
-                self.state.resume_control_waves(
-                    run_id,
-                    max(0, int((deadline - time.monotonic()) * 1000)),
-                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
@@ -4004,6 +4213,11 @@ class Orchestrator:
                     deadline,
                     outcomes,
                     current_contexts,
+                )
+            if session.resumed:
+                self.state.resume_control_waves(
+                    run_id,
+                    max(0, int((deadline - time.monotonic()) * 1000)),
                 )
             runtime_started = not self._adaptive_control
             queue_resumed = session.resumed and bool(durable_catalogue)

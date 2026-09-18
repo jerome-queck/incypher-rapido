@@ -20,6 +20,7 @@ from rapido.solver import (
     SolverOutputError,
     admitted_candidate,
     build_turn_prompt,
+    candidate_is_eligible,
     challenge_candidate_prose,
     project_attempt_carry,
 )
@@ -83,11 +84,11 @@ def test_finding_parser_rejects_non_utf8_text(field: str) -> None:
         SolverFinding.from_message(json.dumps(document))
 
 
-def test_candidate_requires_independent_agreement_and_rejects_prose_or_placeholder() -> None:
+def test_candidate_requires_independent_agreement_and_rejects_placeholder() -> None:
     answer = "INCYPHER{derived_value}"
     assert admitted_candidate([finding(answer), finding(answer, 0.7)], "decode this") == answer
     assert admitted_candidate([finding(answer)], "decode this") is None
-    assert admitted_candidate([finding(answer), finding(answer)], f"example {answer}") is None
+    assert admitted_candidate([finding(answer), finding(answer)], f"example {answer}") == answer
     placeholder = "INCYPHER{answer}"
     assert admitted_candidate([finding(placeholder), finding(placeholder)], "decode this") is None
     for placeholder in (
@@ -103,16 +104,33 @@ def test_candidate_requires_independent_agreement_and_rejects_prose_or_placehold
         )
 
 
+def test_prose_equal_candidate_requires_independent_source_observation() -> None:
+    candidate = "INCYPHER{" + "source_derived_value" + "}"
+    prose = "metadata mentions " + candidate
+
+    assert not candidate_is_eligible(candidate, prose)
+    assert candidate_is_eligible(candidate, prose, source_observed=True)
+    assert not candidate_is_eligible(
+        candidate,
+        prose,
+        source_observed=True,
+        source_supplied=True,
+    )
+
+
 @pytest.mark.parametrize("field", ("name", "category", "type", "description"))
-def test_candidate_rejects_every_controller_challenge_text_field(field: str) -> None:
+def test_controller_text_match_needs_source_observation(field: str) -> None:
     decoy = "INCYPHER{metadata_decoy}"
     challenge = Challenge(
         7, "Name", "crypto", "standard", "Do thing", 100, (), False, 0, 0, None, None
     )
     challenge = replace(challenge, **{field: decoy})
-    assert (
-        admitted_candidate([finding(decoy), finding(decoy)], challenge_candidate_prose(challenge))
-        is None
+    prose = challenge_candidate_prose(challenge)
+    assert not candidate_is_eligible(decoy, prose)
+    assert candidate_is_eligible(
+        decoy,
+        prose,
+        source_observed=True,
     )
 
 

@@ -62,6 +62,12 @@ class AmbiguousBoundaryBoard(BoundaryBoard):
         raise BoardError("ambiguous delivery")
 
 
+class UnreadBoundaryBoard(BoundaryBoard):
+    def submit(self, challenge_id: int, candidate: str) -> Verdict:
+        self.submissions.append((challenge_id, candidate))
+        return Verdict("unread", "ambiguous response", 200)
+
+
 class IndeterminateCleanupBoundaryBoard(BoundaryBoard):
     def __init__(self, challenges: list[Challenge]) -> None:
         super().__init__(challenges)
@@ -2107,6 +2113,33 @@ def test_pending_effect_count_is_global_when_inspecting_prior_or_current_run(
     assert first.run_id == second.run_id
     assert first.status == second.status == "running"
     assert first.pending_submission_count == second.pending_submission_count == 1
+    assert board.submissions == [(1, candidate)]
+
+
+def test_unread_effect_is_reported_and_never_resubmitted_on_resume(tmp_path: Path) -> None:
+    candidate = "INCYPHER{unread-control-effect}"
+    board = UnreadBoundaryBoard([_challenge(1)])
+    config = replace(_config(tmp_path), episodes_per_challenge=2, submit_candidates=True)
+
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="explicit reconciliation"):
+        asyncio.run(
+            DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+        )
+    first = DurableJobControl.inspect(config.state_path)
+    monitor = DurableJobControl.monitor_snapshot(config.state_path, run_id=first.run_id)
+    with sqlite3.connect(config.state_path) as connection:
+        status = connection.execute("SELECT status FROM submission_intents").fetchone()[0]
+
+    with pytest.raises(orchestrator_module.RecoveryBlocked, match="explicit reconciliation"):
+        asyncio.run(
+            DurableJobControl.drive(config, board=board, runtime=BoundaryRuntime(candidate))
+        )
+    second = DurableJobControl.inspect(config.state_path)
+
+    assert status == "unread"
+    assert first.run_id == second.run_id
+    assert first.pending_submission_count == second.pending_submission_count == 1
+    assert monitor.pending_submission_count == 1
     assert board.submissions == [(1, candidate)]
 
 

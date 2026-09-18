@@ -43,6 +43,8 @@ MAX_EVENT_BYTES = 128 * 1024
 MAX_ATTEMPT_EVIDENCE_ITEMS = 20
 MAX_ATTEMPT_EVIDENCE_ITEM_CHARS = 1000
 MAX_SQLITE_INTEGER = 2**63 - 1
+MAX_PRIVATE_INCORRECT_CANDIDATES = 64
+MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES = 64 * 1024
 
 _FAILURE_CLASSES = KNOWN_FAILURE_CLASSES
 
@@ -2147,7 +2149,7 @@ class StateStore:
                   AND (?=0 OR NOT EXISTS (
                     SELECT 1 FROM submission_intents AS pending
                     WHERE pending.challenge_id=jobs.challenge_id
-                      AND pending.status='pending'
+                      AND pending.status IN ('pending', 'unread')
                   ))
                 GROUP BY jobs.challenge_id, jobs.catalogue_rank, jobs.episode
                 ORDER BY jobs.catalogue_rank, first_sequence
@@ -2189,7 +2191,7 @@ class StateStore:
                        EXISTS(
                          SELECT 1 FROM submission_intents AS pending
                          WHERE pending.challenge_id=origin.challenge_id
-                           AND pending.status='pending'
+                           AND pending.status IN ('pending', 'unread')
                        ) AS submission_pending
                 FROM control_failure_origins AS origin
                 JOIN control_jobs AS jobs
@@ -2279,6 +2281,45 @@ class StateStore:
                 (run_id, challenge_id),
             ).fetchone()
         return int(row["count"])
+
+    def has_unrouted_control_failure(self, run_id: str) -> bool:
+        """Return whether current material still needs a durable route decision."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT EXISTS(
+                  SELECT 1 FROM control_failure_origins AS origin
+                  JOIN control_catalogue AS catalogue
+                    ON catalogue.run_id=origin.run_id
+                   AND catalogue.challenge_id=origin.challenge_id
+                  WHERE origin.run_id=?
+                    AND origin.episode>=catalogue.context_episode
+                    AND NOT EXISTS (
+                      SELECT 1 FROM control_route_decisions AS decision
+                      WHERE decision.run_id=origin.run_id
+                        AND decision.challenge_id=origin.challenge_id
+                        AND decision.source_episode=origin.episode
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM submissions AS submission
+                      WHERE submission.run_id=origin.run_id
+                        AND submission.challenge_id=origin.challenge_id
+                        AND submission.context_episode=catalogue.context_episode
+                        AND submission.outcome='correct'
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM submission_intents AS intent
+                      WHERE intent.first_run_id=origin.run_id
+                        AND intent.challenge_id=origin.challenge_id
+                        AND intent.context_episode=catalogue.context_episode
+                        AND intent.context_sha256 IS catalogue.context_sha256
+                        AND intent.status='correct'
+                    )
+                ) AS pending
+                """,
+                (run_id,),
+            ).fetchone()
+        return bool(row["pending"])
 
     def run_terminal_outcomes(self, run_id: str) -> dict[int, str]:
         """Return durable terminal statuses, excluding every challenge still queued."""
@@ -3201,7 +3242,7 @@ class StateStore:
             int(
                 connection.execute(
                     "SELECT COUNT(*) FROM submission_intents "
-                    "WHERE challenge_id=? AND status='pending'",
+                    "WHERE challenge_id=? AND status IN ('pending', 'unread')",
                     (challenge_id,),
                 ).fetchone()[0]
             )
@@ -3792,6 +3833,51 @@ class StateStore:
             )
         return sources
 
+    def private_incorrect_candidate_bytes(
+        self, run_id: str, challenge_id: int
+    ) -> tuple[bytes, ...]:
+        """Return bounded private values rejected for the current material; never log them."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be nonempty")
+        if type(challenge_id) is not int or challenge_id <= 0:
+            raise ValueError("challenge_id must be positive")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT DISTINCT proposal.candidate_key, proposal.candidate
+                FROM candidate_proposals AS proposal
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=proposal.run_id
+                 AND catalogue.challenge_id=proposal.challenge_id
+                JOIN submission_intents AS intent
+                  ON intent.first_run_id=proposal.run_id
+                 AND intent.challenge_id=proposal.challenge_id
+                 AND intent.candidate_sha256=lower(hex(proposal.candidate_key))
+                WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND proposal.episode>=catalogue.context_episode
+                  AND intent.status='incorrect'
+                  AND ((catalogue.context_sha256 IS NOT NULL
+                    AND intent.context_sha256=catalogue.context_sha256) OR
+                    (intent.context_episode=catalogue.context_episode
+                     AND intent.context_sha256 IS catalogue.context_sha256))
+                ORDER BY proposal.candidate_key, proposal.candidate
+                LIMIT ?
+                """,
+                (run_id, challenge_id, MAX_PRIVATE_INCORRECT_CANDIDATES),
+            ).fetchall()
+        selected: list[bytes] = []
+        selected_bytes = 0
+        for row in rows:
+            candidate = bytes(row["candidate"])
+            candidate_key = bytes(row["candidate_key"])
+            if not candidate or hashlib.sha256(candidate).digest() != candidate_key:
+                raise ValueError("private incorrect candidate identity changed")
+            if selected_bytes + len(candidate) > MAX_PRIVATE_INCORRECT_CANDIDATE_BYTES:
+                break
+            selected.append(candidate)
+            selected_bytes += len(candidate)
+        return tuple(selected)
+
     def same_run_memory_failures(
         self,
         run_id: str,
@@ -3932,12 +4018,13 @@ class StateStore:
         return changed == 1
 
     def pending_submission_intents(self) -> list[dict[str, Any]]:
-        """Return only non-secret fingerprints requiring explicit reconciliation."""
+        """Return non-secret unresolved effects requiring explicit reconciliation."""
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT challenge_id, candidate_sha256, first_run_id, reserved_at, updated_at
-                FROM submission_intents WHERE status='pending'
+                SELECT challenge_id, candidate_sha256, first_run_id, status,
+                       reserved_at, updated_at
+                FROM submission_intents WHERE status IN ('pending', 'unread')
                 ORDER BY reserved_at, challenge_id, candidate_sha256
                 """
             ).fetchall()
@@ -3960,7 +4047,8 @@ class StateStore:
             row = connection.execute(
                 """
                 SELECT first_run_id FROM submission_intents
-                WHERE challenge_id=? AND candidate_sha256=? AND status='pending'
+                WHERE challenge_id=? AND candidate_sha256=?
+                  AND status IN ('pending', 'unread')
                 """,
                 (challenge_id, candidate_sha256),
             ).fetchone()
@@ -3969,7 +4057,8 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE submission_intents SET status=?, updated_at=?
-                WHERE challenge_id=? AND candidate_sha256=? AND status='pending'
+                WHERE challenge_id=? AND candidate_sha256=?
+                  AND status IN ('pending', 'unread')
                 """,
                 (outcome, self._now(), challenge_id, candidate_sha256),
             )

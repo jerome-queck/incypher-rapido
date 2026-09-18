@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import sys
 import time
 from collections.abc import Awaitable
@@ -21,6 +22,7 @@ from .control import DurableJobControl
 from .monitor import append_private_jsonl, monitor_payload, render_text
 from .orchestrator import _challenge_coherence_key
 from .state import StateStore
+from .supervisor import run_supervisor, supervisor_projection
 
 
 async def _run_with_shutdown(operation: Awaitable[Any]):
@@ -197,17 +199,53 @@ def _monitor(
         raise ValueError("monitor record path must differ from the state database")
     previous: tuple[float, int] | None = None
     while True:
-        view = DurableJobControl.monitor_snapshot(state_path, run_id=run_id)
-        payload, previous = monitor_payload(view, previous)
+        supervisor = supervisor_projection(state_path)
+        view = None
+        try:
+            view = DurableJobControl.monitor_snapshot(state_path, run_id=run_id)
+        except (OSError, sqlite3.Error, ValueError):
+            if (
+                supervisor is None
+                or supervisor["run_bound"] is not False
+                or supervisor["phase"] == "blocked"
+            ):
+                raise
+            payload = {
+                "status": (
+                    "starting" if supervisor["phase"] in {"active", "scheduled"} else "refused"
+                ),
+                "supervisor": supervisor,
+            }
+            rendered = (
+                json.dumps(payload, sort_keys=True)
+                if output_format == "json"
+                else f"status={payload['status']}"
+            )
+        else:
+            payload, previous = monitor_payload(view, previous)
+            payload["supervisor"] = supervisor
+            rendered = (
+                json.dumps(payload, sort_keys=True)
+                if output_format == "json"
+                else render_text(payload)
+            )
+        if output_format == "text" and supervisor is not None:
+            rendered += (
+                f" supervisor={supervisor['phase']}"
+                f" replacements={supervisor['replacement_count']}"
+                f" supervisor_disposition={supervisor['disposition']}"
+            )
         print(
-            json.dumps(payload, sort_keys=True)
-            if output_format == "json"
-            else render_text(payload),
+            rendered,
             flush=True,
         )
         if record_jsonl:
             append_private_jsonl(record_path, payload)
-        if not follow or view.status != "running":
+        if (
+            not follow
+            or (view is not None and view.status != "running")
+            or (supervisor is not None and supervisor["phase"] == "terminal")
+        ):
             return 0
         time.sleep(interval)
 
@@ -232,13 +270,18 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--follow", action="store_true")
     monitor.add_argument("--interval", type=int, choices=range(5, 301), default=10)
     monitor.add_argument("--record-jsonl", action="store_true")
-    subcommands.add_parser("run", help="run the autonomous native-Codex queue")
+    subcommands.add_parser("run", help="supervise the autonomous native-Codex queue")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    private_worker = selected_argv == ["_worker"]
+    arguments = None if private_worker else build_parser().parse_args(selected_argv)
     try:
+        if private_worker:
+            return _run()
+        assert arguments is not None
         if arguments.command == "preflight":
             return _preflight()
         if arguments.command == "config":
@@ -261,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                 record_jsonl=arguments.record_jsonl,
             )
         if arguments.command == "run":
-            return _run()
+            return run_supervisor()
     except (BoardError, CodexAppError, ConfigError, OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
         return 2

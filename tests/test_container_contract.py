@@ -83,7 +83,9 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
     text = CONTAINER_DOC.read_text()
     for flag in (
         "--env-file=/path/to/rapido.env",
-        "--init",
+        "--name rapido",
+        "--detach",
+        "--restart unless-stopped",
         "--stop-timeout=180",
         "--cpus=8",
         "--memory=24g",
@@ -128,6 +130,8 @@ def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> Non
 
 def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
     text = (ROOT / "deploy" / "docker-compose.example.yml").read_text()
+    assert "restart: unless-stopped" in text
+    assert "init: true" not in text
     assert "stop_signal: SIGTERM" in text
     assert "stop_grace_period: 180s" in text
     assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()

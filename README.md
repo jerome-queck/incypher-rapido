@@ -100,7 +100,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
 | `RAPIDO_FOCUS_CHALLENGE_IDS` | empty | Ordered priority prefix without narrowing full-catalogue coverage. |
-| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Unlimited challenges immediately submit distinct source-qualified candidates through the fifth wrong; later or Board-limited candidates require an independent Verifier. |
+| `RAPIDO_SUBMIT_CANDIDATES` | `true` | Unlimited challenges immediately submit distinct source-qualified candidates through the fifth wrong. One exact, unique, non-placeholder flag literal authored in the authenticated Board description gets one durable try; capped or ambiguous descriptions skip this path. Later ordinary candidates or Board-limited challenges require an independent Verifier. |
 | `RAPIDO_MANAGE_DYNAMIC_INSTANCES` | `true` | Local-first analysis plus one receipt-bound shared-instance lease at a time. |
 | `RAPIDO_WATCH_BOARD` | `true` | Append new challenges during active work; after drain, stay alive until the original deadline and resume new or changed work. |
 | `RAPIDO_BOARD_WATCH_SECONDS` | `60` | Idle challenge-list polling interval. |
@@ -114,6 +114,12 @@ candidates are still submitted. A generic `already_solved` response proves only 
 it does not validate that run's candidate. Board-unsolved challenges are queued first. A fresh
 `already_solved` response closes immediately without wasting a Verifier and is not reported as a
 new HTTP `correct`.
+
+A Board-description literal is not a guess: the controller submits only one exact unique flag-shaped
+literal after a fresh same-challenge refresh confirms unlimited attempts. It never synthesizes
+variants. A wrong verdict retires that identity and normal analysis continues. A correct verdict
+stops the challenge, but is recorded as Board-origin score evidence with `run_local_verified=false`;
+it does not count as initial solver analysis or satisfy a fresh-derivation acceptance gate.
 
 For repeated calibration runs, report current-run and cumulative results separately. Count a
 cumulative challenge once only from the source run that received `correct`, or from independent
@@ -131,7 +137,9 @@ plus host/controller facts from earlier episodes in the same lane. The selected 
 cross-lane model prose. Every verifier `same_run_memory` projection is empty; private controller
 state still retains candidates for verification. Selected same-run solver scripts and analysis
 files survive changed non-Verifier episodes only for identical challenge material; unsafe content,
-links, and raw endpoints are excluded. Raw tool payloads, payload-derived digests,
+links, raw endpoints, and files or names containing settled wrong candidates are excluded. For an
+exact eight-hex candidate, its inner case variants and four-byte endian encodings are excluded too;
+the filter does not mine arbitrary substrings. Raw tool payloads, payload-derived digests,
 authorities, paths, credentials, and candidate fingerprints are never carried into public memory.
 Agents may write and execute analysis scripts through the confined workspace shell. For assigned
 targets, `run_target_script` runs a saved Python program without direct networking and brokers its
@@ -169,10 +177,11 @@ docker exec rapido rapido monitor
 docker exec rapido rapido monitor --follow --interval 10 --record-jsonl
 ```
 
-The monitor reads SQLite in query-only mode and the solver container's own cgroup. It reports
-queue/instance-wait IDs, lane states, tools, continuations, submissions, CPU, memory, and PIDs; it
-never calls the Board or reads candidate values, credentials, raw Board payloads, model prose, or
-Docker state. Recorded samples use `/state/rapido-monitor.jsonl` and mode `0600`.
+The monitor reads SQLite in query-only mode, the solver container's own cgroup, and the private
+supervisor record. It reports queue/instance-wait IDs, lane states, tools, continuations,
+submissions, CPU, memory, PIDs, and sanitized restart state; it never calls the Board or reads
+candidate values, credentials, raw Board payloads, model prose, or Docker state. Recorded samples
+use `/state/rapido-monitor.jsonl` and mode `0600`.
 
 Use the 180-second grace period so bounded target drains, native shutdown, and instance cleanup can
 finish:
@@ -181,19 +190,24 @@ finish:
 docker stop --timeout 180 rapido
 ```
 
-With `--rm`, rerun the same `docker run` command against the same state/auth mounts after a crash;
-Rapido recovers interrupted attempts and recognized stale work roots. Do not start a second
-supervisor against the same state, work root, or Codex home. `docker --rm` removes only the stopped
-container; mounted state and auth persist.
+Launch one named, detached container with `--restart unless-stopped`; keep Rapido as PID 1 without
+Docker `--init`. Rapido supervises a disposable solver worker, reaps its descendants, and retries a
+crash after durable 5/30/120-second backoffs. A replacement resumes only the same still-running Run,
+keeps its original deadline, and reconciles Board state before admitting work. An ambiguous
+submission leaves the supervisor `blocked` until its durable intent is reconciled; unchanged state
+is never retried. Terminal or refused state leaves the container quiescent for inspection. Do not
+start a second supervisor against the same state, work root, or Codex home.
+
+An intentional `docker stop` forwards SIGTERM, drains cleanup, and terminalizes the Run as
+`interrupted`; restarting that container is inspection-only. Same-Run recovery applies to abrupt
+worker, container, or daemon loss that leaves the durable Run `running`.
 
 For an ambiguous submission, inspect the Board independently, then record the exact outcome; never
 blindly retry:
 
 ```sh
-docker run --rm --entrypoint rapido --env-file=/private/path/rapido.env \
-  --mount type=bind,src=/private/path/rapido-state,dst=/state rapido:local pending
-docker run --rm --entrypoint rapido --env-file=/private/path/rapido.env \
-  --mount type=bind,src=/private/path/rapido-state,dst=/state rapido:local reconcile \
+docker exec rapido rapido pending
+docker exec rapido rapido reconcile \
   --challenge-id ID --candidate-sha256 SHA256 \
   --outcome correct
 ```
@@ -201,7 +215,8 @@ docker run --rm --entrypoint rapido --env-file=/private/path/rapido.env \
 Use exactly one supported outcome: `correct`, `incorrect`, or `not-delivered`.
 
 Do not use broad Docker prune/delete commands on the state or auth volume. Preserve sanitized
-evidence first, then remove only the run's containers, volumes, and workspaces as authorized.
+evidence first, then stop and remove only the run's exact named container, state volume, and
+workspace as authorized. Preserve the dedicated authentication volume.
 
 ## Troubleshooting and security
 
