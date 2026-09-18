@@ -1466,19 +1466,22 @@ class Orchestrator:
                     if priority <= prior[0]:
                         continue
                 canonical[relative] = (priority, source, "imported" if imported else "fresh")
-            selected_paths: list[Path] = []
+            selected_paths: set[Path] = set()
+            selected_ancestors: set[Path] = set()
             selected_candidates: list[tuple[Path, Path, str]] = []
             for relative, selected in sorted(
                 canonical.items(),
                 key=lambda item: (-item[1][0], len(item[0].parts), item[0].as_posix()),
             ):
-                if any(
-                    relative in prior.parents or prior in relative.parents
-                    for prior in selected_paths
+                if relative in selected_ancestors or any(
+                    parent in selected_paths for parent in relative.parents
                 ):
                     dropped("shadowed")
                     continue
-                selected_paths.append(relative)
+                selected_paths.add(relative)
+                selected_ancestors.update(
+                    parent for parent in relative.parents if parent != Path(".")
+                )
                 selected_candidates.append((relative, selected[1], selected[2]))
             lane_candidates[lane] = sorted(selected_candidates, key=lambda item: item[0].as_posix())
 
@@ -1568,15 +1571,17 @@ class Orchestrator:
                         dropped("byte_cap")
                         continue
                     destination = staging / f"lane-{lane}" / relative
+                    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
                     try:
                         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        temporary = destination.with_name(
-                            f".{destination.name}.{uuid.uuid4().hex}.tmp"
-                        )
                         temporary.write_bytes(payload)
                         temporary.chmod(0o600)
                         os.replace(temporary, destination)
                     except OSError:
+                        try:
+                            temporary.unlink()
+                        except OSError:
+                            pass
                         dropped("invalid_file")
                         continue
                     files += 1

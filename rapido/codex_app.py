@@ -142,6 +142,74 @@ _RETRYABLE_TOOL_ERRORS = frozenset(
         "tool_timeout",
     }
 )
+_TOOL_ERROR_CODES = frozenset(
+    {
+        "archive_password_rejected",
+        "archive_password_required",
+        "archive_too_large",
+        "command_cleanup_failed",
+        "command_failed",
+        "connection_limit",
+        "deadline_exceeded",
+        "generation_revoked",
+        "inconsistent_system",
+        "input_too_large",
+        "internal_error",
+        "invalid_archive",
+        "invalid_argument",
+        "invalid_artifact",
+        "invalid_audio",
+        "invalid_cursor",
+        "invalid_dicom",
+        "invalid_elf",
+        "invalid_encoding",
+        "invalid_integer",
+        "invalid_modulus",
+        "invalid_workspace",
+        "length_mismatch",
+        "limit_exceeded",
+        "not_a_directory",
+        "not_a_file",
+        "not_found",
+        "not_invertible",
+        "output_too_large",
+        "path_outside_target",
+        "path_outside_workspace",
+        "path_unavailable",
+        "pow_exhausted",
+        "pow_limit",
+        "pow_protocol",
+        "pow_timeout",
+        "protocol_mismatch",
+        "read_failed",
+        "resource_limit",
+        "root_domain",
+        "session_limit",
+        "source_changed",
+        "stale_cursor",
+        "symlink_or_invalid_path",
+        "target_transport",
+        "tcp_session",
+        "team_key_unavailable",
+        "tool_busy",
+        "tool_call_limit",
+        "tool_cleanup_failed",
+        "tool_failed",
+        "tool_timeout",
+        "tool_unavailable",
+        "transfer_limit",
+        "unknown_tool",
+        "unsafe_archive",
+        "unsupported_archive",
+        "unsupported_format",
+        "unsupported_operation",
+        "unsupported_platform",
+        "value_out_of_range",
+        "workspace_quota",
+        "write_conflict",
+        "write_failed",
+    }
+)
 _TOOL_FAILURE_STAGES = frozenset({"arguments", "execution", "result"})
 _TOOL_FAILURE_KINDS = frozenset(
     {"array", "boolean", "bytes", "integer", "missing", "null", "object", "other", "string"}
@@ -1627,9 +1695,14 @@ class CodexAppClient:
                     state.provenance_outputs.append(provenance_result)
                     state.provenance_bytes += encoded_bytes
         except ToolError as exc:
+            code = (
+                exc.code
+                if isinstance(exc.code, str) and exc.code in _TOOL_ERROR_CODES
+                else "internal_error"
+            )
             safe_details = _closed_tool_failure_details(exc.details)
-            observation_result = failed_observation(exc.code, safe_details)
-            error_payload = {"code": exc.code, "message": "tool call failed safely"}
+            observation_result = failed_observation(code, safe_details)
+            error_payload = {"code": code, "message": "tool call failed safely"}
             if safe_details:
                 error_payload["details"] = safe_details
             payload = {

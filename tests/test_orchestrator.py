@@ -654,6 +654,53 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
     store.close()
 
 
+def test_analysis_carry_removes_failed_staging_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path, submit=False)
+    store = StateStore(cfg.state_path)
+    item = challenge(1)
+    run_id = "carry-staging-run"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    material = orchestrator_module._challenge_material_sha256(item)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(item.id, item.name, item.category, item.type, item.value)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, item.id, True)],
+        1,
+        route,
+        (("specialist", route.model, route.effort),),
+        {item.id: material},
+    )
+    run_root = tmp_path / "run"
+    analysis_root = (
+        run_root / "challenge-1" / "episode-0" / "generation-0" / "lane-0" / "rapido-analysis"
+    )
+    analysis_root.mkdir(parents=True)
+    (analysis_root / "a.txt").write_text("first")
+    (analysis_root / "b.txt").write_text("second")
+    original_replace = orchestrator_module.os.replace
+
+    def fail_first(source, destination) -> None:
+        if Path(source).name.startswith(".a.txt."):
+            raise OSError("injected staging failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(orchestrator_module.os, "replace", fail_first)
+    orchestrator = Orchestrator(cfg, FakeBoard([item]), store, FakeRuntime({}))
+
+    files, _, telemetry = orchestrator._capture_analysis_carry(run_id, item, 0, run_root, ())
+
+    carry_root = run_root / "challenge-1" / "carry" / material / "lane-0"
+    assert files == 1
+    assert telemetry["drop_counts"]["invalid_file"] == 1
+    assert [path.relative_to(carry_root) for path in carry_root.rglob("*") if path.is_file()] == [
+        Path("b.txt")
+    ]
+    store.close()
+
+
 def test_two_lanes_overlap_agree_submit_once_and_persist_without_plain_candidate(
     tmp_path: Path,
 ) -> None:

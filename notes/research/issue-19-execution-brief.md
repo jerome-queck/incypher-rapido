@@ -1397,6 +1397,12 @@ tool boundary. Direct HTTP-200 and reconciled-correct counts remain separate. Th
 Python-3.12 PR failure was a sub-second test clock race; its window is widened while preserving the
 same production assertion.
 
+The next exact-head tool/carry review found three adjacent cases: untrusted tool error codes could
+still escape the closed boundary; prefix-conflict selection was quadratic before the 64-file cap;
+and a failed staging rename could leave a dot-prefixed temporary in retained carry. The follow-up
+projects error codes onto a fixed registry, resolves path prefixes in linear work over path depth,
+and unlinks failed staging temporaries before continuing.
+
 Local validation after these review fixes is 992 passed / 4 platform skips, plus 426 focused passes
 and 3 skips. Ruff check/format and diff checks are clean. Exact-head independent re-review, PR CI,
 final merged-image registration, and the 30-minute diagnostic remain pending.

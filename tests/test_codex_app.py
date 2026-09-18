@@ -222,7 +222,7 @@ class ToolStub:
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bad":
             raise ToolError(
-                "bad_tool",
+                "INCYPHER{raw-rejected-code}",
                 "INCYPHER{raw-rejected-tool-message}",
                 details={
                     "contract_version": 1,
@@ -1279,12 +1279,12 @@ async def test_tool_call_and_structured_tool_error(
     responses = {item["id"]: item for item in fake_process.responses}
     assert responses[90]["result"]["success"] is True
     assert responses[91]["result"]["success"] is False
-    assert '"bad_tool"' in responses[91]["result"]["contentItems"][0]["text"]
+    assert '"internal_error"' in responses[91]["result"]["contentItems"][0]["text"]
     assert len(state.tool_calls) == 2
     assert all(isinstance(call["host_observation"], HostObservation) for call in state.tool_calls)
     assert state.tool_calls[0]["host_observation"].success is True
     assert state.tool_calls[1]["host_observation"].success is False
-    assert state.tool_calls[1]["host_observation"].facts["error_code"] == "bad_tool"
+    assert state.tool_calls[1]["host_observation"].facts["error_code"] == "internal_error"
     assert state.tool_calls[1]["host_observation"].facts["retryable"] is False
     assert state.tool_calls[1]["host_observation"].facts["duration_milliseconds"] >= 0
     assert (
@@ -1300,6 +1300,7 @@ async def test_tool_call_and_structured_tool_error(
     )
     assert "must-not-survive" not in responses[91]["result"]["contentItems"][0]["text"]
     assert "raw-rejected-tool-message" not in responses[91]["result"]["contentItems"][0]["text"]
+    assert "raw-rejected-code" not in responses[91]["result"]["contentItems"][0]["text"]
     await client.close()
 
 
