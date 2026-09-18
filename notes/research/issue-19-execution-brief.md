@@ -1417,5 +1417,7 @@ rejected.
 
 Local validation after these review fixes is 995 passed / 4 platform skips, including 303 focused
 state/control/orchestration/evidence passes and 3 skips. Ruff check/format and diff checks are clean.
-Exact-head independent re-review, PR CI, final merged-image registration, and the 30-minute
-diagnostic remain pending.
+Exact-head independent Daybreak/xhigh re-review is clean: 4,000 fresh concurrent constructors had
+zero failures; deterministic pauses before and after attempt migration exposed neither table nor
+trigger without the guard; a forced migration failure rolled back and released the writer lock.
+PR CI, final merged-image registration, and the 30-minute diagnostic remain pending.
