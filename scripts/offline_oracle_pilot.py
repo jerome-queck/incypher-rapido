@@ -10,16 +10,18 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,25 +33,58 @@ from rapido.codex_app import (
     TurnTimeoutError,
 )
 from rapido.config import validate_codex_home
+from rapido.evidence import EvidenceBatch, RunEvidence
+from rapido.memory import MemoryTarget, project_memory
+from rapido.orchestrator import _normalize_tool_calls
+from rapido.routing import baseline_route
 from rapido.solver import (
     OFFLINE_DEVELOPER_INSTRUCTIONS,
     SOLVER_OUTPUT_SCHEMA,
     SolverFinding,
     SolverOutputError,
     build_turn_prompt,
+    candidate_is_eligible,
+    challenge_candidate_prose,
 )
+from rapido.state import StateStore
 from rapido.tools import ToolRegistry
 
 TURN_TIMEOUT_SECONDS = 300.0
 MAX_WORKSPACE_BYTES = 192 * 1024 * 1024
 ORACLE_SCHEMA = "rapido-offline-oracle-v1"
 RECEIPT_SCHEMA = "rapido-offline-oracle-pilot-v1"
+VERIFIER_REPAIR_RECEIPT_SCHEMA = "rapido-offline-verifier-repair-v1"
+MODEL_COMPARISON_EXPERIMENT = "model-comparison"
+VERIFIER_REPAIR_EXPERIMENT = "verifier-repair"
 _SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _CLOSED_LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ORACLE_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 
 Outcome = Literal["correct", "wrong", "unverifiable", "timeout", "provider_failure"]
+VerifierOutcome = Literal[
+    "verified_correct",
+    "verified_wrong",
+    "rejected_correct",
+    "rejected_wrong",
+    "no_candidate",
+    "solver_output",
+    "timeout",
+    "provider_failure",
+]
+VerifierRejection = Literal[
+    "candidate_evidence_incomplete",
+    "candidate_ineligible",
+    "candidate_supplied",
+    "candidate_unobserved",
+    "verifier_requires_fixed_observation",
+    "solver_output",
+]
+_REPAIRABLE_VERIFIER_REJECTIONS = frozenset(
+    {"candidate_unobserved", "verifier_requires_fixed_observation"}
+)
+_VERIFIER_MODEL = "gpt-daybreak-blue-latest"
+_VERIFIER_EFFORT = "xhigh"
 
 
 @dataclass(frozen=True)
@@ -62,6 +97,18 @@ class Arm:
 ARMS = (
     Arm("daybreak_xhigh", "gpt-daybreak-blue-latest", "xhigh"),
     Arm("luna_xhigh", "gpt-5.6-luna", "xhigh"),
+)
+
+
+@dataclass(frozen=True)
+class VerifierArm:
+    id: str
+    continuation: bool
+
+
+VERIFIER_ARMS = (
+    VerifierArm("one_shot", False),
+    VerifierArm("evidence_repair", True),
 )
 
 
@@ -123,6 +170,80 @@ class Measurement:
             "tool_calls": self.tool_calls,
             "tool_errors": dict(self.tool_errors),
             "native_usage": dict(self.native_usage),
+        }
+
+
+@dataclass(frozen=True)
+class VerifierTurnEvaluation:
+    outcome: VerifierOutcome
+    rejection_reason: VerifierRejection | None
+    candidate: str | None = field(default=None, repr=False)
+
+    def public(self) -> dict[str, object]:
+        return {
+            "outcome": self.outcome,
+            "rejection_reason": self.rejection_reason,
+            "verified": self.rejection_reason is None
+            and self.outcome in {"verified_correct", "verified_wrong"},
+        }
+
+
+@dataclass(frozen=True)
+class VerifierMeasurement:
+    task_id: str
+    family: str
+    arm: VerifierArm
+    first: VerifierTurnEvaluation
+    final: VerifierTurnEvaluation
+    fixture_elapsed_seconds: float
+    first_turn_seconds: float
+    repair_turn_seconds: float
+    repair_attempted: bool
+    continuation_count: int
+    same_thread: bool
+    continuation_prompt_candidate_free: bool
+    first_tool_calls: int
+    final_tool_calls: int
+    cumulative_tool_calls: int
+    tool_errors: Mapping[str, object]
+    first_native_usage: Mapping[str, object]
+    final_native_usage: Mapping[str, object]
+    failure_class: str | None
+
+    def public(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "family": self.family,
+            "arm": self.arm.id,
+            "model": _VERIFIER_MODEL,
+            "effort": _VERIFIER_EFFORT,
+            "role": "verifier",
+            "first": self.first.public(),
+            "final": self.final.public(),
+            "repair_attempted": self.repair_attempted,
+            "continuation_count": self.continuation_count,
+            "same_thread": self.same_thread,
+            "continuation_prompt_candidate_free": self.continuation_prompt_candidate_free,
+            "elapsed_seconds": round(
+                self.fixture_elapsed_seconds + self.first_turn_seconds + self.repair_turn_seconds,
+                3,
+            ),
+            "spans": {
+                "fixture_setup_seconds": round(self.fixture_elapsed_seconds, 3),
+                "first_turn_seconds": round(self.first_turn_seconds, 3),
+                "repair_turn_seconds": round(self.repair_turn_seconds, 3),
+            },
+            "tool_calls": {
+                "first_turn": self.first_tool_calls,
+                "final_turn": self.final_tool_calls,
+                "cumulative": self.cumulative_tool_calls,
+            },
+            "tool_errors": dict(self.tool_errors),
+            "native_usage": {
+                "first_turn": dict(self.first_native_usage),
+                "final_turn": dict(self.final_native_usage),
+            },
+            "failure_class": self.failure_class,
         }
 
 
@@ -335,6 +456,196 @@ def _specialist_prompt(fixture: FixtureSpec) -> str:
         "oracle_visible": False,
     }
     return json.dumps(document, sort_keys=True, separators=(",", ":"))
+
+
+def _verifier_route():
+    return replace(
+        baseline_route(
+            model=_VERIFIER_MODEL,
+            effort=_VERIFIER_EFFORT,
+            attempt_seconds=int(TURN_TIMEOUT_SECONDS),
+        ),
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+
+
+def _verifier_prompt(fixture: FixtureSpec) -> str:
+    run_id = "offline-verifier-repair"
+    episode = 1
+    lane = 0
+    route = _verifier_route()
+    memory = project_memory(
+        (),
+        MemoryTarget(run_id, fixture.number, episode, lane, "verifier"),
+    )
+    return build_turn_prompt(
+        _challenge(fixture),
+        [fixture.artifact_name],
+        lane,
+        run_id=run_id,
+        episode=episode,
+        control_route=route,
+        same_run_memory=memory,
+        agent_role="verifier",
+    )
+
+
+def build_verifier_repair_prompt(
+    rejection_reason: str,
+    remaining_seconds: float | None,
+) -> str:
+    """Build one candidate-free follow-up for a repairable Verifier evidence failure."""
+    if rejection_reason not in _REPAIRABLE_VERIFIER_REJECTIONS:
+        raise ValueError("verifier rejection is not repairable")
+    if remaining_seconds is not None and (
+        isinstance(remaining_seconds, bool) or remaining_seconds < 0
+    ):
+        raise ValueError("remaining verifier seconds are invalid")
+    return json.dumps(
+        {
+            "label": "TRUSTED_VERIFIER_EVIDENCE_REPAIR",
+            "continuation_round": 1,
+            "reason": rejection_reason,
+            "remaining_milliseconds": (
+                None if remaining_seconds is None else max(0, int(remaining_seconds * 1000))
+            ),
+            "task": (
+                "The prior flag-shaped hypothesis did not satisfy the Verifier evidence recipe. "
+                "Continue in this same thread without echoing it or placing it in tool input. "
+                "Rerun the derivation from the challenge source. If shell transformation is "
+                "needed, make the transformation write its result to a workspace file without "
+                "embedding the result literal, then inspect that file with a successful fixed "
+                "non-run_shell source tool. Return the required JSON only after that exact "
+                "source observation."
+            ),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _candidate_forms(candidate: str) -> tuple[str, ...]:
+    encoded = candidate.encode("utf-8")
+    return (
+        candidate,
+        hashlib.sha256(encoded).hexdigest(),
+        base64.b64encode(encoded).decode("ascii"),
+        encoded.hex(),
+        urllib.parse.quote(candidate, safe=""),
+    )
+
+
+def _current_candidate_rejection(
+    candidate: str,
+    challenge: Challenge,
+    raw_calls: object,
+) -> VerifierRejection | None:
+    _, calls, complete = _normalize_tool_calls(raw_calls)
+    if not complete:
+        return "candidate_evidence_incomplete"
+    if not candidate_is_eligible(candidate, ""):
+        return "candidate_ineligible"
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    supplied = any(digest in call.supplied_candidate_sha256s for call in calls)
+    observed = any(
+        call.success is True and call.source_bound and digest in call.candidate_sha256s
+        for call in calls
+    )
+    if supplied:
+        return "candidate_supplied"
+    if not observed:
+        return "candidate_unobserved"
+    if not candidate_is_eligible(
+        candidate,
+        challenge_candidate_prose(challenge),
+        source_observed=observed,
+        source_supplied=supplied,
+    ):
+        return "candidate_ineligible"
+    return None
+
+
+def _whole_attempt_attestation(
+    candidate: str,
+    challenge: Challenge,
+    raw_calls: object,
+) -> VerifierRejection | None:
+    """Use the durable production attestation over one complete synthetic attempt."""
+    _, calls, complete = _normalize_tool_calls(raw_calls)
+    with tempfile.TemporaryDirectory(prefix="rapido-offline-attestation-") as temporary:
+        state = StateStore(Path(temporary) / "state.sqlite3")
+        run_id = "offline-attestation"
+        attempt_id = "verifier-attempt"
+        try:
+            state.start_run(run_id, {"offline_verifier_pilot": True})
+            state.upsert_challenge(
+                challenge.id,
+                challenge.name,
+                challenge.category,
+                challenge.type,
+                challenge.value,
+            )
+            state.start_attempt(
+                attempt_id,
+                run_id,
+                challenge.id,
+                episode=1,
+                lane=0,
+                model=_VERIFIER_MODEL,
+                effort=_VERIFIER_EFFORT,
+            )
+            evidence = RunEvidence.open(state, run_id)
+            evidence.commit(
+                attempt_id,
+                EvidenceBatch(
+                    tuple(call.observation for call in calls),
+                    complete=complete,
+                    gap=None if complete else "provenance_incomplete",
+                ),
+            )
+            result = evidence.attest_candidate_with_reason(
+                attempt_id,
+                candidate_sha256=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+                require_non_execution_observation=True,
+            )
+            return result.rejection_reason
+        finally:
+            state.close()
+
+
+def _evaluate_verifier_turn(
+    turn: object,
+    expected: str,
+    challenge: Challenge,
+) -> VerifierTurnEvaluation:
+    if getattr(turn, "status", None) != "completed":
+        timed_out = getattr(turn, "timed_out", False) is True
+        return VerifierTurnEvaluation("timeout" if timed_out else "provider_failure", None)
+    try:
+        finding = SolverFinding.from_message(str(getattr(turn, "text", "")))
+    except SolverOutputError:
+        return VerifierTurnEvaluation("solver_output", "solver_output")
+    candidate = finding.candidate
+    if candidate is None:
+        return VerifierTurnEvaluation("no_candidate", None)
+    current_calls = getattr(turn, "current_turn_tool_calls", getattr(turn, "tool_calls", None))
+    rejection = _current_candidate_rejection(candidate, challenge, current_calls)
+    if rejection is None:
+        rejection = _whole_attempt_attestation(
+            candidate,
+            challenge,
+            getattr(turn, "tool_calls", None),
+        )
+    correct = hmac.compare_digest(candidate, expected)
+    if rejection is None:
+        outcome: VerifierOutcome = "verified_correct" if correct else "verified_wrong"
+    else:
+        outcome = "rejected_correct" if correct else "rejected_wrong"
+    return VerifierTurnEvaluation(outcome, rejection, candidate)
 
 
 def _private_regular_file(path: Path, excluded_roots: Sequence[Path]) -> bytes:
@@ -589,6 +900,171 @@ def _provider_failure_measurement(
     )
 
 
+def _mapping_calls(value: object) -> list[Mapping[str, Any]]:
+    return [call for call in value if isinstance(call, Mapping)] if isinstance(value, list) else []
+
+
+def _failed_verifier_measurement(
+    fixture: FixtureSpec,
+    arm: VerifierArm,
+    *,
+    fixture_elapsed_seconds: float,
+    failure_class: str,
+) -> VerifierMeasurement:
+    failed = VerifierTurnEvaluation("provider_failure", None)
+    return VerifierMeasurement(
+        task_id=fixture.id,
+        family=fixture.family,
+        arm=arm,
+        first=failed,
+        final=failed,
+        fixture_elapsed_seconds=fixture_elapsed_seconds,
+        first_turn_seconds=0.0,
+        repair_turn_seconds=0.0,
+        repair_attempted=False,
+        continuation_count=0,
+        same_thread=True,
+        continuation_prompt_candidate_free=True,
+        first_tool_calls=0,
+        final_tool_calls=0,
+        cumulative_tool_calls=0,
+        tool_errors={"total": 0, "untyped": 0, "by_stage": {}, "by_constraint": {}},
+        first_native_usage={"status": "unavailable"},
+        final_native_usage={"status": "unavailable"},
+        failure_class=failure_class,
+    )
+
+
+async def _measure_verifier(
+    client: Any,
+    fixture: FixtureSpec,
+    arm: VerifierArm,
+    workspace: Path,
+    prompt: str,
+    expected: str,
+    max_workspace_bytes: int,
+    fixture_elapsed_seconds: float,
+) -> VerifierMeasurement:
+    started = time.monotonic()
+    challenge = _challenge(fixture)
+    first: VerifierTurnEvaluation | None = None
+    first_finished: float | None = None
+    first_thread_id: str | None = None
+    first_calls: list[Mapping[str, Any]] = []
+    first_usage: Mapping[str, object] = {"status": "unavailable"}
+    continuation_count = 0
+    continuation_prompt_candidate_free = True
+
+    def continue_once(turn: object, remaining_seconds: float | None) -> str | None:
+        nonlocal first, first_finished, first_thread_id, first_calls, first_usage
+        nonlocal continuation_count, continuation_prompt_candidate_free
+        if first is not None:
+            return None
+        first = _evaluate_verifier_turn(turn, expected, challenge)
+        first_finished = time.monotonic()
+        first_thread_id = getattr(turn, "thread_id", None)
+        first_calls = _mapping_calls(getattr(turn, "current_turn_tool_calls", None))
+        first_usage = _native_usage(turn)
+        if (
+            not arm.continuation
+            or first.candidate is None
+            or first.rejection_reason not in _REPAIRABLE_VERIFIER_REJECTIONS
+        ):
+            return None
+        follow_up = build_verifier_repair_prompt(first.rejection_reason, remaining_seconds)
+        continuation_prompt_candidate_free = not any(
+            form in follow_up for form in _candidate_forms(first.candidate)
+        )
+        if not continuation_prompt_candidate_free:
+            return None
+        continuation_count = 1
+        return follow_up
+
+    result: object | None = None
+    failure_class: str | None = None
+    terminal_override: VerifierTurnEvaluation | None = None
+    try:
+        result = await client.solve(
+            workspace,
+            prompt,
+            developer_instructions=OFFLINE_DEVELOPER_INSTRUCTIONS,
+            model=_VERIFIER_MODEL,
+            reasoning_effort=_VERIFIER_EFFORT,
+            output_schema=SOLVER_OUTPUT_SCHEMA,
+            timeout=TURN_TIMEOUT_SECONDS,
+            tool_registry=ToolRegistry(workspace, max_workspace_bytes=max_workspace_bytes),
+            continuation_callback=continue_once if arm.continuation else None,
+        )
+    except TurnTimeoutError as exc:
+        result = exc.result
+        terminal_override = VerifierTurnEvaluation("timeout", None)
+        failure_class = "timeout"
+    except TimeoutError:
+        terminal_override = VerifierTurnEvaluation("timeout", None)
+        failure_class = "timeout"
+    except ModelValidationError:
+        terminal_override = VerifierTurnEvaluation("provider_failure", None)
+        failure_class = "model_validation"
+    except CodexAppError as exc:
+        result = getattr(exc, "result", None)
+        terminal_override = VerifierTurnEvaluation("provider_failure", None)
+        failure_class = _safe_failure(getattr(result, "failure_class", None)) or "native_runtime"
+    except (OSError, RuntimeError, TypeError, ValueError):
+        terminal_override = VerifierTurnEvaluation("provider_failure", None)
+        failure_class = "native_runtime"
+
+    finished = time.monotonic()
+    if first is None:
+        if terminal_override is not None:
+            first = terminal_override
+        elif result is not None:
+            first = _evaluate_verifier_turn(result, expected, challenge)
+        else:
+            first = VerifierTurnEvaluation("provider_failure", None)
+        first_finished = finished
+        first_thread_id = getattr(result, "thread_id", None)
+        first_calls = _mapping_calls(
+            getattr(result, "current_turn_tool_calls", getattr(result, "tool_calls", None))
+        )
+        first_usage = _native_usage(result)
+    final = (
+        terminal_override
+        if terminal_override is not None
+        else _evaluate_verifier_turn(result, expected, challenge)
+        if result is not None
+        else VerifierTurnEvaluation("provider_failure", None)
+    )
+    cumulative_calls = _mapping_calls(getattr(result, "tool_calls", None))
+    final_calls = _mapping_calls(
+        getattr(result, "current_turn_tool_calls", getattr(result, "tool_calls", None))
+    )
+    assert first_finished is not None
+    same_thread = continuation_count == 0 or (
+        isinstance(first_thread_id, str) and first_thread_id == getattr(result, "thread_id", None)
+    )
+    return VerifierMeasurement(
+        task_id=fixture.id,
+        family=fixture.family,
+        arm=arm,
+        first=first,
+        final=final,
+        fixture_elapsed_seconds=fixture_elapsed_seconds,
+        first_turn_seconds=max(0.0, first_finished - started),
+        repair_turn_seconds=max(0.0, finished - first_finished) if continuation_count else 0.0,
+        repair_attempted=continuation_count == 1,
+        continuation_count=continuation_count,
+        same_thread=same_thread,
+        continuation_prompt_candidate_free=continuation_prompt_candidate_free,
+        first_tool_calls=len(first_calls),
+        final_tool_calls=len(final_calls),
+        cumulative_tool_calls=len(cumulative_calls),
+        tool_errors=closed_tool_error_counts(cumulative_calls),
+        first_native_usage=first_usage,
+        final_native_usage=_native_usage(result),
+        failure_class=failure_class,
+    )
+
+
 def _aggregate(measurements: Sequence[Measurement]) -> dict[str, object]:
     result: dict[str, object] = {}
     for arm in ARMS:
@@ -664,6 +1140,338 @@ def _receipt(
         "runtime": dict(runtime),
         "results": [measurement.public() for measurement in measurements],
         "summary": _aggregate(measurements),
+    }
+
+
+def _verifier_summary(
+    measurements: Sequence[VerifierMeasurement],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for arm in VERIFIER_ARMS:
+        rows = [row for row in measurements if row.arm == arm]
+        first_outcomes = Counter(row.first.outcome for row in rows)
+        final_outcomes = Counter(row.final.outcome for row in rows)
+        first_rejections = Counter(
+            row.first.rejection_reason for row in rows if row.first.rejection_reason is not None
+        )
+        final_rejections = Counter(
+            row.final.rejection_reason for row in rows if row.final.rejection_reason is not None
+        )
+        result[arm.id] = {
+            "model": _VERIFIER_MODEL,
+            "effort": _VERIFIER_EFFORT,
+            "tasks": len(rows),
+            "first_outcomes": {
+                name: first_outcomes.get(name, 0) for name in VerifierOutcome.__args__
+            },
+            "final_outcomes": {
+                name: final_outcomes.get(name, 0) for name in VerifierOutcome.__args__
+            },
+            "first_rejections": dict(sorted(first_rejections.items())),
+            "final_rejections": dict(sorted(final_rejections.items())),
+            "repair_attempts": sum(row.repair_attempted for row in rows),
+            "elapsed_seconds": round(
+                sum(
+                    row.fixture_elapsed_seconds + row.first_turn_seconds + row.repair_turn_seconds
+                    for row in rows
+                ),
+                3,
+            ),
+            "tool_calls": sum(row.cumulative_tool_calls for row in rows),
+        }
+    return result
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+
+def _verifier_gate(
+    measurements: Sequence[VerifierMeasurement],
+    runtime: Mapping[str, Mapping[str, object]],
+    source: Mapping[str, object],
+    image: Mapping[str, object],
+    *,
+    image_required: bool,
+) -> dict[str, object]:
+    one_shot = [row for row in measurements if row.arm.id == "one_shot"]
+    repair = [row for row in measurements if row.arm.id == "evidence_repair"]
+    eligible = [
+        row for row in repair if row.first.rejection_reason in _REPAIRABLE_VERIFIER_REJECTIONS
+    ]
+    converted = [
+        row for row in eligible if row.repair_attempted and row.final.outcome == "verified_correct"
+    ]
+    one_shot_verified = sum(row.final.outcome == "verified_correct" for row in one_shot)
+    repair_first_verified = sum(row.first.outcome == "verified_correct" for row in repair)
+    repair_final_verified = sum(row.final.outcome == "verified_correct" for row in repair)
+    repair_spans = [row.repair_turn_seconds for row in repair if row.repair_attempted]
+    verified_wrong_rows = {
+        (row.task_id, row.arm.id)
+        for row in measurements
+        if row.first.outcome == "verified_wrong" or row.final.outcome == "verified_wrong"
+    }
+    unsafe_continuations = sum(
+        row.repair_attempted and row.first.rejection_reason not in _REPAIRABLE_VERIFIER_REJECTIONS
+        for row in repair
+    )
+    expected_identities = {
+        (fixture.id, fixture.family, arm.id, arm.continuation)
+        for fixture in fixture_catalogue()
+        for arm in VERIFIER_ARMS
+    }
+    actual_identities = [
+        (row.task_id, row.family, row.arm.id, row.arm.continuation) for row in measurements
+    ]
+    actual_identity_counts = Counter(actual_identities)
+    missing_identities = sorted(expected_identities - set(actual_identities))
+    unexpected_identities = sorted(set(actual_identities) - expected_identities)
+    duplicate_identities = sorted(
+        identity for identity, count in actual_identity_counts.items() if count != 1
+    )
+    source_observed = source.get("observed")
+    source_declared = source.get("declared")
+    observed_sha = source_observed.get("head_sha") if isinstance(source_observed, Mapping) else None
+    declared_sha = source_declared.get("sha") if isinstance(source_declared, Mapping) else None
+    source_identity_passed = (
+        isinstance(source_observed, Mapping)
+        and isinstance(observed_sha, str)
+        and _SHA_RE.fullmatch(observed_sha) is not None
+        and isinstance(declared_sha, str)
+        and _SHA_RE.fullmatch(declared_sha) is not None
+        and hmac.compare_digest(observed_sha, declared_sha)
+        and source_observed.get("worktree") == "clean"
+        and source_observed.get("tracked_change_count") == 0
+        and source_observed.get("untracked_file_count") == 0
+        and source.get("declared_matches_head") is True
+    )
+    image_observed = image.get("observed")
+    image_declared = image.get("declared")
+    observed_image_id = image_observed.get("id") if isinstance(image_observed, Mapping) else None
+    declared_image_id = image_declared.get("id") if isinstance(image_declared, Mapping) else None
+    image_identity_passed = not image_required or (
+        isinstance(observed_image_id, str)
+        and _IMAGE_ID_RE.fullmatch(observed_image_id) is not None
+        and isinstance(declared_image_id, str)
+        and _IMAGE_ID_RE.fullmatch(declared_image_id) is not None
+        and hmac.compare_digest(observed_image_id, declared_image_id)
+        and image.get("declared_matches_observed") is True
+    )
+    arm_protocol_passed = all(
+        (row.arm.id == "one_shot" and not row.repair_attempted and row.continuation_count == 0)
+        or (
+            row.arm.id == "evidence_repair"
+            and row.continuation_count in {0, 1}
+            and row.repair_attempted is (row.continuation_count == 1)
+        )
+        for row in measurements
+    )
+    checks = {
+        "exact_fixture_arm_identities": {
+            "actual": len(measurements),
+            "required": len(expected_identities),
+            "missing": [list(identity) for identity in missing_identities],
+            "unexpected": [list(identity) for identity in unexpected_identities],
+            "duplicates": [list(identity) for identity in duplicate_identities],
+            "passed": not missing_identities
+            and not unexpected_identities
+            and not duplicate_identities
+            and len(measurements) == len(expected_identities),
+        },
+        "source_identity": {
+            "required": True,
+            "worktree": (
+                source_observed.get("worktree")
+                if isinstance(source_observed, Mapping)
+                else "unavailable"
+            ),
+            "declared_matches_head": source.get("declared_matches_head"),
+            "passed": source_identity_passed,
+        },
+        "image_identity": {
+            "required": image_required,
+            "status": (
+                "matched"
+                if image_required and image_identity_passed
+                else "mismatch_or_unavailable"
+                if image_required
+                else "not_required"
+            ),
+            "declared_matches_observed": image.get("declared_matches_observed"),
+            "passed": image_identity_passed,
+        },
+        "repair_eligible_first_turns": {
+            "actual": len(eligible),
+            "minimum": 4,
+            "passed": len(eligible) >= 4,
+        },
+        "repair_conversion": {
+            "actual": len(converted),
+            "eligible": len(eligible),
+            "minimum_fraction": 0.75,
+            "passed": len(eligible) >= 4 and len(converted) / len(eligible) >= 0.75,
+        },
+        "added_verified_correct": {
+            "actual": repair_final_verified - repair_first_verified,
+            "minimum": 3,
+            "passed": repair_final_verified - repair_first_verified >= 3,
+        },
+        "not_worse_than_one_shot": {
+            "one_shot": one_shot_verified,
+            "evidence_repair": repair_final_verified,
+            "passed": repair_final_verified >= one_shot_verified,
+        },
+        "verified_wrong_task_arm_rows": {
+            "actual": len(verified_wrong_rows),
+            "maximum": 0,
+            "passed": not verified_wrong_rows,
+        },
+        "unsafe_continuations": {
+            "actual": unsafe_continuations,
+            "maximum": 0,
+            "passed": unsafe_continuations == 0,
+        },
+        "arm_protocol_consistency": {"passed": arm_protocol_passed},
+        "same_thread": {
+            "failures": sum(row.repair_attempted and not row.same_thread for row in repair),
+            "passed": all(not row.repair_attempted or row.same_thread for row in repair),
+        },
+        "one_continuation_maximum": {
+            "maximum_observed": max((row.continuation_count for row in repair), default=0),
+            "passed": all(row.continuation_count <= 1 for row in repair),
+        },
+        "candidate_free_continuation_prompts": {
+            "failures": sum(not row.continuation_prompt_candidate_free for row in repair),
+            "passed": all(row.continuation_prompt_candidate_free for row in repair),
+        },
+        "provider_failures_or_timeouts": {
+            "actual": sum(
+                row.final.outcome in {"provider_failure", "timeout"} for row in measurements
+            ),
+            "maximum": 0,
+            "passed": all(
+                row.final.outcome not in {"provider_failure", "timeout"} for row in measurements
+            ),
+        },
+        "exact_runtime_and_cleanup": {
+            "expected_arms": sorted(arm.id for arm in VERIFIER_ARMS),
+            "actual_arms": sorted(runtime),
+            "passed": set(runtime) == {arm.id for arm in VERIFIER_ARMS}
+            and all(
+                row.get("model") == _VERIFIER_MODEL
+                and row.get("effort") == _VERIFIER_EFFORT
+                and row.get("status") == "completed"
+                and isinstance(row.get("spans"), Mapping)
+                and row["spans"].get("cleanup", {}).get("status") == "completed"
+                for row in runtime.values()
+            ),
+        },
+        "repair_elapsed_median": {
+            "actual_seconds": round(_median(repair_spans), 3),
+            "maximum_seconds": 120,
+            "passed": bool(repair_spans) and _median(repair_spans) <= 120,
+        },
+        "repair_elapsed_p90": {
+            "actual_seconds": round(_percentile(repair_spans, 0.9), 3),
+            "maximum_seconds": 240,
+            "passed": bool(repair_spans) and _percentile(repair_spans, 0.9) <= 240,
+        },
+        "sanitized_receipt": {"passed": True},
+    }
+    passed = all(bool(check["passed"]) for check in checks.values())
+    underpowered_exemptions = {
+        "repair_eligible_first_turns",
+        "repair_conversion",
+        "added_verified_correct",
+        "repair_elapsed_median",
+        "repair_elapsed_p90",
+    }
+    otherwise_clean = all(
+        bool(check["passed"])
+        for name, check in checks.items()
+        if name not in underpowered_exemptions
+    )
+    return {
+        "status": (
+            "passed"
+            if passed
+            else "inconclusive"
+            if len(eligible) < 4 and otherwise_clean
+            else "failed"
+        ),
+        "checks": checks,
+    }
+
+
+def _verifier_receipt(
+    config: PilotConfig,
+    source: Mapping[str, object],
+    image: Mapping[str, object],
+    measurements: Sequence[VerifierMeasurement],
+    runtime: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema": VERIFIER_REPAIR_RECEIPT_SCHEMA,
+        "source": dict(source),
+        "image": dict(image),
+        "protocol": {
+            "experiment": VERIFIER_REPAIR_EXPERIMENT,
+            "oracle_id": config.oracle_id,
+            "oracle_location": "controller_only_outside_solver_workspaces",
+            "post_run_scoring": True,
+            "fixture_count": len(fixture_catalogue()),
+            "families": sorted({fixture.family for fixture in fixture_catalogue()}),
+            "role": "verifier",
+            "fresh_thread_per_task_and_arm": True,
+            "repair_same_thread": True,
+            "repair_continuation_limit": 1,
+            "repairable_rejections": sorted(_REPAIRABLE_VERIFIER_REJECTIONS),
+            "whole_attempt_taint": True,
+            "fixed_non_run_shell_observation_required": True,
+            "prompt_parity": {
+                "offline_developer_authorization_preamble_differs_from_production": True,
+                "common_developer_rules_match_production": True,
+                "verifier_task_and_route_match_production": True,
+            },
+            "source_identity_required": True,
+            "image_identity_required": config.image_id is not None,
+            "timeout_seconds_cumulative": int(TURN_TIMEOUT_SECONDS),
+            "board_enabled": False,
+            "submissions_enabled": False,
+            "fallback_allowed": False,
+            "roster": [
+                {
+                    "arm": arm.id,
+                    "model": _VERIFIER_MODEL,
+                    "effort": _VERIFIER_EFFORT,
+                    "continuation": arm.continuation,
+                }
+                for arm in VERIFIER_ARMS
+            ],
+        },
+        "runtime": {name: dict(row) for name, row in runtime.items()},
+        "results": [measurement.public() for measurement in measurements],
+        "summary": _verifier_summary(measurements),
+        "gate": _verifier_gate(
+            measurements,
+            runtime,
+            source,
+            image,
+            image_required=config.image_id is not None,
+        ),
     }
 
 
@@ -879,8 +1687,234 @@ async def run_pilot(
     return _receipt(config, source, image, measurements, runtime)
 
 
+async def run_verifier_repair_pilot(
+    config: PilotConfig,
+    *,
+    client_factory: Callable[..., Any] = CodexAppClient,
+) -> dict[str, object]:
+    """Compare one-shot verification with one candidate-free same-thread repair."""
+    validate_codex_home(config.codex_home)
+    work_root = _private_directory(config.work_root)
+    key = _private_regular_file(
+        config.oracle_key_file,
+        (
+            work_root,
+            config.codex_home.resolve(strict=True),
+            Path(__file__).resolve().parents[1],
+        ),
+    )
+    if not isinstance(config.oracle_id, str) or _ORACLE_ID_RE.fullmatch(config.oracle_id) is None:
+        raise ValueError("oracle id must be a closed label")
+    if not 1 <= config.max_workspace_bytes <= MAX_WORKSPACE_BYTES:
+        raise ValueError("workspace byte limit is invalid")
+    source = _source_identity(config.source_sha)
+    image = _image_identity(config.image_id)
+    measurements: list[VerifierMeasurement] = []
+    runtime: dict[str, dict[str, object]] = {
+        arm.id: {
+            "model": _VERIFIER_MODEL,
+            "effort": _VERIFIER_EFFORT,
+            "status": "pending",
+            "failure_class": None,
+            "spans": {
+                "startup": {"status": "not_run", "elapsed_seconds": 0.0},
+                "model_validation": {"status": "not_run", "elapsed_seconds": 0.0},
+                "cleanup": {"status": "not_run", "elapsed_seconds": 0.0},
+            },
+        }
+        for arm in VERIFIER_ARMS
+    }
+
+    with tempfile.TemporaryDirectory(
+        prefix="rapido-offline-verifier-repair-", dir=work_root
+    ) as temporary:
+        run_root = Path(temporary)
+        run_root.chmod(0o700)
+        clients: dict[VerifierArm, Any] = {}
+
+        async def start_arm(arm: VerifierArm) -> None:
+            arm_root = run_root / arm.id
+            arm_root.mkdir(mode=0o700)
+            row = runtime[arm.id]
+            spans = row["spans"]
+            assert isinstance(spans, dict)
+            started = time.monotonic()
+            try:
+                client = client_factory(
+                    env={
+                        "CODEX_HOME": str(config.codex_home),
+                        "HOME": str(config.codex_home),
+                        "PATH": "/usr/local/bin:/usr/bin:/bin",
+                        "TERM": "dumb",
+                        "NO_COLOR": "1",
+                    },
+                    binary=config.codex_binary,
+                    cwd=arm_root,
+                    max_workspace_bytes=config.max_workspace_bytes,
+                )
+                if any(client is existing for existing in clients.values()):
+                    raise RuntimeError("client factory reused a native process")
+                clients[arm] = client
+                await asyncio.wait_for(client.start(), timeout=TURN_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
+                spans["startup"] = {
+                    "status": "failed",
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+                row["status"] = "failed"
+                row["failure_class"] = "startup"
+                return
+            spans["startup"] = {
+                "status": "completed",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+            validated = time.monotonic()
+            try:
+                descriptor = await asyncio.wait_for(
+                    client.validate_model(_VERIFIER_MODEL, _VERIFIER_EFFORT),
+                    timeout=TURN_TIMEOUT_SECONDS,
+                )
+                if getattr(
+                    descriptor, "name", None
+                ) != _VERIFIER_MODEL or _VERIFIER_EFFORT not in getattr(
+                    descriptor, "reasoning_efforts", ()
+                ):
+                    raise ModelValidationError(
+                        "native model validation did not retain the exact verifier roster"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
+                spans["model_validation"] = {
+                    "status": "failed",
+                    "elapsed_seconds": round(time.monotonic() - validated, 3),
+                }
+                row["status"] = "failed"
+                row["failure_class"] = "model_validation"
+                return
+            spans["model_validation"] = {
+                "status": "completed",
+                "elapsed_seconds": round(time.monotonic() - validated, 3),
+            }
+            row["status"] = "ready"
+
+        async def close_arm(arm: VerifierArm) -> None:
+            row = runtime[arm.id]
+            spans = row["spans"]
+            assert isinstance(spans, dict)
+            client = clients.get(arm)
+            if client is None:
+                return
+            started = time.monotonic()
+            try:
+                await asyncio.wait_for(client.close(), timeout=TURN_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
+                spans["cleanup"] = {
+                    "status": "failed",
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+                row["status"] = "failed"
+                row["failure_class"] = row["failure_class"] or "cleanup"
+                return
+            spans["cleanup"] = {
+                "status": "completed",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+            if row["status"] == "ready":
+                row["status"] = "completed"
+
+        try:
+            await asyncio.gather(*(start_arm(arm) for arm in VERIFIER_ARMS))
+            for fixture in fixture_catalogue():
+                expected = oracle_answer(key, fixture.id)
+                material = fixture.material(expected)
+                prompt = _verifier_prompt(fixture)
+                prepared: dict[VerifierArm, tuple[Path, float]] = {}
+                pair: dict[VerifierArm, VerifierMeasurement] = {}
+                for arm in VERIFIER_ARMS:
+                    setup_started = time.monotonic()
+                    workspace = run_root / arm.id / fixture.id
+                    try:
+                        workspace.mkdir(mode=0o700, parents=True)
+                        artifact = workspace / fixture.artifact_name
+                        artifact.write_bytes(material)
+                        artifact.chmod(0o600)
+                    except OSError:
+                        pair[arm] = _failed_verifier_measurement(
+                            fixture,
+                            arm,
+                            fixture_elapsed_seconds=time.monotonic() - setup_started,
+                            failure_class="fixture_setup",
+                        )
+                        continue
+                    prepared[arm] = (workspace, time.monotonic() - setup_started)
+
+                tasks: dict[VerifierArm, asyncio.Task[VerifierMeasurement]] = {}
+                for arm in VERIFIER_ARMS:
+                    if arm in pair:
+                        continue
+                    workspace, setup_elapsed = prepared[arm]
+                    client = clients.get(arm)
+                    failure = runtime[arm.id]["failure_class"]
+                    if client is None or runtime[arm.id]["status"] != "ready":
+                        pair[arm] = _failed_verifier_measurement(
+                            fixture,
+                            arm,
+                            fixture_elapsed_seconds=setup_elapsed,
+                            failure_class=str(failure or "startup"),
+                        )
+                        continue
+                    tasks[arm] = asyncio.create_task(
+                        _measure_verifier(
+                            client,
+                            fixture,
+                            arm,
+                            workspace,
+                            prompt,
+                            expected,
+                            config.max_workspace_bytes,
+                            setup_elapsed,
+                        )
+                    )
+                if tasks:
+                    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    for arm, result in zip(tasks, results, strict=True):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if isinstance(result, BaseException):
+                            _, setup_elapsed = prepared[arm]
+                            pair[arm] = _failed_verifier_measurement(
+                                fixture,
+                                arm,
+                                fixture_elapsed_seconds=setup_elapsed,
+                                failure_class="native_runtime",
+                            )
+                        else:
+                            pair[arm] = result
+                measurements.extend(pair[arm] for arm in VERIFIER_ARMS)
+        finally:
+            await asyncio.gather(*(close_arm(arm) for arm in VERIFIER_ARMS))
+
+    receipt = _verifier_receipt(config, source, image, measurements, runtime)
+    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    for fixture in fixture_catalogue():
+        expected = oracle_answer(key, fixture.id)
+        if any(form in encoded for form in _candidate_forms(expected)):
+            raise RuntimeError("sanitized verifier receipt retained private candidate material")
+    return receipt
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
+    result.add_argument(
+        "--experiment",
+        choices=(MODEL_COMPARISON_EXPERIMENT, VERIFIER_REPAIR_EXPERIMENT),
+        default=MODEL_COMPARISON_EXPERIMENT,
+    )
     result.add_argument("--codex-binary", required=True)
     result.add_argument("--codex-home", required=True, type=Path)
     result.add_argument("--work-root", required=True, type=Path)
@@ -904,7 +1938,12 @@ def main() -> int:
         oracle_id=arguments.oracle_id,
         max_workspace_bytes=arguments.max_workspace_bytes,
     )
-    print(json.dumps(asyncio.run(run_pilot(config)), sort_keys=True, separators=(",", ":")))
+    pilot = (
+        run_verifier_repair_pilot(config)
+        if arguments.experiment == VERIFIER_REPAIR_EXPERIMENT
+        else run_pilot(config)
+    )
+    print(json.dumps(asyncio.run(pilot), sort_keys=True, separators=(",", ":")))
     return 0
 
 
