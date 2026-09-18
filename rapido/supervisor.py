@@ -24,7 +24,7 @@ from typing import Any, Self
 
 RESTART_BACKOFF_SECONDS = (5.0, 30.0, 120.0)
 _RECORD_VERSION = 1
-_RECORD_PHASES = frozenset({"active", "blocked", "scheduled", "terminal"})
+_RECORD_PHASES = frozenset({"active", "blocked", "scheduled", "stopping", "terminal"})
 _TERMINAL_RUN_STATES = frozenset({"completed", "deadline", "failed", "interrupted"})
 _FINGERPRINT_TABLES = {
     "runs": ("id", "status", "started_at", "finished_at", "config_json"),
@@ -547,11 +547,19 @@ class Supervisor:
     def _run_owned(self) -> int:
         record = self._files.load()
         initial_record = (
-            record is not None and record.phase in {"active", "scheduled"} and record.run_id is None
+            record is not None
+            and record.phase in {"active", "scheduled", "stopping"}
+            and record.run_id is None
         )
         durable = _read_initially_recoverable_run(self.state_path, initial_record=initial_record)
         if record is not None and record.phase == "terminal":
             return self._quiesce(record.disposition or "refused", record.run_id)
+        if record is not None and record.phase == "stopping":
+            self._finalize_operator_stop(record)
+            finalized = self._files.load()
+            if finalized is not None and finalized.phase == "terminal":
+                return self._quiesce(finalized.disposition or "operator_stopped", finalized.run_id)
+            return self._quiesce("operator_stop_pending", record.run_id)
         if durable is not None and durable.status != "running":
             self._write_terminal(record, durable.run_id, durable.status)
             return self._quiesce(durable.status, durable.run_id)
@@ -1004,22 +1012,36 @@ class Supervisor:
             )
         )
 
-    def _finalize_operator_stop(self) -> None:
+    def _finalize_operator_stop(self, record: SupervisorRecord | None = None) -> None:
         """Persist stop intent after worker/descendant drain and before process exit."""
-        record = self._files.load()
+        if record is None:
+            record = self._files.load()
         if record is not None and record.phase == "terminal":
             return
         run_id = None if record is None else record.run_id
+        if record is None or record.phase != "stopping":
+            record = SupervisorRecord(
+                _RECORD_VERSION,
+                "stopping",
+                run_id,
+                0 if record is None else record.replacement_count,
+                0.0,
+                "operator_stop_pending",
+                None,
+                time.time(),
+            )
+            self._files.write(record)
         try:
             durable = _read_durable_run(self.state_path)
-        except SupervisorRefused:
-            durable = None
+        except SupervisorRefused as exc:
+            self.reporter({"status": "refused", "reason": str(exc)})
+            return
         if run_id is None and durable is not None:
             run_id = durable.run_id
         if durable is not None and durable.status != "running":
-            self._write_terminal(record, durable.run_id, durable.status)
+            disposition = "operator_stopped" if durable.status == "interrupted" else durable.status
+            self._write_terminal(record, durable.run_id, disposition)
             return
-        disposition = "operator_stopped"
         if run_id is not None and durable is not None and durable.status == "running":
             from .state import StateStore
 
@@ -1031,12 +1053,12 @@ class Supervisor:
                 if durable_status not in {"interrupted", "completed", "deadline", "failed"}:
                     raise RuntimeError("operator stop produced an invalid durable run state")
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-                disposition = "operator_stop_persistence_failed"
                 self.reporter({"status": "refused", "reason": str(exc)})
+                return
             finally:
                 if state is not None:
                     state.close()
-        self._write_terminal(record, run_id, disposition)
+        self._write_terminal(record, run_id, "operator_stopped")
 
     def _quiesce(self, disposition: str = "refused", run_id: str | None = None) -> int:
         self.reporter({"status": "quiescent", "run_id": run_id, "disposition": disposition})
