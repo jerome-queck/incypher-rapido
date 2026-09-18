@@ -1667,7 +1667,17 @@ class StateStore:
                       JOIN control_catalogue AS catalogue
                         ON catalogue.run_id=proposal.run_id
                        AND catalogue.challenge_id=proposal.challenge_id
+                      JOIN candidate_evidence_proofs AS proposal_proof
+                        ON proposal_proof.source_attempt_id=proposal.source_attempt_id
+                       AND proposal_proof.run_id=proposal.run_id
+                       AND proposal_proof.challenge_id=proposal.challenge_id
+                       AND proposal_proof.candidate_key=proposal.candidate_key
+                      JOIN attempts AS producer_attempt
+                        ON producer_attempt.id=proposal.source_attempt_id
+                       AND producer_attempt.run_id=proposal.run_id
+                       AND producer_attempt.challenge_id=proposal.challenge_id
                       WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
+                        AND producer_attempt.status='candidate'
                         AND proposal.episode>=catalogue.context_episode
                         AND proposal.context_identity=(
                           CASE WHEN catalogue.context_sha256 IS NOT NULL
@@ -1739,7 +1749,17 @@ class StateStore:
                     JOIN control_catalogue AS catalogue
                       ON catalogue.run_id=proposal.run_id
                      AND catalogue.challenge_id=proposal.challenge_id
+                    JOIN candidate_evidence_proofs AS proposal_proof
+                      ON proposal_proof.source_attempt_id=proposal.source_attempt_id
+                     AND proposal_proof.run_id=proposal.run_id
+                     AND proposal_proof.challenge_id=proposal.challenge_id
+                     AND proposal_proof.candidate_key=proposal.candidate_key
+                    JOIN attempts AS producer_attempt
+                      ON producer_attempt.id=proposal.source_attempt_id
+                     AND producer_attempt.run_id=proposal.run_id
+                     AND producer_attempt.challenge_id=proposal.challenge_id
                     WHERE proposal.run_id=? AND proposal.challenge_id=?
+                      AND producer_attempt.status='candidate'
                       AND proposal.episode>=catalogue.context_episode
                       AND proposal.context_identity=(
                         CASE WHEN catalogue.context_sha256 IS NOT NULL
@@ -3331,7 +3351,17 @@ class StateStore:
                 JOIN control_catalogue AS catalogue
                   ON catalogue.run_id=proposal.run_id
                  AND catalogue.challenge_id=proposal.challenge_id
+                JOIN candidate_evidence_proofs AS proposal_proof
+                  ON proposal_proof.source_attempt_id=proposal.source_attempt_id
+                 AND proposal_proof.run_id=proposal.run_id
+                 AND proposal_proof.challenge_id=proposal.challenge_id
+                 AND proposal_proof.candidate_key=proposal.candidate_key
+                JOIN attempts AS producer_attempt
+                  ON producer_attempt.id=proposal.source_attempt_id
+                 AND producer_attempt.run_id=proposal.run_id
+                 AND producer_attempt.challenge_id=proposal.challenge_id
                 WHERE proposal.run_id=? AND proposal.challenge_id=?
+                  AND producer_attempt.status='candidate'
                   AND proposal.episode>=catalogue.context_episode
                   AND proposal.context_identity=(
                     CASE WHEN catalogue.context_sha256 IS NOT NULL
@@ -4492,7 +4522,17 @@ class StateStore:
                       JOIN control_catalogue AS catalogue
                         ON catalogue.run_id=proposal.run_id
                        AND catalogue.challenge_id=proposal.challenge_id
+                      JOIN candidate_evidence_proofs AS proposal_proof
+                        ON proposal_proof.source_attempt_id=proposal.source_attempt_id
+                       AND proposal_proof.run_id=proposal.run_id
+                       AND proposal_proof.challenge_id=proposal.challenge_id
+                       AND proposal_proof.candidate_key=proposal.candidate_key
+                      JOIN attempts AS producer_attempt
+                        ON producer_attempt.id=proposal.source_attempt_id
+                       AND producer_attempt.run_id=proposal.run_id
+                       AND producer_attempt.challenge_id=proposal.challenge_id
                       WHERE proposal.run_id=?
+                        AND producer_attempt.status='candidate'
                         AND proposal.episode>=catalogue.context_episode
                         AND proposal.context_identity=(
                           CASE WHEN catalogue.context_sha256 IS NOT NULL
