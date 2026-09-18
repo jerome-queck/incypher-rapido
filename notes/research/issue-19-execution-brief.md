@@ -1341,8 +1341,8 @@ accepted two P3 centralization/type refactors as intentionally out of scope for 
 
 - PR #57 merged the evidence-driven `already_solved` correction with green CI. Preserve owner-only
   candidate exports; no candidate value belongs in Git.
-- Complete the external-stop and post-run solver-audit repairs, independent review, merge, and one
-  fresh 1,800-second diagnostic under the amended completion contract below.
+- The relocated 19,800-second gate remains outside this task. Preserve its original requirements;
+  this brief records the owner-amended diagnostic separately.
 
 ### Owner amendment: completion gate moved out of this task
 
@@ -1515,4 +1515,25 @@ concurrent dynamic/Verifier order, failed-create exit, capacity-deferred initial
 static retry, late-Verifier fence, error shapes, dynamic rotation, and static-yield cases are green.
 Focused verification is 218 passed; the full suite is 1,001 passed with four platform skips. Ruff
 lint/format and diff checks are clean. Final independent Daybreak/xhigh review found no P0-P3
-issue. PR CI, evidence merge, exact private-state cleanup, and issue close remain pending.
+issue. PR #60 passed Python 3.11/3.12 and amd64/arm64 container CI, then squash-merged as
+`7211ba1607380687ee3d04ec2c9fcbe566412ced`.
+
+### Exact diagnostic cleanup attestation
+
+Cleanup began only after PR #60 made the sanitized run evidence durable. The pre-deletion database
+check returned `ok`, no foreign-key violation, run status `deadline`, six settled
+`already_solved` effects, and one removed instance. A fresh authenticated read-only Board check
+found all nine dynamic challenges inactive and zero indeterminate; it performed zero writes.
+
+The exact stopped container, database and sidecars, monitor record, locks, and run workspace for
+`46e0533bca63498d8d3e6d38f45224cd` were then deleted. Post-deletion checks found zero entries in
+the dedicated state root, zero matching containers, and zero solver processes. A second fresh
+Board read again found all nine dynamic challenges inactive and zero indeterminate with zero
+writes. The dedicated authentication directory and file remained present at modes `0700` and
+`0600`, with the authentication file byte-identical across deletion. The owner-only 30-line
+candidate projection and complete archive remained mode `0600`; the archive integrity test passed.
+
+The owner-amended diagnostic therefore leaves no pending effect, active or indeterminate instance,
+container, process, state, or workspace residue. Issue closure is permitted only after this
+attestation passes repository CI and merges. The original 19,800-second acceptance gate was moved
+elsewhere and is not claimed as passed.
