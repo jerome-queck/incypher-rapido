@@ -3545,6 +3545,51 @@ class StateStore:
             )
             return self._interrupt_control_jobs(connection, run_id, reason)
 
+    def finalize_operator_stop(self, run_id: str) -> str:
+        """Atomically fence an intentional stop without settling external effects."""
+        if not self._lease_files:
+            raise RuntimeError("operator stop finalization requires the supervisor lease")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("run is absent")
+            status = str(row["status"])
+            if status != "running":
+                return status
+            now = self._now()
+            connection.execute(
+                "UPDATE attempts SET finished_at=?, status='interrupted', "
+                "summary=CASE WHEN summary='' THEN 'run ended before lane finalization' "
+                "ELSE summary END, failure_class='interrupted' "
+                "WHERE run_id=? AND status='running'",
+                (now, run_id),
+            )
+            self._interrupt_control_jobs(connection, run_id, "operator_stop")
+            changed = connection.execute(
+                "UPDATE runs SET finished_at=?, status='interrupted' "
+                "WHERE id=? AND status='running'",
+                (now, run_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("running run changed during operator stop finalization")
+            connection.execute(
+                "INSERT INTO events(run_id, at, kind, data_json) VALUES (?, ?, ?, ?)",
+                (
+                    run_id,
+                    now,
+                    "operator_stop",
+                    json.dumps(
+                        {"external_effects_settled": False, "status": "interrupted"},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return "interrupted"
+
     def active_attempts(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(

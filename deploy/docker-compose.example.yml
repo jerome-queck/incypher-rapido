@@ -25,4 +25,4 @@ services:
     mem_limit: 24g
     pids_limit: 256
     stop_signal: SIGTERM
-    stop_grace_period: 180s
+    stop_grace_period: 190s

@@ -86,7 +86,7 @@ def test_runtime_template_documents_explicit_limits_and_central_owner() -> None:
         "--name rapido",
         "--detach",
         "--restart unless-stopped",
-        "--stop-timeout=180",
+        "--stop-timeout=190",
         "--cpus=8",
         "--memory=24g",
         "--pids-limit=256",
@@ -124,6 +124,8 @@ def test_setup_writes_and_smokes_the_supported_mixed_twenty_lane_roster() -> Non
         'assert value["active_challenges"] == 5',
         'assert value["attempts_per_challenge"] == 4',
         'assert value["concurrency"] == 20',
+        "--stop-timeout=190",
+        "docker stop --time 190 rapido",
     ):
         assert value in text
 
@@ -133,8 +135,9 @@ def test_compose_template_allows_bounded_shutdown_cleanup() -> None:
     assert "restart: unless-stopped" in text
     assert "init: true" not in text
     assert "stop_signal: SIGTERM" in text
-    assert "stop_grace_period: 180s" in text
-    assert "longest admitted TCP-open drain" in CONTAINER_DOC.read_text()
+    assert "stop_grace_period: 190s" in text
+    assert "180-second worker drain" in CONTAINER_DOC.read_text()
+    assert 190 > 180 + 2 * 2 + 5
 
 
 def test_both_architectures_run_hardened_offline_tooling_acceptance() -> None:

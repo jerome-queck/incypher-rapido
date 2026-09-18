@@ -24,7 +24,7 @@ from typing import Any, Self
 
 RESTART_BACKOFF_SECONDS = (5.0, 30.0, 120.0)
 _RECORD_VERSION = 1
-_RECORD_PHASES = frozenset({"active", "blocked", "scheduled", "terminal"})
+_RECORD_PHASES = frozenset({"active", "blocked", "scheduled", "stopping", "terminal"})
 _TERMINAL_RUN_STATES = frozenset({"completed", "deadline", "failed", "interrupted"})
 _FINGERPRINT_TABLES = {
     "runs": ("id", "status", "started_at", "finished_at", "config_json"),
@@ -291,40 +291,53 @@ class _SupervisorFiles:
         return record
 
     def write(self, record: SupervisorRecord) -> None:
-        record.validate()
-        encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
-        temporary = self.record_path.with_name(
-            f".{self.record_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGTERM, signal.SIGINT},
         )
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
         try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("supervisor record write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-        except BaseException:
+            record.validate()
+            current = self.load()
+            if current is not None and (
+                (current.phase == "terminal" and record.phase != "terminal")
+                or (current.phase == "stopping" and record.phase not in {"stopping", "terminal"})
+            ):
+                return
+            encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
+            temporary = self.record_path.with_name(
+                f".{self.record_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary, flags, 0o600)
             try:
-                temporary.unlink()
-            except OSError:
-                pass
-            raise
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("supervisor record write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            except BaseException:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                raise
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, self.record_path)
+            self.record_path.chmod(0o600)
+            directory = os.open(
+                self.record_path.parent,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
-            os.close(descriptor)
-        os.replace(temporary, self.record_path)
-        self.record_path.chmod(0o600)
-        directory = os.open(
-            self.record_path.parent,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _read_durable_run(state_path: Path) -> DurableRun | None:
@@ -517,6 +530,7 @@ class Supervisor:
         self._files = _SupervisorFiles(state_path)
         self._process: subprocess.Popen[bytes] | None = None
         self._stop_signal: int | None = None
+        self._stop_at: float | None = None
         self._stop_event = threading.Event()
         self._forwarded = False
         self._previous_handlers: dict[int, Any] = {}
@@ -532,7 +546,11 @@ class Supervisor:
             try:
                 with self._files:
                     self._enable_child_adoption()
-                    return self._run_owned()
+                    try:
+                        return self._run_owned()
+                    finally:
+                        if self._stop_signal is not None:
+                            self._finalize_operator_stop()
             except (BlockingIOError, OSError, SupervisorRefused, sqlite3.Error) as exc:
                 self.reporter({"status": "refused", "reason": str(exc)})
                 return self._quiesce()
@@ -542,11 +560,19 @@ class Supervisor:
     def _run_owned(self) -> int:
         record = self._files.load()
         initial_record = (
-            record is not None and record.phase in {"active", "scheduled"} and record.run_id is None
+            record is not None
+            and record.phase in {"active", "scheduled", "stopping"}
+            and record.run_id is None
         )
         durable = _read_initially_recoverable_run(self.state_path, initial_record=initial_record)
         if record is not None and record.phase == "terminal":
             return self._quiesce(record.disposition or "refused", record.run_id)
+        if record is not None and record.phase == "stopping":
+            self._finalize_operator_stop(record)
+            finalized = self._files.load()
+            if finalized is not None and finalized.phase == "terminal":
+                return self._quiesce(finalized.disposition or "operator_stopped", finalized.run_id)
+            return self._quiesce("operator_stop_pending", record.run_id)
         if durable is not None and durable.status != "running":
             self._write_terminal(record, durable.run_id, durable.status)
             return self._quiesce(durable.status, durable.run_id)
@@ -647,13 +673,19 @@ class Supervisor:
                 "initial": initial,
             }
         )
+        if self._stop_signal is not None:
+            return 128 + self._stop_signal
+        gate_read, gate_write = os.pipe()
         try:
             process = subprocess.Popen(
-                self.command,
+                (sys.executable, "-m", "rapido.spawn_gate", str(gate_read), "--", *self.command),
                 env=self.environ,
                 start_new_session=True,
+                pass_fds=(gate_read,),
             )
         except OSError:
+            os.close(gate_read)
+            os.close(gate_write)
             durable = _read_initially_recoverable_run(
                 self.state_path, initial_record=run_id is None
             )
@@ -666,8 +698,17 @@ class Supervisor:
                 return self._schedule_or_refuse(None, replacement_count + 1)
             self._write_terminal(active, run_id, "worker_launch_failed")
             return self._quiesce("worker_launch_failed", run_id)
+        os.close(gate_read)
         self._process = process
         self._forwarded = False
+        try:
+            if self._stop_signal is None:
+                os.write(gate_write, b"1")
+        except OSError:
+            if self._stop_signal is None:
+                self.reporter({"status": "refused", "reason": "worker start gate failed"})
+        finally:
+            os.close(gate_write)
         self._forward_if_requested()
         exit_code = self._wait_worker(process)
         self._process = None
@@ -676,11 +717,11 @@ class Supervisor:
         except (OSError, SupervisorRefused) as exc:
             descendants_extinguished = False
             self.reporter({"status": "refused", "reason": str(exc)})
-        if self._stop_signal is not None:
-            return 128 + self._stop_signal
         if not descendants_extinguished:
             self._write_terminal(active, run_id, "descendant_cleanup_failed")
             return self._quiesce("descendant_cleanup_failed", run_id)
+        if self._stop_signal is not None:
+            return 128 + self._stop_signal
 
         try:
             durable = _read_initially_recoverable_run(
@@ -781,7 +822,7 @@ class Supervisor:
             self._reap_adopted_children(process.pid)
             if self._stop_signal is not None:
                 if stop_deadline is None:
-                    stop_deadline = time.monotonic() + self.stop_seconds
+                    stop_deadline = (self._stop_at or time.monotonic()) + self.stop_seconds
                 elif time.monotonic() >= stop_deadline and not killed:
                     self._signal_group(process.pid, signal.SIGKILL)
                     killed = True
@@ -799,7 +840,30 @@ class Supervisor:
         if self._stop_signal is not None:
             return
         self._stop_signal = signum
+        self._stop_at = time.monotonic()
         self._stop_event.set()
+        # Fence restart before forwarding the signal or waiting for any process
+        # tree to drain. If power is lost during cleanup, the next supervisor
+        # resumes stop finalization instead of launching another worker.
+        try:
+            record = self._files.load()
+            if record is None or record.phase not in {"stopping", "terminal"}:
+                self._files.write(
+                    SupervisorRecord(
+                        _RECORD_VERSION,
+                        "stopping",
+                        None if record is None else record.run_id,
+                        0 if record is None else record.replacement_count,
+                        0.0,
+                        "operator_stop_pending",
+                        None,
+                        time.time(),
+                    )
+                )
+        except (OSError, SupervisorRefused) as exc:
+            # Finalization retries this independent fence after the process tree
+            # is gone and still has the Run database as a second durable path.
+            self.reporter({"status": "refused", "reason": str(exc)})
         self._forward_if_requested()
 
     def _install_signal_handlers(self) -> None:
@@ -982,6 +1046,65 @@ class Supervisor:
                 time.time(),
             )
         )
+
+    def _finalize_operator_stop(self, record: SupervisorRecord | None = None) -> None:
+        """Persist stop intent after worker/descendant drain and before process exit."""
+        if record is None:
+            record = self._files.load()
+        if record is not None and record.phase == "terminal":
+            return
+        run_id = None if record is None else record.run_id
+        stopping_written = record is not None and record.phase == "stopping"
+        if record is None or record.phase != "stopping":
+            record = SupervisorRecord(
+                _RECORD_VERSION,
+                "stopping",
+                run_id,
+                0 if record is None else record.replacement_count,
+                0.0,
+                "operator_stop_pending",
+                None,
+                time.time(),
+            )
+            try:
+                self._files.write(record)
+                stopping_written = True
+            except OSError as exc:
+                # The Run database is an independent durable fence. Continue so a
+                # transient sidecar failure cannot leave a running Run restartable.
+                self.reporter({"status": "refused", "reason": str(exc)})
+        try:
+            durable = _read_durable_run(self.state_path)
+        except SupervisorRefused as exc:
+            self.reporter({"status": "refused", "reason": str(exc)})
+            if not stopping_written:
+                self._files.write(record)
+            return
+        if run_id is None and durable is not None:
+            run_id = durable.run_id
+        if durable is not None and durable.status != "running":
+            disposition = "operator_stopped" if durable.status == "interrupted" else durable.status
+            self._write_terminal(record, durable.run_id, disposition)
+            return
+        if run_id is not None and durable is not None and durable.status == "running":
+            from .state import StateStore
+
+            state: StateStore | None = None
+            try:
+                state = StateStore(self.state_path)
+                state.acquire_supervisor()
+                durable_status = state.finalize_operator_stop(run_id)
+                if durable_status not in {"interrupted", "completed", "deadline", "failed"}:
+                    raise RuntimeError("operator stop produced an invalid durable run state")
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                self.reporter({"status": "refused", "reason": str(exc)})
+                if not stopping_written:
+                    self._files.write(record)
+                return
+            finally:
+                if state is not None:
+                    state.close()
+        self._write_terminal(record, run_id, "operator_stopped")
 
     def _quiesce(self, disposition: str = "refused", run_id: str | None = None) -> int:
         self.reporter({"status": "quiescent", "run_id": run_id, "disposition": disposition})
