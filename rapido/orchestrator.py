@@ -20,7 +20,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from .board import FLAG_RE, BoardClient, BoardError, BoardTransportError, Challenge, Verdict
+from .board import (
+    FLAG_RE,
+    BoardClient,
+    BoardError,
+    BoardTemporaryResponseError,
+    BoardTransportError,
+    Challenge,
+    Verdict,
+)
 from .config import RuntimeConfig
 from .evidence import (
     EvidenceBatch,
@@ -659,13 +667,13 @@ class Orchestrator:
     async def _board_read(
         self, deadline: float, function: Any, /, *args: Any, **kwargs: Any
     ) -> Any:
-        """Retry only idempotent Board reads after transport-level failures."""
+        """Retry only idempotent Board reads after transport or temporary server failures."""
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
         retry_delays = tuple(min(transport_timeout, delay) for delay in _BOARD_READ_RETRY_DELAYS)
         for attempt in range(len(retry_delays) + 1):
             try:
                 return await self._board_call(deadline, function, *args, **kwargs)
-            except BoardTransportError:
+            except (BoardTransportError, BoardTemporaryResponseError):
                 if attempt == len(retry_delays):
                     raise
                 delay = retry_delays[attempt]
@@ -1181,7 +1189,7 @@ class Orchestrator:
                         refreshed,
                         deadline,
                     )
-            except BoardTransportError:
+            except (BoardTransportError, BoardTemporaryResponseError):
                 transport_failures, next_read_delay = self._record_board_watch_transport_outage(
                     run_id,
                     watcher="idle",
@@ -3511,7 +3519,7 @@ class Orchestrator:
                         refreshed = await self._challenge_catalogue(deadline, identity)
                         appended = [challenge for challenge in refreshed if challenge.id in new_ids]
                         contexts = await self._probe_material_contexts(run_root, appended, deadline)
-                except BoardTransportError:
+                except (BoardTransportError, BoardTemporaryResponseError):
                     transport_failures, next_read_delay = self._record_board_watch_transport_outage(
                         run_id,
                         watcher="active",
