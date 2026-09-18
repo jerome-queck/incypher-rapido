@@ -1512,7 +1512,7 @@ class StateStore:
                               AND rejected.context_sha256=catalogue.context_sha256) OR
                               (rejected.context_episode=catalogue.context_episode
                                AND rejected.context_sha256 IS catalogue.context_sha256))
-                            AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                            AND rejected.status IN ('correct', 'incorrect')
                         )
                         AND NOT EXISTS (
                           SELECT 1 FROM candidate_verifications AS verification
@@ -1580,7 +1580,7 @@ class StateStore:
                             AND rejected.context_sha256=catalogue.context_sha256) OR
                             (rejected.context_episode=catalogue.context_episode
                              AND rejected.context_sha256 IS catalogue.context_sha256))
-                          AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                          AND rejected.status IN ('correct', 'incorrect')
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM candidate_verifications AS verification
@@ -3165,7 +3165,7 @@ class StateStore:
                         AND rejected.context_sha256=catalogue.context_sha256) OR
                         (rejected.context_episode=catalogue.context_episode
                          AND rejected.context_sha256 IS catalogue.context_sha256))
-                      AND rejected.status IN ('correct', 'incorrect', 'already_solved')
+                      AND rejected.status IN ('correct', 'incorrect')
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM candidate_verifications AS verification

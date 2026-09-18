@@ -172,7 +172,7 @@ def _current_candidate_counts(connection: sqlite3.Connection, run_id: str) -> tu
                   SELECT 1 FROM submission_intents AS settled
                   WHERE settled.challenge_id=proposal.challenge_id
                     AND settled.candidate_sha256=lower(hex(proposal.candidate_key))
-                    AND settled.status IN ('correct', 'incorrect', 'already_solved')
+                    AND settled.status IN ('correct', 'incorrect')
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM candidate_verifications AS verification

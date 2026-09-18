@@ -1194,6 +1194,8 @@ requires later owner authorization and a fresh unattended 19,800-second acceptan
 | Replacement two-hour diagnostic live roster | `gpt-daybreak-blue-latest` / `xhigh`; `gpt-5.6-luna` / `max` and `xhigh` | 73 Daybreak and 71 Luna attempts on the registered mixed roster; no model fallback |
 | Replacement diagnostic lifecycle/result audit | `gpt-daybreak-blue-latest` / `xhigh` | exact stopped state, database, candidates, instances, resources, and private exports audited; no new verified solve, no fallback |
 | Main-CI failure diagnosis and test review | `gpt-daybreak-blue-latest` / `xhigh` | three real-time test races isolated; production change rejected, event-synchronized test-only repair reviewed independently; no fallback |
+| Independent 15-candidate replay | three `gpt-daybreak-blue-latest` / `xhigh` lanes | eight verified, six unverified, one contradicted from fresh material and prior correct evidence; no fallback |
+| `already_solved` lifecycle two-axis review | two `gpt-daybreak-blue-latest` / `xhigh` lanes | disclosure and mismatch-continuation findings fixed; clean P0-P3 spec review and clean P0-P2 standards re-review; no fallback |
 
 The first Astra failure occurred during the minimal-Interface comparison: the provider returned a
 cybersecurity policy stop before a design result. The two Astra comparisons already in flight were
@@ -1285,12 +1287,9 @@ container process. Sampled resource peaks were 4.311 CPU cores, 979,427,328 byte
 12-CPU, 24-GiB, 256-PID envelope was not the measured bottleneck; model conversion and candidate
 verification were.
 
-The exact private archive contains 478 files and excludes authentication. Its SHA-256 is
-`750fa77413dae3b2a725952a6f36e4ed8e7368e2386a4b6b016bc75c3cc42166`. The private structured
-candidate export SHA-256 is `1ad7b9647c3a1128548fb44d8a1b7aad8be0cb7a6346d75fc1b6c90c0fa0c0e3`; the requested
-30-line challenge/flag projection SHA-256 is
-`a82bd3b109222578a628b46823ed3365efc4c4d0731e0ff8a23010456c12a157`. These files are owner-only
-evidence, not sanitized repository artifacts.
+The exact private archive contains 478 files and excludes authentication. A structured candidate
+export and requested 30-line challenge/flag projection are preserved as owner-only evidence; their
+paths, values, and digests are not sanitized repository artifacts.
 
 ### Main-CI failure diagnosis
 
@@ -1309,15 +1308,38 @@ one solve across a coordinated outage, observes the recorded recovery, and prove
 with zero cancellations. The detail/material test waits until the newly admitted challenge starts,
 then cancels and validates both outage cycles and recovery. Independent short timeouts bound test
 failure without deciding test success. The three affected cases passed 20/20 repeated groups; Ruff
-check/format and the updated 951-test local suite were green. Updated CI evidence remains required
-before merge.
+check/format and the updated 951-test local suite were green. PR #56 was squash-merged as
+`6ab427cfe6b8848e576dbaa3700b8450e5acfed7`. Post-merge main run 35301678659 passed Python
+3.11/3.12 and amd64/arm64 container jobs. No production file changed.
+
+### Independent candidate replay and `already_solved` correction
+
+Three independent Daybreak/xhigh lanes replayed all 15 selected candidates against a fresh,
+read-only authenticated material download. Eight candidates were independently verified: challenge
+IDs 7, 15, 17, 80, 90, 94, 106, and 109. Six remain unverified because their archived dynamic raw
+response or full static derivation was insufficient: IDs 11, 19, 24, 33, 68, and 72. Challenge 42
+was contradicted: its selected `already_solved` candidate differs from the candidate that earned an
+HTTP-200 `correct` in run `acc972712a6148b19447c624e54803d7`. Conversely, challenge 15's current
+selection exactly matches an earlier HTTP-200 `correct`. Candidate identities remain owner-only.
+This controlled comparison proves that generic `already_solved` is neither uniformly right nor
+uniformly wrong and cannot authorize closure by itself.
+
+The corrected lifecycle keeps the immediate-submit policy and at-most-once effect fencing. A first
+unlimited source-qualified candidate is still submitted immediately. If the Board returns
+`already_solved`, the settled identity is retained privately, is not resubmitted, does not cancel
+peers, and remains eligible for a fresh same-run Verifier. Only a verified identity may then close
+the challenge without a new `correct`; a mismatch continues through changed Recovery work. The
+owner-only corrected 30-line export replaces challenge 42 with its prior HTTP-200-correct value;
+its digest remains private.
+
+Local release validation is 953 passed / 4 skipped; focused match, mismatch, at-most-once, and
+changed-route regressions pass. Ruff check/format and `git diff --check` are clean. Independent
+Daybreak/xhigh spec re-review found no P0-P3 issue; standards re-review found no P0-P2 issue and
+accepted two P3 centralization/type refactors as intentionally out of scope for this narrow fix.
 
 ## Open decisions
 
-- Merge this sanitized diagnostic evidence and the deterministic main-CI regression repair. Then
-  delete only the replacement diagnostic's exact container and state volume; preserve
-  authentication and the owner-only private exports.
-- Independently verify the 15 exported candidates. Do not infer candidate validity from the
-  account-wide solved state or from a generic `already_solved` response.
+- The evidence-driven `already_solved` lifecycle correction must pass PR CI and squash merge before
+  any future live run. Preserve the owner-only candidate exports; no candidate value belongs in Git.
 - The two-hour diagnostic does not replace the unchanged 19,800-second issue #19 acceptance. Await
   owner direction after reporting it; close #19 only after the final contract passes.

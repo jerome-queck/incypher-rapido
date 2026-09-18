@@ -246,6 +246,29 @@ def test_board_rejected_candidate_dispatches_changed_recovery_route() -> None:
     assert decision.changed_axes
 
 
+def test_verifier_mismatch_dispatches_changed_recovery_route() -> None:
+    verifier = route_failure(
+        _request("disagreement", subreason="retained_candidate_requires_verification")
+    ).successor
+    assert verifier is not None
+    decision = route_failure(
+        RouteRequest(
+            failure=FailureSignal("disagreement", "retained_candidate_requires_verification"),
+            current=verifier,
+            used_fingerprints=frozenset({verifier.fingerprint}),
+            attempts_remaining=True,
+            remaining_milliseconds=10_000,
+        )
+    )
+
+    assert decision.disposition == "dispatch"
+    assert decision.rule_id == "verifier_mismatch_recovery_v1"
+    assert decision.successor is not None
+    assert decision.successor.role == "recovery"
+    assert decision.successor.tactic == "alternate_candidate_after_verifier_mismatch"
+    assert decision.changed_axes
+
+
 def test_classifier_uses_typed_pre_lane_origin() -> None:
     board = classify_failure(
         terminal="error",
