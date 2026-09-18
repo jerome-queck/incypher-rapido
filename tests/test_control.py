@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 import rapido.orchestrator as orchestrator_module
+from rapido import monitor
 from rapido.board import BoardError, Challenge, Verdict
 from rapido.config import RuntimeConfig
 from rapido.control import DurableJobControl
@@ -3086,6 +3087,14 @@ def test_deadline_closes_running_and_queued_jobs_durably(tmp_path: Path) -> None
         (2, "interrupted"),
     }
     assert all(job.closed_sequence is not None for job in view.jobs)
+    assert view.initial_coverage_count == 1
+    snapshot = DurableJobControl.monitor_snapshot(config.state_path, run_id=report.run_id)
+    assert snapshot.initial_coverage_count == 1
+    assert set(snapshot.terminal_challenge_ids) == {1, 2}
+    rendered = monitor.render_text({**asdict(snapshot), "resources": {"available": False}})
+    assert "initial_started=1/2" in rendered
+    assert "lifecycle_settled=2/2" in rendered
+    assert "verified_candidates=0" in rendered
 
 
 def test_no_tool_progress_cancels_lane_and_routes_changed_recovery(

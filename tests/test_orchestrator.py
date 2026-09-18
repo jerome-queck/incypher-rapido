@@ -1631,6 +1631,88 @@ def test_verifier_shell_only_candidate_reports_fixed_observation_requirement(
     store.close()
 
 
+def test_final_proof_rejects_earlier_supplied_candidate_across_whole_turn(
+    tmp_path: Path,
+) -> None:
+    class AdaptiveOrchestrator(Orchestrator):
+        _adaptive_control = True
+
+    class SuppliedThenObservedRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            candidate = json.loads(turn.text)["candidate"]
+            digest = hashlib.sha256(candidate.encode()).hexdigest()
+            turn.tool_calls = [
+                {
+                    "name": "inspect_file",
+                    "success": True,
+                    "source_bound": True,
+                    "supplied_candidate_sha256s": [digest],
+                    "host_observation": HostObservation(
+                        "inspect_file", True, True, supplied_candidate_sha256s=(digest,)
+                    ),
+                },
+                *(
+                    {
+                        "name": "inspect_file",
+                        "success": True,
+                        "source_bound": False,
+                        "host_observation": HostObservation("inspect_file", True, False),
+                    }
+                    for _ in range(548)
+                ),
+                {
+                    "name": "inspect_file",
+                    "success": True,
+                    "source_bound": True,
+                    "candidate_sha256s": [digest],
+                    "host_observation": HostObservation(
+                        "inspect_file", True, True, candidate_sha256s=(digest,)
+                    ),
+                },
+            ]
+            return turn
+
+    answer = "INCYPHER{synthetic_whole_turn_conflict}"
+    cfg = config(tmp_path)
+    store = StateStore(cfg.state_path)
+    run_id = "whole-turn-conflict"
+    route = baseline_route(model=cfg.model, effort=cfg.reasoning_effort, attempt_seconds=15)
+    store.start_run(run_id, cfg.public_record())
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue(run_id, [(0, 1, True)])
+    store.admit_control_wave(run_id, 1, 0, 0, 1, route)
+    store.start_control_wave(run_id, 1, 0)
+    workspace = tmp_path / "lane"
+    workspace.mkdir()
+
+    result = asyncio.run(
+        AdaptiveOrchestrator(
+            cfg, FakeBoard([challenge(1)]), store, SuppliedThenObservedRuntime({1: {0: answer}})
+        )._lane(run_id, challenge(1), 0, 0, workspace, [], 10, route=route)
+    )
+
+    assert result.terminal_status == "unsolved"
+    failure = store._connection.execute(
+        "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(failure["data_json"])["subreason"] == "candidate_supplied"
+    assert (
+        store._connection.execute(
+            "SELECT COUNT(*) FROM candidate_evidence_proofs WHERE source_attempt_id=?",
+            (f"{run_id}:1:0:0",),
+        ).fetchone()[0]
+        == 0
+    )
+    manifest = store._connection.execute(
+        "SELECT complete, observation_count, committed_count FROM evidence_manifests "
+        "WHERE attempt_id=?",
+        (f"{run_id}:1:0:0",),
+    ).fetchone()
+    assert tuple(manifest) == (1, 550, 550)
+    store.close()
+
+
 def test_malformed_model_text_terminalizes_every_attempt(tmp_path: Path) -> None:
     answer = "INCYPHER{fabricated}"
     board = FakeBoard([challenge(1)])

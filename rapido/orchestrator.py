@@ -2083,18 +2083,15 @@ class Orchestrator:
                 candidate = fields.get("candidate")
                 if not isinstance(candidate, str):
                     raise CandidateProvenanceError("candidate_evidence_incomplete")
-                proof = run_evidence.attest_candidate(
+                attestation = run_evidence.attest_candidate_with_reason(
                     attempt_id,
                     candidate_sha256=hashlib.sha256(candidate.encode()).hexdigest(),
                     require_non_execution_observation=verifier_route,
                 )
-                if proof is None:
-                    reason = (
-                        "verifier_requires_fixed_observation"
-                        if verifier_route
-                        else "candidate_evidence_incomplete"
-                    )
-                    raise CandidateProvenanceError(reason)
+                if attestation.proof is None:
+                    if attestation.rejection_reason is None:
+                        raise EvidenceError("candidate attestation outcome is invalid")
+                    raise CandidateProvenanceError(attestation.rejection_reason)
             try:
                 self.state.finish_attempt(
                     attempt_id,
