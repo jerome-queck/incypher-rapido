@@ -52,3 +52,31 @@ def test_private_jsonl_is_append_only_private_and_rejects_symlinks(tmp_path: Pat
     os.link(path, hardlink)
     with pytest.raises(ValueError, match="singly linked"):
         monitor.append_private_jsonl(hardlink, {"sample": 4})
+
+
+def test_text_monitor_distinguishes_initial_exposure_from_settled_lifecycle() -> None:
+    payload = {
+        "run_id": "synthetic",
+        "status": "deadline",
+        "remaining_seconds": 0,
+        "watching": False,
+        "active_challenge_ids": (),
+        "queued_challenge_ids": (),
+        "instance_waiting_challenge_ids": (),
+        "terminal_challenge_ids": tuple(range(15)),
+        "catalogue_count": 15,
+        "initial_coverage_count": 10,
+        "reserved_lane_count": 0,
+        "completed_waiting_lane_count": 0,
+        "tool_call_count": 0,
+        "continuation_count": 0,
+        "submission_outcomes": (),
+        "verified_candidate_count": 0,
+        "resources": {"available": False},
+    }
+
+    output = monitor.render_text(payload)
+
+    assert "initial_started=10/15" in output
+    assert "lifecycle_settled=15/15" in output
+    assert "verified_candidates=0" in output

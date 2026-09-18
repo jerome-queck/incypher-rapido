@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from rapido.evidence import (
+    CandidateAttestation,
     EvidenceBatch,
     EvidenceConflictError,
     EvidenceLimits,
@@ -181,14 +182,13 @@ def test_verifier_attestation_requires_non_execution_candidate_observation(
             )
         ),
     )
-    assert (
-        evidence.attest_candidate(
-            "shell-only",
-            candidate_sha256=candidate_digest,
-            require_non_execution_observation=True,
-        )
-        is None
+    shell_only = evidence.attest_candidate_with_reason(
+        "shell-only",
+        candidate_sha256=candidate_digest,
+        require_non_execution_observation=True,
     )
+    assert shell_only.proof is None
+    assert shell_only.rejection_reason == "verifier_requires_fixed_observation"
 
     _attempt(state, "fixed", lane=1)
     evidence.commit(
@@ -204,15 +204,99 @@ def test_verifier_attestation_requires_non_execution_candidate_observation(
             )
         ),
     )
-    assert (
-        evidence.attest_candidate(
-            "fixed",
-            candidate_sha256=candidate_digest,
-            require_non_execution_observation=True,
-        )
-        is not None
+    fixed = evidence.attest_candidate_with_reason(
+        "fixed",
+        candidate_sha256=candidate_digest,
+        require_non_execution_observation=True,
     )
+    assert fixed.proof is not None
+    assert fixed.rejection_reason is None
     state.close()
+
+
+def test_checkpoint_proof_does_not_override_whole_attempt_supplied_input_conflict(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    candidate = b"INCYPHER{synthetic_scope_conflict}"
+    candidate_digest = hashlib.sha256(candidate).hexdigest()
+    observed = HostObservation(
+        "inspect_file",
+        True,
+        True,
+        candidate_sha256s=(candidate_digest,),
+    )
+    evidence = RunEvidence.open(state, "run-a")
+
+    _attempt(state, "checkpoint", lane=0)
+    evidence.commit("checkpoint", EvidenceBatch((observed,)))
+    checkpoint = evidence.attest_candidate_with_reason(
+        "checkpoint", candidate_sha256=candidate_digest
+    )
+    assert checkpoint.proof is not None
+    assert checkpoint.rejection_reason is None
+
+    _attempt(state, "whole-attempt", lane=1)
+    supplied = HostObservation(
+        "inspect_file",
+        True,
+        True,
+        supplied_candidate_sha256s=(candidate_digest,),
+    )
+    filler = _observation("benign")
+    manifest = evidence.commit(
+        "whole-attempt",
+        EvidenceBatch((supplied, *(filler for _ in range(548)), observed)),
+    )
+    final = evidence.attest_candidate_with_reason(
+        "whole-attempt", candidate_sha256=candidate_digest
+    )
+
+    assert manifest.complete is True
+    assert manifest.observation_count == manifest.committed_count == 550
+    assert manifest.omitted_count == 0
+    assert final.proof is None
+    assert final.rejection_reason == "candidate_supplied"
+    assert evidence.attest_candidate("whole-attempt", candidate_sha256=candidate_digest) is None
+    assert candidate.decode() not in repr(final)
+    assert candidate_digest not in repr(final)
+    proof_count = state._connection.execute(
+        "SELECT COUNT(*) FROM candidate_evidence_proofs"
+    ).fetchone()[0]
+    assert proof_count == 1
+    state.close()
+
+
+@pytest.mark.parametrize(
+    ("batch", "reason"),
+    (
+        (
+            EvidenceBatch(complete=False, gap="provenance_incomplete"),
+            "candidate_evidence_incomplete",
+        ),
+        (EvidenceBatch((_observation(),)), "candidate_unobserved"),
+    ),
+)
+def test_candidate_attestation_reports_other_closed_rejection_reasons(
+    tmp_path: Path, batch: EvidenceBatch, reason: str
+) -> None:
+    state = _state(tmp_path / "state.sqlite3", "run-a")
+    _attempt(state, "a0")
+    evidence = RunEvidence.open(state, "run-a")
+    evidence.commit("a0", batch)
+
+    result = evidence.attest_candidate_with_reason(
+        "a0", candidate_sha256=hashlib.sha256(b"INCYPHER{absent}").hexdigest()
+    )
+
+    assert result.proof is None
+    assert result.rejection_reason == reason
+    state.close()
+
+
+def test_candidate_attestation_rejection_reason_is_runtime_closed() -> None:
+    with pytest.raises(ValueError, match="rejection reason is invalid"):
+        CandidateAttestation(None, "open_reason")  # type: ignore[arg-type]
 
 
 def test_rows_are_immutable_and_verified_before_carry(tmp_path: Path) -> None:

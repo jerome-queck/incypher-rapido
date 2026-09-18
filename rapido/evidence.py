@@ -18,7 +18,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from .board import FLAG_RE
 from .state import StateStore
@@ -552,6 +552,39 @@ class MemoryEvidenceSource:
     observations: tuple[MemoryEvidenceObservation, ...]
     candidate_observed: bool
     candidate_supplied: bool
+
+
+CandidateAttestationRejection: TypeAlias = Literal[
+    "candidate_evidence_incomplete",
+    "candidate_supplied",
+    "candidate_unobserved",
+    "verifier_requires_fixed_observation",
+]
+_CANDIDATE_ATTESTATION_REJECTIONS = frozenset(
+    {
+        "candidate_evidence_incomplete",
+        "candidate_supplied",
+        "candidate_unobserved",
+        "verifier_requires_fixed_observation",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CandidateAttestation:
+    """Candidate proof or one closed, candidate-free rejection reason."""
+
+    proof: MemoryEvidenceSource | None = field(repr=False)
+    rejection_reason: CandidateAttestationRejection | None
+
+    def __post_init__(self) -> None:
+        if (
+            self.rejection_reason is not None
+            and self.rejection_reason not in _CANDIDATE_ATTESTATION_REJECTIONS
+        ):
+            raise ValueError("candidate attestation rejection reason is invalid")
+        if (self.proof is None) == (self.rejection_reason is None):
+            raise ValueError("candidate attestation must contain exactly one outcome")
 
 
 @dataclass(frozen=True)
@@ -1901,6 +1934,20 @@ class RunEvidence:
         require_non_execution_observation: bool = False,
     ) -> MemoryEvidenceSource | None:
         """Bind one private candidate identity to its verified committed observation."""
+        return self.attest_candidate_with_reason(
+            attempt_id,
+            candidate_sha256=candidate_sha256,
+            require_non_execution_observation=require_non_execution_observation,
+        ).proof
+
+    def attest_candidate_with_reason(
+        self,
+        attempt_id: str,
+        *,
+        candidate_sha256: str,
+        require_non_execution_observation: bool = False,
+    ) -> CandidateAttestation:
+        """Attest a candidate or report one closed, candidate-free rejection reason."""
         if type(require_non_execution_observation) is not bool:
             raise TypeError("candidate observation policy must be boolean")
         source = self.memory_source(attempt_id, candidate_sha256=candidate_sha256)
@@ -1912,15 +1959,17 @@ class RunEvidence:
             and candidate_sha256 in payload["candidate_sha256s"]
             for item in manifest.items
         )
-        if (
-            not source.complete
-            or source.gap is not None
-            or not source.candidate_observed
-            or source.candidate_supplied
-            or require_non_execution_observation
-            and not fixed_observation
-        ):
-            return None
+        rejection_reason: CandidateAttestationRejection | None = None
+        if not source.complete or source.gap is not None:
+            rejection_reason = "candidate_evidence_incomplete"
+        elif source.candidate_supplied:
+            rejection_reason = "candidate_supplied"
+        elif not source.candidate_observed:
+            rejection_reason = "candidate_unobserved"
+        elif require_non_execution_observation and not fixed_observation:
+            rejection_reason = "verifier_requires_fixed_observation"
+        if rejection_reason is not None:
+            return CandidateAttestation(proof=None, rejection_reason=rejection_reason)
         attempt = self._attempt(attempt_id)
         candidate_key = bytes.fromhex(candidate_sha256)
         expected = (
@@ -1954,7 +2003,7 @@ class RunEvidence:
                 str(existing["manifest_digest"]),
             ) != expected:
                 raise EvidenceConflictError("candidate evidence proof changed")
-        return source
+        return CandidateAttestation(proof=source, rejection_reason=None)
 
     @staticmethod
     def _bundle_size(bundle: EvidenceBundle) -> tuple[EvidenceBundle, int]:
@@ -2056,6 +2105,8 @@ class RunEvidence:
 
 
 __all__ = [
+    "CandidateAttestation",
+    "CandidateAttestationRejection",
     "CanonicalValue",
     "EvidenceBatch",
     "EvidenceBundle",

@@ -121,11 +121,13 @@ def render_text(payload: dict[str, Any]) -> str:
         f"remaining={payload['remaining_seconds']}s watching={payload['watching']} "
         f"active={payload['active_challenge_ids']} queued={payload['queued_challenge_ids']} "
         f"instance_wait={payload['instance_waiting_challenge_ids']} "
-        f"terminal={len(payload['terminal_challenge_ids'])}/{payload['catalogue_count']} "
+        f"initial_started={payload['initial_coverage_count']}/{payload['catalogue_count']} "
+        f"lifecycle_settled={len(payload['terminal_challenge_ids'])}/{payload['catalogue_count']} "
         f"reserved_lanes={payload['reserved_lane_count']} "
         f"completed_waiting={payload['completed_waiting_lane_count']} "
         f"tools={payload['tool_call_count']} continuations={payload['continuation_count']} "
         f"submissions={dict(payload['submission_outcomes'])} "
+        f"verified_candidates={payload['verified_candidate_count']} "
         f"cpu={cpu}cores memory={memory_gib}GiB pids={pids}"
     )
 

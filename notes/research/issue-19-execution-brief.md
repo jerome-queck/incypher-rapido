@@ -1,7 +1,8 @@
 # Issue 19 execution brief
 
-Status: active. This document is the durable architecture, experiment, decision, and acceptance
-ledger for issue [#19](https://github.com/jerome-queck/incypher-rapido/issues/19). It is sanitized:
+Status: closed under the owner's 2026-09-18 post-observation amendment; the original
+19,800-second gate did not pass. This document is the durable architecture, experiment, decision,
+and acceptance ledger for issue [#19](https://github.com/jerome-queck/incypher-rapido/issues/19). It is sanitized:
 no candidate, candidate digest, credential, challenge description, target authority, instance
 receipt, raw model output, or tool payload belongs here.
 
@@ -1461,26 +1462,32 @@ instances, and Board watch were enabled; no operator steering or model fallback 
 
 The diagnostic missed its registered 15/15 fresh-analysis target: 10 catalogue challenges entered
 episode zero and five remained untouched. Forty-nine attempts made 2,117 tool calls and 89 native
-thread continuations. Daybreak/xhigh produced all 11 source-proved proposals; the proposals reduced
-to six private identities. Six immediate submissions received HTTP-200 `already_solved`; none
+thread continuations. Daybreak/xhigh retained all 11 checkpoint proposals; ten received final
+candidate evidence proofs, and the proposals reduced to six private identities. Six immediate
+submissions received HTTP-200 `already_solved`; none
 received `correct`, and no same-run Verifier independently established an identity. The run therefore
-earns zero current-run and cumulative acceptance solves. The corrected `already_solved` path worked:
+earns zero current-run solves and adds zero to the prior cumulative total of three. The corrected
+`already_solved` path worked:
 all six identities stayed unverified and no peer was cancelled or challenge closed on account
 history alone.
 
 The controller admitted 91 jobs. Forty-nine started and closed; the deadline durably interrupted the
 remaining 42 without starting them. All started attempts received a typed same-run-memory projection.
-Nine episode-one Recovery projections carried 168 bounded records; Verifier projections remained
-independent. Eleven carry operations retained 183 files and 7.21 MB with canonical paths and no
+Nine later-episode projections comprised four Recovery projections carrying 168 bounded records
+and five empty Verifier projections. Eleven carry operations recorded 183 file-retention events
+and 7.21 MB of retention events with canonical paths and no
 nested `carried/` trees. The no-progress watcher stopped seven repeated checkpoints. All 2,117 tool
 observations committed; agent-written scripts and confined shell/artifact/target tools executed.
+The role/episode and carry figures are generated from the audit's sanitized CSVs in
+[`30m-audit-memory-summary-2026-09-18.json`](30m-audit-memory-summary-2026-09-18.json).
 
 Only one dynamic challenge obtained the shared instance lease. Its receipt-bound instance reached
 active, was deleted, and was independently absent in two post-run reads. SQLite integrity and foreign
 keys were clean; submissions had no pending or unread effects. The supervisor ended `deadline`, the
 container exited zero without restart or OOM, and no process leaked. Across 174 monitor samples,
-resource peaks were 4.328 of 12 CPU cores, 2.14 GB cgroup memory, and 146 of 256 PIDs. Remote model
-work, not local CPU, memory, or PID capacity, remained the measured bottleneck. Owner-only mode-0600
+resource peaks were 4.328 of 12 CPU cores, 2.14 GB cgroup memory, and 146 of 256 PIDs. Local CPU,
+memory, and PID exhaustion were not observed; request-level timing was not recorded, so the dominant
+elapsed-time component remains unproved. Owner-only mode-0600
 30-line candidate projection and complete run archive were preserved in Downloads before audit;
 their contents remain outside Git.
 
