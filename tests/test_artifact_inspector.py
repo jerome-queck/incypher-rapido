@@ -396,6 +396,7 @@ def test_argument_contract_error_has_bounded_structural_attribution(tmp_path):
         inspect_artifact(Workspace(tmp_path), {"path": "fixture", "view": []})
     assert error.value.code == "invalid_argument"
     assert error.value.details == {
+        "schema_version": 1,
         "contract_version": 1,
         "failure_stage": "arguments",
         "constraint": "enum",

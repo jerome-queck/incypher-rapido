@@ -1560,9 +1560,15 @@ class Orchestrator:
                 if not advanced:
                     break
             shutil.rmtree(carry_root, ignore_errors=True)
-            os.replace(staging, carry_root)
+            if files:
+                os.replace(staging, carry_root)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        if not files:
+            try:
+                carry_root.parent.rmdir()
+            except OSError:
+                pass
         telemetry = {
             "drop_counts": dict(sorted(drop_counts.items())),
             "lane_counts": [{"lane": lane, **lane_counts[lane]} for lane in sorted(lane_counts)],

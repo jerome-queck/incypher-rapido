@@ -701,7 +701,7 @@ class _TargetScriptBroker:
         if fields - allowed:
             raise _error(
                 "invalid_argument",
-                "target broker arguments contain unsupported fields",
+                "target broker arguments are invalid: unsupported fields",
                 field_path="arguments",
                 constraint="additional_properties",
                 actual_kind="object",
@@ -709,7 +709,7 @@ class _TargetScriptBroker:
         if not required <= fields:
             raise _error(
                 "invalid_argument",
-                "target broker arguments omit a required field",
+                "target broker arguments are invalid: required field omitted",
                 field_path="arguments",
                 constraint="required",
                 actual_kind="object",

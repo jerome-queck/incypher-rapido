@@ -530,8 +530,7 @@ class StateStore:
             )
         self._connection.executescript(
             """
-            DROP VIEW IF EXISTS current_candidate_verifications;
-            CREATE VIEW current_candidate_verifications AS
+            CREATE VIEW IF NOT EXISTS current_candidate_verifications AS
             SELECT verification.*
             FROM candidate_verifications AS verification
             JOIN candidate_proposals AS producer
