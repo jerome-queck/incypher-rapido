@@ -113,9 +113,11 @@ def _prepare(
 def _capture(
     orchestrator: Orchestrator, state: StateStore, item: Challenge, root: Path, episode: int = 0
 ) -> tuple[int, int, Path]:
-    result = orchestrator._capture_analysis_carry("run-a", item, episode, root, ())
+    files, byte_count, _telemetry = orchestrator._capture_analysis_carry(
+        "run-a", item, episode, root, ()
+    )
     material = state.control_catalogue_contexts("run-a")[item.id]
-    return (*result, root / f"challenge-{item.id}" / "carry" / material)
+    return files, byte_count, root / f"challenge-{item.id}" / "carry" / material
 
 
 def test_safe_same_run_material_scripts_survive_next_non_verifier_generation(
@@ -218,3 +220,49 @@ def test_latest_generation_replaces_stale_lane_content(carry_harness) -> None:
     assert (
         successor_workspace / "rapido-analysis" / "carried" / "latest.py"
     ).read_text() == "print('latest')\n"
+
+
+def test_repeated_carry_roundtrips_keep_one_canonical_path(carry_harness) -> None:
+    orchestrator, state, item, root = carry_harness
+    workspace, _ = _prepare(orchestrator, root, item, episode=0, lane_count=1)[0]
+    script = workspace / "rapido-analysis" / "solve.py"
+    script.parent.mkdir()
+    script.write_text("print('stable')\n")
+    _capture(orchestrator, state, item, root, episode=0)
+
+    for episode in (1, 2, 3):
+        workspace, _ = _prepare(orchestrator, root, item, episode=episode, lane_count=1)[0]
+        imported = workspace / "rapido-analysis" / "carried" / "solve.py"
+        assert imported.read_text() == "print('stable')\n"
+        files, _, carry_root = _capture(orchestrator, state, item, root, episode=episode)
+        assert files == 1
+        carried_files = [path for path in carry_root.rglob("*") if path.is_file()]
+        assert [path.relative_to(carry_root) for path in carried_files] == [Path("lane-0/solve.py")]
+
+
+def test_global_carry_cap_is_round_robin_fair_and_deterministic(carry_harness) -> None:
+    orchestrator, state, item, root = carry_harness
+    workspaces = _prepare(orchestrator, root, item, episode=0, lane_count=4)
+    for lane, (workspace, _) in enumerate(workspaces):
+        analysis = workspace / "rapido-analysis"
+        analysis.mkdir()
+        for index in range(20):
+            (analysis / f"item-{index:02d}.txt").write_text(f"lane {lane} item {index}\n")
+
+    files, _, telemetry = orchestrator._capture_analysis_carry("run-a", item, 0, root, ())
+    material = state.control_catalogue_contexts("run-a")[item.id]
+    carry_root = root / f"challenge-{item.id}" / "carry" / material
+    retained = {
+        lane: sorted(path.name for path in (carry_root / f"lane-{lane}").iterdir())
+        for lane in range(4)
+    }
+
+    assert files == 64
+    assert {lane: len(paths) for lane, paths in retained.items()} == {
+        0: 16,
+        1: 16,
+        2: 16,
+        3: 16,
+    }
+    assert telemetry["drop_counts"] == {"file_cap": 16}
+    assert [row["retained"] for row in telemetry["lane_counts"]] == [16, 16, 16, 16]

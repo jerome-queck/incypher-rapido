@@ -158,6 +158,10 @@ synthetic, offline acceptance fixture. No external target access is authorized o
 class SolverOutputError(ValueError):
     """A final model message did not satisfy the solver contract."""
 
+    def __init__(self, message: str, *, category: str = "unknown") -> None:
+        super().__init__(message)
+        self.category = category
+
 
 class CandidateProvenanceError(SolverOutputError):
     """A flag-shaped hypothesis lacked candidate-specific host provenance."""
@@ -446,17 +450,23 @@ class SolverFinding:
     @classmethod
     def from_message(cls, message: str) -> SolverFinding:
         if not isinstance(message, str):
-            raise SolverOutputError("model response is absent or exceeds the message limit")
+            raise SolverOutputError("model response is absent", category="absent")
         try:
             message_size = len(message.encode("utf-8"))
         except UnicodeEncodeError as exc:
-            raise SolverOutputError("model response contains invalid text") from exc
+            raise SolverOutputError(
+                "model response contains invalid text", category="invalid_unicode"
+            ) from exc
         if message_size > MAX_AGENT_MESSAGE_BYTES:
-            raise SolverOutputError("model response is absent or exceeds the message limit")
+            raise SolverOutputError(
+                "model response exceeds the message limit", category="oversized"
+            )
         try:
             raw = json.loads(message)
         except (ValueError, RecursionError) as exc:
-            raise SolverOutputError("model response is not one JSON object") from exc
+            raise SolverOutputError(
+                "model response is not one JSON object", category="invalid_json"
+            ) from exc
         if not isinstance(raw, dict) or set(raw) != {
             "status",
             "candidate",
@@ -465,7 +475,7 @@ class SolverFinding:
             "evidence",
             "next_steps",
         }:
-            raise SolverOutputError("model response has an invalid shape")
+            raise SolverOutputError("model response has an invalid shape", category="shape")
         status = raw["status"]
         candidate = raw["candidate"]
         confidence = raw["confidence"]
@@ -473,27 +483,35 @@ class SolverFinding:
         evidence = raw["evidence"]
         next_steps = raw["next_steps"]
         if status not in {"candidate", "unsolved", "unsupported"}:
-            raise SolverOutputError("model status is invalid")
+            raise SolverOutputError("model status is invalid", category="status")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-            raise SolverOutputError("model confidence is invalid")
+            raise SolverOutputError("model confidence is invalid", category="confidence_type")
         if not 0 <= float(confidence) <= 1:
-            raise SolverOutputError("model confidence is outside [0, 1]")
+            raise SolverOutputError(
+                "model confidence is outside [0, 1]", category="confidence_range"
+            )
         if not _is_bounded_utf8_text(summary, 4000):
-            raise SolverOutputError("model summary is invalid")
+            raise SolverOutputError("model summary is invalid", category="summary")
         for name, value in (("evidence", evidence), ("next_steps", next_steps)):
             if (
                 not isinstance(value, list)
                 or len(value) > 20
                 or any(not _is_bounded_utf8_text(item, 1000) for item in value)
             ):
-                raise SolverOutputError(f"model {name} is invalid")
+                raise SolverOutputError(f"model {name} is invalid", category=name)
         if status == "candidate":
             if not isinstance(candidate, str) or not FLAG_RE.fullmatch(candidate):
-                raise SolverOutputError("candidate does not match a supported flag shape")
+                raise SolverOutputError(
+                    "candidate does not match a supported flag shape",
+                    category="candidate_shape",
+                )
             if not evidence:
-                raise SolverOutputError("candidate has no evidence")
+                raise SolverOutputError("candidate has no evidence", category="candidate_evidence")
         elif candidate is not None:
-            raise SolverOutputError("non-candidate status must carry a null candidate")
+            raise SolverOutputError(
+                "non-candidate status must carry a null candidate",
+                category="unexpected_candidate",
+            )
         return cls(
             status=status,
             candidate=candidate,

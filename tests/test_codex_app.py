@@ -221,7 +221,19 @@ class ToolStub:
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bad":
-            raise ToolError("bad_tool", "nope", details={"field": "x"})
+            raise ToolError(
+                "bad_tool",
+                "nope",
+                details={
+                    "contract_version": 1,
+                    "failure_stage": "arguments",
+                    "field_path": "command",
+                    "constraint": "type",
+                    "actual_kind": "integer",
+                    "actual_size": 1,
+                    "raw_value": "must-not-survive",
+                },
+            )
         return {"name": name, "arguments": arguments}
 
 
@@ -1275,6 +1287,15 @@ async def test_tool_call_and_structured_tool_error(
     assert state.tool_calls[1]["host_observation"].facts["error_code"] == "bad_tool"
     assert state.tool_calls[1]["host_observation"].facts["retryable"] is False
     assert state.tool_calls[1]["host_observation"].facts["duration_milliseconds"] >= 0
+    assert dict(state.tool_calls[1]["host_observation"].facts).items() >= {
+        "actual_kind": "integer",
+        "actual_size": 1,
+        "constraint": "type",
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "field_path": "command",
+    }.items()
+    assert "must-not-survive" not in responses[91]["result"]["contentItems"][0]["text"]
     await client.close()
 
 

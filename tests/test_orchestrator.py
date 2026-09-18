@@ -623,11 +623,14 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
 
     orchestrator = Orchestrator(cfg, FakeBoard([item]), store, FakeRuntime({}))
     events_before = store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    files, retained_bytes = orchestrator._capture_analysis_carry(run_id, item, 0, run_root, ())
+    files, retained_bytes, telemetry = orchestrator._capture_analysis_carry(
+        run_id, item, 0, run_root, ()
+    )
 
     carry_root = run_root / "challenge-1" / "carry" / material / "lane-0"
     assert files == len(safe_files)
     assert retained_bytes == sum(len(payload) for payload in safe_files.values())
+    assert telemetry["drop_counts"]["unsafe"] == len(blocked_files)
     assert {
         path.relative_to(carry_root): path.read_bytes()
         for path in carry_root.rglob("*")
@@ -1131,6 +1134,12 @@ def test_board_description_candidate_correct_skips_lanes_and_is_not_fresh_eviden
     report = asyncio.run(Orchestrator(config(tmp_path), board, store, NoLaneRuntime({})).run())
 
     assert report.solved == 1
+    assert report.submission_correct == 1
+    assert report.board_origin_correct == 1
+    assert report.source_observed_correct == 0
+    assert report.independently_verified == 0
+    assert report.run_local_verified == 0
+    assert report.unverified_challenges == 0
     assert len(board.submissions) == 1
     rows = store._connection.execute(
         "SELECT kind, data_json FROM events "
@@ -1179,6 +1188,11 @@ def test_wrong_board_description_candidate_retires_then_normal_lanes_solve(
     report = asyncio.run(Orchestrator(config(tmp_path), board, store, runtime).run())
 
     assert report.solved == 1
+    assert report.submission_correct == 1
+    assert report.submission_incorrect == 1
+    assert report.board_origin_correct == 0
+    assert report.source_observed_correct == 1
+    assert report.run_local_verified == 1
     assert len(runtime.solve_kwargs) == 2
     assert len(board.submissions) == 2
     submissions = [
@@ -1582,6 +1596,13 @@ def test_malformed_model_text_terminalizes_every_attempt(tmp_path: Path) -> None
     attempts = store.attempts_for_challenge(report.run_id, 1)
     assert all(row["status"] == "failed" for row in attempts)
     assert all(row["failure_class"] == "solver_output" for row in attempts)
+    failures = [
+        json.loads(row["data_json"])
+        for row in store._connection.execute(
+            "SELECT data_json FROM events WHERE kind='attempt_failure' ORDER BY sequence"
+        )
+    ]
+    assert {failure["subreason"] for failure in failures} == {"evidence"}
     store.close()
 
 

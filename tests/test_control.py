@@ -385,6 +385,93 @@ class PersistentPrimaryRuntime(BoundaryRuntime):
         return candidate
 
 
+class ParaphrasedUnsupportedPrimaryRuntime(BoundaryRuntime):
+    def __init__(self) -> None:
+        super().__init__("INCYPHER{unused}")
+        self.continuations: list[str] = []
+
+    async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+        del workspace
+        callback = kwargs.get("continuation_callback")
+        progress = kwargs.get("progress_callback")
+        if kwargs.get("model") != "gpt-daybreak-blue-latest" or not callable(callback):
+            return await UnsolvedBoundaryRuntime.solve(self, Path(), prompt, **kwargs)
+        assert callable(progress)
+        successful = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "zip", "duration_milliseconds": 1},
+        )
+        duplicate = project_tool_observation(
+            "inspect_file",
+            success=True,
+            source_bound=True,
+            result={"format": "zip", "duration_milliseconds": 999},
+        )
+        failed = project_tool_observation(
+            "inspect_file",
+            success=False,
+            source_bound=True,
+            result={"error_code": "invalid_argument", "retryable": False},
+        )
+        calls: list[dict[str, object]] = []
+        for round_index, summary in enumerate(
+            (
+                "required decoder unavailable",
+                "the needed decoder is not installed",
+                "cannot access that decoding prerequisite",
+            )
+        ):
+            observation = successful if round_index == 0 else duplicate
+            progress(observation)
+            calls.append(
+                {
+                    "name": "inspect_file",
+                    "success": True,
+                    "source_bound": True,
+                    "candidate_sha256s": [],
+                    "supplied_candidate_sha256s": [],
+                    "host_observation": observation,
+                }
+            )
+            if round_index:
+                progress(failed)
+                calls.append(
+                    {
+                        "name": "inspect_file",
+                        "success": False,
+                        "source_bound": True,
+                        "candidate_sha256s": [],
+                        "supplied_candidate_sha256s": [],
+                        "host_observation": failed,
+                    }
+                )
+            checkpoint = type(
+                "UnsupportedCheckpoint",
+                (),
+                {
+                    "status": "completed",
+                    "text": json.dumps(
+                        {
+                            "status": "unsupported",
+                            "candidate": None,
+                            "confidence": 0,
+                            "summary": summary,
+                            "evidence": [],
+                            "next_steps": [summary],
+                        }
+                    ),
+                    "tool_calls": list(calls),
+                },
+            )()
+            follow_up = callback(checkpoint, float(kwargs["timeout"]) - round_index - 1)
+            if follow_up is None:
+                return checkpoint
+            self.continuations.append(follow_up)
+        raise AssertionError("stagnant primary continuation was not bounded")
+
+
 class CandidateVerifierRuntime(BoundaryRuntime):
     def __init__(self, candidate: str, verifier_candidate: str | None) -> None:
         super().__init__(candidate)
@@ -1208,6 +1295,40 @@ def test_daybreak_primary_continues_changed_same_session_until_source_bound_cand
         )
 
 
+def test_primary_paraphrases_and_failed_calls_do_not_reset_no_progress_bound(
+    tmp_path: Path,
+) -> None:
+    runtime = ParaphrasedUnsupportedPrimaryRuntime()
+    config = replace(
+        _config(tmp_path),
+        attempts_per_challenge=2,
+        concurrency=2,
+        lead_lanes=1,
+        episodes_per_challenge=1,
+        submit_candidates=False,
+    )
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=BoundaryBoard([_challenge(1)]),
+            runtime=runtime,
+        )
+    )
+
+    assert report.status == "completed"
+    assert len(runtime.continuations) == 2
+    with sqlite3.connect(config.state_path) as connection:
+        stopped = [
+            json.loads(row[0])
+            for row in connection.execute(
+                "SELECT data_json FROM events WHERE kind='primary_solver_stopped'"
+            )
+        ]
+        assert [row["reason"] for row in stopped] == ["repeated_checkpoint_without_novel_success"]
+        assert stopped[0]["novel_success_count"] == 1
+
+
 def test_closed_job_state_matches_each_lane_terminal(tmp_path: Path) -> None:
     config = _config(tmp_path)
     report = asyncio.run(
@@ -1610,6 +1731,10 @@ def test_already_solved_candidate_requires_fresh_verification_before_closing(
 
     assert report.solved == 0
     assert report.candidates == 1
+    assert report.submission_already_solved == 1
+    assert report.independently_verified == 1
+    assert report.run_local_verified == 1
+    assert report.unverified_challenges == 0
     assert board.submissions == [(1, candidate)]
     assert {job.role for job in view.jobs} == {"specialist", "verifier"}
     assert view.pending_candidate_count == 0
@@ -1636,6 +1761,10 @@ def test_already_solved_verifier_mismatch_dispatches_recovery(tmp_path: Path) ->
 
     assert report.solved == 0
     assert report.candidates == 1
+    assert report.submission_already_solved == 2
+    assert report.independently_verified == 0
+    assert report.run_local_verified == 0
+    assert report.unverified_challenges == 1
     assert {job.role for job in view.jobs} == {"specialist", "verifier", "recovery"}
     assert view.pending_candidate_count == 2
     assert view.verified_candidate_count == 0

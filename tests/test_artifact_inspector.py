@@ -391,6 +391,19 @@ def test_malformed_claimed_formats_fail_with_stable_tool_error(tmp_path, name, d
     assert error.value.code in {"invalid_artifact", "invalid_elf", "limit_exceeded"}
 
 
+def test_argument_contract_error_has_bounded_structural_attribution(tmp_path):
+    with pytest.raises(ToolError) as error:
+        inspect_artifact(Workspace(tmp_path), {"path": "fixture", "view": []})
+    assert error.value.code == "invalid_argument"
+    assert error.value.details == {
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "enum",
+        "field_path": "view",
+        "actual_kind": "array",
+    }
+
+
 def test_pcap_and_pcapng_record_views_are_bounded(tmp_path):
     ethernet = bytes.fromhex("00112233445566778899aabb0800") + b"payload"
     (tmp_path / "capture.pcap").write_bytes(_pcap_fixture([ethernet, ethernet]))

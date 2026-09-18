@@ -4223,6 +4223,116 @@ class StateStore:
             ).fetchone()
         return int(row["count"])
 
+    def run_evaluation_counts(self, run_id: str) -> dict[str, int]:
+        """Return candidate-free submission and same-run verification counts."""
+        with self._lock:
+            outcome_rows = self._connection.execute(
+                "SELECT outcome, COUNT(*) AS count FROM submissions "
+                "WHERE run_id=? GROUP BY outcome",
+                (run_id,),
+            ).fetchall()
+            submission_events = self._connection.execute(
+                "SELECT data_json FROM events WHERE run_id=? AND kind='submission' ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+            verified_rows = self._connection.execute(
+                """
+                SELECT DISTINCT verification.challenge_id
+                FROM candidate_verifications AS verification
+                JOIN candidate_proposals AS proposal
+                  ON proposal.source_attempt_id=verification.producer_attempt_id
+                JOIN control_catalogue AS catalogue
+                  ON catalogue.run_id=proposal.run_id
+                 AND catalogue.challenge_id=proposal.challenge_id
+                JOIN candidate_evidence_proofs AS producer_proof
+                  ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                 AND producer_proof.run_id=verification.run_id
+                 AND producer_proof.challenge_id=verification.challenge_id
+                 AND producer_proof.candidate_key=verification.candidate_key
+                JOIN candidate_evidence_proofs AS verifier_proof
+                  ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                 AND verifier_proof.run_id=verification.run_id
+                 AND verifier_proof.challenge_id=verification.challenge_id
+                 AND verifier_proof.candidate_key=verification.candidate_key
+                WHERE verification.run_id=?
+                  AND proposal.episode>=catalogue.context_episode
+                """,
+                (run_id,),
+            ).fetchall()
+            unverified = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                      SELECT DISTINCT proposal.challenge_id
+                      FROM candidate_proposals AS proposal
+                      JOIN control_catalogue AS catalogue
+                        ON catalogue.run_id=proposal.run_id
+                       AND catalogue.challenge_id=proposal.challenge_id
+                      WHERE proposal.run_id=?
+                        AND proposal.episode>=catalogue.context_episode
+                        AND proposal.role IN ('specialist', 'recovery')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM candidate_verifications AS verification
+                          JOIN candidate_evidence_proofs AS producer_proof
+                            ON producer_proof.source_attempt_id=verification.producer_attempt_id
+                           AND producer_proof.run_id=verification.run_id
+                           AND producer_proof.challenge_id=verification.challenge_id
+                           AND producer_proof.candidate_key=verification.candidate_key
+                          JOIN candidate_evidence_proofs AS verifier_proof
+                            ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+                           AND verifier_proof.run_id=verification.run_id
+                           AND verifier_proof.challenge_id=verification.challenge_id
+                           AND verifier_proof.candidate_key=verification.candidate_key
+                          WHERE verification.run_id=proposal.run_id
+                            AND verification.challenge_id=proposal.challenge_id
+                            AND verification.candidate_key=proposal.candidate_key
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM submission_intents AS settled
+                          WHERE settled.first_run_id=proposal.run_id
+                            AND settled.challenge_id=proposal.challenge_id
+                            AND settled.candidate_sha256=lower(hex(proposal.candidate_key))
+                            AND settled.status IN ('correct', 'incorrect')
+                        )
+                    )
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+            )
+
+        outcomes = {str(row["outcome"]): int(row["count"]) for row in outcome_rows}
+        source_observed: set[int] = set()
+        board_origin: set[int] = set()
+        for row in submission_events:
+            try:
+                payload = json.loads(str(row["data_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("outcome") != "correct":
+                continue
+            challenge_id = payload.get("challenge_id")
+            if type(challenge_id) is not int or challenge_id <= 0:
+                continue
+            provenance = payload.get("provenance_class")
+            if provenance == "source_observed_candidate":
+                source_observed.add(challenge_id)
+            elif provenance == "board_description_candidate":
+                board_origin.add(challenge_id)
+        independently_verified = {int(row["challenge_id"]) for row in verified_rows}
+        http_correct = outcomes.get("correct", 0)
+        classified_correct = len(source_observed) + len(board_origin)
+        return {
+            "submission_correct": http_correct,
+            "submission_already_solved": outcomes.get("already_solved", 0),
+            "submission_incorrect": outcomes.get("incorrect", 0),
+            "source_observed_correct": len(source_observed),
+            "board_origin_correct": len(board_origin),
+            "unknown_origin_correct": max(0, http_correct - classified_correct),
+            "independently_verified": len(independently_verified),
+            "run_local_verified": len(source_observed | independently_verified),
+            "unverified_challenges": unverified,
+        }
+
     def submission_risk_count(self) -> int:
         """Count settled wrongs plus effects whose Board outcome is not safely known."""
         with self._lock:

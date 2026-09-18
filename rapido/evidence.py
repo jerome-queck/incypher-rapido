@@ -88,6 +88,9 @@ _INTEGER_KEYS = frozenset(
         "samples",
         "size",
         "width",
+        "actual_size",
+        "contract_version",
+        "limit",
     }
 )
 _BOOLEAN_KEYS = frozenset(
@@ -123,6 +126,10 @@ _TOKEN_KEYS = frozenset(
         "endianness",
         "encoding",
         "error_code",
+        "actual_kind",
+        "constraint",
+        "failure_stage",
+        "field_path",
         "format",
         "inspector",
         "kind",

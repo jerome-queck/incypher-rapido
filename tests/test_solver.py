@@ -57,16 +57,51 @@ def carry(episode: int = 1) -> AttemptCarry:
 
 def test_finding_parser_requires_exact_typed_json_and_evidence() -> None:
     assert finding("INCYPHER{derived}").candidate == "INCYPHER{derived}"
-    with pytest.raises(SolverOutputError, match="evidence"):
+    with pytest.raises(SolverOutputError, match="evidence") as missing_evidence:
         SolverFinding.from_message(
             '{"status":"candidate","candidate":"INCYPHER{x}","confidence":1,'
             '"summary":"","evidence":[],"next_steps":[]}'
         )
-    with pytest.raises(SolverOutputError, match="shape"):
+    assert missing_evidence.value.category == "candidate_evidence"
+    with pytest.raises(SolverOutputError, match="shape") as invalid_shape:
         SolverFinding.from_message(
             '{"status":"unsolved","candidate":null,"confidence":0,"summary":"",'
             '"evidence":[],"next_steps":[],"extra":true}'
         )
+    assert invalid_shape.value.category == "shape"
+
+
+@pytest.mark.parametrize(
+    ("message", "category"),
+    (
+        ("not-json", "invalid_json"),
+        (
+            (
+                '{"status":"bad","candidate":null,"confidence":0,"summary":"",'
+                '"evidence":[],"next_steps":[]}'
+            ),
+            "status",
+        ),
+        (
+            (
+                '{"status":"unsolved","candidate":null,"confidence":"high","summary":"",'
+                '"evidence":[],"next_steps":[]}'
+            ),
+            "confidence_type",
+        ),
+        (
+            (
+                '{"status":"unsolved","candidate":"INCYPHER{x}","confidence":0,'
+                '"summary":"","evidence":[],"next_steps":[]}'
+            ),
+            "unexpected_candidate",
+        ),
+    ),
+)
+def test_finding_parser_exposes_closed_failure_category(message: str, category: str) -> None:
+    with pytest.raises(SolverOutputError) as caught:
+        SolverFinding.from_message(message)
+    assert caught.value.category == category
 
 
 @pytest.mark.parametrize("field", ("summary", "evidence", "next_steps"))
