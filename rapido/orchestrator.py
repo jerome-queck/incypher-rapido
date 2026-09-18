@@ -1429,6 +1429,8 @@ class Orchestrator:
         lane_candidates: dict[int, list[tuple[Path, Path, str]]] = {}
         lane_counts: dict[int, dict[str, int]] = {}
         for lane, (_, lane_root) in sorted(latest_lane_roots.items()):
+            lane_candidates[lane] = []
+            lane_counts[lane] = {"eligible": 0, "retained": 0}
             if not lane_root.is_dir() or lane_root.is_symlink():
                 continue
             analysis_root = lane_root / "rapido-analysis"
@@ -1459,7 +1461,28 @@ class Orchestrator:
                     canonical.items(), key=lambda item: item[0].as_posix()
                 )
             ]
-            lane_counts[lane] = {"eligible": 0, "retained": 0}
+
+        # A recovery wave may intentionally rerun only one lane. Preserve other
+        # lanes' safe carry, but make every lane present in this wave
+        # authoritative: an empty latest analysis retires stale same-lane files.
+        if carry_root.is_dir() and not carry_root.is_symlink():
+            for prior_lane_root in sorted(carry_root.glob("lane-*")):
+                try:
+                    lane = int(prior_lane_root.name.removeprefix("lane-"))
+                except ValueError:
+                    dropped("invalid_file")
+                    continue
+                if lane in latest_lane_roots:
+                    continue
+                if not prior_lane_root.is_dir() or prior_lane_root.is_symlink():
+                    dropped("invalid_file")
+                    continue
+                candidates: list[tuple[Path, Path, str]] = []
+                for source in sorted(prior_lane_root.rglob("*")):
+                    if source.is_file():
+                        candidates.append((source.relative_to(prior_lane_root), source, "prior"))
+                lane_candidates[lane] = candidates
+                lane_counts[lane] = {"eligible": 0, "retained": 0}
 
         if not lane_candidates:
             return (
@@ -1474,7 +1497,7 @@ class Orchestrator:
 
         files = 0
         total = 0
-        origin_counts = {"fresh": 0, "imported": 0}
+        origin_counts = {"fresh": 0, "imported": 0, "prior": 0}
         staging = carry_root.with_name(f".{carry_root.name}.{uuid.uuid4().hex}.tmp")
         staging.mkdir(mode=0o700, parents=True)
         positions = {lane: 0 for lane in lane_candidates}
@@ -2848,7 +2871,12 @@ class Orchestrator:
                     "submission_pending_reconciliation",
                 )
             self.state.finalize_submission(
-                run_id, challenge.id, candidate, verdict.outcome, verdict.http_status
+                run_id,
+                challenge.id,
+                candidate,
+                verdict.outcome,
+                verdict.http_status,
+                provenance_class=provenance_class,
             )
             self.state.event(
                 run_id,

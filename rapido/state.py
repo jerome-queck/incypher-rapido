@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -174,6 +175,10 @@ class StateStore:
                 at TEXT NOT NULL,
                 candidate_sha256 TEXT NOT NULL,
                 context_episode INTEGER NOT NULL DEFAULT 0,
+                provenance_class TEXT NOT NULL DEFAULT 'unknown'
+                  CHECK(provenance_class IN (
+                    'unknown', 'board_description_candidate', 'source_observed_candidate'
+                  )),
                 outcome TEXT NOT NULL,
                 http_status INTEGER NOT NULL
             );
@@ -330,6 +335,8 @@ class StateStore:
                 lane INTEGER NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('specialist', 'verifier', 'recovery')),
                 recipe_kind TEXT NOT NULL,
+                context_identity TEXT NOT NULL DEFAULT '',
+                instance_receipt_sha256 TEXT,
                 candidate_key BLOB NOT NULL CHECK(length(candidate_key) = 32),
                 candidate BLOB NOT NULL,
                 retained_at TEXT NOT NULL,
@@ -364,6 +371,10 @@ class StateStore:
                   REFERENCES candidate_proposals(source_attempt_id),
                 verifier_role TEXT NOT NULL CHECK(verifier_role = 'verifier'),
                 recipe_kind TEXT NOT NULL,
+                verification_scope TEXT NOT NULL DEFAULT 'unscoped'
+                  CHECK(verification_scope IN ('unscoped', 'static_material', 'dynamic_instance')),
+                context_identity TEXT NOT NULL DEFAULT '',
+                instance_receipt_sha256 TEXT,
                 verified_at TEXT NOT NULL,
                 PRIMARY KEY(run_id, challenge_id, candidate_key),
                 FOREIGN KEY(producer_attempt_id, run_id, challenge_id, producer_role, candidate_key)
@@ -385,6 +396,9 @@ class StateStore:
                 verifier_attempt_id TEXT NOT NULL,
                 verifier_role TEXT NOT NULL,
                 recipe_kind TEXT NOT NULL,
+                verification_scope TEXT NOT NULL DEFAULT 'unscoped',
+                context_identity TEXT NOT NULL DEFAULT '',
+                instance_receipt_sha256 TEXT,
                 verified_at TEXT NOT NULL,
                 retired_context_episode INTEGER NOT NULL,
                 retired_at TEXT NOT NULL,
@@ -456,6 +470,110 @@ class StateStore:
             self._connection.execute(
                 "ALTER TABLE submissions ADD COLUMN context_episode INTEGER NOT NULL DEFAULT 0"
             )
+        if "provenance_class" not in submission_columns:
+            self._connection.execute(
+                "ALTER TABLE submissions ADD COLUMN provenance_class "
+                "TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        proposal_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(candidate_proposals)").fetchall()
+        }
+        if "context_identity" not in proposal_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_proposals ADD COLUMN context_identity "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "instance_receipt_sha256" not in proposal_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_proposals ADD COLUMN instance_receipt_sha256 TEXT"
+            )
+        verification_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(candidate_verifications)"
+            ).fetchall()
+        }
+        if "verification_scope" not in verification_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verifications ADD COLUMN verification_scope "
+                "TEXT NOT NULL DEFAULT 'unscoped'"
+            )
+        if "context_identity" not in verification_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verifications ADD COLUMN context_identity "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "instance_receipt_sha256" not in verification_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verifications ADD COLUMN instance_receipt_sha256 TEXT"
+            )
+        history_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(candidate_verification_history)"
+            ).fetchall()
+        }
+        if "verification_scope" not in history_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verification_history ADD COLUMN verification_scope "
+                "TEXT NOT NULL DEFAULT 'unscoped'"
+            )
+        if "context_identity" not in history_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verification_history ADD COLUMN context_identity "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "instance_receipt_sha256" not in history_columns:
+            self._connection.execute(
+                "ALTER TABLE candidate_verification_history ADD COLUMN instance_receipt_sha256 TEXT"
+            )
+        self._connection.executescript(
+            """
+            DROP VIEW IF EXISTS current_candidate_verifications;
+            CREATE VIEW current_candidate_verifications AS
+            SELECT verification.*
+            FROM candidate_verifications AS verification
+            JOIN candidate_proposals AS producer
+              ON producer.source_attempt_id=verification.producer_attempt_id
+            JOIN candidate_proposals AS verifier
+              ON verifier.source_attempt_id=verification.verifier_attempt_id
+            JOIN control_catalogue AS catalogue
+              ON catalogue.run_id=verification.run_id
+             AND catalogue.challenge_id=verification.challenge_id
+            JOIN challenges AS challenge ON challenge.id=verification.challenge_id
+            JOIN candidate_evidence_proofs AS producer_proof
+              ON producer_proof.source_attempt_id=verification.producer_attempt_id
+             AND producer_proof.run_id=verification.run_id
+             AND producer_proof.challenge_id=verification.challenge_id
+             AND producer_proof.candidate_key=verification.candidate_key
+            JOIN candidate_evidence_proofs AS verifier_proof
+              ON verifier_proof.source_attempt_id=verification.verifier_attempt_id
+             AND verifier_proof.run_id=verification.run_id
+             AND verifier_proof.challenge_id=verification.challenge_id
+             AND verifier_proof.candidate_key=verification.candidate_key
+            WHERE verification.context_identity=(
+                CASE WHEN catalogue.context_sha256 IS NOT NULL
+                     THEN catalogue.context_sha256
+                     ELSE 'episode:' || catalogue.context_episode END
+              )
+              AND producer.context_identity=verification.context_identity
+              AND verifier.context_identity=verification.context_identity
+              AND (
+                (challenge.challenge_type!='dynamic_iac'
+                 AND verification.verification_scope='static_material'
+                 AND verification.instance_receipt_sha256 IS NULL)
+                OR
+                (challenge.challenge_type='dynamic_iac'
+                 AND verification.verification_scope='dynamic_instance'
+                 AND length(verification.instance_receipt_sha256)=64
+                 AND verification.instance_receipt_sha256
+                       NOT GLOB '*[^0-9a-f]*'
+                 AND verifier.instance_receipt_sha256=
+                       verification.instance_receipt_sha256)
+              );
+            """
+        )
         intent_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(submission_intents)").fetchall()
@@ -1362,11 +1480,41 @@ class StateStore:
             recipe = "source_bound_tool_observation_v1"
         else:
             raise ValueError("private candidate role is invalid")
+        context = connection.execute(
+            """
+            SELECT catalogue.context_sha256, catalogue.context_episode,
+                   challenge.challenge_type, instance.run_id AS instance_run_id,
+                   instance.status AS instance_status,
+                   instance.receipt_sha256 AS instance_receipt_sha256
+            FROM control_catalogue AS catalogue
+            JOIN challenges AS challenge ON challenge.id=catalogue.challenge_id
+            LEFT JOIN instances AS instance ON instance.challenge_id=catalogue.challenge_id
+            WHERE catalogue.run_id=? AND catalogue.challenge_id=?
+            """,
+            (run_id, challenge_id),
+        ).fetchone()
+        if context is None:
+            raise ValueError("private candidate has no material context")
+        context_identity = (
+            str(context["context_sha256"])
+            if context["context_sha256"] is not None
+            else f"episode:{int(context['context_episode'])}"
+        )
+        challenge_type = str(context["challenge_type"])
+        instance_receipt = None
+        if (
+            challenge_type == "dynamic_iac"
+            and context["instance_run_id"] == run_id
+            and context["instance_status"] == "owned"
+            and isinstance(context["instance_receipt_sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", str(context["instance_receipt_sha256"]))
+        ):
+            instance_receipt = str(context["instance_receipt_sha256"])
         candidate_key = hashlib.sha256(encoded).digest()
         existing = connection.execute(
             """
             SELECT run_id, challenge_id, episode, lane, role, recipe_kind,
-                   candidate_key, candidate
+                   context_identity, instance_receipt_sha256, candidate_key, candidate
             FROM candidate_proposals WHERE source_attempt_id=?
             """,
             (attempt_id,),
@@ -1378,6 +1526,8 @@ class StateStore:
             lane,
             role,
             recipe,
+            context_identity,
+            instance_receipt,
             candidate_key,
             encoded,
         )
@@ -1386,8 +1536,9 @@ class StateStore:
                 """
                 INSERT INTO candidate_proposals(
                   source_attempt_id, run_id, challenge_id, episode, lane, role,
-                  recipe_kind, candidate_key, candidate, retained_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  recipe_kind, context_identity, instance_receipt_sha256,
+                  candidate_key, candidate, retained_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (attempt_id, *expected, self._now()),
             )
@@ -1398,11 +1549,22 @@ class StateStore:
             int(existing["lane"]),
             str(existing["role"]),
             str(existing["recipe_kind"]),
+            str(existing["context_identity"]),
+            (
+                None
+                if existing["instance_receipt_sha256"] is None
+                else str(existing["instance_receipt_sha256"])
+            ),
             bytes(existing["candidate_key"]),
             bytes(existing["candidate"]),
         ) != expected:
             raise ValueError("checkpoint candidate changed before attempt completion")
         if role != "verifier":
+            return
+        verification_scope = (
+            "dynamic_instance" if challenge_type == "dynamic_iac" else "static_material"
+        )
+        if verification_scope == "dynamic_instance" and instance_receipt is None:
             return
         evidence_schema = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_manifests'"
@@ -1437,6 +1599,7 @@ class StateStore:
              AND verifier_manifest.digest=verifier_proof.manifest_digest
             WHERE proposal.run_id=? AND proposal.challenge_id=?
               AND proposal.episode>=catalogue.context_episode
+              AND proposal.context_identity=?
               AND proposal.role IN ('specialist', 'recovery')
               AND proposal.candidate_key=? AND proposal.candidate=?
               AND attempt.status='candidate'
@@ -1447,7 +1610,7 @@ class StateStore:
             ORDER BY proposal.episode, proposal.source_attempt_id
             LIMIT 1
             """,
-            (attempt_id, run_id, challenge_id, candidate_key, encoded),
+            (attempt_id, run_id, challenge_id, context_identity, candidate_key, encoded),
         ).fetchone()
         if producer is not None:
             connection.execute(
@@ -1474,8 +1637,9 @@ class StateStore:
                 """
                 INSERT OR IGNORE INTO candidate_verifications(
                   run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
-                  verifier_attempt_id, verifier_role, recipe_kind, verified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'verifier', ?, ?)
+                  verifier_attempt_id, verifier_role, recipe_kind, verification_scope,
+                  context_identity, instance_receipt_sha256, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'verifier', ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1485,6 +1649,9 @@ class StateStore:
                     producer["role"],
                     attempt_id,
                     recipe,
+                    verification_scope,
+                    context_identity,
+                    instance_receipt,
                     self._now(),
                 ),
             )
@@ -1503,6 +1670,11 @@ class StateStore:
                        AND catalogue.challenge_id=proposal.challenge_id
                       WHERE proposal.run_id=? AND proposal.role IN ('specialist', 'recovery')
                         AND proposal.episode>=catalogue.context_episode
+                        AND proposal.context_identity=(
+                          CASE WHEN catalogue.context_sha256 IS NOT NULL
+                               THEN catalogue.context_sha256
+                               ELSE 'episode:' || catalogue.context_episode END
+                        )
                         AND NOT EXISTS (
                           SELECT 1 FROM submission_intents AS rejected
                           WHERE rejected.challenge_id=proposal.challenge_id
@@ -1515,7 +1687,7 @@ class StateStore:
                             AND rejected.status IN ('correct', 'incorrect')
                         )
                         AND NOT EXISTS (
-                          SELECT 1 FROM candidate_verifications AS verification
+                          SELECT 1 FROM current_candidate_verifications AS verification
                           JOIN candidate_evidence_proofs AS producer_proof
                             ON producer_proof.source_attempt_id=verification.producer_attempt_id
                            AND producer_proof.run_id=verification.run_id
@@ -1540,7 +1712,7 @@ class StateStore:
                 self._connection.execute(
                     """
                     SELECT COUNT(*)
-                    FROM candidate_verifications AS verification
+                    FROM current_candidate_verifications AS verification
                     JOIN candidate_evidence_proofs AS producer_proof
                       ON producer_proof.source_attempt_id=verification.producer_attempt_id
                      AND producer_proof.run_id=verification.run_id
@@ -1570,6 +1742,11 @@ class StateStore:
                      AND catalogue.challenge_id=proposal.challenge_id
                     WHERE proposal.run_id=? AND proposal.challenge_id=?
                       AND proposal.episode>=catalogue.context_episode
+                      AND proposal.context_identity=(
+                        CASE WHEN catalogue.context_sha256 IS NOT NULL
+                             THEN catalogue.context_sha256
+                             ELSE 'episode:' || catalogue.context_episode END
+                      )
                       AND proposal.role IN ('specialist', 'recovery')
                       AND NOT EXISTS (
                         SELECT 1 FROM submission_intents AS rejected
@@ -1583,7 +1760,7 @@ class StateStore:
                           AND rejected.status IN ('correct', 'incorrect')
                       )
                       AND NOT EXISTS (
-                        SELECT 1 FROM candidate_verifications AS verification
+                        SELECT 1 FROM current_candidate_verifications AS verification
                         JOIN candidate_evidence_proofs AS producer_proof
                           ON producer_proof.source_attempt_id=verification.producer_attempt_id
                          AND producer_proof.run_id=verification.run_id
@@ -1609,7 +1786,7 @@ class StateStore:
             rows = self._connection.execute(
                 """
                 SELECT proposal.candidate
-                FROM candidate_verifications AS verification
+                FROM current_candidate_verifications AS verification
                 JOIN candidate_proposals AS proposal
                   ON proposal.source_attempt_id=verification.producer_attempt_id
                 JOIN control_catalogue AS catalogue
@@ -1652,7 +1829,7 @@ class StateStore:
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN verification.candidate_key=? AND producer.candidate=?
                                 THEN 1 ELSE 0 END) AS matching
-                FROM candidate_verifications AS verification
+                FROM current_candidate_verifications AS verification
                 JOIN candidate_proposals AS producer
                   ON producer.source_attempt_id=verification.producer_attempt_id
                 JOIN control_catalogue AS catalogue
@@ -1976,11 +2153,13 @@ class StateStore:
                     """
                     INSERT OR IGNORE INTO candidate_verification_history(
                       run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
-                      verifier_attempt_id, verifier_role, recipe_kind, verified_at,
+                      verifier_attempt_id, verifier_role, recipe_kind, verification_scope,
+                      context_identity, instance_receipt_sha256, verified_at,
                       retired_context_episode, retired_at
                     )
                     SELECT run_id, challenge_id, candidate_key, producer_attempt_id, producer_role,
-                           verifier_attempt_id, verifier_role, recipe_kind, verified_at, ?, ?
+                           verifier_attempt_id, verifier_role, recipe_kind, verification_scope,
+                           context_identity, instance_receipt_sha256, verified_at, ?, ?
                     FROM candidate_verifications WHERE run_id=? AND challenge_id=?
                     """,
                     (episode, self._now(), run_id, challenge_id),
@@ -3155,6 +3334,11 @@ class StateStore:
                  AND catalogue.challenge_id=proposal.challenge_id
                 WHERE proposal.run_id=? AND proposal.challenge_id=?
                   AND proposal.episode>=catalogue.context_episode
+                  AND proposal.context_identity=(
+                    CASE WHEN catalogue.context_sha256 IS NOT NULL
+                         THEN catalogue.context_sha256
+                         ELSE 'episode:' || catalogue.context_episode END
+                  )
                   AND proposal.role IN ('specialist', 'recovery')
                   AND NOT EXISTS (
                     SELECT 1 FROM submission_intents AS rejected
@@ -3168,7 +3352,7 @@ class StateStore:
                       AND rejected.status IN ('correct', 'incorrect')
                   )
                   AND NOT EXISTS (
-                    SELECT 1 FROM candidate_verifications AS verification
+                    SELECT 1 FROM current_candidate_verifications AS verification
                     JOIN candidate_evidence_proofs AS producer_proof
                       ON producer_proof.source_attempt_id=verification.producer_attempt_id
                      AND producer_proof.run_id=verification.run_id
@@ -3774,7 +3958,7 @@ class StateStore:
                   ON route.run_id=job.run_id
                  AND route.challenge_id=job.challenge_id
                  AND route.route_fingerprint=job.route_fingerprint
-                LEFT JOIN candidate_verifications AS verification
+                LEFT JOIN current_candidate_verifications AS verification
                   ON verification.run_id=proposal.run_id
                  AND verification.challenge_id=proposal.challenge_id
                  AND verification.producer_attempt_id=proposal.source_attempt_id
@@ -4138,6 +4322,8 @@ class StateStore:
         candidate: str,
         outcome: str,
         http_status: int,
+        *,
+        provenance_class: str = "unknown",
     ) -> int:
         if outcome not in {
             "correct",
@@ -4148,6 +4334,12 @@ class StateStore:
             "unread",
         }:
             raise ValueError("invalid submission outcome")
+        if provenance_class not in {
+            "unknown",
+            "board_description_candidate",
+            "source_observed_candidate",
+        }:
+            raise ValueError("invalid submission provenance")
         fingerprint = self._candidate_fingerprint(candidate)
         with self.transaction() as connection:
             catalogue = connection.execute(
@@ -4189,8 +4381,8 @@ class StateStore:
                 """
                 INSERT INTO submissions(
                     run_id, challenge_id, at, candidate_sha256, context_episode,
-                    outcome, http_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    provenance_class, outcome, http_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -4198,6 +4390,7 @@ class StateStore:
                     self._now(),
                     fingerprint,
                     int(intent["context_episode"]),
+                    provenance_class,
                     outcome,
                     http_status,
                 ),
@@ -4226,19 +4419,15 @@ class StateStore:
     def run_evaluation_counts(self, run_id: str) -> dict[str, int]:
         """Return candidate-free submission and same-run verification counts."""
         with self._lock:
-            outcome_rows = self._connection.execute(
-                "SELECT outcome, COUNT(*) AS count FROM submissions "
-                "WHERE run_id=? GROUP BY outcome",
-                (run_id,),
-            ).fetchall()
-            submission_events = self._connection.execute(
-                "SELECT data_json FROM events WHERE run_id=? AND kind='submission' ORDER BY sequence",
+            submission_rows = self._connection.execute(
+                "SELECT challenge_id, outcome, provenance_class FROM submissions "
+                "WHERE run_id=? ORDER BY sequence",
                 (run_id,),
             ).fetchall()
             verified_rows = self._connection.execute(
                 """
                 SELECT DISTINCT verification.challenge_id
-                FROM candidate_verifications AS verification
+                FROM current_candidate_verifications AS verification
                 JOIN candidate_proposals AS proposal
                   ON proposal.source_attempt_id=verification.producer_attempt_id
                 JOIN control_catalogue AS catalogue
@@ -4270,9 +4459,14 @@ class StateStore:
                        AND catalogue.challenge_id=proposal.challenge_id
                       WHERE proposal.run_id=?
                         AND proposal.episode>=catalogue.context_episode
+                        AND proposal.context_identity=(
+                          CASE WHEN catalogue.context_sha256 IS NOT NULL
+                               THEN catalogue.context_sha256
+                               ELSE 'episode:' || catalogue.context_episode END
+                        )
                         AND proposal.role IN ('specialist', 'recovery')
                         AND NOT EXISTS (
-                          SELECT 1 FROM candidate_verifications AS verification
+                          SELECT 1 FROM current_candidate_verifications AS verification
                           JOIN candidate_evidence_proofs AS producer_proof
                             ON producer_proof.source_attempt_id=verification.producer_attempt_id
                            AND producer_proof.run_id=verification.run_id
@@ -4292,6 +4486,10 @@ class StateStore:
                           WHERE settled.first_run_id=proposal.run_id
                             AND settled.challenge_id=proposal.challenge_id
                             AND settled.candidate_sha256=lower(hex(proposal.candidate_key))
+                            AND ((catalogue.context_sha256 IS NOT NULL
+                              AND settled.context_sha256=catalogue.context_sha256) OR
+                              (settled.context_episode=catalogue.context_episode
+                               AND settled.context_sha256 IS catalogue.context_sha256))
                             AND settled.status IN ('correct', 'incorrect')
                         )
                     )
@@ -4300,20 +4498,16 @@ class StateStore:
                 ).fetchone()[0]
             )
 
-        outcomes = {str(row["outcome"]): int(row["count"]) for row in outcome_rows}
+        outcomes: dict[str, int] = {}
         source_observed: set[int] = set()
         board_origin: set[int] = set()
-        for row in submission_events:
-            try:
-                payload = json.loads(str(row["data_json"]))
-            except (TypeError, json.JSONDecodeError):
+        for row in submission_rows:
+            outcome = str(row["outcome"])
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if outcome != "correct":
                 continue
-            if not isinstance(payload, dict) or payload.get("outcome") != "correct":
-                continue
-            challenge_id = payload.get("challenge_id")
-            if type(challenge_id) is not int or challenge_id <= 0:
-                continue
-            provenance = payload.get("provenance_class")
+            challenge_id = int(row["challenge_id"])
+            provenance = str(row["provenance_class"])
             if provenance == "source_observed_candidate":
                 source_observed.add(challenge_id)
             elif provenance == "board_description_candidate":

@@ -337,6 +337,164 @@ def test_material_refresh_retires_old_correct_submission_authority(tmp_path: Pat
     store.close()
 
 
+def test_submission_provenance_is_atomic_without_telemetry_event(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.start_run("run-1", {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.record_control_catalogue("run-1", [(0, 1, True)])
+    candidate = "INCYPHER{atomic_provenance}"
+    assert store.reserve_submission("run-1", 1, candidate)
+
+    store.finalize_submission(
+        "run-1",
+        1,
+        candidate,
+        "correct",
+        200,
+        provenance_class="source_observed_candidate",
+    )
+
+    assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    counts = store.run_evaluation_counts("run-1")
+    assert counts["submission_correct"] == 1
+    assert counts["source_observed_correct"] == 1
+    assert counts["unknown_origin_correct"] == 0
+    store.close()
+
+
+def test_verification_is_retired_when_material_identity_changes_in_place(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "scope-run"
+    candidate = "INCYPHER{material_scoped}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, 1, True)],
+        1,
+        producer,
+        (("specialist", producer.model, producer.effort),),
+        {1: "a" * 64},
+    )
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    evidence = RunEvidence.open(store, run_id)
+    _attest_candidate(evidence, "producer", candidate)
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.admit_control_wave(run_id, 1, 1, 0, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    assert store.candidate_is_verified(run_id, 1, candidate)
+
+    store._connection.execute(
+        "UPDATE control_catalogue SET context_sha256=? WHERE run_id=? AND challenge_id=1",
+        ("b" * 64, run_id),
+    )
+
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    assert store.run_evaluation_counts(run_id)["independently_verified"] == 0
+    store.close()
+
+
+def test_dynamic_verifier_without_owned_generation_cannot_verify(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "dynamic-scope-run"
+    candidate = "INCYPHER{dynamic_requires_receipt}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "pwn", "dynamic_iac", 100)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, 1, True)],
+        1,
+        producer,
+        (("specialist", producer.model, producer.effort),),
+        {1: "a" * 64},
+    )
+    evidence = RunEvidence.open(store, run_id)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer", run_id, 1, 0, 0, producer.model, producer.effort)
+    _attest_candidate(evidence, "producer", candidate)
+    store.finish_attempt(
+        "producer", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    store.admit_control_wave(run_id, 1, 1, 0, 1, verifier)
+    store.start_control_wave(run_id, 1, 1)
+    store.start_attempt("verifier", run_id, 1, 1, 0, verifier.model, verifier.effort)
+    _attest_candidate(evidence, "verifier", candidate)
+    store.finish_attempt(
+        "verifier", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+
+    assert (
+        store._connection.execute("SELECT COUNT(*) FROM candidate_verifications").fetchone()[0] == 0
+    )
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    assert store.pending_candidate_count(run_id, 1) == 1
+    store.close()
+
+
+def test_old_material_submission_does_not_hide_current_unverified_candidate(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "rescope-run"
+    candidate = "INCYPHER{same_value_new_material}"
+    route = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    assignment = (("specialist", route.model, route.effort),)
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "crypto", "standard", 100)
+    store.initialize_control_catalogue(run_id, [(0, 1, True)], 1, route, assignment, {1: "a" * 64})
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("old", run_id, 1, 0, 0, route.model, route.effort)
+    store.finish_attempt("old", "candidate", candidate=candidate, retain_private_candidate=True)
+    store.record_submission(run_id, 1, candidate, "incorrect", 200)
+    store.finish_control_wave(run_id, 1, 0, "unsolved")
+    _, episode, _ = store.admit_control_catalogue_revision(
+        run_id=run_id,
+        challenge_id=1,
+        name="A",
+        category="crypto",
+        challenge_type="standard",
+        value=100,
+        executable=True,
+        context_sha256="b" * 64,
+        new_catalogue_rank=1,
+        lanes=1,
+        route=route,
+        assignments=assignment,
+    )
+    store.start_control_wave(run_id, 1, episode)
+    store.start_attempt("new", run_id, 1, episode, 0, route.model, route.effort)
+    store.finish_attempt("new", "candidate", candidate=candidate, retain_private_candidate=True)
+
+    counts = store.run_evaluation_counts(run_id)
+    assert counts["unverified_challenges"] == 1
+    assert store.pending_candidate_count(run_id, 1) == 1
+    store.close()
+
+
 def test_supervisor_lease_excludes_concurrent_recovery(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     first = StateStore(path)

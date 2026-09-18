@@ -222,6 +222,44 @@ def test_latest_generation_replaces_stale_lane_content(carry_harness) -> None:
     ).read_text() == "print('latest')\n"
 
 
+def test_narrow_recovery_preserves_untouched_lane_carry(carry_harness) -> None:
+    orchestrator, state, item, root = carry_harness
+    for lane, (workspace, _) in enumerate(
+        _prepare(orchestrator, root, item, episode=0, lane_count=2)
+    ):
+        script = workspace / "rapido-analysis" / f"lane-{lane}.py"
+        script.parent.mkdir()
+        script.write_text(f"print('lane {lane}')\n")
+    _capture(orchestrator, state, item, root, episode=0)
+
+    recovery, _ = _prepare(orchestrator, root, item, episode=1, lane_count=1)[0]
+    replacement = recovery / "rapido-analysis" / "replacement.py"
+    replacement.parent.mkdir(exist_ok=True)
+    replacement.write_text("print('replacement')\n")
+    files, _, carry_root = _capture(orchestrator, state, item, root, episode=1)
+
+    assert files == 3
+    assert (carry_root / "lane-0" / "replacement.py").is_file()
+    assert (carry_root / "lane-1" / "lane-1.py").read_text() == "print('lane 1')\n"
+
+
+def test_empty_latest_lane_retires_stale_same_lane_carry(carry_harness) -> None:
+    orchestrator, state, item, root = carry_harness
+    workspace, _ = _prepare(orchestrator, root, item, episode=0, lane_count=1)[0]
+    script = workspace / "rapido-analysis" / "stale.py"
+    script.parent.mkdir()
+    script.write_text("print('stale')\n")
+    _, _, carry_root = _capture(orchestrator, state, item, root, episode=0)
+    assert (carry_root / "lane-0" / "stale.py").is_file()
+
+    (root / "challenge-7" / "episode-1" / "generation-0" / "lane-0").mkdir(parents=True)
+    files, retained_bytes, carry_root = _capture(orchestrator, state, item, root, episode=1)
+
+    assert files == 0
+    assert retained_bytes == 0
+    assert not (carry_root / "lane-0").exists()
+
+
 def test_repeated_carry_roundtrips_keep_one_canonical_path(carry_harness) -> None:
     orchestrator, state, item, root = carry_harness
     workspace, _ = _prepare(orchestrator, root, item, episode=0, lane_count=1)[0]

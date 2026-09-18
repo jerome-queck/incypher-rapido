@@ -97,6 +97,7 @@ def _error(code: str, message: str, **details: Any) -> Exception:
         code,
         message,
         details={
+            "schema_version": 1,
             "contract_version": 1,
             "failure_stage": stage,
             "constraint": code,

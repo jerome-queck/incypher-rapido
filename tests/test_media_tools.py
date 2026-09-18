@@ -103,6 +103,15 @@ def test_wav_frame_limit_and_malformed_inputs(tmp_path):
     assert error.value.code == "unsupported_format"
 
 
+def test_media_argument_type_failure_uses_shared_structural_schema(tmp_path):
+    with pytest.raises(ToolError) as caught:
+        wav_analyze(Workspace(tmp_path), [])
+    assert caught.value.details["schema_version"] == 1
+    assert caught.value.details["field_path"] == "arguments"
+    assert caught.value.details["constraint"] == "type"
+    assert caught.value.details["actual_kind"] == "array"
+
+
 def test_wav_finds_candidate_across_lsb_alignment(tmp_path):
     candidate = wav_shifted_flag_fixture(tmp_path / "shifted.wav")
     result = wav_analyze(Workspace(tmp_path), {"path": "shifted.wav"})

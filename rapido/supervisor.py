@@ -111,6 +111,7 @@ _PRISTINE_SCHEMA_COLUMNS = {
         "at",
         "candidate_sha256",
         "context_episode",
+        "provenance_class",
         "outcome",
         "http_status",
     ),

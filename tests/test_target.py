@@ -97,6 +97,26 @@ def test_http_tool_cannot_override_assigned_authority(tmp_path: Path) -> None:
         registry.dispatch("http_request", {"headers": {"Host": "elsewhere.example"}})
 
 
+def test_http_method_type_failure_is_structurally_attributed(tmp_path: Path) -> None:
+    registry = TargetToolRegistry(
+        tmp_path,
+        (TargetEndpoint("http", "assigned.example", 8080),),
+    )
+
+    with pytest.raises(ToolError) as caught:
+        registry.dispatch("http_request", {"method": []})
+
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.details == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "enum",
+        "field_path": "method",
+        "actual_kind": "array",
+    }
+
+
 def test_http_reader_uses_one_decreasing_absolute_deadline() -> None:
     sock = FakeHTTPWireSocket()
     sock.queue = [b"HTTP/1.1 200"]

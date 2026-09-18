@@ -153,6 +153,8 @@ def _closed_tool_failure_details(details: Mapping[str, Any] | None) -> dict[str,
     """Retain only bounded structural diagnostics, never rejected argument values."""
     source = {} if details is None else details
     projected: dict[str, Any] = {}
+    if source.get("schema_version") == 1:
+        projected["schema_version"] = 1
     if source.get("contract_version") == 1:
         projected["contract_version"] = 1
     stage = source.get("failure_stage")
@@ -1645,6 +1647,7 @@ class CodexAppClient:
             observation_result = failed_observation(
                 "invalid_result",
                 {
+                    "schema_version": 1,
                     "contract_version": 1,
                     "failure_stage": "result",
                     "constraint": "invalid_result",
@@ -1668,6 +1671,7 @@ class CodexAppClient:
             observation_result = failed_observation(
                 "internal_error",
                 {
+                    "schema_version": 1,
                     "contract_version": 1,
                     "failure_stage": "execution",
                     "constraint": "internal_error",

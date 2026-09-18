@@ -45,18 +45,40 @@ _SECTION_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _MACHINES = {3: "x86", 40: "arm", 62: "x86_64", 183: "aarch64", 243: "riscv"}
 
 
-def _error(code: str, message: str) -> Exception:
-    from .tools import ToolError
+def _error(code: str, message: str, **details: Any) -> Exception:
+    from .tools import _error as tool_error
 
-    return ToolError(code, message)
+    return tool_error(code, message, **details)
 
 
 def _arguments(arguments: Mapping[str, Any], allowed: set[str]) -> str:
-    if not isinstance(arguments, Mapping) or set(arguments) - allowed:
-        raise _error("invalid_argument", "unsupported binary-tool argument")
+    from .tools import _value_kind
+
+    if not isinstance(arguments, Mapping):
+        raise _error(
+            "invalid_argument",
+            "binary-tool arguments must be an object",
+            field_path="arguments",
+            constraint="type",
+            actual_kind=_value_kind(arguments),
+        )
+    if set(arguments) - allowed:
+        raise _error(
+            "invalid_argument",
+            "unsupported binary-tool argument",
+            field_path="arguments",
+            constraint="additional_properties",
+            actual_kind="object",
+        )
     value = arguments.get("path")
     if not isinstance(value, str) or not value or "\x00" in value:
-        raise _error("invalid_argument", "path must be a nonempty string without NUL bytes")
+        raise _error(
+            "invalid_argument",
+            "path must be a nonempty string without NUL bytes",
+            field_path="path",
+            constraint="nonempty_text",
+            actual_kind=_value_kind(value),
+        )
     try:
         encoded = value.encode("utf-8")
     except UnicodeError as exc:
@@ -68,7 +90,15 @@ def _arguments(arguments: Mapping[str, Any], allowed: set[str]) -> str:
 
 def _integer(value: Any, name: str, low: int, high: int) -> int:
     if type(value) is not int or not low <= value <= high:
-        raise _error("invalid_argument", f"{name} must be an integer between {low} and {high}")
+        from .tools import _value_kind
+
+        raise _error(
+            "invalid_argument",
+            f"{name} must be an integer between {low} and {high}",
+            field_path=name,
+            constraint="range" if type(value) is int else "type",
+            actual_kind=_value_kind(value),
+        )
     return value
 
 

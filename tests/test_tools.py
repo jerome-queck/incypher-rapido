@@ -101,6 +101,7 @@ class ToolFixture(unittest.TestCase):
         self.assertEqual(
             caught.exception.details,
             {
+                "schema_version": 1,
                 "contract_version": 1,
                 "failure_stage": "arguments",
                 "constraint": "type",

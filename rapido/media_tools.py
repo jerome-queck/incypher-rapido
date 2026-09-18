@@ -137,28 +137,58 @@ _SYNTAXES = {
 }
 
 
-def _error(code: str, message: str) -> ToolError:
+def _error(code: str, message: str, **details: Any) -> ToolError:
     # tools imports these entrypoints during registry construction.
-    from .tools import ToolError
+    from .tools import _error as tool_error
 
-    return ToolError(code, message)
+    return tool_error(code, message, **details)
 
 
 def _integer(arguments: Mapping[str, Any], name: str, low: int, high: int, default: int) -> int:
+    from .tools import _value_kind
+
     value = arguments.get(name, default)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise _error("invalid_argument", f"{name} must be an integer")
+        raise _error(
+            "invalid_argument",
+            f"{name} must be an integer",
+            field_path=name,
+            constraint="type",
+            actual_kind=_value_kind(value),
+        )
     if not low <= value <= high:
         raise _error("limit_exceeded", f"{name} must be between {low} and {high}")
     return value
 
 
 def _path_argument(arguments: Mapping[str, Any], allowed: set[str]) -> str:
-    if not isinstance(arguments, Mapping) or set(arguments) - allowed:
-        raise _error("invalid_argument", "unsupported media tool arguments")
+    from .tools import _value_kind
+
+    if not isinstance(arguments, Mapping):
+        raise _error(
+            "invalid_argument",
+            "media-tool arguments must be an object",
+            field_path="arguments",
+            constraint="type",
+            actual_kind=_value_kind(arguments),
+        )
+    if set(arguments) - allowed:
+        raise _error(
+            "invalid_argument",
+            "unsupported media tool arguments",
+            field_path="arguments",
+            constraint="additional_properties",
+            actual_kind="object",
+        )
     value = arguments.get("path")
     if not isinstance(value, str) or not value or "\x00" in value:
-        raise _error("invalid_argument", "path must be a nonempty relative path")
+        raise _error(
+            "invalid_argument",
+            "path must be a nonempty relative path",
+            field_path="path",
+            constraint="nonempty_text",
+            actual_kind=_value_kind(value),
+        )
     if len(value.encode("utf-8")) > 4096:
         raise _error("input_too_large", "path exceeds the input limit")
     return value
