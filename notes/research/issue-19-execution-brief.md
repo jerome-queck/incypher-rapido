@@ -1420,4 +1420,35 @@ state/control/orchestration/evidence passes and 3 skips. Ruff check/format and d
 Exact-head independent Daybreak/xhigh re-review is clean: 4,000 fresh concurrent constructors had
 zero failures; deterministic pauses before and after attempt migration exposed neither table nor
 trigger without the guard; a forced migration failure rolled back and released the writer lock.
-PR CI, final merged-image registration, and the 30-minute diagnostic remain pending.
+PR #59 passed all four CI jobs and squash-merged as `9bbc767`. Post-merge main CI and the 30-minute
+diagnostic remain pending.
+
+### Pre-registration: owner-amended 30-minute diagnostic
+
+Registered at 2026-09-18 06:52:54 UTC, before state creation:
+
+- Source: merged `main` commit `9bbc767de1693037ebb0c19244e039bc7ab2f764`.
+- Image: local tag `rapido:issue19-30m-9bbc767`, immutable image ID
+  `sha256:b0addbc81aff5efeb69cb7ab6026028f829b57a678057101ff57b2baa9b914ef`, Linux
+  ARM64. `rapido:local` resolves to the same ID.
+- Board preflight: authenticated, 15 challenges (six standard, nine dynamic), zero writes. External
+  state/workspace is empty. Prior attempt databases, artifacts, answers, evidence, and exports are
+  excluded from the container.
+- Admission: 1,800 seconds plus only bounded terminal drain/cleanup; all 15 challenges, with
+  challenge 94 as an ordering prefix rather than a filter; Board watch stays active through the
+  original deadline.
+- Scheduler: five active challenges, 20 simultaneous peer lanes, four peers per wave, two
+  Daybreak/xhigh Leads plus two Luna max/xhigh Specialists, typed challenge memory, 800-second
+  first-pass baseline with existing adaptive allocation, and one shared dynamic-instance lease.
+- Runtime: 12 CPUs, 24 GiB RAM, 256 PIDs, 500 GiB run-workspace ceiling; autonomous qualified
+  submissions, managed instances, and Board watch enabled.
+- Conduct: no steering, manual answer relay, model fallback, prior-run solve material, or deliberate
+  probe. Preserve private run and 30-line challenge/flag exports before deleting exact run state;
+  publish only sanitized evidence.
+
+Numeric targets are intentionally diagnostic, not a substitute acceptance gate: 15/15 challenges
+must enter fresh analysis and submission handling; zero pending effects, zero active or indeterminate
+owned instances, and zero process/workspace leaks may remain. The current-run accepted-solve target
+is zero and the cumulative accepted-solve target remains three because this already-solved practice
+account cannot grant credit from a generic `already_solved` response. Any HTTP-200 `correct` or
+same-run independent deterministic verification is reported separately if observed.
