@@ -116,6 +116,15 @@ unverified `already_solved` candidate remains private and queued for a fresh Ver
 resubmitted. Only same-run independent verification may close it, and it is never reported as a new
 HTTP `correct`.
 
+The final run report keeps these axes separate. `submission_correct`,
+`submission_already_solved`, and `submission_incorrect` are Board outcomes;
+`source_observed_correct` and `board_origin_correct` classify correct submissions;
+`independently_verified`, `run_local_verified`, and `unverified_challenges` describe current-run
+evidence. The legacy `solved` field remains a scheduler/lifecycle count, not a benchmark score.
+Submission outcome and provenance commit in one transaction. Independent verification counts only
+for the current material; dynamic verification also records the owned instance-generation receipt.
+Legacy or unscoped verification rows never qualify.
+
 A Board-description literal is not a guess: the controller submits only one exact unique flag-shaped
 literal after a fresh same-challenge refresh confirms unlimited attempts. It never synthesizes
 variants. A wrong verdict retires that identity and normal analysis continues. A correct verdict
@@ -140,7 +149,10 @@ state still retains candidates for verification. Selected same-run solver script
 files survive changed non-Verifier episodes only for identical challenge material; unsafe content,
 links, raw endpoints, and files or names containing settled wrong candidates are excluded. For an
 exact eight-hex candidate, its inner case variants and four-byte endian encodings are excluded too;
-the filter does not mine arbitrary substrings. Raw tool payloads, payload-derived digests,
+the filter does not mine arbitrary substrings. Imported files keep one canonical path across
+episodes, fresh same-path work wins, and the global file cap is allocated round-robin across lanes;
+untouched lanes survive a narrow retry while an empty current lane retires stale carry. Sanitized
+carry events record retained and dropped counts. Raw tool payloads, payload-derived digests,
 authorities, paths, credentials, and candidate fingerprints are never carried into public memory.
 Agents may write and execute analysis scripts through the confined workspace shell. For assigned
 targets, `run_target_script` runs a saved Python program without direct networking and brokers its
@@ -152,7 +164,10 @@ The controller runs peers directly as ephemeral exact-model threads; peers are n
 Initial and ordinary Recovery work defaults to two Daybreak/xhigh plus Luna max/xhigh. A productive
 timeout may earn one changed Recovery with three Daybreak/xhigh plus one Luna/max; repeated or
 zero-evidence timeout routing stops that route, while the unresolved challenge returns at the queue
-tail with a distinct orthogonal strategy. A Verifier is one fresh Daybreak/xhigh lane. The ordered queue puts
+tail with a distinct orthogonal strategy. Persistent Daybreak turns continue in the same native
+thread while successful host observations change; paraphrased conclusions, failed calls, and
+duplicate observations do not manufacture progress or unbounded continuation. A Verifier is one
+fresh Daybreak/xhigh lane. The ordered queue puts
 `RAPIDO_FOCUS_CHALLENGE_IDS` first, then Board-unsolved work, while preserving deterministic
 category/value order. Normal work starts near 800s; higher-value or explicitly focused unsolved
 work can receive an automatic grant up to 1,800s, and productive timeout Recovery recomputes its
