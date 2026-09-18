@@ -2653,7 +2653,7 @@ def test_concurrent_openers_recheck_additive_migration(
         assert "provenance_class" in columns
 
 
-def test_attempt_rebuild_publishes_identity_trigger_in_same_commit(
+def test_schema_and_attempt_rebuild_publish_identity_guard_in_one_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state.sqlite3"
@@ -2691,6 +2691,18 @@ def test_attempt_rebuild_publishes_identity_trigger_in_same_commit(
                 confidence REAL,
                 UNIQUE(run_id, challenge_id, lane)
             );
+            INSERT INTO runs VALUES ('run-1', '2026-01-01', NULL, 'running', '{}');
+            INSERT INTO runs VALUES ('run-2', '2026-01-01', NULL, 'running', '{}');
+            INSERT INTO challenges VALUES (
+                1, 'one', 'test', 'standard', 1, 'running', '2026-01-01'
+            );
+            INSERT INTO challenges VALUES (
+                2, 'two', 'test', 'standard', 1, 'running', '2026-01-01'
+            );
+            INSERT INTO attempts VALUES (
+                'legacy-running', 'run-1', 1, 0, '2026-01-01', NULL,
+                'running', 'old-model', 'high', '', NULL, NULL
+            );
             """
         )
 
@@ -2699,13 +2711,13 @@ def test_attempt_rebuild_publishes_identity_trigger_in_same_commit(
     errors: list[BaseException] = []
     original = StateStore._migrate_attempts
 
-    def pause_after_migration(store: StateStore) -> None:
-        original(store)
+    def pause_at_migration(store: StateStore, *, transaction_open: bool = False) -> None:
         migrated.set()
         if not release.wait(5):
             raise TimeoutError("migration observer did not release constructor")
+        original(store, transaction_open=transaction_open)
 
-    monkeypatch.setattr(StateStore, "_migrate_attempts", pause_after_migration)
+    monkeypatch.setattr(StateStore, "_migrate_attempts", pause_at_migration)
 
     def open_state() -> None:
         try:
@@ -2718,17 +2730,36 @@ def test_attempt_rebuild_publishes_identity_trigger_in_same_commit(
     assert migrated.wait(5)
     try:
         with sqlite3.connect(path) as connection:
-            trigger = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' "
-                "AND name='candidate_evidence_proofs_attempt_identity'"
+            proof_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='candidate_evidence_proofs'"
             ).fetchone()
-        assert trigger is not None
-        assert "status='running'" in str(trigger[0])
+        assert proof_table is None
     finally:
         release.set()
         thread.join(timeout=5)
     assert not thread.is_alive()
     assert not errors
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='candidate_evidence_proofs_attempt_identity'"
+        ).fetchone()
+        assert trigger is not None
+        assert "status='running'" in str(trigger[0])
+        with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+            connection.execute(
+                "INSERT INTO candidate_evidence_proofs VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-running",
+                    "run-2",
+                    2,
+                    bytes(32),
+                    "0" * 64,
+                    "2026-01-01",
+                ),
+            )
 
 
 def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) -> None:

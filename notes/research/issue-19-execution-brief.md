@@ -1407,11 +1407,13 @@ projects error codes onto a fixed registry, resolves path prefixes in linear wor
 and unlinks failed staging temporaries before continuing.
 
 Integration review then reproduced constructor and publication races at the migration boundary.
-Each connection now tolerates bounded lock contention while establishing WAL mode. A legacy attempt
-rebuild, its additive checkpoint column, the scope index, and the verification-identity trigger all
-publish in one immediate write transaction; there is no committed trigger-absent interval. The
-regressions exercise 20 rounds of eight simultaneous fresh openers, three eight-opener legacy gaps,
-and a paused legacy rebuild observed from a second connection at the method boundary.
+Each connection now tolerates bounded lock contention while establishing WAL mode. Base schema,
+the proof table and its identity guard, a legacy attempt rebuild, its additive checkpoint column,
+and the scope index all publish in one immediate write transaction; there is no committed table or
+trigger gap. The regressions exercise 20 rounds of eight simultaneous fresh openers, three
+eight-opener legacy gaps, and a paused pre-migration publication observed from a second connection;
+the proof table remains invisible until its guard is committed, after which mismatched insertion is
+rejected.
 
 Local validation after these review fixes is 995 passed / 4 platform skips, including 303 focused
 state/control/orchestration/evidence passes and 3 skips. Ruff check/format and diff checks are clean.

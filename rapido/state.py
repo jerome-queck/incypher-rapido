@@ -12,7 +12,7 @@ import stat
 import threading
 import time
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,8 +138,10 @@ class StateStore:
                 self._connection.close()
                 raise ValueError("state files must be regular files, never symlinks")
             private_file.chmod(0o600)
-        self._connection.executescript(
-            """
+        try:
+            self._connection.executescript(
+                """
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY,
                 started_at TEXT NOT NULL,
@@ -381,6 +383,16 @@ class StateStore:
             CREATE TRIGGER IF NOT EXISTS candidate_evidence_proofs_no_delete
             BEFORE DELETE ON candidate_evidence_proofs
             BEGIN SELECT RAISE(ABORT, 'candidate evidence proofs are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS candidate_evidence_proofs_attempt_identity
+            BEFORE INSERT ON candidate_evidence_proofs
+            WHEN NOT EXISTS (
+                SELECT 1 FROM attempts
+                WHERE id=NEW.source_attempt_id
+                  AND run_id=NEW.run_id
+                  AND challenge_id=NEW.challenge_id
+                  AND status='running'
+            )
+            BEGIN SELECT RAISE(ABORT, 'candidate evidence proof identity mismatch'); END;
             CREATE TABLE IF NOT EXISTS candidate_verifications (
                 run_id TEXT NOT NULL REFERENCES runs(id),
                 challenge_id INTEGER NOT NULL REFERENCES challenges(id),
@@ -433,8 +445,14 @@ class StateStore:
             BEFORE DELETE ON candidate_verification_history
             BEGIN SELECT RAISE(ABORT, 'candidate verification history is immutable'); END;
             """
-        )
-        self._migrate_attempts()
+            )
+            self._migrate_attempts(transaction_open=True)
+            self._connection.execute("COMMIT")
+        except (RuntimeError, sqlite3.Error):
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            self._connection.close()
+            raise
         self._migrate_control_jobs()
         self._migrate_additive_columns()
         self._migrate_submission_intents()
@@ -734,7 +752,7 @@ class StateStore:
             connection.execute("DROP TABLE submission_intents")
             connection.execute(f"ALTER TABLE {migration_table} RENAME TO submission_intents")
 
-    def _migrate_attempts(self) -> None:
+    def _migrate_attempts(self, *, transaction_open: bool = False) -> None:
         """Atomically upgrade the pre-episode attempts table, retaining every row."""
         required = {
             "episode",
@@ -779,7 +797,8 @@ class StateStore:
             )
 
         migration_table = f"attempts__rapido_migration_{id(self)}"
-        with self.transaction() as connection:
+        transaction = nullcontext(self._connection) if transaction_open else self.transaction()
+        with transaction as connection:
             columns, unique_columns = inspect_schema()
             if not is_current(columns, unique_columns):
                 existing = connection.execute(
@@ -831,6 +850,9 @@ class StateStore:
                         {source("failure_class", "NULL")}
                     FROM attempts
                     """
+                )
+                connection.execute(
+                    "DROP TRIGGER IF EXISTS candidate_evidence_proofs_attempt_identity"
                 )
                 connection.execute("DROP TABLE attempts")
                 connection.execute(f"ALTER TABLE {migration_table} RENAME TO attempts")
