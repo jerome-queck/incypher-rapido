@@ -2026,7 +2026,7 @@ def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
 
     report, runtime, orchestrator, store = asyncio.run(exercise_watch_recovery())
 
-    assert report.status == "deadline"
+    assert report.status in {"completed", "deadline"}
     assert board.list_calls >= 9
     assert orchestrator.outage_saw_active_solve
     assert runtime.recovered_while_solving

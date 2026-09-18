@@ -1395,7 +1395,10 @@ unknown HTTP status; serializes additive migrations; resolves file/directory car
 types malformed solver, target, and media inputs; and suppresses raw exception text at the model
 tool boundary. Direct HTTP-200 and reconciled-correct counts remain separate. The unrelated
 Python-3.12 PR failure was a sub-second test clock race; its window is widened while preserving the
-same production assertion.
+same production assertion. The next Python-3.11 failure was another test-only clock split: fake
+`time.monotonic()` expired while asyncio's real-clock watcher timer could still return either
+`deadline` or `completed`. The test now accepts both lawful terminal labels and retains its actual
+outage-recovery, single-entry, and zero-cancellation assertions.
 
 The next exact-head tool/carry review found three adjacent cases: untrusted tool error codes could
 still escape the closed boundary; prefix-conflict selection was quadratic before the 64-file cap;
