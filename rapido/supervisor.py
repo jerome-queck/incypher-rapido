@@ -291,12 +291,18 @@ class _SupervisorFiles:
         return record
 
     def write(self, record: SupervisorRecord) -> None:
-        record.validate()
         previous_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK,
             {signal.SIGTERM, signal.SIGINT},
         )
         try:
+            record.validate()
+            current = self.load()
+            if current is not None and (
+                (current.phase == "terminal" and record.phase != "terminal")
+                or (current.phase == "stopping" and record.phase not in {"stopping", "terminal"})
+            ):
+                return
             encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
             temporary = self.record_path.with_name(
                 f".{self.record_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"

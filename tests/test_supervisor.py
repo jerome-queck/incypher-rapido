@@ -627,6 +627,36 @@ def test_signal_pending_before_sidecar_replace_cannot_overwrite_stop_fence(
     assert _record(state_path)["phase"] == "stopping"
 
 
+def test_stale_lifecycle_write_cannot_replace_stop_fence(tmp_path: Path) -> None:
+    state_path = _private_state(tmp_path)
+    files = Supervisor(state_path, reporter=lambda _document: None)._files
+    stopping = SupervisorRecord(
+        1,
+        "stopping",
+        "same-run",
+        0,
+        0.0,
+        "operator_stop_pending",
+        None,
+        time.time(),
+    )
+    active = SupervisorRecord(
+        1,
+        "active",
+        "same-run",
+        0,
+        0.0,
+        None,
+        None,
+        time.time(),
+    )
+
+    files.write(stopping)
+    files.write(active)
+
+    assert _record(state_path)["phase"] == "stopping"
+
+
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
     state_path = _private_state(tmp_path)
     marker = tmp_path / "started"
