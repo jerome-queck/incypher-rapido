@@ -76,8 +76,12 @@ def test_existing_derived_artifact_does_not_reserve_quota_twice(tmp_path) -> Non
 )
 def test_derive_artifact_rejects_invalid_or_unbounded_requests(tmp_path, arguments) -> None:
     (tmp_path / "source.txt").write_text("%%%%")
-    with pytest.raises(ToolError):
+    with pytest.raises(ToolError) as error:
         derive_artifact(Workspace(tmp_path), arguments)
+    assert error.value.details["schema_version"] == 1
+    assert error.value.details["contract_version"] == 1
+    assert error.value.details["failure_stage"]
+    assert error.value.details["constraint"]
     assert not (tmp_path / "derived").exists()
 
 

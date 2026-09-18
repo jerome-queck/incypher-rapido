@@ -51,10 +51,10 @@ def _require_linux_sandbox() -> None:
         )
 
 
-def _error(code: str, message: str) -> Exception:
-    from .tools import ToolError
+def _error(code: str, message: str, **details: Any) -> Exception:
+    from .tools import _error as tool_error
 
-    return ToolError(code, message)
+    return tool_error(code, message, **details)
 
 
 def _worker_command(

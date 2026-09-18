@@ -171,7 +171,11 @@ thread while successful host observations change; paraphrased conclusions, faile
 duplicate observations do not manufacture progress or unbounded continuation. A Verifier is one
 fresh Daybreak/xhigh lane. The ordered queue puts
 `RAPIDO_FOCUS_CHALLENGE_IDS` first, then Board-unsolved work, while preserving deterministic
-category/value order. Normal work starts near 800s; higher-value or explicitly focused unsolved
+category/value order. Every first pass starts or terminally settles before any retry, including a
+dynamic local-to-target transition. If the remaining time cannot satisfy the 600-second first-pass
+floor, admission closes instead of skipping to a shorter Verifier or Recovery. A capacity-deferred
+initial dynamic follows other untouched first passes while retaining initial status. Normal work
+starts near 800s; higher-value or explicitly focused unsolved
 work can receive an automatic grant up to 1,800s, and productive timeout Recovery recomputes its
 grant from remaining time and unsolved work. An explicitly configured larger baseline is not
 reduced. No full live wave starts with less than 600s left.
