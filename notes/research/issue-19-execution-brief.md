@@ -648,7 +648,7 @@ comparison green while independent review is pending.
 | New mechanism materially contributed | Source-bound route/verification trace, sanitized | pending final run; one-hour correct was initial and does not satisfy this gate; timeout Recovery must prove live contribution |
 | No steering/fallback/pending/indeterminate/leak/regression | Audit, review, CI, Board and cleanup checks | one-hour rerun independently clean except its raw resource sampler was not durably retained; final proof pending |
 | Exact run state deleted after evidence merge; auth preserved | Targeted post-deletion inspection | complete for corrected calibration; final run pending |
-| #19 closed honestly | GitHub closeout linked to merged evidence | pending |
+| #19 closed honestly | GitHub closeout linked to merged evidence | complete under the owner amendment; the closeout records the 10/15 diagnostic miss, zero accepted solves, and relocated original gate |
 
 ### Mixed-peer live calibration result
 
@@ -1536,4 +1536,5 @@ candidate projection and complete archive remained mode `0600`; the archive inte
 The owner-amended diagnostic therefore leaves no pending effect, active or indeterminate instance,
 container, process, state, or workspace residue. Issue closure is permitted only after this
 attestation passes repository CI and merges. The original 19,800-second acceptance gate was moved
-elsewhere and is not claimed as passed.
+elsewhere and is not claimed as passed. Issue #19 closed on 2026-09-18 with those distinctions in
+the [public owner-amended closeout](https://github.com/jerome-queck/incypher-rapido/issues/19#issuecomment-5727726738).
