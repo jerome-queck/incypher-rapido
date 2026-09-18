@@ -292,39 +292,46 @@ class _SupervisorFiles:
 
     def write(self, record: SupervisorRecord) -> None:
         record.validate()
-        encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
-        temporary = self.record_path.with_name(
-            f".{self.record_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGTERM, signal.SIGINT},
         )
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
         try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("supervisor record write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-        except BaseException:
+            encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
+            temporary = self.record_path.with_name(
+                f".{self.record_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary, flags, 0o600)
             try:
-                temporary.unlink()
-            except OSError:
-                pass
-            raise
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("supervisor record write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            except BaseException:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                raise
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, self.record_path)
+            self.record_path.chmod(0o600)
+            directory = os.open(
+                self.record_path.parent,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
-            os.close(descriptor)
-        os.replace(temporary, self.record_path)
-        self.record_path.chmod(0o600)
-        directory = os.open(
-            self.record_path.parent,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _read_durable_run(state_path: Path) -> DurableRun | None:

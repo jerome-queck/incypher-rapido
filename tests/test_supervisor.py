@@ -15,7 +15,7 @@ import pytest
 
 from rapido import cli
 from rapido.state import StateStore
-from rapido.supervisor import Supervisor, SupervisorRefused
+from rapido.supervisor import Supervisor, SupervisorRecord, SupervisorRefused
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -584,6 +584,47 @@ def test_signal_persists_stop_fence_before_process_cleanup(tmp_path: Path) -> No
     assert restarted.run() == 0
     assert not marker.exists()
     assert _record(state_path)["disposition"] == "operator_stopped"
+
+
+def test_signal_pending_before_sidecar_replace_cannot_overwrite_stop_fence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    state_path = _private_state(tmp_path)
+    supervisor = Supervisor(
+        state_path,
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    active = SupervisorRecord(
+        1,
+        "active",
+        "same-run",
+        0,
+        0.0,
+        None,
+        None,
+        time.time(),
+    )
+    real_replace = os.replace
+    signal_sent = False
+
+    def signal_before_replace(source, destination) -> None:
+        nonlocal signal_sent
+        if Path(destination) == supervisor._files.record_path and not signal_sent:
+            signal_sent = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", signal_before_replace)
+    supervisor._install_signal_handlers()
+    try:
+        supervisor._files.write(active)
+    finally:
+        supervisor._restore_signal_handlers()
+
+    assert signal_sent
+    assert _record(state_path)["phase"] == "stopping"
 
 
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
