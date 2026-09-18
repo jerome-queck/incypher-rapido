@@ -485,6 +485,73 @@ def test_transient_stopping_sidecar_failure_still_terminalizes_run(
     assert not marker.exists()
 
 
+def test_combined_transient_stop_fence_failures_retry_sidecar_without_worker_spawn(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import rapido.supervisor as supervisor_module
+
+    state_path = _private_state(tmp_path)
+    marker = tmp_path / "started"
+    state = StateStore(state_path)
+    state.start_run("same-run", {})
+    state.close()
+    _write_supervisor_record(
+        state_path,
+        phase="scheduled",
+        run_id="same-run",
+        replacement_count=1,
+        not_before=time.time() + 30,
+    )
+    real_write = supervisor_module._SupervisorFiles.write
+    real_read = supervisor_module._read_durable_run
+    write_failed = False
+    reads = 0
+
+    def fail_stopping_once(files, record) -> None:
+        nonlocal write_failed
+        if record.phase == "stopping" and not write_failed:
+            write_failed = True
+            raise OSError("transient sidecar failure")
+        real_write(files, record)
+
+    def fail_read_once(path: Path):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise SupervisorRefused("transient durable read failure")
+        return real_read(path)
+
+    monkeypatch.setattr(supervisor_module._SupervisorFiles, "write", fail_stopping_once)
+    monkeypatch.setattr(supervisor_module, "_read_durable_run", fail_read_once)
+    stopped = Supervisor(
+        state_path,
+        restart_backoffs=(30,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    stopped._stop_signal = signal.SIGTERM
+    stopped._stop_at = time.monotonic()
+    stopped._stop_event.set()
+
+    assert stopped.run() == 128 + signal.SIGTERM
+    assert write_failed and reads >= 2
+    assert _record(state_path)["phase"] == "stopping"
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT status FROM runs").fetchone() == ("running",)
+
+    monkeypatch.setattr(supervisor_module, "_read_durable_run", real_read)
+    restarted = Supervisor(
+        state_path,
+        command=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
+        restart_backoffs=(0,),
+        stay_quiescent=False,
+        reporter=lambda _document: None,
+    )
+    assert restarted.run() == 0
+    assert not marker.exists()
+    assert _record(state_path)["disposition"] == "operator_stopped"
+
+
 def test_signal_at_worker_start_boundary_never_spawns_child(tmp_path: Path) -> None:
     state_path = _private_state(tmp_path)
     marker = tmp_path / "started"

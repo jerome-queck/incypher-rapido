@@ -1019,6 +1019,7 @@ class Supervisor:
         if record is not None and record.phase == "terminal":
             return
         run_id = None if record is None else record.run_id
+        stopping_written = record is not None and record.phase == "stopping"
         if record is None or record.phase != "stopping":
             record = SupervisorRecord(
                 _RECORD_VERSION,
@@ -1032,6 +1033,7 @@ class Supervisor:
             )
             try:
                 self._files.write(record)
+                stopping_written = True
             except OSError as exc:
                 # The Run database is an independent durable fence. Continue so a
                 # transient sidecar failure cannot leave a running Run restartable.
@@ -1040,6 +1042,8 @@ class Supervisor:
             durable = _read_durable_run(self.state_path)
         except SupervisorRefused as exc:
             self.reporter({"status": "refused", "reason": str(exc)})
+            if not stopping_written:
+                self._files.write(record)
             return
         if run_id is None and durable is not None:
             run_id = durable.run_id
@@ -1059,6 +1063,8 @@ class Supervisor:
                     raise RuntimeError("operator stop produced an invalid durable run state")
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
                 self.reporter({"status": "refused", "reason": str(exc)})
+                if not stopping_written:
+                    self._files.write(record)
                 return
             finally:
                 if state is not None:
