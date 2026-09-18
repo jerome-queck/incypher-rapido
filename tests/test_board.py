@@ -8,6 +8,7 @@ import pytest
 from rapido.board import (
     BoardClient,
     BoardError,
+    BoardTemporaryResponseError,
     BoardTransportError,
     HttpResponse,
     _default_transport,
@@ -146,6 +147,31 @@ def test_api_never_follows_or_exposes_redirect_body() -> None:
     with pytest.raises(BoardError, match="HTTP 302") as error:
         board.list_challenges()
     assert "secret-shaped-body" not in str(error.value)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_temporary_http_failures_are_retryable_only_for_reads(status: int, tmp_path: Path) -> None:
+    fake = FakeTransport([HttpResponse(status, b"private response body")] * 6)
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    with pytest.raises(BoardTemporaryResponseError, match=f"challenge list returned HTTP {status}"):
+        board.list_challenges()
+    with pytest.raises(
+        BoardTemporaryResponseError, match=f"anonymous identity returned HTTP {status}"
+    ):
+        board.anonymous_identity_is_rejected()
+    with pytest.raises(
+        BoardTemporaryResponseError, match=f"instance operation returned HTTP {status}"
+    ):
+        board.instance("GET", 7)
+    output = tmp_path / "artifact.bin"
+    with pytest.raises(BoardTemporaryResponseError, match=f"challenge file returned HTTP {status}"):
+        board.download("/files/artifact.bin", output)
+    assert not output.exists()
+    assert board.submit(7, "INCYPHER{candidate}").outcome == "unread"
+    with pytest.raises(BoardError, match=f"instance operation returned HTTP {status}") as error:
+        board.instance("POST", 7)
+    assert not isinstance(error.value, BoardTemporaryResponseError)
+    assert len(fake.requests) == 6
 
 
 def test_download_rejects_off_origin_redirect_before_request(tmp_path: Path) -> None:

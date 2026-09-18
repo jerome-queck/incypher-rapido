@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 import rapido.orchestrator as orchestrator_module
-from rapido.board import BoardError, BoardTransportError, Challenge, Verdict
+from rapido.board import (
+    BoardError,
+    BoardTemporaryResponseError,
+    BoardTransportError,
+    Challenge,
+    Verdict,
+)
 from rapido.config import RuntimeConfig
 from rapido.evidence import EvidenceError, EvidenceLimits, HostObservation, RunEvidence
 from rapido.orchestrator import Orchestrator
@@ -379,15 +385,21 @@ class AlwaysFailingIdentityBoard(FakeBoard):
 class RecoveringWatchBoard(FakeBoard):
     timeout = 0.001
 
-    def __init__(self, challenges: list[Challenge], failed_reads: set[int]) -> None:
+    def __init__(
+        self,
+        challenges: list[Challenge],
+        failed_reads: set[int],
+        failure_type: type[BoardError] = BoardTransportError,
+    ) -> None:
         super().__init__(challenges)
         self.failed_reads = failed_reads
+        self.failure_type = failure_type
         self.list_calls = 0
 
     def list_challenges(self):
         self.list_calls += 1
         if self.list_calls in self.failed_reads:
-            raise BoardTransportError("Board transport failed")
+            raise self.failure_type("Board read temporarily failed")
         return super().list_challenges()
 
 
@@ -1991,12 +2003,13 @@ def test_transient_identity_transport_is_retried_without_operator_restart(tmp_pa
     store.close()
 
 
-def test_board_read_transport_retry_is_bounded_to_three_attempts(tmp_path: Path) -> None:
-    board = AlwaysFailingIdentityBoard(
-        [challenge(1)], BoardTransportError("Board transport failed")
-    )
+@pytest.mark.parametrize("failure_type", [BoardTransportError, BoardTemporaryResponseError])
+def test_board_read_retry_is_bounded_to_three_attempts(
+    tmp_path: Path, failure_type: type[BoardError]
+) -> None:
+    board = AlwaysFailingIdentityBoard([challenge(1)], failure_type("Board read failed"))
     store = StateStore(tmp_path / "state.sqlite3")
-    with pytest.raises(BoardTransportError):
+    with pytest.raises(failure_type):
         asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
     assert board.identity_calls == 3
     store.close()
@@ -2011,8 +2024,9 @@ def test_semantic_board_error_is_not_retried(tmp_path: Path) -> None:
     store.close()
 
 
-def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure_type", [BoardTransportError, BoardTemporaryResponseError])
+def test_active_watch_retryable_read_outage_restarts_pair_without_cancelling_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_type: type[BoardError]
 ) -> None:
     monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.01)
     monkeypatch.setattr(
@@ -2034,7 +2048,7 @@ def test_active_watch_transport_outage_restarts_pair_without_cancelling_work(
 
     class CoordinatedWatchBoard(RecoveringWatchBoard):
         def __init__(self) -> None:
-            super().__init__([challenge(1)], {5, 6, 7})
+            super().__init__([challenge(1)], {5, 6, 7}, failure_type)
             self.solve_started = threading.Event()
 
         def list_challenges(self):
@@ -2242,13 +2256,14 @@ def test_active_watch_retries_whole_new_id_refresh_after_detail_and_material_tra
     store.close()
 
 
-def test_idle_watch_transport_outage_restarts_pair_and_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure_type", [BoardTransportError, BoardTemporaryResponseError])
+def test_idle_watch_retryable_read_outage_restarts_pair_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_type: type[BoardError]
 ) -> None:
     monkeypatch.setattr(
         orchestrator_module, "_BOARD_READ_RETRY_DELAYS", (0.001, 0.002), raising=False
     )
-    board = RecoveringWatchBoard([challenge(1)], {2, 3, 4})
+    board = RecoveringWatchBoard([challenge(1)], {2, 3, 4}, failure_type)
     cfg = replace(
         config(tmp_path, submit=False),
         watch_board=True,

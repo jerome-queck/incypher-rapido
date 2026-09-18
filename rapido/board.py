@@ -36,6 +36,18 @@ class BoardTransportError(BoardError):
     """A retryable failure that occurred before a readable Board response."""
 
 
+class BoardTemporaryResponseError(BoardError):
+    """A retryable server response to an idempotent Board read."""
+
+
+_TEMPORARY_READ_STATUSES = frozenset({500, 502, 503, 504})
+
+
+def _raise_temporary_read_response(response: HttpResponse, operation: str) -> None:
+    if response.status in _TEMPORARY_READ_STATUSES:
+        raise BoardTemporaryResponseError(f"{operation} returned HTTP {response.status}")
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status: int
@@ -238,6 +250,7 @@ class BoardClient:
 
     @staticmethod
     def _document(response: HttpResponse, operation: str) -> Any:
+        _raise_temporary_read_response(response, operation)
         if response.status != 200:
             raise BoardError(f"{operation} returned HTTP {response.status}")
         try:
@@ -270,6 +283,7 @@ class BoardClient:
             },
         )
         response = self._transport(request, self.timeout, self.response_limit)
+        _raise_temporary_read_response(response, "anonymous identity")
         return response.status in {401, 403}
 
     def list_challenges(self) -> list[dict[str, Any]]:
@@ -384,6 +398,8 @@ class BoardClient:
         response = self._request(
             method, f"/api/v1/plugins/ctfd-chall-manager/instance?{query}", body
         )
+        if method == "GET":
+            _raise_temporary_read_response(response, "instance operation")
         if response.status not in {200, 403, 404, 429}:
             raise BoardError(f"instance operation returned HTTP {response.status}")
         try:
@@ -439,6 +455,7 @@ class BoardClient:
         chain: list[str] = []
         for _ in range(5):
             response = self._request("GET", url, byte_limit=limit)
+            _raise_temporary_read_response(response, "challenge file")
             host = urllib.parse.urlsplit(url).hostname or ""
             chain.append(host)
             if response.status in {301, 302, 303, 307, 308}:
