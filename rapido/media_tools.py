@@ -189,7 +189,17 @@ def _path_argument(arguments: Mapping[str, Any], allowed: set[str]) -> str:
             constraint="nonempty_text",
             actual_kind=_value_kind(value),
         )
-    if len(value.encode("utf-8")) > 4096:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _error(
+            "invalid_argument",
+            "path contains invalid text",
+            field_path="path",
+            constraint="valid_unicode",
+            actual_kind="string",
+        ) from exc
+    if len(encoded) > 4096:
         raise _error("input_too_large", "path exceeds the input limit")
     return value
 

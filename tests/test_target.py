@@ -117,6 +117,21 @@ def test_http_method_type_failure_is_structurally_attributed(tmp_path: Path) -> 
     }
 
 
+def test_http_encoding_type_failure_is_structurally_attributed(tmp_path: Path) -> None:
+    registry = TargetToolRegistry(
+        tmp_path,
+        (TargetEndpoint("http", "assigned.example", 8080),),
+    )
+
+    with pytest.raises(ToolError) as caught:
+        registry.dispatch("http_request", {"encoding": [], "data": ""})
+
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.details["field_path"] == "encoding"
+    assert caught.value.details["constraint"] == "enum"
+    assert caught.value.details["actual_kind"] == "array"
+
+
 def test_http_reader_uses_one_decreasing_absolute_deadline() -> None:
     sock = FakeHTTPWireSocket()
     sock.queue = [b"HTTP/1.1 200"]

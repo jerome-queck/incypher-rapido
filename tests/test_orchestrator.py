@@ -606,6 +606,10 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
     safe_files = {
         Path("safe.txt"): b"keep this analysis",
         Path("cafebabe.txt"): b"inner substring was not an exact CRC candidate",
+        Path("collision"): b"fresh file wins over a carried descendant",
+    }
+    shadowed_files = {
+        Path("carried/collision/nested.txt"): b"stale descendant",
     }
     blocked_files = {
         Path("exact.txt"): rejected_crc.encode(),
@@ -616,7 +620,7 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
         Path("deadbeef.txt"): b"safe payload in a rejected-derived path",
         Path(f"nested-{rejected_crc}") / "notes.txt": b"safe payload",
     }
-    for relative, payload in {**safe_files, **blocked_files}.items():
+    for relative, payload in {**safe_files, **shadowed_files, **blocked_files}.items():
         path = analysis_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
@@ -631,6 +635,7 @@ def test_analysis_carry_filters_rejected_candidate_content_and_paths(tmp_path: P
     assert files == len(safe_files)
     assert retained_bytes == sum(len(payload) for payload in safe_files.values())
     assert telemetry["drop_counts"]["unsafe"] == len(blocked_files)
+    assert telemetry["drop_counts"]["shadowed"] == len(shadowed_files)
     assert {
         path.relative_to(carry_root): path.read_bytes()
         for path in carry_root.rglob("*")

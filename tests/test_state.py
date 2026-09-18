@@ -230,7 +230,9 @@ def test_reconciled_correct_closes_interrupted_challenge_without_retry(tmp_path:
     )
     store.start_control_wave("run-1", 1, 0)
     candidate = "INCYPHER{delivered-before-process-loss}"
-    assert store.reserve_submission("run-1", 1, candidate)
+    assert store.reserve_submission(
+        "run-1", 1, candidate, provenance_class="source_observed_candidate"
+    )
     store.reconcile_submission_intent(
         1,
         hashlib.sha256(candidate.encode()).hexdigest(),
@@ -243,7 +245,15 @@ def test_reconciled_correct_closes_interrupted_challenge_without_retry(tmp_path:
     assert store.queued_control_waves("run-1") == ()
     assert store.challenge_has_correct_submission("run-1", 1)
     assert store.run_terminal_outcomes("run-1") == {1: "solved"}
-    assert store._connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+    row = store._connection.execute(
+        "SELECT outcome, http_status, provenance_class FROM submissions"
+    ).fetchone()
+    assert tuple(row) == ("correct", 0, "source_observed_candidate")
+    counts = store.run_evaluation_counts("run-1")
+    assert counts["submission_correct"] == 1
+    assert counts["submission_http_200_correct"] == 0
+    assert counts["submission_reconciled_correct"] == 1
+    assert counts["source_observed_correct"] == 1
     store.close()
 
 
@@ -343,7 +353,13 @@ def test_submission_provenance_is_atomic_without_telemetry_event(tmp_path: Path)
     store.upsert_challenge(1, "A", "crypto", "standard", 100)
     store.record_control_catalogue("run-1", [(0, 1, True)])
     candidate = "INCYPHER{atomic_provenance}"
-    assert store.reserve_submission("run-1", 1, candidate)
+    assert store.reserve_submission(
+        "run-1", 1, candidate, provenance_class="source_observed_candidate"
+    )
+    assert (
+        store._connection.execute("SELECT provenance_class FROM submission_intents").fetchone()[0]
+        == "source_observed_candidate"
+    )
 
     store.finalize_submission(
         "run-1",
@@ -357,6 +373,8 @@ def test_submission_provenance_is_atomic_without_telemetry_event(tmp_path: Path)
     assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     counts = store.run_evaluation_counts("run-1")
     assert counts["submission_correct"] == 1
+    assert counts["submission_http_200_correct"] == 1
+    assert counts["submission_reconciled_correct"] == 0
     assert counts["source_observed_correct"] == 1
     assert counts["unknown_origin_correct"] == 0
     store.close()
@@ -452,6 +470,69 @@ def test_dynamic_verifier_without_owned_generation_cannot_verify(tmp_path: Path)
     )
     assert not store.candidate_is_verified(run_id, 1, candidate)
     assert store.pending_candidate_count(run_id, 1) == 1
+    store.close()
+
+
+def test_dynamic_verification_rotates_with_instance_generation(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = "dynamic-generation-run"
+    candidate = "INCYPHER{generation_scoped}"
+    producer = baseline_route(model="gpt-daybreak-blue-latest", effort="xhigh", attempt_seconds=15)
+    verifier = replace(
+        producer,
+        role="verifier",
+        tactic="independent_source_reobservation",
+        context_profile="fresh_source_only_no_candidate_carry",
+        verification_recipe="fresh_source_reobservation_v1",
+    )
+    store.start_run(run_id, {})
+    store.upsert_challenge(1, "A", "pwn", "dynamic_iac", 100)
+    store.initialize_control_catalogue(
+        run_id,
+        [(0, 1, True)],
+        1,
+        producer,
+        (("specialist", producer.model, producer.effort),),
+        {1: "a" * 64},
+    )
+    evidence = RunEvidence.open(store, run_id)
+
+    def retain(attempt_id: str, episode: int, route) -> None:
+        store.admit_control_wave(run_id, 1, episode, 0, 1, route)
+        store.start_control_wave(run_id, 1, episode)
+        store.start_attempt(attempt_id, run_id, 1, episode, 0, route.model, route.effort)
+        _attest_candidate(evidence, attempt_id, candidate)
+        store.finish_attempt(
+            attempt_id, "candidate", candidate=candidate, retain_private_candidate=True
+        )
+
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="b" * 64)
+    store.start_control_wave(run_id, 1, 0)
+    store.start_attempt("producer-b", run_id, 1, 0, 0, producer.model, producer.effort)
+    _attest_candidate(evidence, "producer-b", candidate)
+    store.finish_attempt(
+        "producer-b", "candidate", candidate=candidate, retain_private_candidate=True
+    )
+    retain("verifier-b", 1, verifier)
+    assert store.candidate_is_verified(run_id, 1, candidate)
+
+    store.mark_instance(run_id, 1, "creating")
+    assert not store.candidate_is_verified(run_id, 1, candidate)
+    assert (
+        store._connection.execute(
+            "SELECT instance_receipt_sha256 FROM candidate_verification_history"
+        ).fetchone()[0]
+        == "b" * 64
+    )
+
+    store.mark_instance(run_id, 1, "owned", receipt_sha256="c" * 64)
+    retain("producer-c", 2, producer)
+    retain("verifier-c", 3, verifier)
+    current = store._connection.execute(
+        "SELECT instance_receipt_sha256 FROM current_candidate_verifications"
+    ).fetchone()
+    assert current[0] == "c" * 64
+    assert store.candidate_is_verified(run_id, 1, candidate)
     store.close()
 
 

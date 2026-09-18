@@ -482,7 +482,11 @@ class SolverFinding:
         summary = raw["summary"]
         evidence = raw["evidence"]
         next_steps = raw["next_steps"]
-        if status not in {"candidate", "unsolved", "unsupported"}:
+        if not isinstance(status, str) or status not in {
+            "candidate",
+            "unsolved",
+            "unsupported",
+        }:
             raise SolverOutputError("model status is invalid", category="status")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
             raise SolverOutputError("model confidence is invalid", category="confidence_type")

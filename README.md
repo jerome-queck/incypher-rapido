@@ -118,6 +118,8 @@ HTTP `correct`.
 
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
+`submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200
+evidence from a crash-reconciled outcome whose HTTP status is unknowable;
 `source_observed_correct` and `board_origin_correct` classify correct submissions;
 `independently_verified`, `run_local_verified`, and `unverified_challenges` describe current-run
 evidence. The legacy `solved` field remains a scheduler/lifecycle count, not a benchmark score.

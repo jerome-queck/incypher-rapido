@@ -112,6 +112,15 @@ def test_media_argument_type_failure_uses_shared_structural_schema(tmp_path):
     assert caught.value.details["actual_kind"] == "array"
 
 
+def test_media_path_invalid_unicode_uses_typed_failure(tmp_path):
+    with pytest.raises(ToolError) as caught:
+        wav_analyze(Workspace(tmp_path), {"path": "bad-\ud800"})
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.details["field_path"] == "path"
+    assert caught.value.details["constraint"] == "valid_unicode"
+    assert caught.value.details["actual_kind"] == "string"
+
+
 def test_wav_finds_candidate_across_lsb_alignment(tmp_path):
     candidate = wav_shifted_flag_fixture(tmp_path / "shifted.wav")
     result = wav_analyze(Workspace(tmp_path), {"path": "shifted.wav"})

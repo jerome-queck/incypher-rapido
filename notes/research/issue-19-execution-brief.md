@@ -1388,6 +1388,15 @@ re-entry and prose-equality cases. The remaining implementation is split into tw
   remain excluded.
 
 PR #58 passed independent Daybreak/xhigh review and four CI jobs, then squash-merged as `cd812bd`.
-Local validation of the combined solver implementation is 986 passed / 4 platform skips, with Ruff
-and diff checks clean. Independent solver review, PR CI, final merged-image registration, and the
-30-minute diagnostic remain pending at this point.
+Independent Daybreak/xhigh review of PR #59 then found seven reproducible boundary defects. The
+repair binds dynamic verification to the current instance receipt and archives it on generation
+rotation; persists submission provenance before the Board POST; records reconciled outcomes with
+unknown HTTP status; serializes additive migrations; resolves file/directory carry collisions;
+types malformed solver, target, and media inputs; and suppresses raw exception text at the model
+tool boundary. Direct HTTP-200 and reconciled-correct counts remain separate. The unrelated
+Python-3.12 PR failure was a sub-second test clock race; its window is widened while preserving the
+same production assertion.
+
+Local validation after these review fixes is 992 passed / 4 platform skips, plus 426 focused passes
+and 3 skips. Ruff check/format and diff checks are clean. Exact-head independent re-review, PR CI,
+final merged-image registration, and the 30-minute diagnostic remain pending.

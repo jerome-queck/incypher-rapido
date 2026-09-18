@@ -208,8 +208,16 @@ def solve_team_pow(
 
 def _encoded_payload(arguments: Mapping[str, Any]) -> bytes:
     encoding = arguments.get("encoding", "utf8")
-    if encoding not in {"utf8", "hex", "base64"}:
-        raise _error("invalid_argument", "encoding must be utf8, hex, or base64")
+    if not isinstance(encoding, str) or encoding not in {"utf8", "hex", "base64"}:
+        from .tools import _value_kind
+
+        raise _error(
+            "invalid_argument",
+            "encoding must be utf8, hex, or base64",
+            field_path="encoding",
+            constraint="enum",
+            actual_kind=_value_kind(encoding),
+        )
     value = _bounded_text(arguments.get("data", ""), "data", MAX_TARGET_REQUEST_BYTES * 2)
     try:
         if encoding == "utf8":

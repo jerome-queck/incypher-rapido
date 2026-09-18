@@ -193,6 +193,8 @@ class RunReport:
     errors: int
     overlapping_waves: int
     submission_correct: int = 0
+    submission_http_200_correct: int = 0
+    submission_reconciled_correct: int = 0
     submission_already_solved: int = 0
     submission_incorrect: int = 0
     source_observed_correct: int = 0
@@ -1438,6 +1440,15 @@ class Orchestrator:
                 continue
             canonical: dict[Path, tuple[int, Path, str]] = {}
             for source in sorted(analysis_root.rglob("*")):
+                try:
+                    source_metadata = source.lstat()
+                except OSError:
+                    dropped("invalid_file")
+                    continue
+                if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+                    if not stat.S_ISDIR(source_metadata.st_mode):
+                        dropped("invalid_file")
+                    continue
                 relative = source.relative_to(analysis_root)
                 parts = list(relative.parts)
                 imported = False
@@ -1455,12 +1466,21 @@ class Orchestrator:
                     if priority <= prior[0]:
                         continue
                 canonical[relative] = (priority, source, "imported" if imported else "fresh")
-            lane_candidates[lane] = [
-                (relative, selected[1], selected[2])
-                for relative, selected in sorted(
-                    canonical.items(), key=lambda item: item[0].as_posix()
-                )
-            ]
+            selected_paths: list[Path] = []
+            selected_candidates: list[tuple[Path, Path, str]] = []
+            for relative, selected in sorted(
+                canonical.items(),
+                key=lambda item: (-item[1][0], len(item[0].parts), item[0].as_posix()),
+            ):
+                if any(
+                    relative in prior.parents or prior in relative.parents
+                    for prior in selected_paths
+                ):
+                    dropped("shadowed")
+                    continue
+                selected_paths.append(relative)
+                selected_candidates.append((relative, selected[1], selected[2]))
+            lane_candidates[lane] = sorted(selected_candidates, key=lambda item: item[0].as_posix())
 
         # A recovery wave may intentionally rerun only one lane. Preserve other
         # lanes' safe carry, but make every lane present in this wave
@@ -1548,11 +1568,17 @@ class Orchestrator:
                         dropped("byte_cap")
                         continue
                     destination = staging / f"lane-{lane}" / relative
-                    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-                    temporary.write_bytes(payload)
-                    temporary.chmod(0o600)
-                    os.replace(temporary, destination)
+                    try:
+                        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        temporary = destination.with_name(
+                            f".{destination.name}.{uuid.uuid4().hex}.tmp"
+                        )
+                        temporary.write_bytes(payload)
+                        temporary.chmod(0o600)
+                        os.replace(temporary, destination)
+                    except OSError:
+                        dropped("invalid_file")
+                        continue
                     files += 1
                     total += len(payload)
                     lane_counts[lane]["retained"] += 1
@@ -2858,7 +2884,12 @@ class Orchestrator:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "board_limit")
             if deadline - time.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
-            if not self.state.reserve_submission(run_id, challenge.id, candidate):
+            if not self.state.reserve_submission(
+                run_id,
+                challenge.id,
+                candidate,
+                provenance_class=provenance_class,
+            ):
                 settled_outcome = self._reuse_settled_candidate(run_id, challenge.id, candidate)
                 if settled_outcome is not None:
                     return settled_outcome

@@ -2043,7 +2043,7 @@ def test_active_watch_appends_new_work_while_prior_challenge_remains_unresolved(
 def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.5)
+    monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 1.0)
     challenges = [_challenge(value, challenge_type="dynamic_iac") for value in (1, 2)]
     board = ManagedInstanceBoundaryBoard(challenges)
 
@@ -2051,7 +2051,7 @@ def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
         async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
             document = json.loads(prompt)
             if document["execution_phase"] == "shared_instance":
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(2.2)
             return await super().solve(workspace, prompt, **kwargs)
 
     config = replace(
@@ -2060,7 +2060,7 @@ def test_instance_waiter_crossing_admission_floor_never_starts_late_target(
         attempts_per_challenge=2,
         concurrency=4,
         manage_dynamic_instances=True,
-        run_seconds=0.8,
+        run_seconds=3.0,
         watch_board=True,
     )
 
@@ -2613,6 +2613,33 @@ def test_concurrent_openers_recheck_route_authority_migration(tmp_path: Path) ->
             )
             == 3
         )
+
+
+def test_concurrent_openers_recheck_additive_migration(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    StateStore(path).close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE submissions DROP COLUMN provenance_class")
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def open_state() -> None:
+        barrier.wait()
+        try:
+            StateStore(path).close()
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_state) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(submissions)")}
+    assert "provenance_class" in columns
 
 
 def test_failure_origin_escalates_to_board_and_never_downgrades(tmp_path: Path) -> None:

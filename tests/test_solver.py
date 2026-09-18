@@ -84,6 +84,13 @@ def test_finding_parser_requires_exact_typed_json_and_evidence() -> None:
         ),
         (
             (
+                '{"status":[],"candidate":null,"confidence":0,"summary":"",'
+                '"evidence":[],"next_steps":[]}'
+            ),
+            "status",
+        ),
+        (
+            (
                 '{"status":"unsolved","candidate":null,"confidence":"high","summary":"",'
                 '"evidence":[],"next_steps":[]}'
             ),

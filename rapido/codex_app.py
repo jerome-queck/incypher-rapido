@@ -1629,7 +1629,7 @@ class CodexAppClient:
         except ToolError as exc:
             safe_details = _closed_tool_failure_details(exc.details)
             observation_result = failed_observation(exc.code, safe_details)
-            error_payload = {"code": exc.code, "message": exc.message}
+            error_payload = {"code": exc.code, "message": "tool call failed safely"}
             if safe_details:
                 error_payload["details"] = safe_details
             payload = {
@@ -1643,7 +1643,7 @@ class CodexAppClient:
             }
             if call_record is not None:
                 call_record["success"] = False
-        except (ProtocolError, ValueError, TypeError) as exc:
+        except (ProtocolError, ValueError, TypeError):
             observation_result = failed_observation(
                 "invalid_result",
                 {
@@ -1659,7 +1659,12 @@ class CodexAppClient:
                     {
                         "type": "inputText",
                         "text": _json_text(
-                            {"error": {"code": "invalid_result", "message": str(exc)}},
+                            {
+                                "error": {
+                                    "code": "invalid_result",
+                                    "message": "tool result was invalid",
+                                }
+                            },
                             limit=MAX_TOOL_RESULT_BYTES,
                         ),
                     }
