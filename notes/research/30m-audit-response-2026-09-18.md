@@ -1,5 +1,10 @@
 # Response to the independent 30-minute audit — 2026-09-18
 
+> Retrospective correction (2026-09-19): references below to a cumulative baseline of three
+> are stale. The deduplicated pre-full-run lower bound is 14 distinct qualifying challenge
+> IDs; see [cumulative solve reconciliation](cumulative-solve-reconciliation-2026-09-19.md).
+> This 30-minute run still added zero current-run or cumulative validated IDs.
+
 The external package `incypher-rapido-30m-audit-20260918.zip` passed its 31-file checksum
 manifest. Its reproduction utility, run against the original private archive with SHA-256
 `0f71220e9f46e40232cb70c2e4c5f5b0556c45e784a0364774bc81171c083feb`, reproduced

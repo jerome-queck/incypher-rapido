@@ -1,5 +1,12 @@
 # Issue 19 execution brief
 
+> Retrospective correction (2026-09-19): later post-calibration and full-run sections
+> that reuse three as the then-current cumulative baseline are stale. Issue #11's
+> cumulative-three amendment and earlier registered targets remain historical facts.
+> The deduplicated pre-replacement-run lower bound is 14 qualifying IDs; see
+> [cumulative solve reconciliation](cumulative-solve-reconciliation-2026-09-19.md).
+> This correction does not change any run's registered target or observed outcome.
+
 Status: closed under the owner's 2026-09-18 post-observation amendment; the original
 19,800-second gate did not pass. This document is the durable architecture, experiment, decision,
 and acceptance ledger for issue [#19](https://github.com/jerome-queck/incypher-rapido/issues/19). It is sanitized:
