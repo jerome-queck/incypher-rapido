@@ -1777,33 +1777,62 @@ def test_persistent_scheduler_requeues_unresolved_past_episode_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(orchestrator_module, "MIN_MEANINGFUL_ATTEMPT_SECONDS", 0.05)
+
+    class HoldThirdEpisode(UnsolvedBoundaryRuntime):
+        def __init__(self) -> None:
+            super().__init__("unused")
+            self.solve_count = 0
+            self.third_started = asyncio.Event()
+            self.release_third = asyncio.Event()
+
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            self.solve_count += 1
+            if self.solve_count == 3:
+                self.third_started.set()
+                await self.release_third.wait()
+            return await super().solve(workspace, prompt, **kwargs)
+
+    runtime = HoldThirdEpisode()
     config = replace(
         _config(tmp_path),
         active_challenges=1,
         attempts_per_challenge=1,
         concurrency=1,
         episodes_per_challenge=1,
-        run_seconds=0.25,
+        run_seconds=60,
         watch_board=True,
     )
 
-    report = asyncio.run(
-        DurableJobControl.drive(
-            config,
-            board=BoundaryBoard([_challenge(1)]),
-            runtime=UnsolvedBoundaryRuntime("unused"),
+    async def observe_requeue() -> None:
+        task = asyncio.create_task(
+            DurableJobControl.drive(
+                config,
+                board=BoundaryBoard([_challenge(1)]),
+                runtime=runtime,
+            )
         )
-    )
+        try:
+            await asyncio.wait_for(runtime.third_started.wait(), timeout=1)
+        finally:
+            task.cancel()
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+            assert isinstance(result[0], asyncio.CancelledError)
+
+    asyncio.run(observe_requeue())
     with sqlite3.connect(config.state_path) as connection:
+        run_id, status = connection.execute(
+            "SELECT id, status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
         max_episode = connection.execute(
-            "SELECT MAX(episode) FROM control_jobs WHERE run_id=?", (report.run_id,)
+            "SELECT MAX(episode) FROM control_jobs WHERE run_id=?", (run_id,)
         ).fetchone()[0]
         closed = connection.execute(
             "SELECT COUNT(*) FROM events WHERE run_id=? AND kind='challenge_engagement_closed'",
-            (report.run_id,),
+            (run_id,),
         ).fetchone()[0]
 
-    assert report.status == "deadline"
+    assert status == "interrupted"
+    assert runtime.solve_count == 3
     assert max_episode > config.episodes_per_challenge
     assert closed == 0
 
