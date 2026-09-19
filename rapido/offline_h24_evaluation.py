@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Final, Literal
 
 from .board_contract import SCENARIO_IDS, validate_public_receipt
+from .native_receipts import AttemptKey, summarize_native_attempt_receipts
 from .offline_h24 import CATALOGUE, validate_catalogue
 
 PREREGISTRATION_SCHEMA: Final = "rapido-offline-h24-preregistration-v1"
@@ -44,6 +45,12 @@ _SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
+_DESCRIPTOR_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_DESCRIPTOR_FORBIDDEN = re.compile(
+    r"(?:INCYPHER\{|flag\{|https?://|^[A-Za-z]:[\\/]|^(?:\\\\|//)|^/|"
+    r"\b[0-9a-f]{40,64}\b|secret|credential|password|bearer|authorization|api[_-]?key|token)",
+    re.IGNORECASE,
+)
 _TERMINAL_OUTCOMES = frozenset(
     {
         "completed",
@@ -455,6 +462,13 @@ def _validate_descriptor_rows(value: object) -> list[dict[str, object]]:
             )
         ):
             raise TypeError("runtime descriptor values must be strings or null")
+        for name in ("returned_model", "returned_effort", "revision"):
+            item = row[name]
+            if item is not None and (
+                _DESCRIPTOR_VALUE.fullmatch(str(item)) is None
+                or _DESCRIPTOR_FORBIDDEN.search(str(item)) is not None
+            ):
+                raise ValueError("runtime descriptor contains a non-closed value")
         if row["revision_status"] not in {"observed", "unavailable", "invalid"}:
             raise ValueError("runtime descriptor revision status is invalid")
         if (
@@ -646,6 +660,16 @@ def _validate_outcome(
     for name, offset in (("correct", correct_offset), ("qualified", qualified_offset)):
         if offset is not None and offset > terminal_offset:
             raise ValueError(f"{name} timestamp follows terminal timestamp")
+    spans = _validate_spans(row["spans"])
+    if spans:
+        span_origin = min(int(span["start_offset_milliseconds"]) for span in spans)
+        span_terminal = max(int(span["end_offset_milliseconds"]) for span in spans)
+        if terminal_offset != span_terminal:
+            raise ValueError("terminal timestamp does not match native spans")
+        if span_terminal - span_origin > int(expected_task["wall_seconds"]) * 1_000:
+            raise ValueError("task-arm spans exceed the frozen task deadline")
+    elif terminal_offset != 0:
+        raise ValueError("span-free outcome must retain a zero terminal offset")
 
     return {
         **dict(row),
@@ -660,7 +684,7 @@ def _validate_outcome(
         "terminal_offset_milliseconds": terminal_offset,
         "usage": _validate_usage(row["usage"]),
         "tool_call_count": _integer(row["tool_call_count"], "tool call count"),
-        "spans": _validate_spans(row["spans"]),
+        "spans": spans,
         "artifact_bytes": _integer(row["artifact_bytes"], "outcome artifact bytes"),
     }
 
@@ -727,6 +751,58 @@ def _timing_summary(
         "concurrent_lane_milliseconds": lane - wall,
         "semantics": "relative intervals; lane time additive; wall time interval union",
     }
+
+
+def _validate_temporal_contract(
+    rows: Sequence[Mapping[str, object]],
+    runtime_spans: Sequence[Mapping[str, object]],
+    tasks: Sequence[Mapping[str, object]],
+) -> None:
+    global_milliseconds = GLOBAL_SCORING_SECONDS * 1_000
+    ordered_runtime = sorted(
+        runtime_spans,
+        key=lambda span: (
+            int(span["start_offset_milliseconds"]),
+            int(span["end_offset_milliseconds"]),
+        ),
+    )
+    previous_runtime_end = 0
+    for span in ordered_runtime:
+        start = int(span["start_offset_milliseconds"])
+        end = int(span["end_offset_milliseconds"])
+        if end > global_milliseconds or start < previous_runtime_end:
+            raise ValueError("runtime spans exceed the global window or overlap serialized startup")
+        previous_runtime_end = end
+    for arm in ARMS:
+        arm_spans = {str(span["stage"]): span for span in runtime_spans if span["arm"] == arm}
+        startup = arm_spans.get("startup")
+        validation = arm_spans.get("model_validation")
+        if (
+            startup is not None
+            and validation is not None
+            and int(startup["end_offset_milliseconds"])
+            > int(validation["start_offset_milliseconds"])
+        ):
+            raise ValueError("model validation begins before startup completes")
+
+    by_key = {(str(row["task_id"]), str(row["arm"])): row for row in rows}
+    previous_pair_end = previous_runtime_end
+    observed_gap = False
+    for task in tasks:
+        pair = [by_key[(str(task["id"]), arm)] for arm in ARMS]
+        pair_spans = [span for row in pair for span in row["spans"]]  # type: ignore[union-attr]
+        if not pair_spans:
+            observed_gap = True
+            continue
+        if observed_gap:
+            raise ValueError("a later task started after an unstarted task-order gap")
+        pair_start = min(int(span["start_offset_milliseconds"]) for span in pair_spans)
+        pair_end = max(int(span["end_offset_milliseconds"]) for span in pair_spans)
+        if pair_end - pair_start > int(task["wall_seconds"]) * 1_000:
+            raise ValueError("task pair exceeds the frozen task deadline")
+        if pair_start < previous_pair_end or pair_end > global_milliseconds:
+            raise ValueError("task pairs violate frozen order or the global deadline")
+        previous_pair_end = pair_end
 
 
 def _usage_summary(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -839,12 +915,13 @@ def _resource_gate(
     task_specs: Mapping[str, Mapping[str, object]],
     runtime: Mapping[str, object],
     limits: Mapping[str, object],
-) -> bool:
+) -> tuple[bool, bool]:
+    artifact_passed = True
     for row in rows:
         spec = task_specs[str(row["task_id"])]
         if int(row["artifact_bytes"]) > int(spec["artifact_bytes_ceiling"]):
-            return False
-    return (
+            artifact_passed = False
+    runtime_passed = (
         runtime["observation_status"] == "observed"
         and float(runtime["sample_interval_seconds"])
         <= float(limits["sampling_interval_seconds_max"])
@@ -853,6 +930,7 @@ def _resource_gate(
         and int(runtime["peak_pids"]) <= int(limits["pids_ceiling"])
         and runtime["oom_killed"] is False
     )
+    return artifact_passed, runtime_passed
 
 
 def classify_h24(
@@ -902,7 +980,7 @@ def _closed_failure(value: object) -> str:
         return "none"
     if value in _FAILURE_CLASSES:
         return str(value)
-    if value in {"interrupted", "cleanup"}:
+    if value == "interrupted":
         return "cancelled"
     if value in {"usage_limit_exceeded", "rate_limit_exceeded", "session_budget_exceeded"}:
         return "provider_quota"
@@ -959,8 +1037,12 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
         raise ValueError("raw H24 result identity is invalid")
     if row.get("model") != MODEL or row.get("effort") != EFFORT or row.get("role") != "verifier":
         raise ValueError("raw H24 result roster is invalid")
-    first = _raw_object(row.get("first"), "raw first evaluation")
-    final = _raw_object(row.get("final"), "raw final evaluation")
+    first = _exact(
+        row.get("first"), {"outcome", "rejection_reason", "verified"}, "raw first evaluation"
+    )
+    final = _exact(
+        row.get("final"), {"outcome", "rejection_reason", "verified"}, "raw final evaluation"
+    )
     first_outcome = first.get("outcome")
     final_outcome = final.get("outcome")
     allowed = {
@@ -975,14 +1057,40 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
     }
     if first_outcome not in allowed or final_outcome not in allowed:
         raise ValueError("raw H24 verifier outcome is invalid")
+    for label, evaluation in (("first", first), ("final", final)):
+        verified = _boolean(evaluation.get("verified"), f"raw {label} verified status")
+        expected_verified = evaluation.get("rejection_reason") is None and evaluation.get(
+            "outcome"
+        ) in {"verified_correct", "verified_wrong"}
+        if verified is not expected_verified:
+            raise ValueError("raw H24 verified status contradicts its outcome or rejection")
     repair_attempted = _boolean(row.get("repair_attempted"), "raw repair attempted")
     continuation_count = _integer(row.get("continuation_count"), "raw continuation count")
+    same_thread = _boolean(row.get("same_thread"), "raw same-thread status")
+    candidate_free = _boolean(
+        row.get("continuation_prompt_candidate_free"), "raw continuation privacy status"
+    )
     if continuation_count != int(repair_attempted) or continuation_count > 1:
         raise ValueError("raw H24 continuation count is invalid")
     if arm == "one_shot" and repair_attempted:
         raise ValueError("raw one-shot result attempted repair")
+    if not repair_attempted and first != final:
+        raise ValueError("raw H24 result changed without a repair continuation")
+    if repair_attempted and (not same_thread or not candidate_free):
+        raise ValueError("raw H24 repair violated same-thread or candidate-free policy")
+    first_rejection = first.get("rejection_reason")
+    if repair_attempted and (
+        arm != "evidence_repair"
+        or first_rejection not in {"candidate_unobserved", "verifier_requires_fixed_observation"}
+        or first_outcome not in {"rejected_correct", "rejected_wrong"}
+    ):
+        raise ValueError("raw H24 repair lacks an eligible evidence rejection")
 
     native = _raw_object(row.get("native_observability"), "raw native observability")
+    summarize_native_attempt_receipts(
+        (AttemptKey(str(task["id"]), arm),),
+        (native,),
+    )
     spans = _raw_span_projection(native)
     terminal_offset = max(
         (int(span["end_offset_milliseconds"]) for span in spans),
@@ -1023,14 +1131,33 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
     elif final_outcome in candidate_outcomes:
         first_candidate_elapsed = final_end - task_origin
 
+    failure_class = _closed_failure(row.get("failure_class"))
     terminal_outcome = {
         "timeout": "timeout",
         "provider_failure": "provider_failure",
         "no_candidate": "inconclusive",
         "solver_output": "inconclusive",
+        "rejected_correct": "inconclusive",
+        "rejected_wrong": "inconclusive",
     }.get(str(final_outcome), "completed")
+    if failure_class == "cancelled":
+        terminal_outcome = "cancelled"
+    expected_native_outcome = {
+        "timeout": "timeout",
+        "provider_failure": "provider_failure",
+        "no_candidate": "inconclusive",
+        "solver_output": "inconclusive",
+        "rejected_correct": "inconclusive",
+        "rejected_wrong": "inconclusive",
+    }.get(str(final_outcome), "completed")
+    if failure_class == "cancelled":
+        expected_native_outcome = "cancelled"
+    if native.get("outcome") != expected_native_outcome:
+        raise ValueError("raw native outcome contradicts verifier outcome")
     rejection = final.get("rejection_reason")
-    if qualification_accepted:
+    if failure_class == "cancelled":
+        qualification_reason = "cancelled"
+    elif qualification_accepted:
         qualification_reason = "qualified"
     elif rejection in _QUALIFICATION_REASONS:
         qualification_reason = rejection
@@ -1041,7 +1168,6 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
             "timeout": "timeout",
             "provider_failure": "provider_failure",
         }.get(str(final_outcome), "wrong")
-    first_rejection = first.get("rejection_reason")
     repair_trigger = (
         first_rejection
         if arm == "evidence_repair" and first_rejection in _REPAIR_TRIGGERS - {"none"}
@@ -1050,13 +1176,46 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
     usage = _raw_object(native.get("usage"), "raw native usage")
     accounted = _raw_object(usage.get("accounted"), "raw accounted usage")
     tools = _raw_object(row.get("tool_calls"), "raw tool calls")
+    native_tools = _raw_object(native.get("tools"), "raw native tools")
+    native_counts = _raw_object(native_tools.get("counts"), "raw native tool counts")
+    if (
+        tools.get("first_turn") != native_counts.get("first_turn")
+        or tools.get("cumulative") != native_counts.get("cumulative")
+        or (repair_attempted and tools.get("final_turn") != native_counts.get("repair_turn"))
+        or (not repair_attempted and tools.get("final_turn") != native_counts.get("first_turn"))
+    ):
+        raise ValueError("raw public and native tool counts disagree")
+    budget = _raw_object(native.get("budget"), "raw native budget")
+    if budget.get("configured_milliseconds") != int(task["wall_seconds"]) * 1_000:
+        raise ValueError("raw native budget differs from the frozen task cap")
+    stages = {str(span["stage"]): span for span in spans}
+    fixture_span = stages.get("fixture_setup")
+    first_span = stages.get("first_turn")
+    repair_span = stages.get("repair_turn")
+    if (
+        first_span is not None
+        and fixture_span is not None
+        and int(fixture_span["end_offset_milliseconds"])
+        > int(first_span["start_offset_milliseconds"])
+    ):
+        raise ValueError("raw native fixture and first-turn spans are out of order")
+    if repair_attempted:
+        if (
+            first_span is None
+            or repair_span is None
+            or int(first_span["end_offset_milliseconds"])
+            > int(repair_span["start_offset_milliseconds"])
+        ):
+            raise ValueError("raw native repair span is missing or out of order")
+    elif repair_span is not None:
+        raise ValueError("raw native receipt contains an unattempted repair span")
     return {
         "task_id": task["id"],
         "arm": arm,
         "order": task["order"],
         "group": task["group"],
         "terminal_outcome": terminal_outcome,
-        "failure_class": _closed_failure(row.get("failure_class")),
+        "failure_class": failure_class,
         "oracle_correct": oracle_correct,
         "qualification_accepted": qualification_accepted,
         "qualified_correct": qualified_correct,
@@ -1276,9 +1435,16 @@ def evaluate_h24_receipt(
     registration = validate_source_image_registration(top["registration"], preregistration)
     started = _timestamp(top["run_started_at_utc"], "run start")
     registered = _timestamp(registration["registered_at_utc"], "registration timestamp")
-    if registered > started:
-        raise ValueError("source/image registration occurred after outcome collection began")
     barrier = _validate_barrier(top["barrier"])
+    barrier_start = int(barrier["start_wall_epoch_milliseconds"])
+    barrier_seconds, barrier_milliseconds = divmod(barrier_start, 1_000)
+    barrier_datetime = datetime.fromtimestamp(barrier_seconds, tz=started.tzinfo).replace(
+        microsecond=barrier_milliseconds * 1_000
+    )
+    if started.microsecond % 1_000 != 0 or started != barrier_datetime:
+        raise ValueError("run UTC timestamp does not exactly bind the common start barrier")
+    if registered >= barrier_datetime:
+        raise ValueError("source/image registration did not precede the common start barrier")
     scoring_elapsed = _integer(top["scoring_elapsed_milliseconds"], "scoring elapsed")
     descriptors = _validate_descriptor_rows(top["runtime_descriptor_preflight"])
     runtime_spans = _validate_runtime_spans(top["runtime_spans"])
@@ -1297,6 +1463,7 @@ def evaluate_h24_receipt(
         for arm in ARMS:
             rows.append(_validate_outcome(values[cursor], task, arm))
             cursor += 1
+    _validate_temporal_contract(rows, runtime_spans, tasks)
 
     soak = top["soak"]
     validate_public_receipt(soak)
@@ -1336,7 +1503,9 @@ def evaluate_h24_receipt(
     task_specs = {str(task["id"]): task for task in tasks}
     limits = preregistration["runtime_resource_limits"]
     assert isinstance(limits, Mapping)
-    resource_passed = _resource_gate(rows, task_specs, runtime_resources, limits)
+    artifact_passed, runtime_resource_passed = _resource_gate(
+        rows, task_specs, runtime_resources, limits
+    )
     deadline_passed = (
         scoring_elapsed >= GLOBAL_SCORING_SECONDS * 1_000
         and barrier["creation_before_barrier"] is True
@@ -1365,7 +1534,8 @@ def evaluate_h24_receipt(
     soak_passed = soak["passed"] is True
     safety_integrity_passed = (
         fixture_preflight_valid
-        and resource_passed
+        and artifact_passed
+        and runtime_resource_passed
         and deadline_passed
         and cleanup_passed
         and false_accept_passed
@@ -1401,7 +1571,8 @@ def evaluate_h24_receipt(
             "fixture_preflight": fixture_preflight_valid,
             "provider_pair_failures": provider_pair_failures,
             "provider_pair_failure_limit_passed": provider_pair_failures <= 2,
-            "resource_ceilings": resource_passed,
+            "fixture_artifact_ceiling": artifact_passed,
+            "observable_runtime_resources": runtime_resource_passed,
             "global_deadline": deadline_passed,
             "state_contract_10_of_10": soak_passed,
             "false_accept_free": false_accept_passed,

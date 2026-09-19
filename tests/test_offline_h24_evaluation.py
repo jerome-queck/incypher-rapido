@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from rapido.native_receipts import AttemptKey, Budget, Span, build_native_attempt_receipt
 from rapido.offline_h24_evaluation import (
     ARMS,
     MODEL,
@@ -166,7 +167,8 @@ def _soak() -> dict[str, object]:
 
 
 def _outcome(task: dict[str, object], arm: str, *, correct: bool = True) -> dict[str, object]:
-    start = 0 if arm == "one_shot" else 5
+    pair_start = 10 + (int(task["order"]) - 1) * 20
+    start = pair_start if arm == "one_shot" else pair_start + 5
     return {
         "task_id": task["id"],
         "arm": arm,
@@ -182,10 +184,10 @@ def _outcome(task: dict[str, object], arm: str, *, correct: bool = True) -> dict
         "repair_trigger": "none",
         "repair_attempted": False,
         "first_candidate_elapsed_milliseconds": 50,
-        "correct_offset_milliseconds": 500 if correct else None,
-        "qualified_offset_milliseconds": 600 if correct else None,
+        "correct_offset_milliseconds": start + 5 if correct else None,
+        "qualified_offset_milliseconds": start + 10 if correct else None,
         "paired_qualified_elapsed_milliseconds": 100 if correct else None,
-        "terminal_offset_milliseconds": 1000,
+        "terminal_offset_milliseconds": start + 10,
         "usage": {
             "input_tokens": None,
             "output_tokens": None,
@@ -212,7 +214,7 @@ def _receipt(preregistration: dict[str, object]) -> dict[str, object]:
         "schema": RECEIPT_SCHEMA,
         "preregistration_sha256": preregistration_sha256(preregistration),
         "registration": _registration(preregistration),
-        "run_started_at_utc": "2026-09-19T00:01:00Z",
+        "run_started_at_utc": "2027-01-15T08:00:00.000Z",
         "barrier": {
             "start_wall_epoch_milliseconds": 1_800_000_000_000,
             "global_deadline_wall_epoch_milliseconds": 1_800_019_800_000,
@@ -259,7 +261,25 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
     results = []
     for task in tasks:
         for arm in ARMS:
-            start = 0 if arm == "one_shot" else 5
+            pair_start = 10 + (int(task["order"]) - 1) * 20
+            start = pair_start if arm == "one_shot" else pair_start + 5
+            configured = int(task["wall_seconds"]) * 1_000
+            native = build_native_attempt_receipt(
+                key=AttemptKey(str(task["id"]), arm),
+                outcome="completed",
+                spans=(
+                    Span("fixture_setup", "completed", start, start),
+                    Span("first_turn", "completed", start, start + 10),
+                    Span("repair_turn", "not_run", None, None),
+                ),
+                budget=Budget(configured, configured, configured - 10, configured - 10),
+                first_event=None,
+                final_event=None,
+                first_turn_calls=(),
+                repair_turn_calls=(),
+                cumulative_calls=(),
+                repair_attempted=False,
+            )
             results.append(
                 {
                     "task_id": task["id"],
@@ -280,7 +300,7 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
                     },
                     "repair_attempted": False,
                     "continuation_count": 0,
-                    "same_thread": False,
+                    "same_thread": True,
                     "continuation_prompt_candidate_free": True,
                     "elapsed_seconds": 0.1,
                     "spans": {
@@ -288,41 +308,17 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
                         "first_turn_seconds": 0.09,
                         "repair_turn_seconds": 0.0,
                     },
-                    "tool_calls": {"first_turn": 1, "final_turn": 1, "cumulative": 1},
+                    "tool_calls": {"first_turn": 0, "final_turn": 0, "cumulative": 0},
                     "tool_errors": {},
                     "native_usage": {},
                     "failure_class": None,
-                    "native_observability": {
-                        "spans": [
-                            {
-                                "stage": "first_turn",
-                                "status": "completed",
-                                "start_offset_milliseconds": start,
-                                "end_offset_milliseconds": start + 10,
-                                "duration_milliseconds": 10,
-                            },
-                            {
-                                "stage": "repair_turn",
-                                "status": "not_run",
-                                "start_offset_milliseconds": None,
-                                "end_offset_milliseconds": None,
-                                "duration_milliseconds": None,
-                            },
-                        ],
-                        "usage": {
-                            "accounted": {
-                                "input_tokens": None,
-                                "output_tokens": None,
-                                "cached_input_tokens": None,
-                                "reasoning_tokens": None,
-                            }
-                        },
-                    },
+                    "native_observability": native,
                     "artifact_bytes": 1,
                 }
             )
     runtime = {}
-    for arm in ARMS:
+    for arm_index, arm in enumerate(ARMS):
+        runtime_start = arm_index * 2
         runtime[arm] = {
             "descriptor": {
                 "returned_model": "gpt-daybreak-blue-latest",
@@ -333,13 +329,13 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
             "spans": {
                 "startup": {
                     "status": "completed",
-                    "start_offset_milliseconds": 0,
-                    "end_offset_milliseconds": 1,
+                    "start_offset_milliseconds": runtime_start,
+                    "end_offset_milliseconds": runtime_start + 1,
                 },
                 "model_validation": {
                     "status": "completed",
-                    "start_offset_milliseconds": 1,
-                    "end_offset_milliseconds": 2,
+                    "start_offset_milliseconds": runtime_start + 1,
+                    "end_offset_milliseconds": runtime_start + 2,
                 },
             },
         }
@@ -397,6 +393,21 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
         "summary": {},
         "native_observability": {},
     }
+
+
+def _adapt_raw(preregistration: dict[str, object], raw_h24: dict[str, object]) -> dict[str, object]:
+    final = _receipt(preregistration)
+    return build_evaluation_receipt(
+        preregistration=preregistration,
+        registration=final["registration"],
+        raw_h24=raw_h24,
+        soak=final["soak"],
+        barrier=final["barrier"],
+        runtime_resources=final["runtime_resources"],
+        cleanup=final["cleanup"],
+        run_started_at_utc=final["run_started_at_utc"],
+        scoring_elapsed_milliseconds=final["scoring_elapsed_milliseconds"],
+    )
 
 
 @pytest.fixture
@@ -458,8 +469,8 @@ def test_recomputes_checkpoint_usage_and_overlapping_span_semantics(
     }
     assert result["timing"] == {
         "lane_milliseconds": 480,
-        "wall_active_milliseconds": 15,
-        "concurrent_lane_milliseconds": 465,
+        "wall_active_milliseconds": 360,
+        "concurrent_lane_milliseconds": 120,
         "semantics": "relative intervals; lane time additive; wall time interval union",
     }
 
@@ -467,23 +478,216 @@ def test_recomputes_checkpoint_usage_and_overlapping_span_semantics(
 def test_pure_adapter_maps_raw_pilot_into_exact_final_envelope(
     preregistration: dict[str, object],
 ) -> None:
-    final = _receipt(preregistration)
-    adapted = build_evaluation_receipt(
-        preregistration=preregistration,
-        registration=final["registration"],
-        raw_h24=_raw_h24(preregistration),
-        soak=final["soak"],
-        barrier=final["barrier"],
-        runtime_resources=final["runtime_resources"],
-        cleanup=final["cleanup"],
-        run_started_at_utc=final["run_started_at_utc"],
-        scoring_elapsed_milliseconds=final["scoring_elapsed_milliseconds"],
-    )
+    adapted = _adapt_raw(preregistration, _raw_h24(preregistration))
 
     assert adapted["schema"] == RECEIPT_SCHEMA
     assert len(adapted["outcomes"]) == 48
     assert len(adapted["runtime_spans"]) == 4
     assert evaluate_h24_receipt(preregistration, adapted)["counts"]["one_shot"]["C"] == 24
+
+
+@pytest.mark.parametrize("field", ["same_thread", "continuation_prompt_candidate_free"])
+def test_adapter_rejects_repair_thread_or_candidate_privacy_drift(
+    preregistration: dict[str, object], field: str
+) -> None:
+    raw = _raw_h24(preregistration)
+    row = raw["results"][1]
+    row["first"] = {
+        "outcome": "rejected_correct",
+        "rejection_reason": "candidate_unobserved",
+        "verified": False,
+    }
+    row["repair_attempted"] = True
+    row["continuation_count"] = 1
+    row[field] = False
+
+    with pytest.raises(ValueError, match="same-thread or candidate-free"):
+        _adapt_raw(preregistration, raw)
+
+
+@pytest.mark.parametrize("mutation", ["identity", "outcome", "tools", "budget"])
+def test_adapter_rejects_native_receipt_contradictions(
+    preregistration: dict[str, object], mutation: str
+) -> None:
+    raw = _raw_h24(preregistration)
+    row = raw["results"][0]
+    native = row["native_observability"]
+    if mutation == "identity":
+        native["attempt"]["task_id"] = "h24-easy-01"
+    elif mutation == "outcome":
+        native["outcome"] = "timeout"
+    elif mutation == "tools":
+        row["tool_calls"]["cumulative"] = 1
+    else:
+        native["budget"]["configured_milliseconds"] += 1
+
+    with pytest.raises(ValueError):
+        _adapt_raw(preregistration, raw)
+
+
+def test_adapter_rejects_verified_boolean_contradiction(
+    preregistration: dict[str, object],
+) -> None:
+    raw = _raw_h24(preregistration)
+    raw["results"][0]["final"]["verified"] = False
+    with pytest.raises(ValueError, match="verified status"):
+        _adapt_raw(preregistration, raw)
+
+
+def test_adapter_retains_real_cancellation_as_cancelled(
+    preregistration: dict[str, object],
+) -> None:
+    raw = _raw_h24(preregistration)
+    row = raw["results"][0]
+    row["first"] = {
+        "outcome": "provider_failure",
+        "rejection_reason": None,
+        "verified": False,
+    }
+    row["final"] = copy.deepcopy(row["first"])
+    row["failure_class"] = "interrupted"
+    row["native_observability"]["outcome"] = "cancelled"
+
+    adapted = _adapt_raw(preregistration, raw)
+    assert adapted["outcomes"][0]["terminal_outcome"] == "cancelled"
+    assert adapted["outcomes"][0]["failure_class"] == "cancelled"
+    assert adapted["outcomes"][0]["qualification_reason"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    ("raw_failure", "expected_failure"),
+    [
+        ("cyber_policy", "provider_policy"),
+        ("usage_limit_exceeded", "provider_quota"),
+    ],
+)
+def test_adapter_maps_safe_provider_failures_to_closed_classes(
+    preregistration: dict[str, object], raw_failure: str, expected_failure: str
+) -> None:
+    raw = _raw_h24(preregistration)
+    row = raw["results"][0]
+    row["first"] = {
+        "outcome": "provider_failure",
+        "rejection_reason": None,
+        "verified": False,
+    }
+    row["final"] = copy.deepcopy(row["first"])
+    row["failure_class"] = raw_failure
+    row["native_observability"]["outcome"] = "provider_failure"
+
+    adapted = _adapt_raw(preregistration, raw)
+    assert adapted["outcomes"][0]["terminal_outcome"] == "provider_failure"
+    assert adapted["outcomes"][0]["failure_class"] == expected_failure
+
+
+def test_adapter_rejects_changed_final_without_repair(
+    preregistration: dict[str, object],
+) -> None:
+    raw = _raw_h24(preregistration)
+    raw["results"][0]["final"] = {
+        "outcome": "verified_wrong",
+        "rejection_reason": None,
+        "verified": True,
+    }
+    with pytest.raises(ValueError, match="without a repair"):
+        _adapt_raw(preregistration, raw)
+
+
+def test_final_validator_rejects_task_cap_and_task_order_drift(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    row = receipt["outcomes"][0]
+    cap = preregistration["tasks"][0]["wall_seconds"] * 1_000
+    row["spans"][0]["end_offset_milliseconds"] = (
+        row["spans"][0]["start_offset_milliseconds"] + cap + 1
+    )
+    row["terminal_offset_milliseconds"] = row["spans"][0]["end_offset_milliseconds"]
+    row["qualified_offset_milliseconds"] = row["terminal_offset_milliseconds"]
+    with pytest.raises(ValueError, match="task deadline"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+    receipt = _receipt(preregistration)
+    task = preregistration["tasks"][-1]
+    pair = [row for row in receipt["outcomes"] if row["task_id"] == task["id"]]
+    pair_start = pair[0]["spans"][0]["start_offset_milliseconds"]
+    delayed = pair[1]
+    delayed["spans"][0]["end_offset_milliseconds"] = pair_start + task["wall_seconds"] * 1_000 + 1
+    delayed["terminal_offset_milliseconds"] = delayed["spans"][0]["end_offset_milliseconds"]
+    delayed["correct_offset_milliseconds"] = delayed["terminal_offset_milliseconds"]
+    delayed["qualified_offset_milliseconds"] = delayed["terminal_offset_milliseconds"]
+    delayed["paired_qualified_elapsed_milliseconds"] = (
+        delayed["terminal_offset_milliseconds"] - delayed["spans"][0]["start_offset_milliseconds"]
+    )
+    with pytest.raises(ValueError, match="task pair exceeds"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+    receipt = _receipt(preregistration)
+    later = receipt["outcomes"][2]
+    later["spans"][0]["start_offset_milliseconds"] = 0
+    later["spans"][0]["end_offset_milliseconds"] = 5
+    later["terminal_offset_milliseconds"] = 5
+    later["correct_offset_milliseconds"] = 4
+    later["qualified_offset_milliseconds"] = 5
+    with pytest.raises(ValueError, match="frozen order"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+
+def test_final_validator_rejects_runtime_span_global_and_serialization_drift(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["runtime_spans"] = [
+        {
+            "arm": "one_shot",
+            "stage": "startup",
+            "status": "completed",
+            "start_offset_milliseconds": 0,
+            "end_offset_milliseconds": 19_800_001,
+        }
+    ]
+    with pytest.raises(ValueError, match="global window"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+    receipt = _receipt(preregistration)
+    receipt["runtime_spans"] = [
+        {
+            "arm": "one_shot",
+            "stage": "startup",
+            "status": "completed",
+            "start_offset_milliseconds": 0,
+            "end_offset_milliseconds": 5,
+        },
+        {
+            "arm": "evidence_repair",
+            "stage": "startup",
+            "status": "completed",
+            "start_offset_milliseconds": 4,
+            "end_offset_milliseconds": 6,
+        },
+    ]
+    with pytest.raises(ValueError, match="overlap serialized startup"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+
+@pytest.mark.parametrize("value", ["/private/model", "INCYPHER{private}", "https://model.invalid"])
+def test_descriptor_values_are_closed_and_redacted(
+    preregistration: dict[str, object], value: str
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["runtime_descriptor_preflight"][0]["returned_model"] = value
+    with pytest.raises(ValueError, match="non-closed"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+
+@pytest.mark.parametrize("timestamp", ["2027-01-15T08:00:00.001Z", "2027-01-15T08:00:00.000999Z"])
+def test_run_timestamp_must_exactly_bind_barrier(
+    preregistration: dict[str, object], timestamp: str
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["run_started_at_utc"] = timestamp
+    with pytest.raises(ValueError, match="exactly bind"):
+        evaluate_h24_receipt(preregistration, receipt)
 
 
 @pytest.mark.parametrize("mode", ["missing", "duplicate", "extra"])
@@ -552,7 +756,7 @@ def test_easy_resource_cleanup_and_descriptor_gates(preregistration: dict[str, o
     receipt = _receipt(preregistration)
     receipt["runtime_resources"]["oom_killed"] = True
     result = evaluate_h24_receipt(preregistration, receipt)
-    assert result["gates"]["resource_ceilings"] is False
+    assert result["gates"]["observable_runtime_resources"] is False
     assert result["decision"] == "no_justified_change"
 
     receipt = _receipt(preregistration)
@@ -666,15 +870,27 @@ def test_registration_must_precede_run_and_artifact_ceiling_is_gated(
     preregistration: dict[str, object],
 ) -> None:
     receipt = _receipt(preregistration)
-    receipt["registration"]["registered_at_utc"] = "2026-09-19T00:02:00Z"
-    with pytest.raises(ValueError, match="after outcome collection"):
+    receipt["registration"]["registered_at_utc"] = receipt["run_started_at_utc"]
+    with pytest.raises(ValueError, match="precede the common start barrier"):
         evaluate_h24_receipt(preregistration, receipt)
 
     receipt = _receipt(preregistration)
     task = preregistration["tasks"][0]
     receipt["outcomes"][0]["artifact_bytes"] = task["artifact_bytes_ceiling"] + 1
     result = evaluate_h24_receipt(preregistration, receipt)
-    assert result["gates"]["resource_ceilings"] is False
+    assert result["gates"]["fixture_artifact_ceiling"] is False
+    assert result["decision"] == "no_justified_change"
+
+
+def test_provisional_cleanup_is_a_failed_gate_not_an_invalid_receipt(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["cleanup"]["completed"] = False
+    receipt["cleanup"]["workspace_residue_bytes"] = 128
+
+    result = evaluate_h24_receipt(preregistration, receipt)
+    assert result["gates"]["cleanup_and_privacy"] is False
     assert result["decision"] == "no_justified_change"
 
 

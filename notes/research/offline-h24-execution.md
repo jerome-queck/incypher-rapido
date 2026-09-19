@@ -23,11 +23,13 @@ candidate-free continuation after only `candidate_unobserved` or
 benign soak together; the receipt binds its wall-clock start and deadline, exactly 19,800,000 ms
 apart. Cleanup is outside scoring, receives at most 190 seconds, and earns no score.
 
-The 24 task records retain their fixture wall, CPU, memory, and artifact ceilings. The final row
-records truthful artifact bytes. Container-level CPU percentage, RSS, PID and OOM observations are
-aggregate because they cannot be attributed honestly to a task-arm pair; unavailable samples stay
-null. The frozen aggregate ceilings are 1,200% CPU, 24 GiB RSS, 256 PIDs, and a maximum 10-second
-sample interval. Resource evidence is a gate, never a synthesized estimate.
+The 24 task records retain their fixture wall, CPU, memory, and artifact declarations. Per-task CPU
+and memory values are fixture-generation/reference-checker design bounds only: the container does
+not expose truthful task-arm attribution, so they are not scored as observed runtime gates. The
+final row records truthful artifact bytes and enforces that observable ceiling. Container-level CPU
+percentage, RSS, PID and OOM observations are aggregate; unavailable samples stay null. The frozen
+observable aggregate gates are 1,200% CPU, 24 GiB RSS, 256 PIDs, and a maximum 10-second sample
+interval. Resource evidence is never synthesized.
 
 Target network is false. Provider transport is required only for the native model connection. No
 Board, challenge, target authority, submission, credential, vulnerable service, archived script,
@@ -55,6 +57,13 @@ barrier, cleanup and sampled container resources. `evaluate_h24_receipt` is pure
 requires exactly 48 task-arm rows in frozen task order then `one_shot`, `evidence_repair`; all 10
 state-contract scenarios; and exact closed fields. Failed, unstarted, timed-out, provider-failed,
 cancelled and inconclusive rows remain in the denominator.
+
+The adapter validates each native attempt one-to-one against task and arm, reconciles native
+outcome/tool counts/configured budget with the public row, and rejects repairs that are not an
+eligible same-thread candidate-free continuation. Runtime descriptors admit only bounded public
+labels. Runtime startup/preflight and task-pair spans must remain ordered inside their task and
+global deadlines. The run timestamp exactly equals the millisecond-aligned barrier; immutable
+source/image registration strictly precedes it.
 
 Rows expose only public identity, closed outcome labels, correctness/qualification booleans,
 nullable event times and usage, closed spans/counts, repair state, and artifact bytes. Candidate
@@ -130,8 +139,11 @@ evidence is durable.
 - `rapido/offline_h24_evaluation.py`: frozen contract builder, registration validator, exact final
   receipt validator, recomputation, gates and classifier;
 - `notes/research/offline-h24-preregistration-v1.json`: exact prospective contract;
-- `tests/test_offline_h24_evaluation.py`: synthetic adversarial contract tests.
+- `tests/test_offline_h24_evaluation.py`: synthetic adversarial contract tests;
+- `notes/research/offline-h24-execution.md`: prospective execution and evidence boundary.
 
 No production solver, routing, target tool, Board client, proof gate, scheduler, fixture generator,
-native runner, container, credential or live state is changed here. Focused verification is
-recorded in the PR after final review. No result is claimed in this document.
+native runner, container, credential or live state is changed here. On 2026-09-19, Ruff passed for
+the evaluator and its tests; the evaluator/pilot/supervisor set passed 98 tests; the repository
+suite passed 1,290 tests with four skips. No native, Board, container, H24 outcome, or real-clock
+soak run occurred. No result is claimed in this document.
