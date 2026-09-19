@@ -66,6 +66,7 @@ _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_REFERENCE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _BASE_REFERENCE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})\Z")
 _RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
+_VOLUME_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}\Z")
 _CLOSED_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 _CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
 _FORBIDDEN_ENV = frozenset(
@@ -87,6 +88,7 @@ _ROLE_LABEL = "io.incypher.rapido.offline-h24-role"
 _OWNER_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _ORACLE_ID = "rapido-offline-h24-oracle-v1"
 _INSTALLED_RAPIDO = "/opt/venv/lib/python3.12/site-packages/rapido"
+_SEALED_IMAGE_VOLUMES = frozenset({"/auth/codex", "/state"})
 _WRAPPER_SOURCES = {
     "offline_oracle_pilot.py": Path("scripts/offline_oracle_pilot.py"),
     "board_contract_soak.py": Path("scripts/board_contract_soak.py"),
@@ -273,6 +275,8 @@ class EvaluationState:
     removed: set[str] = field(default_factory=set)
     ownership_ambiguous: bool = False
     create_outcome_unresolved: bool = False
+    inherited_volumes: set[str] = field(default_factory=set)
+    unresolved_volume_intents: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -467,6 +471,24 @@ def validate_source(
         raise SupervisorError("source_dirty")
 
 
+def _declared_volume_destinations(config: Mapping[str, object], label: str) -> frozenset[str]:
+    volumes = _mapping(config.get("Volumes"), label)
+    destinations: set[str] = set()
+    for destination, metadata in volumes.items():
+        if (
+            type(destination) is not str
+            or not destination.startswith("/")
+            or destination == "/"
+            or "//" in destination
+            or destination.endswith("/")
+            or not isinstance(metadata, Mapping)
+            or metadata
+        ):
+            raise SupervisorError(label)
+        destinations.add(destination)
+    return frozenset(destinations)
+
+
 def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     result = _run(
         runner,
@@ -486,6 +508,8 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     config = _mapping(row.get("Config"), "image_identity")
     labels = _mapping(config.get("Labels"), "image_identity")
     _string(labels.get("io.incypher.rapido.base-reference"), _BASE_REFERENCE, "image_identity")
+    if _declared_volume_destinations(config, "image_identity") != _SEALED_IMAGE_VOLUMES:
+        raise SupervisorError("image_identity")
     image_os = row.get("Os")
     architecture = row.get("Architecture")
     if (
@@ -546,15 +570,113 @@ def _owned_container_ids(ownership_token: str, runner: Runner, *, timeout: float
     return set(values)
 
 
+def _inherited_local_volume(
+    mount: Mapping[str, object],
+    allowed: frozenset[str],
+    evaluation_state: EvaluationState,
+) -> tuple[str, str, str]:
+    name = mount.get("Name")
+    if type(name) is str and _VOLUME_NAME.fullmatch(name) is not None:
+        evaluation_state.inherited_volumes.add(name)
+    if set(mount) != {
+        "Type",
+        "Name",
+        "Source",
+        "Destination",
+        "Driver",
+        "Mode",
+        "RW",
+        "Propagation",
+    }:
+        raise SupervisorError("container_identity")
+    source = mount.get("Source")
+    destination = mount.get("Destination")
+    if (
+        type(name) is not str
+        or _VOLUME_NAME.fullmatch(name) is None
+        or type(source) is not str
+        or not source.startswith("/")
+        or type(destination) is not str
+        or destination not in allowed
+        or mount.get("Driver") != "local"
+        or mount.get("Mode") != ""
+        or mount.get("RW") is not True
+        or mount.get("Propagation") != ""
+    ):
+        raise SupervisorError("container_identity")
+    return destination, name, source
+
+
+def _validate_anonymous_volume_metadata(
+    expected_mountpoints: Mapping[str, str], runner: Runner, *, timeout: float
+) -> None:
+    if not expected_mountpoints:
+        return
+    names = sorted(expected_mountpoints)
+    result = _run(
+        runner,
+        ("docker", "volume", "inspect", *names),
+        "container_identity",
+        timeout=timeout,
+    )
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SupervisorError("container_identity") from exc
+    if not isinstance(rows, list) or len(rows) != len(names):
+        raise SupervisorError("container_identity")
+    observed: set[str] = set()
+    for value in rows:
+        row = _mapping(value, "container_identity")
+        if set(row) != {
+            "CreatedAt",
+            "Driver",
+            "Labels",
+            "Mountpoint",
+            "Name",
+            "Options",
+            "Scope",
+        }:
+            raise SupervisorError("container_identity")
+        name = row.get("Name")
+        created_at = row.get("CreatedAt")
+        labels = _mapping(row.get("Labels"), "container_identity")
+        try:
+            created = datetime.fromisoformat(created_at) if type(created_at) is str else None
+        except ValueError as exc:
+            raise SupervisorError("container_identity") from exc
+        if (
+            type(name) is not str
+            or name not in expected_mountpoints
+            or name in observed
+            or created is None
+            or created.tzinfo is None
+            or row.get("Driver") != "local"
+            or labels != {"com.docker.volume.anonymous": ""}
+            or row.get("Mountpoint") != expected_mountpoints[name]
+            or row.get("Options") is not None
+            or row.get("Scope") != "local"
+        ):
+            raise SupervisorError("container_identity")
+        observed.add(name)
+    if observed != set(expected_mountpoints):
+        raise SupervisorError("container_identity")
+
+
 def _inspect_container_intent(
     container_id: str,
     intent: ContainerIntent,
     ownership_token: str,
+    evaluation_state: EvaluationState,
     runner: Runner,
     *,
-    timeout: float = 30,
+    clock: Clock,
+    deadline: float,
 ) -> None:
     if _CONTAINER_ID.fullmatch(container_id) is None:
+        raise SupervisorError("container_identity")
+    timeout = _remaining_timeout(clock, deadline)
+    if timeout is None:
         raise SupervisorError("container_identity")
     result = _run(
         runner,
@@ -574,7 +696,10 @@ def _inspect_container_intent(
         raise SupervisorError("container_identity") from exc
     config = _mapping(row.get("Config"), "container_identity")
     labels = _mapping(config.get("Labels"), "container_identity")
-    state = _mapping(row.get("State"), "container_identity")
+    declared_volumes = _declared_volume_destinations(config, "container_identity")
+    if declared_volumes != _SEALED_IMAGE_VOLUMES:
+        raise SupervisorError("container_identity")
+    container_state = _mapping(row.get("State"), "container_identity")
     if (
         row.get("Id") != container_id
         or row.get("Name") != f"/{intent.name}"
@@ -582,30 +707,50 @@ def _inspect_container_intent(
         or config.get("User") != CONTAINER_USER
         or labels.get(_OWNER_LABEL) != ownership_token
         or labels.get(_ROLE_LABEL) != intent.role
-        or state.get("Running") is not False
+        or container_state.get("Running") is not False
     ):
         raise SupervisorError("container_identity")
     mounts = row.get("Mounts")
     if not isinstance(mounts, list):
         raise SupervisorError("container_identity")
-    actual: dict[str, tuple[Path, bool]] = {}
+    actual_binds: dict[str, tuple[Path, bool]] = {}
+    actual_volumes: set[str] = set()
+    volume_mountpoints: dict[str, str] = {}
+    seen_destinations: set[str] = set()
     for value in mounts:
         mount = _mapping(value, "container_identity")
-        if mount.get("Type") != "bind":
+        mount_type = mount.get("Type")
+        if mount_type == "volume":
+            destination, name, source = _inherited_local_volume(
+                mount, declared_volumes, evaluation_state
+            )
+            if destination in seen_destinations or name in volume_mountpoints:
+                raise SupervisorError("container_identity")
+            seen_destinations.add(destination)
+            actual_volumes.add(destination)
+            volume_mountpoints[name] = source
+            continue
+        if mount_type != "bind":
             raise SupervisorError("container_identity")
         source = mount.get("Source")
         destination = mount.get("Destination")
         writable = mount.get("RW")
         if type(source) is not str or type(destination) is not str or type(writable) is not bool:
             raise SupervisorError("container_identity")
-        if destination in actual:
+        if destination in seen_destinations:
             raise SupervisorError("container_identity")
-        actual[destination] = (Path(source), not writable)
-    expected = {
+        seen_destinations.add(destination)
+        actual_binds[destination] = (Path(source), not writable)
+    expected_binds = {
         destination: (source, readonly) for source, destination, readonly in intent.bind_mounts
     }
-    if actual != expected:
+    expected_volumes = declared_volumes - expected_binds.keys()
+    if actual_binds != expected_binds or actual_volumes != expected_volumes:
         raise SupervisorError("container_identity")
+    timeout = _remaining_timeout(clock, deadline)
+    if timeout is None:
+        raise SupervisorError("container_identity")
+    _validate_anonymous_volume_metadata(volume_mountpoints, runner, timeout=timeout)
 
 
 def _create_owned_container(
@@ -656,15 +801,16 @@ def _create_owned_container(
         )
         new_ids = inventory - known
     state.created.update(new_ids)
-    if len(new_ids) == 1:
+    container_id = next(iter(new_ids)) if len(new_ids) == 1 else None
+    if container_id is not None:
         state.create_outcome_unresolved = False
+        state.unresolved_volume_intents.add(container_id)
     if clock.monotonic() >= operation_deadline:
         raise SupervisorError(failure)
     returned_id = result.stdout.strip()
-    if len(new_ids) != 1:
+    if container_id is None:
         state.ownership_ambiguous = len(new_ids) > 1
         raise SupervisorError(failure if not new_ids else f"{failure}_ambiguous")
-    container_id = next(iter(new_ids))
     if (
         result.returncode == 0
         and _CONTAINER_ID.fullmatch(returned_id) is not None
@@ -672,13 +818,21 @@ def _create_owned_container(
     ):
         state.ownership_ambiguous = True
         raise SupervisorError(f"{failure}_ambiguous")
-    _inspect_container_intent(
-        container_id,
-        intent,
-        ownership_token,
-        runner,
-        timeout=min(30, operation_deadline - clock.monotonic()),
-    )
+    try:
+        _inspect_container_intent(
+            container_id,
+            intent,
+            ownership_token,
+            state,
+            runner,
+            clock=clock,
+            deadline=operation_deadline,
+        )
+        state.unresolved_volume_intents.discard(container_id)
+    except SupervisorError as exc:
+        if clock.monotonic() >= operation_deadline:
+            raise SupervisorError(failure) from exc
+        raise
     if clock.monotonic() >= operation_deadline:
         raise SupervisorError(failure)
     state.by_role[intent.role] = container_id
@@ -772,6 +926,7 @@ def verify_image_source(
     ownership_token = _ownership_token()
     state = EvaluationState()
     owned_container_id: str | None = None
+    primary_failed = False
     probe_root = Path(tempfile.mkdtemp(prefix=".rapido-image-source-", dir=output))
     probe_root.chmod(0o700)
     try:
@@ -848,7 +1003,11 @@ def verify_image_source(
             ):
                 raise SupervisorError("image_source_mismatch")
     except OSError as exc:
+        primary_failed = True
         raise SupervisorError("image_source_mismatch") from exc
+    except BaseException:
+        primary_failed = True
+        raise
     finally:
         cleanup_failed = not _cleanup_owned_containers(
             ownership_token,
@@ -861,7 +1020,7 @@ def verify_image_source(
             shutil.rmtree(probe_root)
         except OSError:
             cleanup_failed = True
-        if cleanup_failed and not state.create_outcome_unresolved:
+        if cleanup_failed and not state.create_outcome_unresolved and not primary_failed:
             raise SupervisorError("image_source_probe_cleanup")
     if state.ownership_ambiguous:
         raise SupervisorError("container_ownership_ambiguous")
@@ -1808,6 +1967,34 @@ def _remove_container(
     raise SupervisorError("container_remove")
 
 
+def _tracked_volumes_absent(names: set[str], runner: Runner, clock: Clock, deadline: float) -> bool:
+    for name in sorted(names):
+        timeout = _remaining_timeout(clock, deadline)
+        if timeout is None:
+            return False
+        result = runner(
+            (
+                "docker",
+                "volume",
+                "ls",
+                "--quiet",
+                "--filter",
+                f"name=^{re.escape(name)}$",
+            ),
+            timeout=timeout,
+        )
+        values = result.stdout.split()
+        if (
+            result.returncode != 0
+            or clock.monotonic() > deadline
+            or len(values) != len(set(values))
+            or any(value != name for value in values)
+            or values
+        ):
+            return False
+    return True
+
+
 def _cleanup_owned_containers(
     ownership_token: str,
     state: EvaluationState,
@@ -1835,6 +2022,7 @@ def _cleanup_owned_containers(
             return False
         discovered = inventory - state.created
         if discovered:
+            state.unresolved_volume_intents.update(discovered)
             state.created.update(discovered)
             state.ownership_ambiguous = True
         if inventory:
@@ -1882,7 +2070,10 @@ def _cleanup_owned_containers(
                 not state.create_outcome_unresolved
                 and observed_at - quiet_since >= OWNER_QUIET_SECONDS
             ):
-                return not cleanup_failed
+                volumes_absent = _tracked_volumes_absent(
+                    state.inherited_volumes, runner, clock, cleanup_deadline
+                )
+                return not cleanup_failed and volumes_absent and not state.unresolved_volume_intents
         remaining = cleanup_deadline - clock.monotonic()
         if remaining <= 0:
             break
@@ -2345,6 +2536,7 @@ def run_descriptor_preflight(
         _validate_auth_unmounted(paths.auth, runner)
         container_id: str | None = None
         create_deadline = clock.monotonic() + 120
+        primary_failed = False
         try:
             container_id = _create_owned_container(
                 descriptor_preflight_argv(
@@ -2383,6 +2575,9 @@ def run_descriptor_preflight(
             )
             if result.returncode != 0:
                 raise SupervisorError("preflight_run")
+        except BaseException:
+            primary_failed = True
+            raise
         finally:
             cleanup_attested = _cleanup_owned_containers(
                 ownership_token,
@@ -2391,7 +2586,7 @@ def run_descriptor_preflight(
                 clock,
                 clock.monotonic() + OWNER_CLEANUP_SECONDS,
             )
-            if not cleanup_attested and not state.create_outcome_unresolved:
+            if not cleanup_attested and not state.create_outcome_unresolved and not primary_failed:
                 raise SupervisorError("preflight_cleanup")
         if state.ownership_ambiguous:
             raise SupervisorError("container_ownership_ambiguous")
