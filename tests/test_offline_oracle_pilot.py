@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rapido.codex_app import ModelValidationError
+from rapido.codex_app import CodexAppError, ModelValidationError
 from rapido.evidence import project_tool_observation
 from rapido.tools import ToolError, ToolRegistry
 
@@ -146,6 +146,18 @@ def _passing_gate_inputs() -> tuple[
                     first_native_usage={"status": "observed", "input_tokens": 1},
                     final_native_usage={"status": "observed", "input_tokens": 1},
                     failure_class=None,
+                    native_receipt=PILOT.build_native_attempt_receipt(
+                        key=PILOT.AttemptKey(fixture.id, arm.id),
+                        outcome="completed",
+                        spans=(PILOT.Span("first_turn", "completed", 0, 10),),
+                        budget=PILOT.Budget(300_000, 300_000, 290_000, 290_000),
+                        first_event={"usage": {"inputTokens": 1}},
+                        final_event={"usage": {"inputTokens": 1}},
+                        first_turn_calls=(),
+                        repair_turn_calls=(),
+                        cumulative_calls=(),
+                        repair_attempted=False,
+                    ),
                 )
             )
     runtime = {
@@ -259,6 +271,29 @@ def test_verifier_repair_prompt_is_candidate_free_and_rejects_tainted_routes() -
     for rejection in ("candidate_supplied", "candidate_evidence_incomplete"):
         with pytest.raises(ValueError, match="not repairable"):
             PILOT.build_verifier_repair_prompt(rejection, 10)
+
+
+def test_public_diagnostic_counts_reject_unregistered_secret_like_labels() -> None:
+    counts = PILOT.closed_tool_error_counts(
+        [
+            {
+                "success": False,
+                "host_observation": SimpleNamespace(
+                    facts={
+                        "failure_stage": "arguments",
+                        "constraint": "private_oracle_key",
+                    }
+                ),
+            }
+        ]
+    )
+    assert counts == {
+        "total": 1,
+        "untyped": 1,
+        "by_stage": {"arguments": 1},
+        "by_constraint": {"untyped": 1},
+    }
+    assert PILOT._safe_failure("credential_value") == "unknown"
 
 
 def test_score_requires_source_proof_for_correct_and_wrong_answers() -> None:
@@ -567,6 +602,11 @@ def test_fake_pilot_uses_isolated_concurrent_processes_and_sanitizes_receipt(
     assert len(receipt["results"]) == 24
     assert {row["outcome"] for row in receipt["results"]} == {"correct"}
     assert all(row["native_usage"]["status"] == "observed" for row in receipt["results"])
+    assert receipt["native_observability"]["attempt_count"] == 24
+    assert all(
+        row["native_observability"]["schema"] == "rapido-native-attempt-receipt-v1"
+        for row in receipt["results"]
+    )
     assert all(
         set(row["spans"]) == {"fixture_setup_seconds", "turn_seconds"} for row in receipt["results"]
     )
@@ -574,6 +614,17 @@ def test_fake_pilot_uses_isolated_concurrent_processes_and_sanitizes_receipt(
         runtime = receipt["runtime"][arm.id]
         assert runtime["status"] == "completed"
         assert {span["status"] for span in runtime["spans"].values()} == {"completed"}
+        assert all(
+            set(span)
+            == {
+                "status",
+                "start_offset_milliseconds",
+                "end_offset_milliseconds",
+                "elapsed_seconds",
+            }
+            and span["end_offset_milliseconds"] >= span["start_offset_milliseconds"]
+            for span in runtime["spans"].values()
+        )
         summary = receipt["summary"][arm.id]
         assert summary["outcomes"]["correct"] == 12
         assert summary["tool_errors_untyped"] == 0
@@ -675,7 +726,8 @@ def test_fake_verifier_repair_pilot_reuses_thread_and_emits_candidate_free_metri
     config = PILOT.PilotConfig("codex", codex_home, work_root, key_file, source_sha="c" * 40)
     receipt = asyncio.run(PILOT.run_verifier_repair_pilot(config, client_factory=factory))
 
-    assert receipt["schema"] == "rapido-offline-verifier-repair-v1"
+    assert receipt["schema"] == "rapido-offline-verifier-repair-v2"
+    assert receipt["native_observability"]["attempt_count"] == 24
     assert receipt["protocol"]["experiment"] == "verifier-repair"
     assert receipt["protocol"]["whole_attempt_taint"] is True
     assert receipt["protocol"]["fixed_non_run_shell_observation_required"] is True
@@ -759,6 +811,7 @@ def test_verifier_repair_does_not_continue_supplied_candidate(tmp_path: Path) ->
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    run_started = PILOT.time.monotonic()
     measurement = asyncio.run(
         PILOT._measure_verifier(
             SuppliedClient(),
@@ -769,6 +822,9 @@ def test_verifier_repair_does_not_continue_supplied_candidate(tmp_path: Path) ->
             candidate,
             PILOT.MAX_WORKSPACE_BYTES,
             0.0,
+            run_started,
+            run_started,
+            run_started,
         )
     )
 
@@ -776,6 +832,354 @@ def test_verifier_repair_does_not_continue_supplied_candidate(tmp_path: Path) ->
     assert measurement.final.rejection_reason == "candidate_supplied"
     assert measurement.repair_attempted is False
     assert measurement.continuation_count == 0
+
+
+@pytest.mark.parametrize(
+    ("terminal_error", "final_outcome", "failure_class"),
+    [
+        (TimeoutError("synthetic continuation timeout"), "timeout", "timeout"),
+        (CodexAppError("synthetic continuation failure"), "provider_failure", "native_runtime"),
+    ],
+)
+def test_verifier_continuation_failure_retains_first_turn_accounting(
+    tmp_path: Path,
+    terminal_error: BaseException,
+    final_outcome: str,
+    failure_class: str,
+) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+    candidate = PILOT.oracle_answer(b"r" * 32, fixture.id)
+
+    class FailingContinuationClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            del workspace, prompt
+            first = _verifier_turn(candidate, [_candidate_call("run_shell", candidate)])
+            callback = kwargs["continuation_callback"]
+            follow_up = callback(first, 240.0)
+            assert isinstance(follow_up, str)
+            raise terminal_error
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_started = PILOT.time.monotonic()
+    measurement = asyncio.run(
+        PILOT._measure_verifier(
+            FailingContinuationClient(),
+            fixture,
+            next(arm for arm in PILOT.VERIFIER_ARMS if arm.id == "evidence_repair"),
+            workspace,
+            PILOT._verifier_prompt(fixture),
+            candidate,
+            PILOT.MAX_WORKSPACE_BYTES,
+            0.0,
+            run_started,
+            run_started,
+            run_started,
+        )
+    )
+
+    assert measurement.first.outcome == "rejected_correct"
+    assert measurement.first.rejection_reason == "verifier_requires_fixed_observation"
+    assert measurement.final.outcome == final_outcome
+    assert measurement.failure_class == failure_class
+    assert measurement.repair_attempted is True
+    assert measurement.continuation_count == 1
+    assert measurement.first_tool_calls == 1
+    assert measurement.final_tool_calls == 0
+    assert measurement.cumulative_tool_calls == 1
+    assert measurement.first_native_usage == {
+        "status": "observed",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+    }
+    receipt = measurement.native_receipt
+    assert receipt["outcome"] == final_outcome
+    assert receipt["budget"]["granted_milliseconds"] == 300_000
+    assert receipt["budget"]["remaining_after_first_milliseconds"] == 240_000
+    assert 0 <= receipt["budget"]["remaining_terminal_milliseconds"] <= 240_000
+    spans = {span["stage"]: span for span in receipt["spans"]}
+    assert spans["first_turn"]["status"] == "completed"
+    assert spans["repair_turn"]["status"] == "failed"
+    assert receipt["tools"]["counts"] == {
+        "first_turn": 1,
+        "repair_turn": 0,
+        "cumulative": 1,
+        "by_stage": {
+            "successful": 1,
+            "arguments": 0,
+            "execution": 0,
+            "result": 0,
+            "untyped": 0,
+        },
+    }
+    assert receipt["usage"]["first"]["input_tokens"] == 10
+    assert receipt["usage"]["final"] == {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+    }
+    assert set(receipt["usage"]["repair_delta_status"].values()) == {"incomplete"}
+
+
+def test_specialist_unverifiable_is_integrated_as_inconclusive_native_receipt(
+    tmp_path: Path,
+) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+
+    class InvalidSolverClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            del workspace, prompt, kwargs
+            return SimpleNamespace(
+                status="completed",
+                timed_out=False,
+                failure_class=None,
+                text="not-json",
+                tool_calls=[],
+                raw={"id": "turn-1", "status": "completed"},
+                cumulative_native_usage={
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cached_input_tokens": None,
+                    "reasoning_tokens": 1,
+                },
+            )
+
+    workspace = tmp_path / "specialist-inconclusive"
+    workspace.mkdir()
+    started = PILOT.time.monotonic()
+    measurement = asyncio.run(
+        PILOT._measure(
+            InvalidSolverClient(),
+            fixture,
+            PILOT.ARMS[0],
+            workspace,
+            PILOT._specialist_prompt(fixture),
+            "unused-private-answer",
+            PILOT.MAX_WORKSPACE_BYTES,
+            0.0,
+            started,
+            started,
+            started,
+        )
+    )
+
+    assert measurement.outcome == "unverifiable"
+    assert measurement.native_receipt["outcome"] == "inconclusive"
+    assert measurement.native_receipt["usage"]["accounted"] == {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "cached_input_tokens": None,
+        "reasoning_tokens": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_outcome"),
+    [
+        ("no_candidate", "no_candidate"),
+        ("solver_output", "solver_output"),
+        ("rejected_correct", "rejected_correct"),
+        ("rejected_wrong", "rejected_wrong"),
+    ],
+)
+def test_verifier_nonterminal_results_are_integrated_as_inconclusive_native_receipts(
+    tmp_path: Path,
+    case: str,
+    expected_outcome: str,
+) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+    expected = PILOT.oracle_answer(b"i" * 32, fixture.id)
+    wrong = PILOT.oracle_answer(b"w" * 32, fixture.id)
+
+    class InconclusiveVerifierClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            del workspace, prompt, kwargs
+            if case == "solver_output":
+                text = "not-json"
+            elif case == "no_candidate":
+                text = json.dumps(
+                    {
+                        "status": "unsolved",
+                        "candidate": None,
+                        "confidence": 0.0,
+                        "summary": "no supported candidate",
+                        "evidence": [],
+                        "next_steps": [],
+                    }
+                )
+            else:
+                candidate = expected if case == "rejected_correct" else wrong
+                text = json.dumps(
+                    {
+                        "status": "candidate",
+                        "candidate": candidate,
+                        "confidence": 1.0,
+                        "summary": "candidate lacks a fixed observation",
+                        "evidence": ["model claim only"],
+                        "next_steps": [],
+                    }
+                )
+            return SimpleNamespace(
+                status="completed",
+                timed_out=False,
+                failure_class=None,
+                text=text,
+                tool_calls=[],
+                current_turn_tool_calls=[],
+                raw={"id": "turn-1", "status": "completed"},
+                cumulative_native_usage=None,
+                thread_id="thread-verifier",
+            )
+
+    workspace = tmp_path / case
+    workspace.mkdir()
+    started = PILOT.time.monotonic()
+    measurement = asyncio.run(
+        PILOT._measure_verifier(
+            InconclusiveVerifierClient(),
+            fixture,
+            PILOT.VERIFIER_ARMS[0],
+            workspace,
+            PILOT._verifier_prompt(fixture),
+            expected,
+            PILOT.MAX_WORKSPACE_BYTES,
+            0.0,
+            started,
+            started,
+            started,
+        )
+    )
+
+    assert measurement.final.outcome == expected_outcome
+    assert measurement.native_receipt["outcome"] == "inconclusive"
+
+
+def test_cancelled_native_turn_retains_complete_receipt_while_reraising(tmp_path: Path) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+
+    class CancelClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            del workspace, prompt, kwargs
+            error = asyncio.CancelledError()
+            error.result = SimpleNamespace(
+                tool_calls=[
+                    {
+                        "name": "run_shell",
+                        "success": True,
+                        "duration_milliseconds": 17,
+                    }
+                ],
+                cumulative_native_usage={
+                    "input_tokens": 14,
+                    "output_tokens": 4,
+                    "cached_input_tokens": 3,
+                    "reasoning_tokens": None,
+                },
+            )
+            raise error
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_started = PILOT.time.monotonic()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(
+            PILOT._measure(
+                CancelClient(),
+                fixture,
+                PILOT.ARMS[0],
+                workspace,
+                PILOT._specialist_prompt(fixture),
+                "unused-private-answer",
+                PILOT.MAX_WORKSPACE_BYTES,
+                0.0,
+                run_started,
+                run_started,
+                run_started,
+            )
+        )
+    receipt = caught.value.native_receipt
+    assert receipt["outcome"] == "cancelled"
+    assert receipt["attempt"] == {"task_id": fixture.id, "arm_id": PILOT.ARMS[0].id}
+    assert receipt["usage"]["accounted"] == {
+        "input_tokens": 14,
+        "output_tokens": 4,
+        "cached_input_tokens": 3,
+        "reasoning_tokens": None,
+    }
+    assert receipt["tools"]["successful_call_timing"] == {
+        "observed_call_count": 1,
+        "missing_call_count": 0,
+        "observed_total_milliseconds": 17,
+        "total_milliseconds": 17,
+    }
+
+
+def test_cancelled_verifier_repair_retains_cumulative_usage_and_call_timing(
+    tmp_path: Path,
+) -> None:
+    fixture = PILOT.fixture_catalogue()[0]
+    candidate = PILOT.oracle_answer(b"c" * 32, fixture.id)
+
+    class CancelRepairClient:
+        async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
+            del workspace, prompt
+            first_call = _candidate_call("run_shell", candidate)
+            first = _verifier_turn(candidate, [first_call])
+            callback = kwargs["continuation_callback"]
+            assert isinstance(callback(first, 240.0), str)
+            error = asyncio.CancelledError()
+            error.result = SimpleNamespace(
+                tool_calls=[
+                    first_call,
+                    {
+                        "name": "read_text",
+                        "success": True,
+                        "duration_milliseconds": 19,
+                    },
+                ],
+                cumulative_native_usage={
+                    "input_tokens": 15,
+                    "output_tokens": 3,
+                    "cached_input_tokens": None,
+                    "reasoning_tokens": None,
+                },
+            )
+            raise error
+
+    workspace = tmp_path / "cancelled-repair"
+    workspace.mkdir()
+    started = PILOT.time.monotonic()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(
+            PILOT._measure_verifier(
+                CancelRepairClient(),
+                fixture,
+                PILOT.VERIFIER_ARMS[1],
+                workspace,
+                PILOT._verifier_prompt(fixture),
+                candidate,
+                PILOT.MAX_WORKSPACE_BYTES,
+                0.0,
+                started,
+                started,
+                started,
+            )
+        )
+
+    receipt = caught.value.native_receipt
+    assert receipt["outcome"] == "cancelled"
+    assert receipt["usage"]["first"]["input_tokens"] == 10
+    assert receipt["usage"]["final"]["input_tokens"] == 15
+    assert receipt["usage"]["repair_delta"]["input_tokens"] == 5
+    assert receipt["tools"]["successful_call_timing"] == {
+        "observed_call_count": 1,
+        "missing_call_count": 1,
+        "observed_total_milliseconds": 19,
+        "total_milliseconds": None,
+    }
 
 
 def test_parser_preserves_model_comparison_as_default() -> None:

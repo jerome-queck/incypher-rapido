@@ -132,6 +132,11 @@ no-socket controller/state scenarios through scripted Board method shapes. Its a
 and separately labelled real-clock soak are reliability evidence, never H24 correctness or
 real-target success.
 
+The [native usage and span receipt contract](notes/research/native-usage-spans.md) records nullable
+provider usage, cumulative repair deltas, correlated monotonic intervals, fair budgets and closed
+argument-repair outcomes. It is receipt-only observability: no metric feeds model prompts, routing,
+proof acceptance or live control.
+
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
 `submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200

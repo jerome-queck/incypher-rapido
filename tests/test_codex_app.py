@@ -1101,6 +1101,95 @@ async def test_solve_continuation_reuses_one_thread_and_one_cumulative_deadline(
 
 
 @run_async
+async def test_usage_notification_is_exact_turn_scoped_and_cumulative_across_continuation(
+    tmp_path: Path,
+) -> None:
+    class UsageProcess(FakeProcess):
+        client: CodexAppClient | None = None
+
+        async def _complete_turn(self, thread_id: str, turn_id: str) -> None:
+            assert self.client is not None
+            while (thread_id, turn_id) not in self.client._thread_turns:
+                await asyncio.sleep(0)
+            ordinal = int(turn_id.rsplit("-", 1)[1])
+
+            def breakdown(multiplier: int) -> dict[str, int]:
+                return {
+                    "inputTokens": 10 * multiplier,
+                    "cachedInputTokens": 2 * multiplier,
+                    "outputTokens": 3 * multiplier,
+                    "reasoningOutputTokens": 1 * multiplier,
+                    "totalTokens": 16 * multiplier,
+                }
+
+            # Same-thread but wrong-turn telemetry must not attach to the active turn.
+            await self.stdout.push(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": "wrong-turn",
+                        "tokenUsage": {"last": breakdown(99), "total": breakdown(99)},
+                    },
+                }
+            )
+            await self.stdout.push(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "tokenUsage": {
+                            "last": breakdown(1),
+                            "total": breakdown(ordinal),
+                            "modelContextWindow": 200_000,
+                        },
+                    },
+                }
+            )
+            await super()._complete_turn(thread_id, turn_id)
+
+    process = UsageProcess()
+    workspace = tmp_path / "usage"
+    workspace.mkdir()
+    client = make_client(process, tmp_path)
+    process.client = client
+    await client.start()
+    snapshots: list[dict[str, int | None] | None] = []
+
+    def continue_once(result: TurnResult, _remaining: float | None) -> str | None:
+        snapshots.append(result.cumulative_native_usage)
+        return "repair" if len(snapshots) == 1 else None
+
+    result = await client.solve(
+        workspace,
+        "initial",
+        tool_registry=ToolStub(workspace),
+        continuation_callback=continue_once,
+    )
+
+    assert snapshots == [
+        {
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "cached_input_tokens": 2,
+            "reasoning_tokens": 1,
+        },
+        {
+            "input_tokens": 20,
+            "output_tokens": 6,
+            "cached_input_tokens": 4,
+            "reasoning_tokens": 2,
+        },
+    ]
+    assert result.cumulative_native_usage == snapshots[-1]
+    assert set(result.raw) == {"id", "status", "threadId"}
+    assert "tokenUsage" not in result.raw
+    assert all("tokenUsage" not in item.get("params", {}) for item in process.stdin.writes)
+    await client.close()
+
+
+@run_async
 async def test_thread_rejects_cross_workspace_tool_registry(
     fake_process: FakeProcess, tmp_path: Path
 ) -> None:
@@ -1284,6 +1373,9 @@ async def test_tool_call_and_structured_tool_error(
     assert len(state.tool_calls) == 2
     assert all(isinstance(call["host_observation"], HostObservation) for call in state.tool_calls)
     assert state.tool_calls[0]["host_observation"].success is True
+    assert state.tool_calls[0]["duration_milliseconds"] >= 0
+    assert "duration_milliseconds" not in state.tool_calls[0]["host_observation"].facts
+    assert "duration_milliseconds" not in json.dumps(responses[90], sort_keys=True)
     assert state.tool_calls[1]["host_observation"].success is False
     assert state.tool_calls[1]["host_observation"].facts["error_code"] == "internal_error"
     assert state.tool_calls[1]["host_observation"].facts["retryable"] is False
@@ -2536,6 +2628,37 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
     tool_response = await wait_for_response(fake_process, 991)
     assert "result" in tool_response, tool_response
     assert tool_response["result"]["success"] is True
+    await fake_process.stdout.push(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "cancelled-turn",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 8,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 3,
+                        "reasoningOutputTokens": 1,
+                        "totalTokens": 14,
+                    },
+                    "total": {
+                        "inputTokens": 8,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 3,
+                        "reasoningOutputTokens": 1,
+                        "totalTokens": 14,
+                    },
+                },
+            },
+        }
+    )
+
+    async def wait_for_usage_projection() -> None:
+        while client._turns["cancelled-turn"].cumulative_native_usage is None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_usage_projection(), 1)
 
     running.cancel()
     with pytest.raises(asyncio.CancelledError) as caught:
@@ -2547,6 +2670,7 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
     assert set(call) == {
         "candidate_sha256s",
         "candidate_sensitive",
+        "duration_milliseconds",
         "host_observation",
         "name",
         "source_bound",
@@ -2555,6 +2679,14 @@ async def test_turn_cancellation_retains_only_completed_sanitized_tool_evidence(
     }
     assert isinstance(call["host_observation"], HostObservation)
     assert call["host_observation"].tool == "decode_hex"
+    assert type(call["duration_milliseconds"]) is int
+    assert call["duration_milliseconds"] >= 0
+    assert retained.cumulative_native_usage == {
+        "input_tokens": 8,
+        "output_tokens": 3,
+        "cached_input_tokens": 2,
+        "reasoning_tokens": 1,
+    }
     assert "sensitive-raw-payload" not in repr(retained)
     assert not hasattr(retained, "raw")
     await client.close()
