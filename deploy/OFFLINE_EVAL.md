@@ -22,13 +22,19 @@ temporary directory. The wrapper deletes installed `.pyc`/`.pyo` files and empty
 directories as root. The supervisor permits only the exact tracked directory and regular `.py`
 file set: extra bytecode, extensions, metadata, links, devices, missing files, or changed bytes all
 fail. It byte-compares the artifacts with the validated clean repository, then removes the exact
-probe ID and its anonymous
-volumes in `finally`. The probe is owned only after create returns a validated full Docker ID; a
-name race, failed create, or malformed ID cannot authorize removal. Image-provided code is never
-executed during this check. Descriptor
+probe ID and its anonymous volumes in `finally`. Before create, the supervisor generates a private
+cryptographically random ownership label. It inventories that exact label after every create,
+including errors and timeouts, and adopts exactly one full-ID container only after its immutable
+label, role, name, image, user and bind-mount intent match. Zero, multiple or mismatched candidates
+fail closed; every discovered owned ID is removed by exact ID. A rename or unrelated same-name
+replacement is never cleanup authority. Image-provided code is never executed during this check.
+Descriptor
 preflight is a separate fixed-argv mode: it mounts no seed/oracle, requests only the frozen
 Daybreak/xhigh catalogue descriptors, and emits an allowlisted receipt. The H24 runner must expose
 `--descriptor-preflight` and `--output-file`; these are the intentionally narrow integration seam.
+That private receipt binds the exact preregistration hash, observed and declared source SHA,
+declared and observed image ID, and both frozen descriptors. Execute validates and consumes that
+exact binding before creating any scored container.
 
 ## Private paths
 
@@ -36,7 +42,13 @@ Prepare disjoint private paths outside the repository. Authentication, fresh wor
 mode `0700`; `auth.json` and the fresh oracle seed are mode `0600`; owner is UID 10001. The auth
 home must contain no `config.toml`, `config.json`, or `mcp.json`. Work and output begin empty. The
 supervisor refuses a Board/token environment, an existing evaluation name, or another container
-mounting the auth home. It creates a nonblocking auth lease and preserves auth.
+mounting the auth home. It creates a nonblocking auth lease and preserves auth. A private baseline
+pins the auth directory identity, owner and mode and the original `auth.json` key set. Post-run,
+the directory must be unchanged; `auth.json` must be a nonempty valid JSON regular non-symlink,
+UID-10001 mode-0600 single-link file containing every original key; capability files must remain
+absent. Atomic credential refresh is therefore allowed, while replacement by links, permission or
+ownership drift, truncation, invalid JSON and key loss fail closed. No auth value or digest is
+published.
 
 Raw child receipts and Docker logs stay mode `0600` under private output. The public supervisor
 receipt contains no host paths, container IDs, raw Docker output, seed/candidate/digest material,
@@ -52,9 +64,16 @@ Board or target network authority. The benign soak has one CPU, 2 GiB, 64 PIDs a
 `none`. Total allocation remains within the registered 12-CPU/~24-GiB host envelope.
 
 Both containers are read-only, use only a noexec/nosuid/nodev `/tmp`, drop every capability, set
-no-new-privileges, omit `--init`, and use a 190-second stop grace. H24 mounts writable auth, fresh
+no-new-privileges, omit `--init`, explicitly run as `10001:10001`, and use a 190-second stop grace.
+The supervisor also rejects an image whose configured user is not exactly `10001:10001`. H24
+mounts writable auth, fresh
 work and private output plus read-only seed/protocol. The soak mounts only private output and the
 read-only protocol. Neither receives a repository or Board environment.
+
+The same private ownership label reconciliation and immutable intent validation applies to H24,
+soak and descriptor preflight creates. All start, state inspection, sampling, stop, log, removal and
+absence checks use their captured full IDs. Container names are collision prechecks and human
+labels only, never lifecycle or cleanup authority; ownership labels and IDs stay private.
 
 Resource sampling targets each barrier-relative five-second cadence point and retains peak CPU,
 RSS, PID and OOM observations; unavailable fields stay null. The recorded interval is the actual
@@ -64,7 +83,7 @@ the frozen ten-second maximum fails its independent gate. H24 completion starts 
 and the scoring phase remains open until the exact
 common deadline even when both workers finish early. The deadline starts one 190-second cleanup
 window. Workers may drain naturally for 180 seconds; only containers still running at that boundary
-receive an immediate stop. The remaining outer grace covers inspection, logs, exact-name removal,
+receive an immediate stop. The remaining outer grace covers inspection, logs, exact-ID removal,
 private cleanup, and evidence persistence. Both exit codes, private receipts, failures and raw logs
 are retained. Container absence and auth preservation are verified.
 

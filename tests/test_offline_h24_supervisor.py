@@ -33,6 +33,9 @@ SOURCE_SHA = "1" * 40
 TREE_SHA = "2" * 40
 IMAGE_ID = "sha256:" + "3" * 64
 PROBE_ID = "4" * 64
+H24_ID = "5" * 64
+SOAK_ID = "6" * 64
+DESCRIPTOR_ID = "7" * 64
 
 
 def _private_directory(path: Path) -> Path:
@@ -84,7 +87,7 @@ def _protocol_files(tmp_path: Path) -> tuple[Any, Path, Path]:
 def _paths(tmp_path: Path, preregistration: Path, registration: Path) -> Any:
     repository = _private_directory(tmp_path / "repository")
     auth = _private_directory(tmp_path / "auth")
-    _private_file(auth / "auth.json", b"{}")
+    _private_file(auth / "auth.json", b'{"tokens":{}}')
     work = _private_directory(tmp_path / "work")
     output = _private_directory(tmp_path / "output")
     seed = _private_file(tmp_path / "seed", b"s" * 32)
@@ -133,6 +136,15 @@ class DockerFake:
         self.command_times: list[tuple[tuple[str, ...], float]] = []
         self.existing: set[str] = set()
         self.running: set[str] = set()
+        self.names: dict[str, str] = {}
+        self.configs: dict[str, dict[str, object]] = {}
+
+    def _id_for_name(self, name: str) -> str:
+        return {
+            SUPERVISOR._H24_NAME: H24_ID,
+            SUPERVISOR._SOAK_NAME: SOAK_ID,
+            f"{SUPERVISOR._H24_NAME}-descriptor": DESCRIPTOR_ID,
+        }[name]
 
     def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
         del timeout
@@ -141,44 +153,98 @@ class DockerFake:
         self.command_times.append((command, self.clock.monotonic() if self.clock else -1.0))
         if command[:3] == ("docker", "ps", "--all") and "--quiet" not in command:
             name = command[command.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
-            return SUPERVISOR.CommandResult(0, f"{name}\n" if name in self.existing else "")
+            matches = [container_id for container_id, value in self.names.items() if value == name]
+            return SUPERVISOR.CommandResult(0, f"{name}\n" if matches else "")
         if command == ("docker", "ps", "--all", "--quiet"):
-            return SUPERVISOR.CommandResult(0, "")
+            return SUPERVISOR.CommandResult(0, "\n".join(sorted(self.existing)))
+        if command[:5] == ("docker", "ps", "--all", "--quiet", "--no-trunc"):
+            filter_value = command[command.index("--filter") + 1]
+            if filter_value.startswith("label="):
+                key, expected = filter_value.removeprefix("label=").split("=", 1)
+                matches = [
+                    container_id
+                    for container_id in self.existing
+                    if self.configs[container_id]["labels"].get(key) == expected
+                ]
+            else:
+                expected = filter_value.removeprefix("id=")
+                matches = [value for value in self.existing if value == expected]
+            return SUPERVISOR.CommandResult(0, "\n".join(sorted(matches)))
         if command[:2] == ("docker", "create"):
             name = command[command.index("--name") + 1]
-            self.existing.add(name)
-            return SUPERVISOR.CommandResult(0, "created\n")
+            container_id = self._id_for_name(name)
+            labels: dict[str, str] = {}
+            for index, value in enumerate(command):
+                if value == "--label":
+                    key, label_value = command[index + 1].split("=", 1)
+                    labels[key] = label_value
+            mounts: list[dict[str, object]] = []
+            for index, value in enumerate(command):
+                if value != "--mount":
+                    continue
+                fields = dict(
+                    item.split("=", 1) if "=" in item else (item, "")
+                    for item in command[index + 1].split(",")
+                )
+                mounts.append(
+                    {
+                        "Type": fields["type"],
+                        "Source": fields["src"],
+                        "Destination": fields["dst"],
+                        "RW": "readonly" not in fields,
+                    }
+                )
+            self.existing.add(container_id)
+            self.names[container_id] = name
+            self.configs[container_id] = {"labels": labels, "mounts": mounts}
+            return SUPERVISOR.CommandResult(0, f"{container_id}\n")
         if command[:2] == ("docker", "start") and "--attach" not in command:
             self.running.update(command[2:])
             return SUPERVISOR.CommandResult(0, "started\n")
         if command[:2] == ("docker", "stats"):
+            container_ids = command[command.index("--format={{json .}}") + 1 :]
             rows = [
                 json.dumps(
                     {
-                        "Name": name,
+                        "ID": container_id,
+                        "Name": self.names[container_id],
                         "CPUPerc": "125.5%",
                         "MemUsage": "256MiB / 20GiB",
                         "PIDs": "17",
                     }
                 )
-                for name in command[4:]
+                for container_id in container_ids
             ]
             return SUPERVISOR.CommandResult(0, "\n".join(rows))
         if command[:3] == ("docker", "container", "inspect"):
-            name = command[-1]
-            running = name in self.running
-            if (name.endswith("eval") and not self.keep_h24_running) or (
-                name.endswith("soak") and not self.keep_soak_running
+            container_id = command[-1]
+            name = self.names[container_id]
+            running = container_id in self.running
+            if (container_id == H24_ID and not self.keep_h24_running) or (
+                container_id == SOAK_ID and not self.keep_soak_running
             ):
                 running = False
-                self.running.discard(name)
+                self.running.discard(container_id)
+            state = {
+                "Running": running,
+                "ExitCode": 0,
+                "OOMKilled": self.oom and name.endswith("eval"),
+            }
+            if command[3] == "--format={{json .State}}":
+                return SUPERVISOR.CommandResult(0, json.dumps(state))
             return SUPERVISOR.CommandResult(
                 0,
                 json.dumps(
                     {
-                        "Running": running,
-                        "ExitCode": 0,
-                        "OOMKilled": self.oom and name.endswith("eval"),
+                        "Id": container_id,
+                        "Name": f"/{name}",
+                        "Image": IMAGE_ID,
+                        "Config": {
+                            "User": SUPERVISOR.CONTAINER_USER,
+                            "Labels": self.configs[container_id]["labels"],
+                        },
+                        "State": state,
+                        "Mounts": self.configs[container_id]["mounts"],
                     }
                 ),
             )
@@ -188,13 +254,43 @@ class DockerFake:
         if command[:2] == ("docker", "logs"):
             return SUPERVISOR.CommandResult(0, "private raw child log\n")
         if command[:2] == ("docker", "rm"):
-            self.existing.discard(command[-1])
-            self.running.discard(command[-1])
+            container_id = command[-1]
+            self.existing.discard(container_id)
+            self.running.discard(container_id)
             return SUPERVISOR.CommandResult(0, "removed\n")
         raise AssertionError(command)
 
 
-def _seed_child_receipts(output: Path) -> None:
+def _seed_descriptor_receipt(output: Path, protocol: Any) -> None:
+    value = {
+        "schema": SUPERVISOR.DESCRIPTOR_SCHEMA,
+        "preregistration_sha256": preregistration_sha256(protocol.preregistration),
+        "source": {
+            "observed": {
+                "head_sha": protocol.source_sha,
+                "worktree": "packaged_source",
+                "tracked_change_count": None,
+                "untracked_file_count": None,
+            },
+            "declared": {"sha": protocol.source_sha},
+            "declared_matches_head": True,
+            "identity_basis": "sealed_metadata_file",
+        },
+        "image": {
+            "observed": {"id": protocol.image_id},
+            "declared": {"id": protocol.image_id},
+            "declared_matches_observed": True,
+        },
+        "descriptors": protocol.preregistration["descriptor_preflight"],
+        "matched": True,
+    }
+    path = output / SUPERVISOR.DESCRIPTOR_RECEIPT
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+
+
+def _seed_child_receipts(output: Path, protocol: Any) -> None:
+    _seed_descriptor_receipt(output, protocol)
     for name, schema in (
         (SUPERVISOR.H24_RECEIPT, "rapido-offline-h24-pilot-v1"),
         (SUPERVISOR.SOAK_RECEIPT, "rapido-benign-board-contract-v1"),
@@ -251,15 +347,20 @@ def test_wrapper_dockerfile_is_separate_pinned_and_minimal() -> None:
 def test_fixed_argv_boundaries_and_resources(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
-    h24 = SUPERVISOR.h24_create_argv(protocol, paths)
-    soak = SUPERVISOR.soak_create_argv(protocol, paths)
-    descriptor = SUPERVISOR.descriptor_preflight_argv(protocol, paths)
+    ownership_token = "a" * 64
+    h24 = SUPERVISOR.h24_create_argv(protocol, paths, ownership_token=ownership_token)
+    soak = SUPERVISOR.soak_create_argv(protocol, paths, ownership_token=ownership_token)
+    descriptor = SUPERVISOR.descriptor_preflight_argv(
+        protocol, paths, ownership_token=ownership_token
+    )
 
     for argv in (h24, soak, descriptor):
         assert "--init" not in argv
         assert "--read-only" in argv
         assert "--cap-drop=ALL" in argv
         assert "--security-opt=no-new-privileges:true" in argv
+        assert argv[argv.index("--user") + 1] == "10001:10001"
+        assert argv[argv.index("--label") + 1].endswith(ownership_token)
         assert argv[argv.index("--stop-timeout") + 1] == "190"
         assert "--h24-preregistration-file" in argv or "board_contract_soak.py" in " ".join(argv)
         assert not any("CTFD" in item or "TEAM_KEY" in item for item in argv)
@@ -350,10 +451,11 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
                     "Os": "linux",
                     "Architecture": "arm64",
                     "Config": {
+                        "User": "10001:10001",
                         "Labels": {
                             "org.opencontainers.image.revision": SOURCE_SHA,
                             "io.incypher.rapido.source-revision": SOURCE_SHA,
-                        }
+                        },
                     },
                 }
             ),
@@ -377,6 +479,14 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
         SUPERVISOR.inspect_image(protocol, wrong_platform)
 
+    def wrong_user(argv: Any, *, timeout: float | None = None) -> Any:
+        value = json.loads(runner(argv, timeout=timeout).stdout)
+        value["Config"]["User"] = "0:0"
+        return SUPERVISOR.CommandResult(0, json.dumps(value))
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
+        SUPERVISOR.inspect_image(protocol, wrong_user)
+
 
 def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     tmp_path: Path,
@@ -398,6 +508,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             self.create_fails = create_fails
             self.malformed_id = malformed_id
             self.existing = False
+            self.labels: dict[str, str] = {}
             self.commands: list[tuple[str, ...]] = []
 
         def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
@@ -410,21 +521,39 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 )
                 return SUPERVISOR.CommandResult(0, "\0".join(tracked) + "\0")
             if command[:3] == ("docker", "ps", "--all"):
-                filter_value = command[command.index("--filter") + 1]
-                value = (
-                    PROBE_ID if filter_value.startswith("id=") else SUPERVISOR._SOURCE_PROBE_NAME
-                )
+                value = PROBE_ID if "--quiet" in command else SUPERVISOR._SOURCE_PROBE_NAME
                 return SUPERVISOR.CommandResult(
                     0,
                     f"{value}\n" if self.existing else "",
                 )
             if command[:2] == ("docker", "create"):
-                self.existing = True
                 if self.create_fails:
                     return SUPERVISOR.CommandResult(1, "")
+                self.existing = True
+                for index, value in enumerate(command):
+                    if value == "--label":
+                        key, label_value = command[index + 1].split("=", 1)
+                        self.labels[key] = label_value
                 return SUPERVISOR.CommandResult(
                     0,
                     "malformed\n" if self.malformed_id else f"{PROBE_ID}\n",
+                )
+            if command[:3] == ("docker", "container", "inspect"):
+                return SUPERVISOR.CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "Id": PROBE_ID,
+                            "Name": f"/{SUPERVISOR._SOURCE_PROBE_NAME}",
+                            "Image": IMAGE_ID,
+                            "Config": {
+                                "User": SUPERVISOR.CONTAINER_USER,
+                                "Labels": self.labels,
+                            },
+                            "State": {"Running": False},
+                            "Mounts": [],
+                        }
+                    ),
                 )
             if command[:2] == ("docker", "cp"):
                 source = command[2]
@@ -498,7 +627,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             removal_failure,
         )
 
-    for unsafe in (SourceProbeFake(create_fails=True), SourceProbeFake(malformed_id=True)):
+    for unsafe in (SourceProbeFake(create_fails=True),):
         with pytest.raises(
             SUPERVISOR.SupervisorError,
             match="image_source_probe_create|image_source_probe_identity",
@@ -510,6 +639,9 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 unsafe,
             )
         assert not any(command[:2] == ("docker", "rm") for command in unsafe.commands)
+    reconciled = SourceProbeFake(malformed_id=True)
+    SUPERVISOR.verify_image_source(protocol, ROOT, paths.output, reconciled)
+    assert reconciled.existing is False
     assert not any(path.name.startswith(".rapido-image-source-") for path in paths.output.iterdir())
 
 
@@ -531,14 +663,14 @@ def test_host_budget_enforces_registered_envelope() -> None:
 def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     runner = DockerFake(paths.output)
     clock = FakeClock()
     receipt = SUPERVISOR.run_evaluation(protocol, paths, runner=runner, clock=clock, finalize=False)
 
     assert receipt["status"] == "completed"
     starts = [command for command in runner.commands if command[:2] == ("docker", "start")]
-    assert starts == [("docker", "start", protocol.h24_name, protocol.soak_name)]
+    assert starts == [("docker", "start", H24_ID, SOAK_ID)]
     creates = [command for command in runner.commands if command[:2] == ("docker", "create")]
     barriers = {command[command.index("--start-at-unix-ms") + 1] for command in creates}
     assert len(barriers) == 1
@@ -566,11 +698,223 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths.output.iterdir())
 
 
+def test_evaluation_tracks_exact_ids_and_does_not_remove_name_replacements(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    replacements = {"8" * 64, "9" * 64}
+
+    class ReplacementFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            if command == ("docker", "start", H24_ID, SOAK_ID):
+                for original, replacement in zip(
+                    (H24_ID, SOAK_ID), sorted(replacements), strict=True
+                ):
+                    expected_name = self.names[original]
+                    self.names[original] = f"{expected_name}-renamed"
+                    self.existing.add(replacement)
+                    self.names[replacement] = expected_name
+                    self.configs[replacement] = self.configs[original]
+            return super().__call__(command, timeout=timeout)
+
+    runner = ReplacementFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "completed"
+    assert receipt["cleanup"]["no_orphan_containers"] is True
+    assert runner.existing == replacements
+    removed = {
+        command[-1] for command in runner.commands if command[:3] == ("docker", "rm", "--volumes")
+    }
+    assert removed == {H24_ID, SOAK_ID}
+
+
+def test_timed_out_create_is_reconciled_by_private_label_and_exact_intent(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class TimedOutCreateFake(DockerFake):
+        timed_out = False
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.timed_out:
+                self.timed_out = True
+                return SUPERVISOR.CommandResult(124)
+            return result
+
+    runner = TimedOutCreateFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "completed"
+    assert runner.existing == set()
+    assert ("docker", "start", H24_ID, SOAK_ID) in runner.commands
+    assert ("docker", "rm", "--volumes", H24_ID) in runner.commands
+
+
+def test_ambiguous_owned_create_fails_closed_and_cleans_every_exact_id(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    second_id = "a" * 64
+
+    class AmbiguousCreateFake(DockerFake):
+        injected = False
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.injected:
+                self.injected = True
+                self.existing.add(second_id)
+                self.names[second_id] = self.names[H24_ID]
+                self.configs[second_id] = self.configs[H24_ID]
+            return result
+
+    runner = AmbiguousCreateFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_create_ambiguous"
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+    removed = {
+        command[-1] for command in runner.commands if command[:3] == ("docker", "rm", "--volumes")
+    }
+    assert removed == {H24_ID, second_id}
+
+
+def test_reconciled_create_rejects_mount_drift_before_start_and_cleans_exact_id(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class MountDriftFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+                and command[-1] == H24_ID
+            ):
+                value = json.loads(result.stdout)
+                value["Mounts"][0]["Source"] = "/unexpected"
+                return SUPERVISOR.CommandResult(0, json.dumps(value))
+            return result
+
+    runner = MountDriftFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+
+
+def test_auth_integrity_rejects_structural_corruption_but_allows_safe_rotation(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+
+    def execute(root: Path, mutation: str) -> dict[str, object]:
+        paths = _paths(root, preregistration, registration)
+        _seed_child_receipts(paths.output, protocol)
+
+        class AuthMutationFake(DockerFake):
+            mutated = False
+
+            def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+                command = tuple(argv)
+                if command[:2] == ("docker", "start") and not self.mutated:
+                    self.mutated = True
+                    auth_file = paths.auth / "auth.json"
+                    if mutation == "symlink":
+                        replacement = paths.auth / "replacement.json"
+                        replacement.write_text('{"tokens":{},"refreshed":true}')
+                        replacement.chmod(0o600)
+                        auth_file.unlink()
+                        auth_file.symlink_to(replacement)
+                    elif mutation == "mode":
+                        auth_file.chmod(0o644)
+                    elif mutation == "hardlink":
+                        os.link(auth_file, paths.auth / "second-link.json")
+                    elif mutation == "invalid_json":
+                        auth_file.write_text("{")
+                    elif mutation == "key_loss":
+                        auth_file.write_text('{"refreshed":true}')
+                    elif mutation == "capability":
+                        (paths.auth / "config.toml").write_text("enabled = true")
+                    else:
+                        replacement = paths.auth / "replacement.json"
+                        replacement.write_text('{"tokens":{},"refreshed":true}')
+                        replacement.chmod(0o600)
+                        os.replace(replacement, auth_file)
+                return super().__call__(command, timeout=timeout)
+
+        return SUPERVISOR.run_evaluation(
+            protocol,
+            paths,
+            runner=AuthMutationFake(paths.output),
+            clock=FakeClock(),
+            finalize=False,
+        )
+
+    for mutation in ("symlink", "mode", "hardlink", "invalid_json", "key_loss", "capability"):
+        corrupt_root = tmp_path / mutation
+        corrupt_root.mkdir()
+        corrupted = execute(corrupt_root, mutation)
+        assert corrupted["status"] == "failed"
+        assert corrupted["failure_class"] == "auth_integrity"
+        assert corrupted["cleanup"]["auth_preserved"] is False
+
+    rotation_root = tmp_path / "rotation"
+    rotation_root.mkdir()
+    rotated = execute(rotation_root, "rotation")
+    assert rotated["status"] == "completed"
+    assert rotated["cleanup"]["auth_preserved"] is True
+
+
 def test_resource_cadence_uses_measured_gap_and_terminal_coverage(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=20, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     receipt = SUPERVISOR.run_evaluation(
         protocol,
         paths,
@@ -589,7 +933,7 @@ def test_resource_cadence_uses_measured_gap_and_terminal_coverage(tmp_path: Path
     early_root = tmp_path / "early"
     early_root.mkdir()
     early_paths = _paths(early_root, preregistration, registration)
-    _seed_child_receipts(early_paths.output)
+    _seed_child_receipts(early_paths.output, protocol)
     early = SUPERVISOR.run_evaluation(
         protocol,
         early_paths,
@@ -607,7 +951,7 @@ def test_slow_stats_records_over_max_gap_instead_of_nominal_cadence(tmp_path: Pa
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=30, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
 
     class SlowStats(DockerFake):
@@ -640,7 +984,7 @@ def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Pa
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
     runner = DockerFake(paths.output, keep_soak_running=True, clock=clock)
     SUPERVISOR.run_evaluation(protocol, paths, runner=runner, clock=clock, finalize=False)
@@ -650,7 +994,7 @@ def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Pa
         for command, timestamp in runner.command_times
         if command[:4] == ("docker", "stop", "--time", "0")
     ]
-    assert scoring_stops == [(("docker", "stop", "--time", "0", protocol.soak_name), 1_183.0)]
+    assert scoring_stops == [(("docker", "stop", "--time", "0", SOAK_ID), 1_183.0)]
     assert not any(
         command[:4] == ("docker", "stop", "--time", "190") for command in runner.commands
     )
@@ -668,7 +1012,7 @@ def test_late_sampling_consumes_registered_cleanup_grace(
 ) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
     offsets: list[int] = []
     blocking_calls: list[tuple[tuple[str, ...], float, float]] = []
@@ -683,10 +1027,9 @@ def test_late_sampling_consumes_registered_cleanup_grace(
             ):
                 assert timeout is not None and timeout > 0
                 blocking_calls.append((command, clock.monotonic(), timeout))
-            if command[:2] == ("docker", "stats") or command[:3] == (
-                "docker",
-                "container",
-                "inspect",
+            if command[:2] == ("docker", "stats") or (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .State}}"
             ):
                 clock.sleep(30)
             return super().__call__(command, timeout=timeout)
@@ -733,7 +1076,7 @@ def test_late_sampling_consumes_registered_cleanup_grace(
 def test_oom_and_child_failures_are_retained_not_dropped(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     runner = DockerFake(paths.output, oom=True)
     receipt = SUPERVISOR.run_evaluation(
         protocol, paths, runner=runner, clock=FakeClock(), finalize=False
@@ -747,11 +1090,12 @@ def test_oom_and_child_failures_are_retained_not_dropped(tmp_path: Path) -> None
 def test_public_receipt_excludes_paths_ids_raw_logs_and_secrets(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
+    runner = DockerFake(paths.output)
     receipt = SUPERVISOR.run_evaluation(
         protocol,
         paths,
-        runner=DockerFake(paths.output),
+        runner=runner,
         clock=FakeClock(),
         finalize=False,
     )
@@ -761,6 +1105,14 @@ def test_public_receipt_excludes_paths_ids_raw_logs_and_secrets(tmp_path: Path) 
     assert "candidate-value" not in encoded
     assert "CTFD_API_TOKEN" not in encoded
     assert "container_id" not in encoded
+    assert H24_ID not in encoded and SOAK_ID not in encoded
+    owner_labels = {
+        value.split("=", 1)[1]
+        for command in runner.commands
+        for value in command
+        if value.startswith(f"{SUPERVISOR._OWNER_LABEL}=")
+    }
+    assert owner_labels and all(value not in encoded for value in owner_labels)
     assert SOURCE_SHA in encoded and IMAGE_ID in encoded
 
 
@@ -799,19 +1151,9 @@ def test_descriptor_preflight_emits_only_frozen_closed_rows(
     class DescriptorFake(DockerFake):
         def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
             command = tuple(argv)
-            if command[:4] == ("docker", "start", "--attach", f"{protocol.h24_name}-descriptor"):
+            if command[:4] == ("docker", "start", "--attach", DESCRIPTOR_ID):
                 self.commands.append(command)
-                raw = {
-                    "schema": SUPERVISOR.DESCRIPTOR_SCHEMA,
-                    "preregistration_sha256": "public-binding",
-                    "source": {},
-                    "image": {},
-                    "descriptors": protocol.preregistration["descriptor_preflight"],
-                    "matched": True,
-                }
-                path = paths.output / SUPERVISOR.DESCRIPTOR_RECEIPT
-                path.write_text(json.dumps(raw))
-                path.chmod(0o600)
+                _seed_descriptor_receipt(paths.output, protocol)
                 return SUPERVISOR.CommandResult(0, "")
             return super().__call__(command, timeout=timeout)
 
@@ -828,6 +1170,104 @@ def test_descriptor_preflight_emits_only_frozen_closed_rows(
     assert "source" not in encoded_commands
     assert "image" not in encoded_commands
     assert "oracle" not in encoded_commands
+
+
+@pytest.mark.parametrize(
+    "binding",
+    ("preregistration", "source", "image", "descriptors"),
+)
+def test_execute_rejects_unbound_descriptor_receipt_before_docker_create(
+    tmp_path: Path,
+    binding: str,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    descriptor_path = paths.output / SUPERVISOR.DESCRIPTOR_RECEIPT
+    descriptor = json.loads(descriptor_path.read_text())
+    if binding == "preregistration":
+        descriptor["preregistration_sha256"] = "f" * 64
+    elif binding == "source":
+        descriptor["source"]["observed"]["head_sha"] = "f" * 40
+    elif binding == "image":
+        descriptor["image"]["observed"]["id"] = "sha256:" + "f" * 64
+    else:
+        descriptor["descriptors"][0]["returned_effort"] = "low"
+    descriptor_path.write_text(json.dumps(descriptor))
+
+    def no_docker(argv: Any, *, timeout: float | None = None) -> Any:
+        del argv, timeout
+        raise AssertionError("descriptor binding must fail before Docker access")
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="preflight_receipt"):
+        SUPERVISOR.run_evaluation(
+            protocol,
+            paths,
+            runner=no_docker,
+            clock=FakeClock(),
+            finalize=False,
+        )
+
+
+def test_descriptor_preflight_reconciles_timed_out_create_and_removes_exact_id(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+
+    class DescriptorTimeoutFake(DockerFake):
+        timed_out = False
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            if command == ("docker", "start", "--attach", DESCRIPTOR_ID):
+                self.commands.append(command)
+                _seed_descriptor_receipt(paths.output, protocol)
+                return SUPERVISOR.CommandResult(0, "")
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.timed_out:
+                self.timed_out = True
+                return SUPERVISOR.CommandResult(124)
+            return result
+
+    runner = DescriptorTimeoutFake(paths.output)
+    result = SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner)
+
+    assert result["status"] == "matched"
+    assert runner.existing == set()
+    assert ("docker", "rm", "--volumes", DESCRIPTOR_ID) in runner.commands
+
+
+def test_descriptor_preflight_rejects_ambiguous_create_and_cleans_all_owned_ids(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    second_id = "b" * 64
+
+    class DescriptorAmbiguousFake(DockerFake):
+        injected = False
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.injected:
+                self.injected = True
+                self.existing.add(second_id)
+                self.names[second_id] = self.names[DESCRIPTOR_ID]
+                self.configs[second_id] = self.configs[DESCRIPTOR_ID]
+            return result
+
+    runner = DescriptorAmbiguousFake(paths.output)
+    with pytest.raises(SUPERVISOR.SupervisorError, match="preflight_create_ambiguous"):
+        SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner)
+
+    assert runner.existing == set()
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    removed = {
+        command[-1] for command in runner.commands if command[:3] == ("docker", "rm", "--volumes")
+    }
+    assert removed == {DESCRIPTOR_ID, second_id}
 
 
 def test_finalizer_joins_sanitized_facts_and_writes_private_evaluation(
@@ -911,7 +1351,7 @@ def test_cleanup_span_includes_private_deletion_and_first_persistence_pass(
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
     observed: list[int] = []
     private_inputs_present: list[tuple[bool, bool]] = []
@@ -948,7 +1388,7 @@ def test_assembly_failure_preserves_private_inputs(
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
 
     def reject(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
         del args, kwargs
@@ -976,7 +1416,7 @@ def test_late_persistence_records_failed_cleanup_gate(
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
     observed: list[int] = []
 
@@ -1012,7 +1452,7 @@ def test_worker_drain_leaves_tail_inside_outer_cleanup_grace(
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
-    _seed_child_receipts(paths.output)
+    _seed_child_receipts(paths.output, protocol)
     clock = FakeClock()
     observed: list[int] = []
 

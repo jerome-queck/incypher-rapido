@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -31,6 +32,7 @@ from rapido.offline_h24_evaluation import (
     GLOBAL_SCORING_SECONDS,
     build_evaluation_receipt,
     evaluate_h24_receipt,
+    preregistration_sha256,
     validate_preregistration,
     validate_source_image_registration,
 )
@@ -47,6 +49,7 @@ WORKER_DRAIN_SECONDS = 180
 SAMPLE_TARGET_SECONDS = 5.0
 CLEANUP_POLL_SECONDS = 10.0
 CONTAINER_UID = 10_001
+CONTAINER_USER = "10001:10001"
 H24_RECEIPT = "h24-receipt.json"
 SOAK_RECEIPT = "soak-receipt.json"
 DESCRIPTOR_RECEIPT = "descriptor-preflight.json"
@@ -73,6 +76,9 @@ _CAPABILITY_FILES = frozenset({"config.toml", "config.json", "mcp.json"})
 _H24_NAME = "rapido-h24-eval"
 _SOAK_NAME = "rapido-h24-soak"
 _SOURCE_PROBE_NAME = "rapido-h24-source-probe"
+_OWNER_LABEL = "io.incypher.rapido.offline-h24-owner"
+_ROLE_LABEL = "io.incypher.rapido.offline-h24-role"
+_OWNER_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _ORACLE_ID = "rapido-offline-h24-oracle-v1"
 _INSTALLED_RAPIDO = "/opt/venv/lib/python3.12/site-packages/rapido"
 _WRAPPER_SOURCES = {
@@ -254,9 +260,30 @@ class ResourcePeak:
 @dataclass
 class EvaluationState:
     created: set[str] = field(default_factory=set)
+    by_role: dict[str, str] = field(default_factory=dict)
     started: set[str] = field(default_factory=set)
     stopped: set[str] = field(default_factory=set)
     removed: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class ContainerIntent:
+    name: str
+    role: str
+    image_id: str
+    bind_mounts: tuple[tuple[Path, str, bool], ...]
+
+
+@dataclass(frozen=True)
+class AuthBaseline:
+    directory_device: int
+    directory_inode: int
+    directory_owner: int
+    directory_mode: int
+    file_owner: int
+    file_mode: int
+    file_links: int
+    required_keys: frozenset[str] = field(repr=False)
 
 
 class SupervisorError(RuntimeError):
@@ -428,10 +455,15 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
         row = _mapping(json.loads(result.stdout), "image_identity")
     except json.JSONDecodeError as exc:
         raise SupervisorError("image_identity") from exc
-    labels = _mapping(_mapping(row.get("Config"), "image_identity").get("Labels"), "image_identity")
+    config = _mapping(row.get("Config"), "image_identity")
+    labels = _mapping(config.get("Labels"), "image_identity")
     image_os = row.get("Os")
     architecture = row.get("Architecture")
-    if image_os != "linux" or architecture not in {"amd64", "arm64"}:
+    if (
+        image_os != "linux"
+        or architecture not in {"amd64", "arm64"}
+        or config.get("User") != CONTAINER_USER
+    ):
         raise SupervisorError("image_identity")
     assert isinstance(architecture, str)
     identity = ImageIdentity(
@@ -449,6 +481,132 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     ):
         raise SupervisorError("image_identity")
     return identity
+
+
+def _ownership_token() -> str:
+    return secrets.token_hex(32)
+
+
+def _validate_ownership_token(value: str) -> str:
+    if _OWNER_TOKEN.fullmatch(value) is None:
+        raise SupervisorError("container_identity")
+    return value
+
+
+def _owned_container_ids(ownership_token: str, runner: Runner, *, timeout: float = 30) -> set[str]:
+    token = _validate_ownership_token(ownership_token)
+    result = runner(
+        (
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"label={_OWNER_LABEL}={token}",
+        ),
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise SupervisorError("docker_inventory")
+    values = result.stdout.split()
+    if len(values) != len(set(values)) or any(
+        _CONTAINER_ID.fullmatch(value) is None for value in values
+    ):
+        raise SupervisorError("docker_inventory")
+    return set(values)
+
+
+def _inspect_container_intent(
+    container_id: str,
+    intent: ContainerIntent,
+    ownership_token: str,
+    runner: Runner,
+    *,
+    timeout: float = 30,
+) -> None:
+    if _CONTAINER_ID.fullmatch(container_id) is None:
+        raise SupervisorError("container_identity")
+    result = _run(
+        runner,
+        (
+            "docker",
+            "container",
+            "inspect",
+            "--format={{json .}}",
+            container_id,
+        ),
+        "container_identity",
+        timeout=timeout,
+    )
+    try:
+        row = _mapping(json.loads(result.stdout), "container_identity")
+    except json.JSONDecodeError as exc:
+        raise SupervisorError("container_identity") from exc
+    config = _mapping(row.get("Config"), "container_identity")
+    labels = _mapping(config.get("Labels"), "container_identity")
+    state = _mapping(row.get("State"), "container_identity")
+    if (
+        row.get("Id") != container_id
+        or row.get("Name") != f"/{intent.name}"
+        or row.get("Image") != intent.image_id
+        or config.get("User") != CONTAINER_USER
+        or labels.get(_OWNER_LABEL) != ownership_token
+        or labels.get(_ROLE_LABEL) != intent.role
+        or state.get("Running") is not False
+    ):
+        raise SupervisorError("container_identity")
+    mounts = row.get("Mounts")
+    if not isinstance(mounts, list):
+        raise SupervisorError("container_identity")
+    actual: dict[str, tuple[Path, bool]] = {}
+    for value in mounts:
+        mount = _mapping(value, "container_identity")
+        if mount.get("Type") != "bind":
+            continue
+        source = mount.get("Source")
+        destination = mount.get("Destination")
+        writable = mount.get("RW")
+        if type(source) is not str or type(destination) is not str or type(writable) is not bool:
+            raise SupervisorError("container_identity")
+        if destination in actual:
+            raise SupervisorError("container_identity")
+        actual[destination] = (Path(source), not writable)
+    expected = {
+        destination: (source, readonly) for source, destination, readonly in intent.bind_mounts
+    }
+    if actual != expected:
+        raise SupervisorError("container_identity")
+
+
+def _create_owned_container(
+    argv: Sequence[str],
+    intent: ContainerIntent,
+    ownership_token: str,
+    runner: Runner,
+    state: EvaluationState,
+    *,
+    failure: str,
+    timeout: float = 120,
+) -> str:
+    known = set(state.created)
+    result = runner(tuple(argv), timeout=timeout)
+    inventory = _owned_container_ids(ownership_token, runner, timeout=30)
+    new_ids = inventory - known
+    state.created.update(new_ids)
+    returned_id = result.stdout.strip()
+    if len(new_ids) != 1:
+        raise SupervisorError(failure if not new_ids else f"{failure}_ambiguous")
+    container_id = next(iter(new_ids))
+    if (
+        result.returncode == 0
+        and _CONTAINER_ID.fullmatch(returned_id) is not None
+        and returned_id != container_id
+    ):
+        raise SupervisorError(f"{failure}_ambiguous")
+    _inspect_container_intent(container_id, intent, ownership_token, runner)
+    state.by_role[intent.role] = container_id
+    return container_id
 
 
 def _tracked_python_sources(repository: Path, runner: Runner) -> tuple[dict[str, bytes], set[str]]:
@@ -532,6 +690,8 @@ def verify_image_source(
     runner: Runner,
 ) -> None:
     """Compare installed image sources without executing image-provided code."""
+    ownership_token = _ownership_token()
+    state = EvaluationState()
     owned_container_id: str | None = None
     cleanup_failed = False
     probe_root = Path(tempfile.mkdtemp(prefix=".rapido-image-source-", dir=output))
@@ -539,27 +699,37 @@ def verify_image_source(
     try:
         if not _container_absent(_SOURCE_PROBE_NAME, runner):
             raise SupervisorError("image_source_probe_in_use")
-        created = _run(
-            runner,
-            (
-                "docker",
-                "create",
-                "--name",
-                _SOURCE_PROBE_NAME,
-                "--network",
-                "none",
-                "--read-only",
-                "--entrypoint",
-                "/bin/false",
-                protocol.image_reference,
-            ),
-            "image_source_probe_create",
-            timeout=120,
+        argv = (
+            "docker",
+            "create",
+            "--name",
+            _SOURCE_PROBE_NAME,
+            "--label",
+            f"{_OWNER_LABEL}={ownership_token}",
+            "--label",
+            f"{_ROLE_LABEL}=source_probe",
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            CONTAINER_USER,
+            "--entrypoint",
+            "/bin/false",
+            protocol.image_reference,
         )
-        candidate_id = created.stdout.strip()
-        if _CONTAINER_ID.fullmatch(candidate_id) is None:
-            raise SupervisorError("image_source_probe_identity")
-        owned_container_id = candidate_id
+        owned_container_id = _create_owned_container(
+            argv,
+            ContainerIntent(
+                _SOURCE_PROBE_NAME,
+                "source_probe",
+                protocol.image_id,
+                (),
+            ),
+            ownership_token,
+            runner,
+            state,
+            failure="image_source_probe_create",
+        )
         installed = probe_root / "rapido"
         _run(
             runner,
@@ -601,14 +771,12 @@ def verify_image_source(
     except OSError as exc:
         raise SupervisorError("image_source_mismatch") from exc
     finally:
-        if owned_container_id is not None:
+        for container_id in sorted(state.created):
             try:
-                if not _container_id_absent(owned_container_id, runner):
-                    result = runner(("docker", "rm", "--volumes", owned_container_id), timeout=30)
-                    cleanup_failed = result.returncode != 0
-                cleanup_failed = cleanup_failed or not _container_id_absent(
-                    owned_container_id, runner
-                )
+                if not _container_id_absent(container_id, runner):
+                    result = runner(("docker", "rm", "--volumes", container_id), timeout=30)
+                    cleanup_failed = cleanup_failed or result.returncode != 0
+                cleanup_failed = cleanup_failed or not _container_id_absent(container_id, runner)
             except SupervisorError:
                 cleanup_failed = True
         try:
@@ -661,6 +829,90 @@ def _private_file(path: Path, label: str, owner_uid: int) -> Path:
     if metadata.st_uid != owner_uid or metadata.st_nlink != 1:
         raise SupervisorError(label)
     return path.resolve(strict=True)
+
+
+def _auth_baseline(auth: Path) -> AuthBaseline:
+    directory_fd: int | None = None
+    auth_fd: int | None = None
+    try:
+        directory_fd = os.open(
+            auth,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        directory = os.fstat(directory_fd)
+        auth_fd = os.open(
+            "auth.json",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        file_metadata = os.fstat(auth_fd)
+        for name in _CAPABILITY_FILES:
+            try:
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise SupervisorError("auth_integrity")
+        with os.fdopen(auth_fd, encoding="utf-8") as stream:
+            auth_fd = None
+            document = json.load(stream)
+        path_file_metadata = os.stat("auth.json", dir_fd=directory_fd, follow_symlinks=False)
+        path_directory_metadata = os.stat(auth, follow_symlinks=False)
+        for name in _CAPABILITY_FILES:
+            try:
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise SupervisorError("auth_integrity")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SupervisorError("auth_integrity") from exc
+    finally:
+        if auth_fd is not None:
+            os.close(auth_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or stat.S_IMODE(directory.st_mode) != 0o700
+        or not stat.S_ISREG(file_metadata.st_mode)
+        or stat.S_IMODE(file_metadata.st_mode) != 0o600
+        or file_metadata.st_uid != directory.st_uid
+        or file_metadata.st_nlink != 1
+        or (path_file_metadata.st_dev, path_file_metadata.st_ino)
+        != (file_metadata.st_dev, file_metadata.st_ino)
+        or (path_directory_metadata.st_dev, path_directory_metadata.st_ino)
+        != (directory.st_dev, directory.st_ino)
+        or not isinstance(document, Mapping)
+        or not document
+        or any(type(key) is not str for key in document)
+    ):
+        raise SupervisorError("auth_integrity")
+    return AuthBaseline(
+        directory.st_dev,
+        directory.st_ino,
+        directory.st_uid,
+        stat.S_IMODE(directory.st_mode),
+        file_metadata.st_uid,
+        stat.S_IMODE(file_metadata.st_mode),
+        file_metadata.st_nlink,
+        frozenset(document),
+    )
+
+
+def _auth_matches_baseline(auth: Path, baseline: AuthBaseline) -> bool:
+    try:
+        observed = _auth_baseline(auth)
+    except SupervisorError:
+        return False
+    return (
+        observed.directory_device == baseline.directory_device
+        and observed.directory_inode == baseline.directory_inode
+        and observed.directory_owner == baseline.directory_owner
+        and observed.directory_mode == baseline.directory_mode
+        and observed.file_owner == baseline.file_owner
+        and observed.file_mode == baseline.file_mode
+        and observed.file_links == baseline.file_links
+        and observed.required_keys >= baseline.required_keys
+    )
 
 
 def _public_contract_file(path: Path, label: str, *, immutable: bool) -> Path:
@@ -731,12 +983,21 @@ def _mount(source: Path, target: str, *, readonly: bool = False) -> str:
     return ",".join(fields)
 
 
-def _hardened_create_prefix(name: str, resource: Resources) -> list[str]:
+def _hardened_create_prefix(
+    name: str, resource: Resources, *, ownership_token: str, role: str
+) -> list[str]:
+    token = _validate_ownership_token(ownership_token)
+    if _CLOSED_ID.fullmatch(role) is None:
+        raise SupervisorError("container_identity")
     return [
         "docker",
         "create",
         "--name",
         name,
+        "--label",
+        f"{_OWNER_LABEL}={token}",
+        "--label",
+        f"{_ROLE_LABEL}={role}",
         "--stop-timeout",
         str(CLEANUP_SECONDS),
         "--cpus",
@@ -745,6 +1006,8 @@ def _hardened_create_prefix(name: str, resource: Resources) -> list[str]:
         f"{resource.memory_gib}g",
         "--pids-limit",
         str(resource.pids),
+        "--user",
+        CONTAINER_USER,
         "--read-only",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev",
@@ -753,9 +1016,13 @@ def _hardened_create_prefix(name: str, resource: Resources) -> list[str]:
     ]
 
 
-def descriptor_preflight_argv(protocol: Protocol, paths: Paths) -> tuple[str, ...]:
+def descriptor_preflight_argv(
+    protocol: Protocol, paths: Paths, *, ownership_token: str
+) -> tuple[str, ...]:
     name = f"{protocol.h24_name}-descriptor"
-    argv = _hardened_create_prefix(name, protocol.h24)
+    argv = _hardened_create_prefix(
+        name, protocol.h24, ownership_token=ownership_token, role="descriptor"
+    )
     argv.extend(
         [
             "--mount",
@@ -800,9 +1067,12 @@ def h24_create_argv(
     protocol: Protocol,
     paths: Paths,
     *,
+    ownership_token: str,
     start_wall_epoch_milliseconds: int | None = None,
 ) -> tuple[str, ...]:
-    argv = _hardened_create_prefix(protocol.h24_name, protocol.h24)
+    argv = _hardened_create_prefix(
+        protocol.h24_name, protocol.h24, ownership_token=ownership_token, role="h24"
+    )
     argv.extend(
         [
             "--mount",
@@ -859,9 +1129,12 @@ def soak_create_argv(
     protocol: Protocol,
     paths: Paths,
     *,
+    ownership_token: str,
     start_wall_epoch_milliseconds: int | None = None,
 ) -> tuple[str, ...]:
-    argv = _hardened_create_prefix(protocol.soak_name, protocol.soak)
+    argv = _hardened_create_prefix(
+        protocol.soak_name, protocol.soak, ownership_token=ownership_token, role="soak"
+    )
     argv.extend(
         [
             "--network",
@@ -1008,7 +1281,7 @@ def _container_state(name: str, runner: Runner, *, timeout: float = 30) -> dict[
 
 
 def _sample(
-    names: Sequence[str],
+    containers: Mapping[str, str],
     runner: Runner,
     peaks: Mapping[str, ResourcePeak],
     *,
@@ -1016,15 +1289,16 @@ def _sample(
     deadline: float | None = None,
     timeout: float = 30,
 ) -> None:
-    if not names:
+    if not containers:
         return
     result = runner(
         (
             "docker",
             "stats",
             "--no-stream",
+            "--no-trunc",
             "--format={{json .}}",
-            *names,
+            *containers,
         ),
         timeout=timeout,
     )
@@ -1040,8 +1314,9 @@ def _sample(
             continue
         if not isinstance(row, Mapping):
             continue
-        name = row.get("Name")
-        if isinstance(name, str) and name in peaks:
+        container_id = row.get("ID")
+        name = containers.get(container_id) if isinstance(container_id, str) else None
+        if name is not None:
             peaks[name].observe(row, observed_at)
 
 
@@ -1136,19 +1411,82 @@ def _receipt_projection(path: Path) -> dict[str, object]:
 
 
 def _load_private_json(path: Path, label: str) -> Mapping[str, object]:
+    descriptor: int | None = None
     try:
-        metadata = path.lstat()
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = None
+            value = json.load(stream)
+        path_metadata = path.lstat()
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SupervisorError(label) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
+        not stat.S_ISREG(metadata.st_mode)
         or stat.S_IMODE(metadata.st_mode) & 0o077
+        or (path_metadata.st_dev, path_metadata.st_ino) != (metadata.st_dev, metadata.st_ino)
         or not isinstance(value, Mapping)
     ):
         raise SupervisorError(label)
     return value
+
+
+def validate_descriptor_receipt(protocol: Protocol, path: Path) -> list[dict[str, object]]:
+    row = _load_private_json(path, "preflight_receipt")
+    expected_source = {
+        "observed": {
+            "head_sha": protocol.source_sha,
+            "worktree": "packaged_source",
+            "tracked_change_count": None,
+            "untracked_file_count": None,
+        },
+        "declared": {"sha": protocol.source_sha},
+        "declared_matches_head": True,
+        "identity_basis": "sealed_metadata_file",
+    }
+    expected_image = {
+        "observed": {"id": protocol.image_id},
+        "declared": {"id": protocol.image_id},
+        "declared_matches_observed": True,
+    }
+    expected_fields = {
+        "schema",
+        "preregistration_sha256",
+        "source",
+        "image",
+        "descriptors",
+        "matched",
+    }
+    descriptors = row.get("descriptors")
+    if (
+        set(row) != expected_fields
+        or row.get("schema") != DESCRIPTOR_SCHEMA
+        or row.get("preregistration_sha256") != preregistration_sha256(protocol.preregistration)
+        or row.get("source") != expected_source
+        or row.get("image") != expected_image
+        or row.get("matched") is not True
+        or descriptors != protocol.preregistration.get("descriptor_preflight")
+        or not isinstance(descriptors, list)
+        or len(descriptors) != 2
+    ):
+        raise SupervisorError("preflight_receipt")
+    allowed = {
+        "arm",
+        "returned_model",
+        "returned_effort",
+        "revision",
+        "revision_status",
+    }
+    closed: list[dict[str, object]] = []
+    for descriptor in descriptors:
+        item = _mapping(descriptor, "preflight_receipt")
+        if set(item) != allowed:
+            raise SupervisorError("preflight_receipt")
+        closed.append({key: item[key] for key in sorted(allowed)})
+    return closed
 
 
 def _runtime_resources(peak: ResourcePeak) -> dict[str, object]:
@@ -1274,7 +1612,7 @@ def _remaining_timeout(clock: Clock, deadline: float, maximum: float = 30) -> fl
 
 
 def _remove_container(
-    name: str,
+    container_id: str,
     runner: Runner,
     state: EvaluationState,
     *,
@@ -1286,15 +1624,15 @@ def _remove_container(
     )
     if timeout is None:
         raise SupervisorError("cleanup_timeout")
-    result = runner(("docker", "rm", name), timeout=timeout)
+    result = runner(("docker", "rm", "--volumes", container_id), timeout=timeout)
     if result.returncode == 0:
-        state.removed.add(name)
+        state.removed.add(container_id)
         return
     timeout = (
         _remaining_timeout(clock, deadline) if clock is not None and deadline is not None else 30
     )
-    if timeout is not None and _container_absent(name, runner, timeout=timeout):
-        state.removed.add(name)
+    if timeout is not None and _container_id_absent(container_id, runner, timeout=timeout):
+        state.removed.add(container_id)
         return
     raise SupervisorError("container_remove")
 
@@ -1398,6 +1736,9 @@ def run_evaluation(
     finalize: bool = True,
 ) -> dict[str, object]:
     clock = clock or SystemClock()
+    validate_descriptor_receipt(protocol, paths.output / DESCRIPTOR_RECEIPT)
+    auth_baseline = _auth_baseline(paths.auth)
+    ownership_token = _ownership_token()
     state = EvaluationState()
     peaks = {
         protocol.h24_name: ResourcePeak(),
@@ -1412,7 +1753,7 @@ def run_evaluation(
     worker_drain_deadline_mono: float | None = None
     cleanup_deadline_mono: float | None = None
     cleanup_finished_mono: float | None = None
-    running: set[str] = set()
+    running: dict[str, str] = {}
     cleanup = {
         "containers_absent": False,
         "auth_preserved": False,
@@ -1453,6 +1794,7 @@ def run_evaluation(
                     h24_create_argv(
                         protocol,
                         paths,
+                        ownership_token=ownership_token,
                         start_wall_epoch_milliseconds=barrier_wall_milliseconds,
                     ),
                 ),
@@ -1461,28 +1803,68 @@ def run_evaluation(
                     soak_create_argv(
                         protocol,
                         paths,
+                        ownership_token=ownership_token,
                         start_wall_epoch_milliseconds=barrier_wall_milliseconds,
                     ),
                 ),
             ):
-                _run(runner, argv, "container_create", timeout=120)
-                state.created.add(name)
+                if name == protocol.h24_name:
+                    intent = ContainerIntent(
+                        name,
+                        "h24",
+                        protocol.image_id,
+                        (
+                            (paths.auth, "/auth/codex", False),
+                            (paths.work, "/work", False),
+                            (paths.output, "/output", False),
+                            (paths.seed, "/seed/oracle.key", True),
+                            (
+                                paths.preregistration,
+                                "/run/rapido-protocol/preregistration.json",
+                                True,
+                            ),
+                        ),
+                    )
+                else:
+                    intent = ContainerIntent(
+                        name,
+                        "soak",
+                        protocol.image_id,
+                        (
+                            (paths.output, "/output", False),
+                            (
+                                paths.preregistration,
+                                "/run/rapido-protocol/preregistration.json",
+                                True,
+                            ),
+                        ),
+                    )
+                _create_owned_container(
+                    argv,
+                    intent,
+                    ownership_token,
+                    runner,
+                    state,
+                    failure="container_create",
+                )
 
             if clock.monotonic() >= barrier_mono:
                 raise SupervisorError("start_barrier_missed")
             barrier_receipt["creation_before_barrier"] = True
+            h24_id = state.by_role["h24"]
+            soak_id = state.by_role["soak"]
             _run(
                 runner,
-                ("docker", "start", protocol.h24_name, protocol.soak_name),
+                ("docker", "start", h24_id, soak_id),
                 "container_start",
                 timeout=60,
             )
-            state.started.update((protocol.h24_name, protocol.soak_name))
+            state.started.update((h24_id, soak_id))
             remaining = barrier_mono - clock.monotonic()
             if remaining > 0:
                 clock.sleep(remaining)
 
-            running = {protocol.h24_name, protocol.soak_name}
+            running = {h24_id: protocol.h24_name, soak_id: protocol.soak_name}
             for peak in peaks.values():
                 peak.start_coverage(barrier_mono)
             next_sample_mono = barrier_mono
@@ -1502,7 +1884,7 @@ def run_evaluation(
                 if timeout is None:
                     break
                 _sample(
-                    sorted(running),
+                    running,
                     runner,
                     peaks,
                     clock=clock,
@@ -1510,14 +1892,14 @@ def run_evaluation(
                     timeout=timeout,
                 )
                 next_sample_mono += SAMPLE_TARGET_SECONDS
-                for name in tuple(running):
+                for container_id, name in tuple(running.items()):
                     timeout = _remaining_timeout(clock, scoring_deadline_mono)
                     if timeout is None:
                         break
-                    container = _container_state(name, runner, timeout=timeout)
+                    container = _container_state(container_id, runner, timeout=timeout)
                     if container.get("Running") is not True:
                         peaks[name].end_coverage(min(clock.monotonic(), scoring_deadline_mono))
-                        running.remove(name)
+                        running.pop(container_id)
             for peak in peaks.values():
                 peak.end_coverage(scoring_deadline_mono)
 
@@ -1525,13 +1907,13 @@ def run_evaluation(
             # The registered outer grace reserves its final ten seconds for
             # forced stop, inspection, removal, and evidence persistence.
             while running and clock.monotonic() < worker_drain_deadline_mono:
-                for name in tuple(running):
+                for container_id in tuple(running):
                     timeout = _remaining_timeout(clock, worker_drain_deadline_mono)
                     if timeout is None:
                         break
-                    container = _container_state(name, runner, timeout=timeout)
+                    container = _container_state(container_id, runner, timeout=timeout)
                     if container.get("Running") is not True:
-                        running.remove(name)
+                        running.pop(container_id)
                 remaining = worker_drain_deadline_mono - clock.monotonic()
                 if running and remaining > 0:
                     clock.sleep(min(CLEANUP_POLL_SECONDS, remaining))
@@ -1549,10 +1931,11 @@ def run_evaluation(
                 running.clear()
 
             for role, name in (("h24", protocol.h24_name), ("soak", protocol.soak_name)):
+                container_id = state.by_role[role]
                 timeout = _remaining_timeout(clock, cleanup_deadline_mono)
                 if timeout is None:
                     raise SupervisorError("cleanup_timeout")
-                container = _container_state(name, runner, timeout=timeout)
+                container = _container_state(container_id, runner, timeout=timeout)
                 exits[role] = _integer(container.get("ExitCode"))
                 peaks[name].oom_killed = (
                     container.get("OOMKilled") if type(container.get("OOMKilled")) is bool else None
@@ -1560,54 +1943,59 @@ def run_evaluation(
                 timeout = _remaining_timeout(clock, cleanup_deadline_mono)
                 if timeout is None:
                     raise SupervisorError("cleanup_timeout")
-                _retain_logs(name, role, paths.output, runner, timeout=timeout)
+                _retain_logs(container_id, role, paths.output, runner, timeout=timeout)
         except SupervisorError as exc:
             failure_class = exc.failure_class
         finally:
             operation_deadline = cleanup_deadline_mono or clock.monotonic() + CLEANUP_SECONDS
-            for name in sorted(state.created):
-                if name not in state.removed:
+            for container_id in sorted(state.created):
+                if container_id not in state.removed:
                     with contextlib.suppress(SupervisorError):
                         timeout = _remaining_timeout(clock, operation_deadline)
                         if timeout is None:
                             break
-                        if not _container_absent(name, runner, timeout=timeout):
+                        if not _container_id_absent(container_id, runner, timeout=timeout):
                             timeout = _remaining_timeout(clock, operation_deadline)
                             if timeout is None:
                                 break
-                            container = _container_state(name, runner, timeout=timeout)
+                            container = _container_state(container_id, runner, timeout=timeout)
                             if container.get("Running") is True:
                                 timeout = _remaining_timeout(clock, operation_deadline)
                                 if timeout is None:
                                     break
                                 result = runner(
-                                    ("docker", "stop", "--time", "0", name), timeout=timeout
+                                    ("docker", "stop", "--time", "0", container_id),
+                                    timeout=timeout,
                                 )
                                 if result.returncode == 0:
-                                    state.stopped.add(name)
+                                    state.stopped.add(container_id)
                         _remove_container(
-                            name,
+                            container_id,
                             runner,
                             state,
                             clock=clock,
                             deadline=operation_deadline,
                         )
             absent: list[bool] = []
-            for name in (protocol.h24_name, protocol.soak_name):
+            for container_id in sorted(state.created):
                 timeout = _remaining_timeout(clock, operation_deadline)
                 if timeout is None:
                     absent.append(False)
                     continue
                 with contextlib.suppress(SupervisorError):
-                    absent.append(_container_absent(name, runner, timeout=timeout))
-            cleanup["containers_absent"] = len(absent) == 2 and all(absent)
+                    absent.append(_container_id_absent(container_id, runner, timeout=timeout))
+            cleanup["containers_absent"] = (
+                len(state.by_role) == 2 and len(absent) == len(state.created) and all(absent)
+            )
             cleanup["no_orphan_containers"] = cleanup["containers_absent"]
-            cleanup["auth_preserved"] = paths.auth.is_dir() and (paths.auth / "auth.json").is_file()
+            cleanup["auth_preserved"] = _auth_matches_baseline(paths.auth, auth_baseline)
 
     receipts = {
         "h24": _receipt_projection(paths.output / H24_RECEIPT),
         "soak": _receipt_projection(paths.output / SOAK_RECEIPT),
     }
+    if not cleanup["auth_preserved"]:
+        failure_class = failure_class or "auth_integrity"
     cleanup["private_receipts_preserved"] = all(row["present"] for row in receipts.values())
     if finalize:
         try:
@@ -1730,13 +2118,42 @@ def run_descriptor_preflight(
     runner: Runner = subprocess_runner,
 ) -> dict[str, object]:
     name = f"{protocol.h24_name}-descriptor"
+    ownership_token = _ownership_token()
+    state = EvaluationState()
+    auth_baseline = _auth_baseline(paths.auth)
     with auth_lease(paths.auth):
         _validate_container_absence(protocol, runner)
         _validate_auth_unmounted(paths.auth, runner)
-        _run(runner, descriptor_preflight_argv(protocol, paths), "preflight_create", timeout=120)
+        container_id: str | None = None
         try:
+            container_id = _create_owned_container(
+                descriptor_preflight_argv(
+                    protocol,
+                    paths,
+                    ownership_token=ownership_token,
+                ),
+                ContainerIntent(
+                    name,
+                    "descriptor",
+                    protocol.image_id,
+                    (
+                        (paths.auth, "/auth/codex", False),
+                        (paths.work, "/work", False),
+                        (paths.output, "/output", False),
+                        (
+                            paths.preregistration,
+                            "/run/rapido-protocol/preregistration.json",
+                            True,
+                        ),
+                    ),
+                ),
+                ownership_token,
+                runner,
+                state,
+                failure="preflight_create",
+            )
             result = runner(
-                ("docker", "start", "--attach", name),
+                ("docker", "start", "--attach", container_id),
                 timeout=600,
             )
             _atomic_private_write(
@@ -1745,37 +2162,31 @@ def run_descriptor_preflight(
             if result.returncode != 0:
                 raise SupervisorError("preflight_run")
         finally:
-            _remove_container(name, runner, EvaluationState(created={name}))
+            cleanup_failed = False
+            if container_id is not None:
+                try:
+                    container = _container_state(container_id, runner)
+                    if container.get("Running") is True:
+                        _run(
+                            runner,
+                            ("docker", "stop", "--time", "0", container_id),
+                            "preflight_stop",
+                        )
+                except SupervisorError:
+                    cleanup_failed = True
+            for owned_id in sorted(state.created):
+                try:
+                    _remove_container(owned_id, runner, state)
+                except SupervisorError:
+                    cleanup_failed = True
+            if cleanup_failed:
+                raise SupervisorError("preflight_cleanup")
+        if not _auth_matches_baseline(paths.auth, auth_baseline):
+            raise SupervisorError("auth_integrity")
     projection = _receipt_projection(paths.output / DESCRIPTOR_RECEIPT)
     if projection["parse_status"] != "parsed":
         raise SupervisorError("preflight_receipt")
-    try:
-        raw = json.loads((paths.output / DESCRIPTOR_RECEIPT).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise SupervisorError("preflight_receipt") from exc
-    row = _mapping(raw, "preflight_receipt")
-    if (
-        row.get("schema") != DESCRIPTOR_SCHEMA
-        or row.get("matched") is not True
-        or row.get("descriptors") != protocol.preregistration.get("descriptor_preflight")
-    ):
-        raise SupervisorError("preflight_receipt")
-    descriptors = row.get("descriptors")
-    if not isinstance(descriptors, list) or len(descriptors) != 2:
-        raise SupervisorError("preflight_receipt")
-    allowed = {
-        "arm",
-        "returned_model",
-        "returned_effort",
-        "revision",
-        "revision_status",
-    }
-    closed: list[dict[str, object]] = []
-    for descriptor in descriptors:
-        item = _mapping(descriptor, "preflight_receipt")
-        if set(item) != allowed:
-            raise SupervisorError("preflight_receipt")
-        closed.append({key: item[key] for key in sorted(allowed)})
+    closed = validate_descriptor_receipt(protocol, paths.output / DESCRIPTOR_RECEIPT)
     return {
         "schema": DESCRIPTOR_SCHEMA,
         "protocol_id": protocol.protocol_id,
