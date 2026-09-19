@@ -160,6 +160,58 @@ def valid_receipt(tmp_path: Path) -> dict[str, object]:
     ).public()
 
 
+def test_public_receipt_accepts_all_ten_recomputed_semantic_passes(
+    valid_receipt: dict[str, object],
+) -> None:
+    validate_public_receipt(valid_receipt)
+    assert valid_receipt["passed_count"] == len(SCENARIO_IDS)
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "field", "failed_value"),
+    [
+        (SCENARIO_IDS[0], "correct", False),
+        (SCENARIO_IDS[1], "second_write", True),
+        (SCENARIO_IDS[2], "attempt_delta", 1),
+        (SCENARIO_IDS[3], "started_jobs", 1),
+        (SCENARIO_IDS[4], "current_verification_count", 0),
+        (SCENARIO_IDS[5], "method_oracle_match", False),
+        (SCENARIO_IDS[6], "memory_record_count", 1),
+        (SCENARIO_IDS[7], "deadline_unchanged", False),
+        (SCENARIO_IDS[8], "owned_instances", 100),
+        (SCENARIO_IDS[9], "turn_peak", 1),
+    ],
+)
+def test_public_receipt_rejects_true_pass_bits_for_failed_scenario_facts(
+    valid_receipt: dict[str, object],
+    scenario_id: str,
+    field: str,
+    failed_value: object,
+) -> None:
+    receipt = copy.deepcopy(valid_receipt)
+    scenarios = receipt["scenarios"]
+    assert isinstance(scenarios, list)
+    row = scenarios[SCENARIO_IDS.index(scenario_id)]
+    row["facts"][field] = failed_value
+
+    with pytest.raises(ValueError, match="pass bit contradicts"):
+        validate_public_receipt(receipt)
+
+
+def test_public_receipt_rejects_false_pass_bit_for_passing_facts(
+    valid_receipt: dict[str, object],
+) -> None:
+    receipt = copy.deepcopy(valid_receipt)
+    scenarios = receipt["scenarios"]
+    assert isinstance(scenarios, list)
+    scenarios[0]["passed"] = False
+    receipt["passed_count"] = 9
+    receipt["passed"] = False
+
+    with pytest.raises(ValueError, match="pass bit contradicts"):
+        validate_public_receipt(receipt)
+
+
 @pytest.mark.parametrize("field", ["credential", "api_key", "private_value"])
 def test_public_receipt_rejects_unallowlisted_top_level_fields(
     valid_receipt: dict[str, object], field: str

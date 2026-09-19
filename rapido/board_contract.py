@@ -230,6 +230,96 @@ _FACT_DOMAINS: dict[str, dict[str, object]] = {
 }
 
 
+def _scenario_semantic_passed(
+    scenario_id: str,
+    facts: Mapping[str, object],
+    requested_seconds: float,
+) -> bool:
+    """Recompute the public pass bit from every allowlisted fact."""
+
+    if scenario_id == SCENARIO_IDS[0]:
+        return all(facts[name] is True for name in _SCENARIO_FACT_FIELDS[scenario_id])
+    if scenario_id == SCENARIO_IDS[1]:
+        return (
+            facts["writes"] == 1 and facts["reconciled"] is True and facts["second_write"] is False
+        )
+    if scenario_id == SCENARIO_IDS[2]:
+        return (
+            facts["transient_recovered"] is True
+            and facts["auth_http_status"] == 401
+            and facts["auth_error"] == "board_http_401"
+            and facts["attempt_delta"] == 0
+        )
+    if scenario_id == SCENARIO_IDS[3]:
+        return (
+            facts["queued_jobs"] == 1
+            and facts["started_jobs"] == 0
+            and facts["attempt_count"] == 0
+            and facts["submission_count"] == 0
+            and facts["solve_count"] == 0
+            and facts["current_verification_count"] == 0
+        )
+    if scenario_id == SCENARIO_IDS[4]:
+        return (
+            facts["fresh_generation"] is True
+            and facts["exact_match"] is True
+            and facts["current_verification_count"] == 1
+            and facts["current_generation_match"] is True
+        )
+    if scenario_id == SCENARIO_IDS[5]:
+        return (
+            facts["exact_match"] is False
+            and facts["current_verification_count"] == 0
+            and facts["old_value_current"] is False
+            and facts["new_value_current"] is False
+            and facts["method_oracle_match"] is True
+            and facts["method_axis"] == "synthetic_only"
+        )
+    if scenario_id == SCENARIO_IDS[6]:
+        return (
+            facts["refreshed"] is True
+            and facts["context_advanced"] is True
+            and facts["same_reference"] is True
+            and facts["material_changed"] is True
+            and facts["memory_record_count"] == 0
+            and facts["prompt_memory_count"] == 0
+            and facts["old_private_excluded"] is True
+        )
+    if scenario_id == SCENARIO_IDS[7]:
+        transient = float(facts["transient_offset_seconds"])
+        change = float(facts["change_offset_seconds"])
+        deadline = float(facts["deadline_seconds"])
+        return (
+            facts["change_observed"] is True
+            and 0 < transient <= change <= deadline
+            and deadline == round(requested_seconds, 3)
+            and facts["deadline_unchanged"] is True
+        )
+    if scenario_id == SCENARIO_IDS[8]:
+        return (
+            facts["status"] == "deadline"
+            and facts["active_jobs"] == 0
+            and facts["queued_jobs"] == 0
+            and facts["pending_writes"] == 0
+            and facts["owned_instances"] == 0
+            and facts["workspace_entries"] == 0
+            and facts["instance_creates"] == 1
+            and facts["instance_deletes"] == 1
+            and facts["runtime_cancelled"] is True
+            and facts["runtime_closed"] is True
+        )
+    if scenario_id == SCENARIO_IDS[9]:
+        return (
+            facts["startup_peak"] == 1
+            and facts["turn_peak"] == 2
+            and facts["pilot_result_rows"] == 24
+            and facts["diagnostics_redacted"] is True
+            and facts["startup_contract"] == "pr71_serialized"
+            and facts["diagnostics_contract"] == "pr70_closed_labels"
+        )
+    raise AssertionError("contract scenario semantics are incomplete")
+
+
 def _envelope(data: object, status: int = 200, *, success: bool = True) -> HttpResponse:
     return HttpResponse(
         status,
@@ -481,6 +571,13 @@ def validate_public_receipt(value: object) -> None:
                     )
             if not valid:
                 raise ValueError("contract receipt fact is outside its field domain")
+        semantic_passed = _scenario_semantic_passed(
+            expected_id,
+            facts,
+            float(value["requested_seconds"]),
+        )
+        if row["passed"] is not semantic_passed:
+            raise ValueError("contract receipt scenario pass bit contradicts its facts")
         passed += int(row["passed"])
     if (
         value["scenario_count"] != len(SCENARIO_IDS)

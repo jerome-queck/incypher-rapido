@@ -184,10 +184,10 @@ def _outcome(task: dict[str, object], arm: str, *, correct: bool = True) -> dict
         "false_accept": "none",
         "repair_trigger": "none",
         "repair_attempted": False,
-        "first_candidate_elapsed_milliseconds": 50,
+        "first_candidate_elapsed_milliseconds": 5,
         "correct_offset_milliseconds": start + 5 if correct else None,
         "qualified_offset_milliseconds": start + 10 if correct else None,
-        "paired_qualified_elapsed_milliseconds": 100 if correct else None,
+        "paired_qualified_elapsed_milliseconds": 10 if correct else None,
         "terminal_offset_milliseconds": start + 10,
         "usage": {
             "input_tokens": None,
@@ -206,6 +206,66 @@ def _outcome(task: dict[str, object], arm: str, *, correct: bool = True) -> dict
         ],
         "artifact_bytes": 1,
     }
+
+
+def _set_terminal_state(row: dict[str, object], state: str) -> None:
+    if state == "completed":
+        return
+    spans = row["spans"]
+    assert isinstance(spans, list)
+    span = spans[0]
+    assert isinstance(span, dict)
+    row.update(
+        {
+            "terminal_outcome": state,
+            "oracle_correct": state == "inconclusive",
+            "qualification_accepted": False,
+            "qualified_correct": False,
+            "false_accept": "none",
+            "correct_offset_milliseconds": (
+                span["start_offset_milliseconds"] + 5 if state == "inconclusive" else None
+            ),
+            "qualified_offset_milliseconds": None,
+            "paired_qualified_elapsed_milliseconds": None,
+        }
+    )
+    if state == "inconclusive":
+        row.update(
+            {
+                "failure_class": "none",
+                "qualification_reason": "candidate_unobserved",
+            }
+        )
+        return
+    row.update(
+        {
+            "first_candidate_elapsed_milliseconds": None,
+            "qualification_reason": state,
+        }
+    )
+    if state == "timeout":
+        row["failure_class"] = "timeout"
+        span["status"] = "failed"
+    elif state == "provider_failure":
+        row["failure_class"] = "provider_transport"
+        span["status"] = "failed"
+    elif state == "fixture_failure":
+        row["failure_class"] = "fixture_setup"
+        span.update({"stage": "fixture_setup", "status": "failed"})
+    elif state == "cancelled":
+        row["failure_class"] = "cancelled"
+        span["status"] = "cancelled"
+    elif state == "not_started":
+        row.update(
+            {
+                "failure_class": "none",
+                "terminal_offset_milliseconds": 0,
+                "tool_call_count": 0,
+                "spans": [],
+            }
+        )
+    else:
+        raise AssertionError("unknown test terminal state")
 
 
 def _receipt(preregistration: dict[str, object]) -> dict[str, object]:
@@ -629,8 +689,10 @@ def test_final_validator_rejects_task_cap_and_task_order_drift(
     later["spans"][0]["start_offset_milliseconds"] = 0
     later["spans"][0]["end_offset_milliseconds"] = 5
     later["terminal_offset_milliseconds"] = 5
+    later["first_candidate_elapsed_milliseconds"] = 4
     later["correct_offset_milliseconds"] = 4
     later["qualified_offset_milliseconds"] = 5
+    later["paired_qualified_elapsed_milliseconds"] = 5
     with pytest.raises(ValueError, match="frozen order"):
         evaluate_h24_receipt(preregistration, receipt)
 
@@ -761,6 +823,84 @@ def test_exact_48_row_join_rejects_missing_duplicate_and_extra(
         receipt["outcomes"].append(copy.deepcopy(receipt["outcomes"][0]))
 
     with pytest.raises(ValueError):
+        evaluate_h24_receipt(preregistration, receipt)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "completed",
+        "inconclusive",
+        "timeout",
+        "provider_failure",
+        "fixture_failure",
+        "cancelled",
+        "not_started",
+    ],
+)
+def test_terminal_state_truth_table_retains_every_valid_result(
+    preregistration: dict[str, object], state: str
+) -> None:
+    receipt = _receipt(preregistration)
+    row = receipt["outcomes"][0]
+    _set_terminal_state(row, state)
+
+    result = evaluate_h24_receipt(preregistration, receipt)
+
+    expected_c = 24 if state in {"completed", "inconclusive"} else 23
+    expected_q = 24 if state == "completed" else 23
+    assert result["counts"]["one_shot"]["C"] == expected_c
+    assert result["counts"]["one_shot"]["Q"] == expected_q
+    assert result["gates"]["all_rows_started"] is (state != "not_started")
+
+
+def test_not_started_rejects_work_results_and_cannot_create_a_positive_signal(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    forged = receipt["outcomes"][0]
+    forged["terminal_outcome"] = "not_started"
+    forged["qualification_reason"] = "not_started"
+    forged["qualification_accepted"] = False
+    forged["qualified_correct"] = False
+    forged["qualified_offset_milliseconds"] = None
+    forged["paired_qualified_elapsed_milliseconds"] = None
+    with pytest.raises(ValueError, match="cannot be correct or qualified"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+    receipt = _receipt(preregistration)
+    forged = receipt["outcomes"][0]
+    original_spans = copy.deepcopy(forged["spans"])
+    _set_terminal_state(forged, "not_started")
+    forged["spans"] = original_spans
+    forged["terminal_offset_milliseconds"] = original_spans[0]["end_offset_milliseconds"]
+    with pytest.raises(ValueError, match="cannot contain runtime spans"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+    receipt = _receipt(preregistration)
+    unstarted = [
+        row for row in receipt["outcomes"] if row["group"] != "easy" and row["arm"] == "one_shot"
+    ][:2]
+    for row in unstarted:
+        _set_terminal_state(row, "not_started")
+    result = evaluate_h24_receipt(preregistration, receipt)
+    assert (
+        result["counts"]["evidence_repair"]["non_easy_C"]
+        - result["counts"]["one_shot"]["non_easy_C"]
+        == 2
+    )
+    assert result["gates"]["all_rows_started"] is False
+    assert result["decision"] == "no_justified_change"
+
+
+def test_final_validator_couples_repair_state_to_a_repair_span(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    row = receipt["outcomes"][1]
+    row["repair_trigger"] = "candidate_unobserved"
+    row["repair_attempted"] = True
+    with pytest.raises(ValueError, match="repair-turn span"):
         evaluate_h24_receipt(preregistration, receipt)
 
 

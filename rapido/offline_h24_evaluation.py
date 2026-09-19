@@ -116,6 +116,37 @@ _FAILURE_CLASSES = frozenset(
         "unknown",
     }
 )
+_OUTCOME_FAILURE_CLASSES = {
+    "completed": frozenset({"none"}),
+    "inconclusive": frozenset({"none", "solver_output", "evidence"}),
+    "timeout": frozenset({"timeout"}),
+    "provider_failure": frozenset(
+        {
+            "provider_transport",
+            "provider_policy",
+            "provider_quota",
+            "startup",
+            "model_validation",
+            "evidence",
+            "unknown",
+        }
+    ),
+    "fixture_failure": frozenset({"fixture_setup"}),
+    "cancelled": frozenset({"cancelled"}),
+    "not_started": frozenset({"none"}),
+}
+_INCONCLUSIVE_REASONS = frozenset(
+    {
+        "candidate_evidence_incomplete",
+        "candidate_ineligible",
+        "candidate_supplied",
+        "candidate_unobserved",
+        "verifier_requires_fixed_observation",
+        "solver_output",
+        "no_candidate",
+        "wrong",
+    }
+)
 _SPAN_STAGES = frozenset(
     {
         "startup",
@@ -583,6 +614,106 @@ def _validate_spans(value: object) -> list[dict[str, object]]:
     return result
 
 
+def _validate_outcome_state(
+    *,
+    terminal_outcome: str,
+    failure_class: str,
+    qualification_reason: str,
+    false_accept: str,
+    oracle_correct: bool,
+    qualification_accepted: bool,
+    qualified_correct: bool,
+    repair_trigger: str,
+    repair_attempted: bool,
+    first_candidate: int | None,
+    correct_offset: int | None,
+    qualified_offset: int | None,
+    paired_qualified: int | None,
+    terminal_offset: int,
+    spans: Sequence[Mapping[str, object]],
+    usage: Mapping[str, int | None],
+    tool_call_count: int,
+) -> None:
+    if failure_class not in _OUTCOME_FAILURE_CLASSES[terminal_outcome]:
+        raise ValueError("H24 terminal outcome and failure class disagree")
+
+    if terminal_outcome == "completed":
+        if qualification_reason not in {"qualified", "wrong"}:
+            raise ValueError("completed outcome has an invalid qualification reason")
+    elif terminal_outcome == "inconclusive":
+        if qualification_reason not in _INCONCLUSIVE_REASONS:
+            raise ValueError("inconclusive outcome has an invalid qualification reason")
+        if qualification_accepted or qualified_correct or false_accept != "none":
+            raise ValueError("inconclusive outcome cannot be qualified")
+    else:
+        expected_reason = {
+            "timeout": "timeout",
+            "provider_failure": "provider_failure",
+            "fixture_failure": "fixture_failure",
+            "cancelled": "cancelled",
+            "not_started": "not_started",
+        }[terminal_outcome]
+        if qualification_reason != expected_reason:
+            raise ValueError("terminal failure and qualification reason disagree")
+        if oracle_correct or qualification_accepted or qualified_correct or false_accept != "none":
+            raise ValueError("terminal failure cannot be correct or qualified")
+
+    stages = {str(span["stage"]): span for span in spans}
+    statuses = {str(span["status"]) for span in spans}
+    if terminal_outcome in {"completed", "inconclusive"} and "first_turn" not in stages:
+        raise ValueError("started terminal outcome lacks a first-turn span")
+    if terminal_outcome == "completed" and statuses != {"completed"}:
+        raise ValueError("completed outcome contains an unfinished span")
+    if terminal_outcome == "inconclusive":
+        if "cancelled" in statuses:
+            raise ValueError("inconclusive outcome contains a cancelled span")
+        if failure_class == "none" and "failed" in statuses:
+            raise ValueError("inconclusive outcome has an unclassified failed span")
+    if terminal_outcome == "fixture_failure" and {"first_turn", "repair_turn"} & stages.keys():
+        raise ValueError("fixture failure cannot contain model-turn spans")
+    if terminal_outcome == "not_started":
+        if spans or terminal_offset != 0:
+            raise ValueError("not-started outcome cannot contain runtime spans")
+        if first_candidate is not None or any(
+            offset is not None for offset in (correct_offset, qualified_offset, paired_qualified)
+        ):
+            raise ValueError("not-started outcome cannot contain result timestamps")
+        if repair_trigger != "none" or repair_attempted:
+            raise ValueError("not-started outcome cannot contain repair state")
+        if tool_call_count != 0 or any(value is not None for value in usage.values()):
+            raise ValueError("not-started outcome cannot contain observed work")
+
+    has_repair_span = "repair_turn" in stages
+    if has_repair_span is not repair_attempted:
+        raise ValueError("repair attempt and repair-turn span disagree")
+    if repair_trigger != "none" and (first_candidate is None or "first_turn" not in stages):
+        raise ValueError("repair trigger lacks a first-turn candidate")
+    if first_candidate is not None and "first_turn" not in stages:
+        raise ValueError("candidate timing lacks a first-turn span")
+    if terminal_outcome == "completed" and first_candidate is None:
+        raise ValueError("completed outcome lacks a candidate timestamp")
+
+    if spans:
+        span_origin = min(int(span["start_offset_milliseconds"]) for span in spans)
+        active_elapsed = terminal_offset - span_origin
+        if first_candidate is not None and first_candidate > active_elapsed:
+            raise ValueError("candidate timestamp falls outside native spans")
+        for name, offset in (("correct", correct_offset), ("qualified", qualified_offset)):
+            if offset is not None and offset < span_origin:
+                raise ValueError(f"{name} timestamp precedes native spans")
+        if (
+            correct_offset is not None
+            and first_candidate is not None
+            and span_origin + first_candidate > correct_offset
+        ):
+            raise ValueError("correctness precedes the first candidate")
+        if qualified_offset is not None:
+            if correct_offset is None or correct_offset > qualified_offset:
+                raise ValueError("qualification precedes correctness")
+            if paired_qualified != qualified_offset - span_origin:
+                raise ValueError("paired qualification timing disagrees with native spans")
+
+
 def _validate_runtime_spans(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         raise TypeError("runtime spans must be a list")
@@ -689,6 +820,28 @@ def _validate_outcome(
     elif terminal_offset != 0:
         raise ValueError("span-free outcome must retain a zero terminal offset")
 
+    usage = _validate_usage(row["usage"])
+    tool_call_count = _integer(row["tool_call_count"], "tool call count")
+    _validate_outcome_state(
+        terminal_outcome=str(row["terminal_outcome"]),
+        failure_class=str(row["failure_class"]),
+        qualification_reason=str(row["qualification_reason"]),
+        false_accept=str(row["false_accept"]),
+        oracle_correct=oracle_correct,
+        qualification_accepted=qualification_accepted,
+        qualified_correct=qualified_correct,
+        repair_trigger=str(row["repair_trigger"]),
+        repair_attempted=repair_attempted,
+        first_candidate=first_candidate,
+        correct_offset=correct_offset,
+        qualified_offset=qualified_offset,
+        paired_qualified=paired_qualified,
+        terminal_offset=terminal_offset,
+        spans=spans,
+        usage=usage,
+        tool_call_count=tool_call_count,
+    )
+
     return {
         **dict(row),
         "oracle_correct": oracle_correct,
@@ -700,8 +853,8 @@ def _validate_outcome(
         "qualified_offset_milliseconds": qualified_offset,
         "paired_qualified_elapsed_milliseconds": paired_qualified,
         "terminal_offset_milliseconds": terminal_offset,
-        "usage": _validate_usage(row["usage"]),
-        "tool_call_count": _integer(row["tool_call_count"], "tool call count"),
+        "usage": usage,
+        "tool_call_count": tool_call_count,
         "spans": spans,
         "artifact_bytes": _integer(row["artifact_bytes"], "outcome artifact bytes"),
     }
@@ -1160,6 +1313,12 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
     }.get(str(final_outcome), "completed")
     if failure_class == "cancelled":
         terminal_outcome = "cancelled"
+    elif terminal_outcome == "timeout" and failure_class == "none":
+        failure_class = "timeout"
+    elif terminal_outcome == "provider_failure" and failure_class == "none":
+        failure_class = "unknown"
+    if terminal_outcome == "provider_failure" and failure_class == "fixture_setup":
+        terminal_outcome = "fixture_failure"
     expected_native_outcome = {
         "timeout": "timeout",
         "provider_failure": "provider_failure",
@@ -1175,6 +1334,8 @@ def _raw_outcome_projection(raw: object, task: Mapping[str, object], arm: str) -
     rejection = final.get("rejection_reason")
     if failure_class == "cancelled":
         qualification_reason = "cancelled"
+    elif terminal_outcome == "fixture_failure":
+        qualification_reason = "fixture_failure"
     elif qualification_accepted:
         qualification_reason = "qualified"
     elif rejection in _QUALIFICATION_REASONS:
@@ -1550,6 +1711,7 @@ def evaluate_h24_receipt(
         and cleanup["source_database_mutation_detected"] is False
     )
     false_accept_passed = all(row["false_accept"] == "none" for row in rows)
+    all_rows_started = all(row["terminal_outcome"] != "not_started" for row in rows)
     soak_passed = soak["passed"] is True
     safety_integrity_passed = (
         fixture_preflight_valid
@@ -1558,6 +1720,7 @@ def evaluate_h24_receipt(
         and deadline_passed
         and cleanup_passed
         and false_accept_passed
+        and all_rows_started
         and soak_passed
     )
     opportunities = sum(
@@ -1595,6 +1758,7 @@ def evaluate_h24_receipt(
             "global_deadline": deadline_passed,
             "state_contract_10_of_10": soak_passed,
             "false_accept_free": false_accept_passed,
+            "all_rows_started": all_rows_started,
             "cleanup_and_privacy": cleanup_passed,
             "easy_non_regression": easy,
             "safety_integrity": safety_integrity_passed,
