@@ -541,6 +541,34 @@ def test_private_paths_reject_public_modes_and_overlap(tmp_path: Path) -> None:
         SUPERVISOR.validate_paths(overlap, owner_uid=os.getuid())
 
 
+def test_private_cleanup_paths_require_private_owned_parents(tmp_path: Path) -> None:
+    _, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    tmp_path.chmod(0o755)
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="work_cleanup_parent_invalid"):
+        SUPERVISOR.validate_paths(paths, owner_uid=os.getuid())
+
+    tmp_path.chmod(0o700)
+    public_parent = tmp_path / "public-parent"
+    public_parent.mkdir(mode=0o755)
+    public_parent.chmod(0o755)
+    public_seed = _private_file(public_parent / "seed", b"s" * 32)
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="seed_cleanup_parent_invalid"):
+        SUPERVISOR.validate_paths(
+            replace(paths, seed=public_seed),
+            owner_uid=os.getuid(),
+        )
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="cleanup_parent_invalid"):
+        SUPERVISOR._private_cleanup_parent(
+            paths.work,
+            "cleanup_parent_invalid",
+            os.getuid() + 1,
+        )
+
+
 def test_external_registration_requires_material_immutability(tmp_path: Path) -> None:
     _, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
