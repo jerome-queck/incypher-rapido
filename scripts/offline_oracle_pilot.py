@@ -1412,13 +1412,14 @@ def _h24_not_run_measurement(
     outcome: Literal["timeout", "provider_failure"],
     failure_class: str,
     fixture_status: Literal["completed", "failed", "not_run"],
+    native_outcome: Literal["timeout", "provider_failure", "cancelled"] | None = None,
 ) -> VerifierMeasurement:
     evaluation = VerifierTurnEvaluation(outcome, None)
     configured = fixture.wall_seconds * 1_000
     granted = 0 if budget is None else budget.granted_milliseconds
     native_receipt = build_native_attempt_receipt(
         key=AttemptKey(fixture.id, arm.id),
-        outcome=outcome,
+        outcome=outcome if native_outcome is None else native_outcome,
         spans=(
             Span(
                 "fixture_setup",
@@ -1496,6 +1497,7 @@ async def _measure_verifier(
     developer_instructions: str = OFFLINE_DEVELOPER_INSTRUCTIONS,
     repair_prompt_builder: Callable[[str, float | None], str] = build_verifier_repair_prompt,
     clock: Callable[[], float] = time.monotonic,
+    retain_child_cancellation: bool = False,
 ) -> VerifierMeasurement:
     started = clock()
     if deadline is None:
@@ -1585,16 +1587,22 @@ async def _measure_verifier(
         evidence = getattr(exc, "result", None)
         cancelled_calls = _mapping_calls(getattr(evidence, "tool_calls", None))
         cancelled_event = _raw_event(evidence)
-        cancelled_first_calls = cancelled_calls if first is None else first_calls
-        cancelled_repair_calls = (
-            cancelled_calls[len(first_calls) :]
-            if first is not None and len(cancelled_calls) >= len(first_calls)
-            else []
-        )
+        if first is None:
+            cancelled_first_calls = cancelled_calls
+            cancelled_repair_calls: list[Mapping[str, Any]] = []
+            cumulative_cancelled_calls = cancelled_calls
+        elif continuation_count and len(cancelled_calls) >= len(first_calls):
+            cancelled_first_calls = first_calls
+            cancelled_repair_calls = cancelled_calls[len(first_calls) :]
+            cumulative_cancelled_calls = cancelled_calls
+        else:
+            cancelled_first_calls = first_calls
+            cancelled_repair_calls = []
+            cumulative_cancelled_calls = first_calls
         first_terminal = cancelled_at if first_finished is None else first_finished
         remaining_first = deadline.remaining_milliseconds(first_terminal)
         remaining_terminal = deadline.remaining_milliseconds(cancelled_at)
-        exc.native_receipt = build_native_attempt_receipt(
+        native_receipt = build_native_attempt_receipt(
             key=AttemptKey(fixture.id, arm.id),
             outcome="cancelled",
             spans=(
@@ -1616,7 +1624,7 @@ async def _measure_verifier(
                     _offset_milliseconds(run_started, first_terminal),
                     _offset_milliseconds(run_started, cancelled_at),
                 )
-                if first is not None
+                if continuation_count
                 else Span("repair_turn", "not_run", None, None),
             ),
             budget=Budget(
@@ -1629,9 +1637,49 @@ async def _measure_verifier(
             final_event=cancelled_event,
             first_turn_calls=cancelled_first_calls,
             repair_turn_calls=cancelled_repair_calls,
-            cumulative_calls=cancelled_calls,
-            repair_attempted=first is not None,
+            cumulative_calls=cumulative_cancelled_calls,
+            repair_attempted=continuation_count == 1,
         )
+        exc.native_receipt = native_receipt
+        cancelled = VerifierTurnEvaluation("provider_failure", None)
+        cancelled_first = first if first is not None else cancelled
+        cancelled_first_usage = first_usage if first is not None else _native_usage(evidence)
+        cancelled_measurement = VerifierMeasurement(
+            task_id=fixture.id,
+            family=fixture.family,
+            arm=arm,
+            first=cancelled_first,
+            final=cancelled,
+            fixture_elapsed_seconds=fixture_elapsed_seconds,
+            first_turn_seconds=max(0.0, first_terminal - started),
+            repair_turn_seconds=(
+                max(0.0, cancelled_at - first_terminal) if continuation_count else 0.0
+            ),
+            repair_attempted=continuation_count == 1,
+            continuation_count=continuation_count,
+            # A continuation is created only inside this one solve call.  Cancelled
+            # evidence intentionally omits thread identifiers, but cannot switch threads.
+            same_thread=True,
+            continuation_prompt_candidate_free=continuation_prompt_candidate_free,
+            first_tool_calls=len(cancelled_first_calls),
+            final_tool_calls=len(
+                cancelled_repair_calls if continuation_count else cancelled_first_calls
+            ),
+            cumulative_tool_calls=len(cumulative_cancelled_calls),
+            tool_errors=closed_tool_error_counts(cumulative_cancelled_calls),
+            first_native_usage=cancelled_first_usage,
+            final_native_usage=_native_usage(evidence),
+            failure_class="interrupted",
+            native_receipt=native_receipt,
+        )
+        exc.cancelled_measurement = cancelled_measurement
+        current_task = asyncio.current_task()
+        if (
+            retain_child_cancellation
+            and current_task is not None
+            and current_task.cancelling() == 0
+        ):
+            return cancelled_measurement
         raise
     except TurnTimeoutError as exc:
         result = exc.result
@@ -2644,22 +2692,38 @@ async def run_verifier_repair_pilot(
 
 
 _DESCRIPTOR_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_DESCRIPTOR_SENSITIVE_RE = re.compile(
+    r"(?:secret|credential|password|bearer|authorization|api[_-]?key|token)", re.IGNORECASE
+)
 
 
 def _h24_descriptor_receipt(descriptor: object) -> dict[str, object]:
+    returned = getattr(descriptor, "name", None)
+    model_matches = type(returned) is str and returned == _VERIFIER_MODEL
+    efforts = getattr(descriptor, "reasoning_efforts", ())
+    effort_supported = (
+        isinstance(efforts, Sequence)
+        and not isinstance(efforts, (str, bytes, bytearray))
+        and any(type(value) is str and value == _VERIFIER_EFFORT for value in efforts)
+    )
     raw = getattr(descriptor, "raw", None)
     revision: str | None = None
     if isinstance(raw, Mapping):
         for key in ("revision", "modelRevision", "modelVersion", "version", "snapshot"):
             value = raw.get(key)
-            if isinstance(value, str) and _DESCRIPTOR_VALUE_RE.fullmatch(value):
+            if (
+                isinstance(value, str)
+                and _DESCRIPTOR_VALUE_RE.fullmatch(value)
+                and _DESCRIPTOR_SENSITIVE_RE.search(value) is None
+            ):
                 revision = value
                 break
     return {
         "requested_model": _VERIFIER_MODEL,
-        "returned_model": getattr(descriptor, "name", None),
+        "returned_model": _VERIFIER_MODEL if model_matches else None,
+        "model_status": "matched" if model_matches else "mismatch_or_invalid",
         "requested_effort": _VERIFIER_EFFORT,
-        "effort_supported": _VERIFIER_EFFORT in tuple(getattr(descriptor, "reasoning_efforts", ())),
+        "effort_supported": effort_supported,
         "revision": revision,
         "revision_status": "observed" if revision is not None else "unavailable",
     }
@@ -2878,6 +2942,9 @@ async def run_h24_pilot(
                 clients[arm] = client
                 await asyncio.wait_for(client.start(), timeout=TURN_TIMEOUT_SECONDS)
             except asyncio.CancelledError:
+                spans["startup"] = _runtime_span("cancelled", run_started, started, clock())
+                row["status"] = "failed"
+                row["failure_class"] = "interrupted"
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
                 spans["startup"] = _runtime_span("failed", run_started, started, clock())
@@ -2894,11 +2961,16 @@ async def run_h24_pilot(
                 projected = _h24_descriptor_receipt(descriptor)
                 row["descriptor"] = projected
                 if (
-                    projected["returned_model"] != _VERIFIER_MODEL
+                    projected["model_status"] != "matched"
                     or projected["effort_supported"] is not True
                 ):
                     raise ModelValidationError("native model descriptor does not match H24 roster")
             except asyncio.CancelledError:
+                spans["model_validation"] = _runtime_span(
+                    "cancelled", run_started, validated, clock()
+                )
+                row["status"] = "failed"
+                row["failure_class"] = "interrupted"
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
                 spans["model_validation"] = _runtime_span("failed", run_started, validated, clock())
@@ -2929,12 +3001,39 @@ async def run_h24_pilot(
             if row["status"] == "ready":
                 row["status"] = "completed"
 
+        cancelled_error: asyncio.CancelledError | None = None
+        active_fixture: H24FixtureSpec | None = None
+        active_pair: dict[VerifierArm, VerifierMeasurement] = {}
+        active_staged: dict[VerifierArm, tuple[Path, float, float]] = {}
+        active_tasks: dict[VerifierArm, asyncio.Task[VerifierMeasurement]] = {}
+        active_deadline: PairDeadline | None = None
         try:
             # PR71: shared-home first-use startup is serialized; only paired turns overlap.
             for arm in VERIFIER_ARMS:
                 await start_arm(arm)
+            observed_revisions = [
+                runtime[arm.id]["descriptor"]["revision"]
+                for arm in VERIFIER_ARMS
+                if isinstance(runtime[arm.id].get("descriptor"), Mapping)
+                and runtime[arm.id]["descriptor"].get("revision_status") == "observed"
+            ]
+            if len(observed_revisions) == len(VERIFIER_ARMS) and len(set(observed_revisions)) != 1:
+                for arm in VERIFIER_ARMS:
+                    row = runtime[arm.id]
+                    row["status"] = "failed"
+                    row["failure_class"] = "model_validation"
+                    spans = row["spans"]
+                    assert isinstance(spans, dict)
+                    model_validation = spans["model_validation"]
+                    assert isinstance(model_validation, dict)
+                    model_validation["status"] = "failed"
             roster_ready = all(runtime[arm.id]["status"] == "ready" for arm in VERIFIER_ARMS)
             for index, fixture in enumerate(fixtures):
+                active_fixture = fixture
+                active_pair = {}
+                active_staged = {}
+                active_tasks = {}
+                active_deadline = None
                 if not roster_ready:
                     for arm in VERIFIER_ARMS:
                         measurements.append(
@@ -2957,6 +3056,7 @@ async def run_h24_pilot(
                     admitted,
                     global_deadline,
                 )
+                active_deadline = deadline
                 if deadline.granted_milliseconds <= 0:
                     for arm in VERIFIER_ARMS:
                         measurements.append(
@@ -2974,8 +3074,8 @@ async def run_h24_pilot(
                         )
                     continue
 
-                staged: dict[VerifierArm, tuple[Path, float, float]] = {}
-                pair: dict[VerifierArm, VerifierMeasurement] = {}
+                staged = active_staged
+                pair = active_pair
                 for arm in VERIFIER_ARMS:
                     setup_started = clock()
                     workspace = run_root / arm.id / fixture.id
@@ -2999,7 +3099,7 @@ async def run_h24_pilot(
                     staged[arm] = (workspace, setup_started, setup_finished)
 
                 dispatch_order = VERIFIER_ARMS if index % 2 == 0 else tuple(reversed(VERIFIER_ARMS))
-                tasks: dict[VerifierArm, asyncio.Task[VerifierMeasurement]] = {}
+                tasks = active_tasks
                 prompt = _h24_prompt(fixture)
                 for arm in dispatch_order:
                     if arm in pair:
@@ -3022,14 +3122,37 @@ async def run_h24_pilot(
                             developer_instructions=H24_DEVELOPER_INSTRUCTIONS,
                             repair_prompt_builder=build_h24_repair_prompt,
                             clock=clock,
+                            retain_child_cancellation=True,
                         )
                     )
                 if tasks:
                     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                     for arm, result in zip(tasks, results, strict=True):
                         if isinstance(result, asyncio.CancelledError):
-                            raise result
+                            cancelled = getattr(result, "cancelled_measurement", None)
+                            if (
+                                isinstance(cancelled, VerifierMeasurement)
+                                and cancelled.task_id == fixture.id
+                                and cancelled.arm == arm
+                            ):
+                                pair[arm] = cancelled
+                            else:
+                                _, setup_started, setup_finished = staged[arm]
+                                pair[arm] = _h24_not_run_measurement(
+                                    fixture,
+                                    arm,
+                                    run_started=run_started,
+                                    fixture_started=setup_started,
+                                    fixture_finished=setup_finished,
+                                    budget=deadline,
+                                    outcome="provider_failure",
+                                    failure_class="interrupted",
+                                    fixture_status="completed",
+                                    native_outcome="cancelled",
+                                )
                         if isinstance(result, BaseException):
+                            if arm in pair:
+                                continue
                             _, setup_started, setup_finished = staged[arm]
                             pair[arm] = _h24_not_run_measurement(
                                 fixture,
@@ -3045,11 +3168,70 @@ async def run_h24_pilot(
                         else:
                             pair[arm] = result
                 measurements.extend(pair[arm] for arm in VERIFIER_ARMS)
+        except asyncio.CancelledError as exc:
+            cancelled_error = exc
+            for row in runtime.values():
+                if row["status"] in {"pending", "ready"}:
+                    row["status"] = "failed"
+                    row["failure_class"] = "interrupted"
+            for task in active_tasks.values():
+                if not task.done():
+                    task.cancel()
+            if active_tasks:
+                drained = await asyncio.gather(*active_tasks.values(), return_exceptions=True)
+                for arm, result in zip(active_tasks, drained, strict=True):
+                    if arm in active_pair:
+                        continue
+                    if isinstance(result, VerifierMeasurement):
+                        active_pair[arm] = result
+                        continue
+                    cancelled = getattr(result, "cancelled_measurement", None)
+                    if (
+                        isinstance(cancelled, VerifierMeasurement)
+                        and active_fixture is not None
+                        and cancelled.task_id == active_fixture.id
+                        and cancelled.arm == arm
+                    ):
+                        active_pair[arm] = cancelled
+
+            retained = {(row.task_id, row.arm.id) for row in measurements}
+            for row in active_pair.values():
+                identity = (row.task_id, row.arm.id)
+                if identity not in retained:
+                    measurements.append(row)
+                    retained.add(identity)
+            for fixture in fixtures:
+                for arm in VERIFIER_ARMS:
+                    identity = (fixture.id, arm.id)
+                    if identity in retained:
+                        continue
+                    staged = active_staged.get(arm) if fixture is active_fixture else None
+                    measurements.append(
+                        _h24_not_run_measurement(
+                            fixture,
+                            arm,
+                            run_started=run_started,
+                            fixture_started=None if staged is None else staged[1],
+                            fixture_finished=None if staged is None else staged[2],
+                            budget=active_deadline if fixture is active_fixture else None,
+                            outcome="provider_failure",
+                            failure_class="interrupted",
+                            fixture_status="completed" if staged is not None else "not_run",
+                            native_outcome="cancelled",
+                        )
+                    )
+                    retained.add(identity)
         finally:
-            await asyncio.gather(*(close_arm(arm) for arm in VERIFIER_ARMS))
+            await asyncio.gather(
+                *(close_arm(arm) for arm in VERIFIER_ARMS),
+                return_exceptions=cancelled_error is not None,
+            )
 
     receipt = _h24_receipt(config, source, image, fixtures, measurements, runtime)
     _assert_h24_receipt_private(receipt, seed, fixtures)
+    if cancelled_error is not None:
+        cancelled_error.receipt = receipt
+        raise cancelled_error
     return receipt
 
 

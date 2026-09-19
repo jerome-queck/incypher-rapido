@@ -340,8 +340,121 @@ def test_h24_descriptor_mismatch_fails_closed_with_48_rows_and_no_solve(
     encoded = json.dumps(receipt)
     assert "must-not-copy" not in encoded
     for row in receipt["runtime"].values():
+        assert row["descriptor"]["model_status"] == "matched"
+        assert row["descriptor"]["returned_model"] == PILOT._VERIFIER_MODEL
         assert row["descriptor"]["revision"] == "2026-09-19"
         assert row["descriptor"]["effort_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("returned_name", "forbidden"),
+    [
+        pytest.param(["unexpected-model-list"], "unexpected-model-list", id="non-string"),
+        pytest.param(object(), "non-json-model-object", id="non-json"),
+        pytest.param("private-secret-token-model", "private-secret-token-model", id="secret-like"),
+    ],
+)
+def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returned_name: object,
+    forbidden: str,
+) -> None:
+    config = _config(tmp_path)
+    _patch_identities(monkeypatch)
+    clients: list[object] = []
+
+    class AdversarialDescriptorClient:
+        def __init__(self, **_: object) -> None:
+            self.solves = 0
+            clients.append(self)
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            assert (model, effort) == (PILOT._VERIFIER_MODEL, PILOT._VERIFIER_EFFORT)
+            return SimpleNamespace(
+                name=returned_name,
+                reasoning_efforts=(effort,),
+                raw={
+                    "revision": "api-key-secret-revision",
+                    "private": "descriptor-private-value",
+                },
+            )
+
+        async def solve(self, *_: object, **__: object) -> object:
+            self.solves += 1
+            raise AssertionError("invalid model descriptor must prevent solves")
+
+        async def close(self) -> None: ...
+
+    receipt = asyncio.run(PILOT.run_h24_pilot(config, client_factory=AdversarialDescriptorClient))
+    encoded = json.dumps(receipt, sort_keys=True)
+
+    assert len(clients) == 2
+    assert sum(client.solves for client in clients) == 0
+    assert len(receipt["results"]) == 48
+    assert receipt["native_observability"]["outcomes"]["provider_failure"] == 48
+    assert forbidden not in encoded
+    assert "api-key-secret-revision" not in encoded
+    assert "descriptor-private-value" not in encoded
+    for row in receipt["runtime"].values():
+        assert row["failure_class"] == "model_validation"
+        assert row["descriptor"] == {
+            "requested_model": PILOT._VERIFIER_MODEL,
+            "returned_model": None,
+            "model_status": "mismatch_or_invalid",
+            "requested_effort": PILOT._VERIFIER_EFFORT,
+            "effort_supported": True,
+            "revision": None,
+            "revision_status": "unavailable",
+        }
+
+
+def test_h24_observed_descriptor_revision_mismatch_fails_before_solve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _patch_identities(monkeypatch)
+    clients: list[object] = []
+
+    class RevisionMismatchClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.arm = Path(str(kwargs["cwd"])).name
+            self.solves = 0
+            clients.append(self)
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            revision = "revision-one" if self.arm == "one_shot" else "revision-two"
+            return SimpleNamespace(
+                name=model,
+                reasoning_efforts=(effort,),
+                raw={"revision": revision},
+            )
+
+        async def solve(self, *_: object, **__: object) -> object:
+            self.solves += 1
+            raise AssertionError("descriptor revision mismatch must prevent solves")
+
+        async def close(self) -> None: ...
+
+    receipt = asyncio.run(PILOT.run_h24_pilot(config, client_factory=RevisionMismatchClient))
+
+    assert len(clients) == 2
+    assert sum(client.solves for client in clients) == 0
+    assert len(receipt["results"]) == 48
+    assert receipt["native_observability"]["outcomes"]["provider_failure"] == 48
+    assert {row["descriptor"]["revision"] for row in receipt["runtime"].values()} == {
+        "revision-one",
+        "revision-two",
+    }
+    assert all(row["failure_class"] == "model_validation" for row in receipt["runtime"].values())
+    assert all(
+        row["spans"]["model_validation"]["status"] == "failed"
+        for row in receipt["runtime"].values()
+    )
 
 
 def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
@@ -416,6 +529,175 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
         len(pair) == 2 and set(pair[0]["inodes"]).isdisjoint(set(pair[1]["inodes"]))
         for pair in by_task.values()
     )
+
+
+def test_h24_per_arm_cancellation_retains_evidence_and_all_48_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _patch_identities(monkeypatch)
+    solves = 0
+
+    class CancellingClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.arm = Path(str(kwargs["cwd"])).name
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            return SimpleNamespace(name=model, reasoning_efforts=(effort,), raw={"slug": model})
+
+        async def solve(self, workspace: Path, prompt: str, **_: object) -> object:
+            del prompt
+            nonlocal solves
+            solves += 1
+            if self.arm == "one_shot" and workspace.name == "h24-easy-01":
+                cancelled = asyncio.CancelledError()
+                cancelled.result = SimpleNamespace(
+                    tool_calls=[],
+                    cumulative_native_usage=None,
+                    raw={
+                        "usage": {"inputTokens": 7, "outputTokens": 1},
+                        "private": "cancelled-private-evidence",
+                    },
+                )
+                raise cancelled
+            return _unsolved_turn(f"{self.arm}-{workspace.name}")
+
+        async def close(self) -> None: ...
+
+    receipt = asyncio.run(PILOT.run_h24_pilot(config, client_factory=CancellingClient))
+    results = receipt["results"]
+    cancelled = [row for row in results if row["failure_class"] == "interrupted"]
+
+    assert solves == 48
+    assert len(results) == 48
+    assert len(cancelled) == 1
+    assert cancelled[0]["task_id"] == "h24-easy-01"
+    assert cancelled[0]["arm"] == "one_shot"
+    assert cancelled[0]["final"]["outcome"] == "provider_failure"
+    assert cancelled[0]["failure_class"] == "interrupted"
+    assert cancelled[0]["same_thread"] is True
+    assert cancelled[0]["native_observability"]["outcome"] == "cancelled"
+    assert cancelled[0]["native_observability"]["usage"]["accounted"] == {
+        "input_tokens": 7,
+        "output_tokens": 1,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+    }
+    assert receipt["summary"]["arms"]["one_shot"]["outcomes"]["provider_failure"] == 1
+    assert receipt["native_observability"]["outcomes"]["cancelled"] == 1
+    assert receipt["native_observability"]["outcomes"]["inconclusive"] == 47
+    assert any(row["task_id"] == "h24-health-03" and row["arm"] == "one_shot" for row in results)
+    assert "cancelled-private-evidence" not in json.dumps(receipt, sort_keys=True)
+    assert list(config.work_root.iterdir()) == []
+
+
+def test_h24_top_level_caller_cancellation_propagates_after_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _patch_identities(monkeypatch)
+    entered = asyncio.Event()
+    clients: list[object] = []
+
+    class BlockingClient:
+        def __init__(self, **_: object) -> None:
+            self.closed = False
+            clients.append(self)
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            return SimpleNamespace(name=model, reasoning_efforts=(effort,), raw={"slug": model})
+
+        async def solve(self, *_: object, **__: object) -> object:
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("blocked solve cannot return")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def exercise() -> None:
+        task = asyncio.create_task(PILOT.run_h24_pilot(config, client_factory=BlockingClient))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        receipt = caught.value.receipt
+        assert len(receipt["results"]) == 48
+        assert receipt["native_observability"]["attempt_count"] == 48
+        assert receipt["native_observability"]["outcomes"]["cancelled"] == 48
+        assert all(row["failure_class"] == "interrupted" for row in receipt["results"])
+        active = [row for row in receipt["results"] if row["task_id"] == "h24-easy-01"]
+        assert len(active) == 2
+        assert all(
+            row["native_observability"]["budget"]["granted_milliseconds"] == 300_000
+            for row in active
+        )
+        assert all(
+            row["native_observability"]["spans"][0]["status"] == "completed" for row in active
+        )
+        assert "oracle.key" not in json.dumps(receipt, sort_keys=True)
+
+    asyncio.run(exercise())
+    assert len(clients) == 2
+    assert all(client.closed for client in clients)
+    assert list(config.work_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("phase", ["startup", "model_validation"])
+def test_h24_startup_or_validation_cancellation_attaches_terminal_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    config = _config(tmp_path)
+    _patch_identities(monkeypatch)
+    entered = asyncio.Event()
+    clients: list[object] = []
+
+    class BlockingPreflightClient:
+        def __init__(self, **_: object) -> None:
+            self.closed = False
+            clients.append(self)
+
+        async def start(self) -> None:
+            if phase == "startup":
+                entered.set()
+                await asyncio.Event().wait()
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            if phase == "model_validation":
+                entered.set()
+                await asyncio.Event().wait()
+            return SimpleNamespace(name=model, reasoning_efforts=(effort,), raw={"slug": model})
+
+        async def solve(self, *_: object, **__: object) -> object:
+            raise AssertionError("cancelled preflight must prevent solves")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def exercise() -> dict[str, object]:
+        task = asyncio.create_task(
+            PILOT.run_h24_pilot(config, client_factory=BlockingPreflightClient)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        return caught.value.receipt
+
+    receipt = asyncio.run(exercise())
+    active_runtime = receipt["runtime"]["one_shot"]
+    assert len(receipt["results"]) == 48
+    assert receipt["native_observability"]["outcomes"]["cancelled"] == 48
+    assert active_runtime["status"] == "failed"
+    assert active_runtime["failure_class"] == "interrupted"
+    assert active_runtime["spans"][phase]["status"] == "cancelled"
+    assert all(row["status"] == "failed" for row in receipt["runtime"].values())
+    assert all(client.closed for client in clients)
+    assert list(config.work_root.iterdir()) == []
 
 
 def test_shared_deadline_repair_is_one_solve_same_thread_and_decreasing(tmp_path: Path) -> None:
