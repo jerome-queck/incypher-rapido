@@ -1,6 +1,8 @@
 # H24 offline fixture contract
 
-Status: fixture protocol only; no native outcome has been unsealed.
+Status: frozen fixture protocol. Native results are recorded separately in
+[`offline-h24-final-evidence-2026-09-20.md`](offline-h24-final-evidence-2026-09-20.md); historical
+no-run statements below remain scoped to this fixture PR.
 
 `rapido.offline_h24` defines the public, candidate-free H24 task catalogue and the private fixture
 preparation boundary. The catalogue is fixed at 24 tasks: six easy sentinels, six medium artifact

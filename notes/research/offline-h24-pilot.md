@@ -1,7 +1,8 @@
 # Offline H24 pilot protocol
 
-Status: implemented and covered by model-free tests. No native H24 outcome has been run or
-unsealed.
+Status: implemented protocol. Native results are recorded separately in
+[`offline-h24-final-evidence-2026-09-20.md`](offline-h24-final-evidence-2026-09-20.md); historical
+no-run statements below remain scoped to this implementation PR.
 
 `scripts/offline_oracle_pilot.py --experiment h24` is the offline-only runner for the frozen
 24-task catalogue in `rapido.offline_h24`. It compares `one_shot` with `evidence_repair`; both arms

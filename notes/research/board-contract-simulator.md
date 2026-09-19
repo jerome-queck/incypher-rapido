@@ -1,7 +1,9 @@
 # Benign Board-contract simulator
 
-Status: implementation contract. Native H24 outcomes and the 19,800-second real-clock soak remain
-unrun until the final preregistration PR.
+Status: implementation contract. The terminal native attempt and 19,800-second real-clock soak are
+recorded separately in
+[`offline-h24-final-evidence-2026-09-20.md`](offline-h24-final-evidence-2026-09-20.md); historical
+no-run statements below remain scoped to this implementation PR.
 
 ## Boundary
 
