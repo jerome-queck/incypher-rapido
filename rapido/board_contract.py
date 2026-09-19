@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import importlib.machinery
 import importlib.util
 import json
 import math
@@ -21,7 +20,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 from .board import BoardClient, BoardError, BoardTransportError, HttpResponse
@@ -69,6 +68,7 @@ _TOP_LEVEL_FIELDS = frozenset(
     }
 )
 _PACKAGED_OFFLINE_PILOT_DIRECTORY = Path("/opt/rapido-eval")
+_LOADED_OFFLINE_PILOT: Any | None = None
 _SCENARIO_FACT_FIELDS = {
     SCENARIO_IDS[0]: frozenset({"correct", "incorrect", "historical", "historical_not_current"}),
     SCENARIO_IDS[1]: frozenset({"writes", "reconciled", "second_write"}),
@@ -630,13 +630,9 @@ def _verifier_route(route: Any) -> Any:
     )
 
 
-def _regular_offline_pilot_source(source: Path, *, missing_ok: bool) -> Path | None:
+def _regular_offline_pilot_source(source: Path) -> Path:
     try:
         metadata = source.lstat()
-    except FileNotFoundError:
-        if missing_ok:
-            return None
-        raise RuntimeError("offline pilot module is unavailable") from None
     except OSError as exc:
         raise RuntimeError("offline pilot module is unavailable") from exc
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
@@ -665,31 +661,16 @@ class _PeakProbe:
 
 
 def _load_offline_pilot() -> Any:
+    global _LOADED_OFFLINE_PILOT
     name = "_rapido_board_contract_offline_pilot"
     existing = sys.modules.get(name)
-    source = _regular_offline_pilot_source(
-        _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py",
-        missing_ok=False,
-    )
-    assert source is not None
     if existing is not None:
-        existing_source = getattr(existing, "__file__", None)
-        specification = getattr(existing, "__spec__", None)
-        loader = getattr(specification, "loader", None)
-        if (
-            not isinstance(existing, ModuleType)
-            or type(existing_source) is not str
-            or Path(existing_source) != source
-            or getattr(existing, "__name__", None) != name
-            or getattr(existing, "__loader__", None) is not loader
-            or getattr(specification, "name", None) != name
-            or getattr(specification, "origin", None) != str(source)
-            or not isinstance(loader, importlib.machinery.SourceFileLoader)
-            or loader.name != name
-            or Path(loader.path) != source
-        ):
+        if existing is not _LOADED_OFFLINE_PILOT:
             raise RuntimeError("offline pilot module is unavailable")
         return existing
+    source = _regular_offline_pilot_source(
+        _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py"
+    )
     specification = importlib.util.spec_from_file_location(name, source)
     if specification is None or specification.loader is None:
         raise RuntimeError("offline pilot module is unavailable")
@@ -701,6 +682,7 @@ def _load_offline_pilot() -> Any:
         if sys.modules.get(name) is module:
             del sys.modules[name]
         raise
+    _LOADED_OFFLINE_PILOT = module
     return module
 
 

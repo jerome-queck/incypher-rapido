@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.util
 import json
 import os
 import socket
@@ -166,8 +167,10 @@ def test_offline_pilot_loader_rejects_foreign_cache_claiming_expected_path(
     packaged.mkdir()
     source = packaged / "offline_oracle_pilot.py"
     source.write_text("PACKAGED_MARKER = 'sealed'\n")
-    injected = mock.Mock()
-    injected.__file__ = str(source)
+    specification = importlib.util.spec_from_file_location(OFFLINE_PILOT_MODULE, source)
+    assert specification is not None
+    injected = importlib.util.module_from_spec(specification)
+    injected.FORGED_MARKER = True
     monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
     sys.modules[OFFLINE_PILOT_MODULE] = injected
 

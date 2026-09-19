@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import run_contract
 from rapido.clock import ManualClock, SystemClock
 
@@ -99,6 +100,7 @@ def _write_private_output(path: Path, encoded: str) -> None:
 
 
 def main() -> int:
+    BOARD_CONTRACT._PACKAGED_OFFLINE_PILOT_DIRECTORY = Path(__file__).resolve().parent
     arguments = _arguments()
     if not 0 < arguments.duration_seconds <= 19_800:
         raise SystemExit("--duration-seconds must be within 0..19800")

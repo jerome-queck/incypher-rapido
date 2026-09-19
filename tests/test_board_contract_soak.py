@@ -53,6 +53,22 @@ def test_start_barrier_waits_only_for_bounded_future_window() -> None:
     assert deadline == 20_815_000
 
 
+def test_main_binds_pilot_to_resolved_entrypoint_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, Path] = {}
+
+    def arguments() -> object:
+        observed["directory"] = BOARD_CONTRACT._PACKAGED_OFFLINE_PILOT_DIRECTORY
+        raise SystemExit(0)
+
+    monkeypatch.setattr(SOAK, "_arguments", arguments)
+    with pytest.raises(SystemExit, match="0"):
+        SOAK.main()
+    assert observed["directory"] == Path(SOAK.__file__).resolve().parent
+
+
 def test_start_barrier_accepts_small_scheduling_lag_without_sleep() -> None:
     sleeps: list[float] = []
     deadline = SOAK._wait_for_start(
