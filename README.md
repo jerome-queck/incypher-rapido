@@ -121,6 +121,12 @@ candidate-free reporting contract keeps accepted post-run correctness, new Board
 account-history responses, runtime-current verification, and stricter evaluator results separate;
 see [`notes/research/reporting-contract.md`](notes/research/reporting-contract.md).
 
+The candidate-free [H24 fixture manifest](notes/research/offline-h24-manifest-v1.json) freezes 24
+benign offline task templates and budgets. Private-seed generation, bounded parser/checker rules,
+and isolation limits are documented in
+[`notes/research/offline-h24-fixtures.md`](notes/research/offline-h24-fixtures.md). This fixture
+contract does not authorize live targets or change production routing.
+
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
 `submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200
