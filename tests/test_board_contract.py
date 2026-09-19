@@ -140,6 +140,12 @@ def test_short_real_clock_smoke_is_separately_labelled(tmp_path: Path) -> None:
     assert receipt["clock_mode"] == "real"
     assert receipt["requested_seconds"] == 2.0
     assert receipt["passed"] is True
+    watch = next(
+        row
+        for row in receipt["scenarios"]
+        if row["scenario_id"] == "watch_change_original_deadline"
+    )
+    assert watch["facts"]["deadline_seconds"] == 2.0
 
 
 @pytest.fixture

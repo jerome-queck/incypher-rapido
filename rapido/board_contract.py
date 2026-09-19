@@ -1370,7 +1370,7 @@ async def run_contract(
             (1, 2),
             observed,
         )
-        elapsed_to_deadline = selected_clock.monotonic() - window_origin
+        registered_window_seconds = original_deadline - window_origin
         ended_at_deadline = selected_clock.monotonic() >= original_deadline
         receipts.append(
             _scenario(
@@ -1389,7 +1389,7 @@ async def run_contract(
                 change_observed=any(item.id == 108 for item in observed),
                 transient_offset_seconds=round(transient_offset or 0.0, 3),
                 change_offset_seconds=round(change_offset or 0.0, 3),
-                deadline_seconds=round(elapsed_to_deadline, 3),
+                deadline_seconds=round(registered_window_seconds, 3),
                 deadline_unchanged=math.isclose(
                     original_deadline,
                     window_origin + soak_seconds,
