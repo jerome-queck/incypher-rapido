@@ -136,12 +136,106 @@ def test_pdf_parser_is_bounded_behind_structured_protocol(tmp_path):
     ]
 
 
+def test_content_dependent_pdf_range_error_preserves_closed_repair_details(tmp_path):
+    source = tmp_path / "one.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=144)
+    writer.write(source)
+    descriptor = _open(source)
+    try:
+        with pytest.raises(ToolError) as error:
+            run_artifact_worker(
+                descriptor,
+                "pdf",
+                size=os.fstat(descriptor).st_size,
+                cursor=None,
+                base=_base(
+                    "one.pdf",
+                    os.fstat(descriptor).st_size,
+                    "pdf",
+                    "structure",
+                    "page:9",
+                ),
+            )
+    finally:
+        os.close(descriptor)
+    assert error.value.code == "invalid_argument"
+    assert error.value.details == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "selection_range",
+        "field_path": "selection",
+        "actual_kind": "string",
+        "allowed_values": ["page:<index>"],
+    }
+
+
+def test_worker_error_detail_filters_are_allowlisted_at_both_boundaries(tmp_path):
+    adversarial = {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "field_path": "selection",
+        "constraint": "selection_range",
+        "actual_kind": "string",
+        "allowed_values": ["page:<index>", "INCYPHER{raw-candidate}"],
+        "raw_value": "INCYPHER{must-not-cross}",
+    }
+    assert artifact_worker_main._closed_error_details(adversarial) == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "field_path": "selection",
+        "constraint": "selection_range",
+        "actual_kind": "string",
+        "allowed_values": ["page:<index>"],
+    }
+    assert (
+        artifact_worker_main._closed_error_details(
+            {"field_path": "rawCandidate", "constraint": "rawCandidate"}
+        )
+        == {}
+    )
+
+    source = tmp_path / "source"
+    source.write_bytes(b"x")
+    script = _fixture_worker(
+        tmp_path,
+        f"""
+import json, sys
+json.dump({{
+    "protocol": 1,
+    "ok": False,
+    "error": {{"code": "invalid_argument", "message": "selection is invalid", "details": {adversarial!r}}},
+}}, sys.stdout)
+""",
+    )
+    descriptor = _open(source)
+    try:
+        with pytest.raises(ToolError) as error:
+            artifact_worker._run_worker(descriptor, _request(), worker_script=script)
+    finally:
+        os.close(descriptor)
+    assert error.value.details == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "selection_range",
+        "field_path": "selection",
+        "actual_kind": "string",
+        "allowed_values": ["page:<index>"],
+    }
+    assert "raw-candidate" not in str(error.value.details)
+    assert "must-not-cross" not in str(error.value.details)
+
+
 def test_tar_inventory_worker_preserves_pagination_and_display_path(tmp_path):
     source = tmp_path / "many.tar"
     _tar_fixture(source, 101)
     descriptor = _open(source)
     size = os.fstat(descriptor).st_size
-    base = _base("many.tar", size, "tar", "structure", "entries")
+    base = _base("many.tar", size, "tar", "structure")
     try:
         first = run_artifact_worker(descriptor, "tar", size=size, cursor=None, base=base)
         second = run_artifact_worker(
@@ -192,7 +286,7 @@ def test_tar_worker_fails_safely_on_malformed_or_resource_limited_inventory(
                 "tar",
                 size=size,
                 cursor=None,
-                base=_base("bounded.tar", size, "tar", "structure", "entries"),
+                base=_base("bounded.tar", size, "tar", "structure"),
             )
     finally:
         os.close(descriptor)

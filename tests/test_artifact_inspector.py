@@ -171,6 +171,226 @@ def test_spec_is_one_strict_required_path_interface():
     json.dumps(spec)
 
 
+def test_detected_formats_report_bounded_view_selector_capabilities(tmp_path):
+    (tmp_path / "image.dcm").write_bytes(_dicom_fixture())
+    (tmp_path / "program.elf").write_bytes(_elf_fixture())
+    with zipfile.ZipFile(tmp_path / "bundle.zip", "w") as archive:
+        archive.writestr("one.txt", "one")
+
+    dicom = inspect_artifact(Workspace(tmp_path), {"path": "image.dcm"})
+    elf = inspect_artifact(Workspace(tmp_path), {"path": "program.elf"})
+    archive = inspect_artifact(Workspace(tmp_path), {"path": "bundle.zip"})
+
+    for result in (dicom, elf, archive):
+        capabilities = result["capabilities"]
+        assert capabilities["supported_views"] == ["summary", "text", "structure", "bytes"]
+        assert capabilities["supported_selections_by_view"]["bytes"] == []
+        assert "bytes" in capabilities["cursor_views"]
+    assert dicom["capabilities"]["supported_selections_by_view"]["summary"] == []
+    assert elf["capabilities"]["supported_selections_by_view"]["structure"] == [
+        "section:<index>",
+        "disassembly",
+        "disassembly:0x<address>",
+    ]
+    assert archive["capabilities"]["supported_selections_by_view"]["text"] == []
+
+
+def test_capability_matrix_is_exhaustive_and_only_advertises_effective_selectors():
+    empty = {view: [] for view in ("summary", "text", "structure", "bytes")}
+    encodings = [
+        "encoding:cp1252",
+        "encoding:latin-1",
+        "encoding:utf-16-be",
+        "encoding:utf-16-le",
+        "encoding:utf-8",
+    ]
+    expected = {
+        "text": {**empty, "summary": encodings, "text": encodings, "structure": encodings},
+        "zip": empty,
+        "tar": empty,
+        "gzip": empty,
+        "pdf": {
+            **empty,
+            "text": ["metadata", "page:<index>"],
+            "structure": ["metadata", "page:<index>"],
+        },
+        "pcap": empty,
+        "pcapng": empty,
+        "elf": {
+            **empty,
+            "summary": ["section:<index>"],
+            "text": ["disassembly", "disassembly:0x<address>"],
+            "structure": ["section:<index>", "disassembly", "disassembly:0x<address>"],
+        },
+        "pe": {
+            **empty,
+            "text": ["disassembly", "disassembly:0x<address>", "exports", "imports"],
+            "structure": ["disassembly", "disassembly:0x<address>", "exports", "imports"],
+        },
+        "png": {
+            **empty,
+            "text": ["channel:<R|G|B|A>", "bitplane:<R|G|B|A>:<0-7>", "ocr"],
+            "structure": ["channel:<R|G|B|A>", "bitplane:<R|G|B|A>:<0-7>"],
+        },
+        "wav": empty,
+        "dicom": empty,
+        "binary": empty,
+    }
+    cursor_views = {
+        "text": ["text", "structure", "bytes"],
+        "zip": ["text", "structure", "bytes"],
+        "tar": ["text", "structure", "bytes"],
+        "gzip": ["bytes"],
+        "pdf": ["text", "structure", "bytes"],
+        "pcap": ["text", "structure", "bytes"],
+        "pcapng": ["text", "structure", "bytes"],
+        "elf": ["text", "structure", "bytes"],
+        "pe": ["text", "structure", "bytes"],
+        "png": ["bytes"],
+        "wav": ["bytes"],
+        "dicom": ["bytes"],
+        "binary": ["text", "bytes"],
+    }
+    for format_name, selections in expected.items():
+        capabilities = artifact_inspector._artifact_capabilities(format_name)
+        assert capabilities["supported_views"] == (
+            ["text", "bytes"]
+            if format_name == "binary"
+            else ["summary", "text", "structure", "bytes"]
+        )
+        assert capabilities["supported_selections_by_view"] == selections
+        assert capabilities["cursor_views"] == cursor_views[format_name]
+    for image_format in ("jpeg", "gif", "bmp", "tiff", "webp"):
+        assert artifact_inspector._artifact_capabilities(image_format) == (
+            artifact_inspector._artifact_capabilities("png")
+        )
+
+
+def test_ignored_selector_combinations_are_rejected_and_binary_summary_is_unadvertised(tmp_path):
+    (tmp_path / "program.elf").write_bytes(_elf_fixture())
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(tmp_path / "document.pdf")
+    (tmp_path / "capture.pcap").write_bytes(_pcap_fixture([b"data"]))
+    (tmp_path / "capture.pcapng").write_bytes(_pcapng_fixture())
+    Image.new("RGB", (2, 2), (1, 2, 3)).save(tmp_path / "image.png")
+    (tmp_path / "blob").write_bytes(b"\x00\x00\xff\xff")
+    workspace = Workspace(tmp_path)
+    cases = [
+        ("program.elf", "text", "section:0", "view", ["summary", "structure"]),
+        ("document.pdf", "summary", "page:0", "view", ["text", "structure"]),
+        ("capture.pcap", "structure", "packets", "selection", []),
+        ("capture.pcapng", "structure", "blocks", "selection", []),
+        ("image.png", "summary", "channel:R", "view", ["text", "structure"]),
+        (
+            "image.png",
+            "structure",
+            "metadata",
+            "selection",
+            ["channel:<R|G|B|A>", "bitplane:<R|G|B|A>:<0-7>"],
+        ),
+    ]
+    for path, view, selection, field_path, allowed_values in cases:
+        with pytest.raises(ToolError) as error:
+            inspect_artifact(
+                workspace,
+                {"path": path, "view": view, "selection": selection},
+            )
+        assert error.value.details["field_path"] == field_path
+        assert error.value.details["allowed_values"] == allowed_values
+    binary = inspect_artifact(workspace, {"path": "blob"})
+    assert binary["coverage"] == "unsupported"
+    assert binary["capabilities"]["supported_views"] == ["text", "bytes"]
+
+
+def test_cursor_is_rejected_for_every_non_consuming_selected_path(tmp_path):
+    (tmp_path / "program.elf").write_bytes(_elf_fixture())
+    (tmp_path / "program.exe").write_bytes(_pe_fixture())
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(tmp_path / "document.pdf")
+    workspace = Workspace(tmp_path)
+    cases = [
+        ("program.elf", "structure", "section:0", "cursor_forbidden_for_selection"),
+        ("document.pdf", "text", "metadata", "cursor_forbidden_for_selection"),
+        ("document.pdf", "structure", "page:0", "cursor_forbidden_for_selection"),
+        ("program.exe", "structure", None, "cursor_forbidden_for_format_view"),
+    ]
+    for path, view, selection, constraint in cases:
+        arguments = {"path": path, "view": view, "cursor": "unused"}
+        if selection is not None:
+            arguments["selection"] = selection
+        with pytest.raises(ToolError) as error:
+            inspect_artifact(workspace, arguments)
+        assert error.value.code == "invalid_argument"
+        assert error.value.details["field_path"] == "cursor"
+        assert error.value.details["constraint"] == constraint
+        assert error.value.details["allowed_values"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "arguments", "field_path", "constraint", "allowed_values"),
+    [
+        (
+            "image.dcm",
+            _dicom_fixture(),
+            {"view": "text", "selection": "signals"},
+            "selection",
+            "unsupported_for_format_view",
+            [],
+        ),
+        (
+            "program.elf",
+            _elf_fixture(),
+            {"view": "summary", "selection": "disassembly"},
+            "view",
+            "view_selection_mismatch",
+            ["text", "structure"],
+        ),
+    ],
+)
+def test_format_semantic_errors_are_closed_before_optional_workers(
+    tmp_path,
+    name,
+    data,
+    arguments,
+    field_path,
+    constraint,
+    allowed_values,
+):
+    (tmp_path / name).write_bytes(data)
+    with pytest.raises(ToolError) as caught:
+        isolated_inspect_artifact(Workspace(tmp_path), {"path": name, **arguments})
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.details["field_path"] == field_path
+    assert caught.value.details["constraint"] == constraint
+    assert caught.value.details["allowed_values"] == allowed_values
+
+
+def test_zip_selection_and_cursor_errors_are_repairable(tmp_path):
+    with zipfile.ZipFile(tmp_path / "bundle.zip", "w") as archive:
+        archive.writestr("one.txt", "one")
+    workspace = Workspace(tmp_path)
+    with pytest.raises(ToolError) as selection:
+        inspect_artifact(
+            workspace,
+            {"path": "bundle.zip", "view": "structure", "selection": "packets"},
+        )
+    assert selection.value.details["field_path"] == "selection"
+    assert selection.value.details["constraint"] == "unsupported_for_format_view"
+    assert selection.value.details["allowed_values"] == []
+
+    with pytest.raises(ToolError) as cursor:
+        inspect_artifact(
+            workspace,
+            {"path": "bundle.zip", "view": "structure", "cursor": "invalid"},
+        )
+    assert cursor.value.code == "invalid_cursor"
+    assert cursor.value.details["field_path"] == "cursor"
+    assert cursor.value.details["constraint"] == "cursor_encoding"
+    assert cursor.value.details["allowed_values"] == ["next_cursor"]
+
+
 def test_public_inspector_routes_optional_parsers_through_bound_worker(tmp_path, monkeypatch):
     source = tmp_path / "image.png"
     source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
@@ -287,12 +507,25 @@ def test_text_and_bytes_paging_is_source_bound_and_stale_after_change(tmp_path):
             workspace, {"path": "long.txt", "view": "text", "cursor": first["next_cursor"]}
         )
     assert wrong_view.value.code == "stale_cursor"
+    assert wrong_view.value.details == {
+        "schema_version": 1,
+        "contract_version": 1,
+        "failure_stage": "arguments",
+        "constraint": "cursor_binding",
+        "field_path": "cursor",
+        "actual_kind": "string",
+        "allowed_values": ["next_cursor"],
+    }
     path.write_text("changed\n" * 20_000)
     with pytest.raises(ToolError) as stale:
         inspect_artifact(
             workspace, {"path": "long.txt", "view": "bytes", "cursor": first["next_cursor"]}
         )
     assert stale.value.code == "stale_cursor"
+    assert stale.value.details["failure_stage"] == "arguments"
+    assert stale.value.details["field_path"] == "cursor"
+    assert stale.value.details["constraint"] == "cursor_binding"
+    assert stale.value.details["allowed_values"] == ["next_cursor"]
 
 
 def test_structure_lines_and_all_results_respect_output_cap(tmp_path):
@@ -402,6 +635,7 @@ def test_argument_contract_error_has_bounded_structural_attribution(tmp_path):
         "constraint": "enum",
         "field_path": "view",
         "actual_kind": "array",
+        "allowed_values": ["summary", "text", "structure", "bytes"],
     }
 
 

@@ -215,6 +215,45 @@ _TOOL_FAILURE_KINDS = frozenset(
     {"array", "boolean", "bytes", "integer", "missing", "null", "object", "other", "string"}
 )
 _TOOL_FAILURE_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
+_TOOL_FAILURE_ALLOWED_VALUES = frozenset(
+    {
+        "bitplane:<R|G|B|A>:<0-7>",
+        "blocks",
+        "bytes",
+        "channel:<R|G|B|A>",
+        "cp1252",
+        "deleted",
+        "disassembly",
+        "disassembly:0x<address>",
+        "encoding:cp1252",
+        "encoding:latin-1",
+        "encoding:utf-16-be",
+        "encoding:utf-16-le",
+        "encoding:utf-8",
+        "entries",
+        "exports",
+        "imports",
+        "latin-1",
+        "list",
+        "metadata",
+        "next_cursor",
+        "ocr",
+        "packets",
+        "page:<index>",
+        "read",
+        "section:<index>",
+        "signals",
+        "stat",
+        "strict_absolute_path",
+        "structure",
+        "summary",
+        "superblock",
+        "text",
+        "utf-16-be",
+        "utf-16-le",
+        "utf-8",
+    }
+)
 
 
 def _closed_tool_failure_details(details: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -235,6 +274,15 @@ def _closed_tool_failure_details(details: Mapping[str, Any] | None) -> dict[str,
     actual_kind = source.get("actual_kind")
     if isinstance(actual_kind, str) and actual_kind in _TOOL_FAILURE_KINDS:
         projected["actual_kind"] = actual_kind
+    allowed_values = source.get("allowed_values")
+    if isinstance(allowed_values, (list, tuple)) and len(allowed_values) <= 32:
+        safe_allowed_values = [
+            value
+            for value in allowed_values
+            if isinstance(value, str) and value in _TOOL_FAILURE_ALLOWED_VALUES
+        ]
+        if safe_allowed_values or not allowed_values:
+            projected["allowed_values"] = safe_allowed_values
     for key in ("actual_size", "count", "limit", "size"):
         value = source.get(key)
         if type(value) is int and 0 <= value <= 2**63 - 1:

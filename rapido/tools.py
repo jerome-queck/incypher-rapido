@@ -87,7 +87,14 @@ class ToolError(Exception):
 def _error(code: str, message: str, **details: Any) -> ToolError:
     stage = (
         "arguments"
-        if code in {"invalid_argument", "input_too_large", "limit_exceeded"}
+        if code
+        in {
+            "invalid_argument",
+            "invalid_cursor",
+            "stale_cursor",
+            "input_too_large",
+            "limit_exceeded",
+        }
         else "result"
         if code in {"invalid_result", "output_too_large"}
         else "execution"
@@ -1459,6 +1466,10 @@ def inspect_filesystem(workspace: Workspace, arguments: Mapping[str, Any]) -> di
             raise _error(
                 "invalid_argument",
                 "filesystem_path must be a strict absolute path without whitespace or traversal",
+                field_path="filesystem_path",
+                constraint="path_grammar",
+                actual_kind="string",
+                allowed_values=["strict_absolute_path"],
             )
         commands[action] = {
             "list": "ls -l",
@@ -1466,7 +1477,14 @@ def inspect_filesystem(workspace: Workspace, arguments: Mapping[str, Any]) -> di
             "read": "cat",
         }[action] + f" {filesystem_path}"
     elif action not in commands:
-        raise _error("invalid_argument", "action must be superblock, deleted, list, stat, or read")
+        raise _error(
+            "invalid_argument",
+            "action must be superblock, deleted, list, stat, or read",
+            field_path="action",
+            constraint="enum",
+            actual_kind="string",
+            allowed_values=["superblock", "deleted", "list", "stat", "read"],
+        )
     executable = shutil.which("debugfs", path="/usr/bin:/bin:/usr/sbin:/sbin")
     if not executable:
         raise _error("tool_unavailable", "read-only filesystem analyzer is unavailable")
@@ -1713,7 +1731,14 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "type": "string",
                 "enum": ["superblock", "deleted", "list", "stat", "read"],
             },
-            "filesystem_path": {"type": "string"},
+            "filesystem_path": {
+                "type": "string",
+                "pattern": r"^/(?:[A-Za-z0-9._+@,:=-]+/?)*$",
+                "description": (
+                    "Absolute path inside the filesystem image; ASCII only, without whitespace "
+                    "or '..' components."
+                ),
+            },
         },
         "run_shell": {
             "command": {

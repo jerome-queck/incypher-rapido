@@ -239,11 +239,11 @@ def test_tooling_acceptance_covers_declared_artifact_adapters_and_views() -> Non
             requests.add((path, view, fields.get("selection")))
 
     required = {
-        ("fixture.pcapng", "text", "packets"),
+        ("fixture.pcapng", "text", None),
         ("fixture.exe", "structure", "imports"),
         ("fixture.exe", "structure", "exports"),
-        ("archive.tar", "structure", "entries"),
-        ("payload.gz", "structure", "entries"),
+        ("archive.tar", "structure", None),
+        ("payload.gz", "structure", None),
         ("opaque.bin", "text", None),
         ("opaque.bin", "bytes", None),
     }
