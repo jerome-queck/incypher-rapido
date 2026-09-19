@@ -276,6 +276,7 @@ class EvaluationState:
     ownership_ambiguous: bool = False
     create_outcome_unresolved: bool = False
     inherited_volumes: set[str] = field(default_factory=set)
+    unresolved_volume_intents: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -574,6 +575,9 @@ def _inherited_local_volume(
     allowed: frozenset[str],
     evaluation_state: EvaluationState,
 ) -> tuple[str, str, str]:
+    name = mount.get("Name")
+    if type(name) is str and _VOLUME_NAME.fullmatch(name) is not None:
+        evaluation_state.inherited_volumes.add(name)
     if set(mount) != {
         "Type",
         "Name",
@@ -585,11 +589,8 @@ def _inherited_local_volume(
         "Propagation",
     }:
         raise SupervisorError("container_identity")
-    name = mount.get("Name")
     source = mount.get("Source")
     destination = mount.get("Destination")
-    if type(name) is str and _VOLUME_NAME.fullmatch(name) is not None:
-        evaluation_state.inherited_volumes.add(name)
     if (
         type(name) is not str
         or _VOLUME_NAME.fullmatch(name) is None
@@ -800,15 +801,16 @@ def _create_owned_container(
         )
         new_ids = inventory - known
     state.created.update(new_ids)
-    if len(new_ids) == 1:
+    container_id = next(iter(new_ids)) if len(new_ids) == 1 else None
+    if container_id is not None:
         state.create_outcome_unresolved = False
+        state.unresolved_volume_intents.add(container_id)
     if clock.monotonic() >= operation_deadline:
         raise SupervisorError(failure)
     returned_id = result.stdout.strip()
-    if len(new_ids) != 1:
+    if container_id is None:
         state.ownership_ambiguous = len(new_ids) > 1
         raise SupervisorError(failure if not new_ids else f"{failure}_ambiguous")
-    container_id = next(iter(new_ids))
     if (
         result.returncode == 0
         and _CONTAINER_ID.fullmatch(returned_id) is not None
@@ -826,6 +828,7 @@ def _create_owned_container(
             clock=clock,
             deadline=operation_deadline,
         )
+        state.unresolved_volume_intents.discard(container_id)
     except SupervisorError as exc:
         if clock.monotonic() >= operation_deadline:
             raise SupervisorError(failure) from exc
@@ -2066,12 +2069,10 @@ def _cleanup_owned_containers(
                 not state.create_outcome_unresolved
                 and observed_at - quiet_since >= OWNER_QUIET_SECONDS
             ):
-                return not cleanup_failed and _tracked_volumes_absent(
-                    state.inherited_volumes,
-                    runner,
-                    clock,
-                    cleanup_deadline,
+                volumes_absent = _tracked_volumes_absent(
+                    state.inherited_volumes, runner, clock, cleanup_deadline
                 )
+                return not cleanup_failed and volumes_absent and not state.unresolved_volume_intents
         remaining = cleanup_deadline - clock.monotonic()
         if remaining <= 0:
             break

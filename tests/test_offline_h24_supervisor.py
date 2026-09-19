@@ -1512,6 +1512,141 @@ def test_volume_inventory_error_blocks_clean_attestation(tmp_path: Path) -> None
     assert runner.volumes == {}
 
 
+def test_unavailable_intent_inspect_blocks_clean_attestation_without_volume_names(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class InspectFailureFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+            ):
+                return SUPERVISOR.CommandResult(1, "")
+            return result
+
+    runner = InspectFailureFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
+    assert runner.existing == set()
+    assert runner.volumes == {}
+    assert not any(
+        command[:4] == ("docker", "volume", "ls", "--quiet") for command in runner.commands
+    )
+
+
+def test_extra_key_mount_harvests_name_and_retention_blocks_cleanup(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class ExtraKeyRetainedFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create"):
+                container_id = result.stdout.strip()
+                for mount in self.configs[container_id]["mounts"]:
+                    if mount["Type"] == "volume":
+                        self.volumes[str(mount["Name"])]["Labels"] = {}
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+            ):
+                value = json.loads(result.stdout)
+                volume = next(mount for mount in value["Mounts"] if mount["Type"] == "volume")
+                volume["Unexpected"] = True
+                return SUPERVISOR.CommandResult(0, json.dumps(value))
+            return result
+
+    runner = ExtraKeyRetainedFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
+    assert runner.existing == set()
+    assert runner.volumes
+    queries = [
+        command
+        for command in runner.commands
+        if command[:4] == ("docker", "volume", "ls", "--quiet")
+    ]
+    assert {command[-1] for command in queries} == {f"name=^{name}$" for name in runner.volumes}
+
+
+def test_later_volume_intent_success_does_not_clear_prior_unresolved_state(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    clock = FakeClock()
+    runner = DockerFake(paths.output, clock=clock)
+    ownership_token = "e" * 64
+    prior_id = "f" * 64
+    state = SUPERVISOR.EvaluationState(unresolved_volume_intents={prior_id})
+    intent = SUPERVISOR.ContainerIntent(
+        protocol.h24_name,
+        "h24",
+        protocol.image_id,
+        (
+            (paths.auth, "/auth/codex", False),
+            (paths.work, "/work", False),
+            (paths.output, "/output", False),
+            (paths.seed, "/seed/oracle.key", True),
+            (paths.preregistration, "/run/rapido-protocol/preregistration.json", True),
+        ),
+    )
+
+    container_id = SUPERVISOR._create_owned_container(
+        SUPERVISOR.h24_create_argv(protocol, paths, ownership_token=ownership_token),
+        intent,
+        ownership_token,
+        runner,
+        state,
+        failure="container_create",
+        clock=clock,
+        deadline=clock.monotonic() + 30,
+    )
+
+    assert container_id == H24_ID
+    assert state.unresolved_volume_intents == {prior_id}
+    assert (
+        SUPERVISOR._cleanup_owned_containers(
+            ownership_token,
+            state,
+            runner,
+            clock,
+            clock.monotonic() + SUPERVISOR.OWNER_CLEANUP_SECONDS,
+        )
+        is False
+    )
+    assert runner.existing == set()
+    assert runner.volumes == {}
+
+
 def test_auth_integrity_rejects_structural_corruption_but_allows_safe_rotation(
     tmp_path: Path,
 ) -> None:
