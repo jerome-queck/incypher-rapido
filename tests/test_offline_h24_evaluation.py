@@ -9,6 +9,7 @@ import pytest
 from rapido.native_receipts import AttemptKey, Budget, Span, build_native_attempt_receipt
 from rapido.offline_h24_evaluation import (
     ARMS,
+    H24_MODEL_VISIBLE_TOOLS,
     MODEL,
     ORDER_SEED,
     RECEIPT_SCHEMA,
@@ -358,6 +359,7 @@ def _raw_h24(preregistration: dict[str, object]) -> dict[str, object]:
                 for task in tasks
             ],
             "global_deadline_seconds": 19800,
+            "model_visible_tools": list(H24_MODEL_VISIBLE_TOOLS),
             "pair_deadline": "minimum_of_global_and_admission_plus_task_cap",
             "startup": "serialized_shared_home",
             "paired_turns": "concurrent",
@@ -670,14 +672,58 @@ def test_final_validator_rejects_runtime_span_global_and_serialization_drift(
         evaluate_h24_receipt(preregistration, receipt)
 
 
-@pytest.mark.parametrize("value", ["/private/model", "INCYPHER{private}", "https://model.invalid"])
-def test_descriptor_values_are_closed_and_redacted(
-    preregistration: dict[str, object], value: str
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("returned_model", "/private/model"),
+        ("returned_model", "INCYPHER{private}"),
+        ("returned_model", "https://model.invalid"),
+        ("returned_model", "target.example.invalid"),
+        ("returned_effort", "example.invalid:443"),
+    ],
+)
+def test_descriptor_identity_values_are_exact_frozen_enums(
+    preregistration: dict[str, object], field: str, value: str
 ) -> None:
     receipt = _receipt(preregistration)
-    receipt["runtime_descriptor_preflight"][0]["returned_model"] = value
-    with pytest.raises(ValueError, match="non-closed"):
+    receipt["runtime_descriptor_preflight"][0][field] = value
+    with pytest.raises(ValueError, match="frozen value"):
         evaluate_h24_receipt(preregistration, receipt)
+
+
+@pytest.mark.parametrize("revision", ["target.example.invalid", "example.invalid:443", "a" * 40])
+def test_descriptor_observed_revision_rejects_authorities_and_digests(
+    preregistration: dict[str, object], revision: str
+) -> None:
+    receipt = _receipt(preregistration)
+    descriptor = receipt["runtime_descriptor_preflight"][0]
+    descriptor["revision_status"] = "observed"
+    descriptor["revision"] = revision
+    with pytest.raises(ValueError, match="closed public value"):
+        evaluate_h24_receipt(preregistration, receipt)
+
+
+def test_descriptor_null_mismatch_is_retained_as_inconclusive(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["runtime_descriptor_preflight"][0]["returned_model"] = None
+    result = evaluate_h24_receipt(preregistration, receipt)
+    assert result["gates"]["model_preflight"] is False
+    assert result["decision"] == "inconclusive"
+
+
+def test_descriptor_observed_public_revision_is_safely_retained(
+    preregistration: dict[str, object],
+) -> None:
+    receipt = _receipt(preregistration)
+    descriptor = receipt["runtime_descriptor_preflight"][0]
+    descriptor["revision_status"] = "observed"
+    descriptor["revision"] = "release_2026-09-19"
+
+    result = evaluate_h24_receipt(preregistration, receipt)
+    assert result["gates"]["model_preflight"] is False
+    assert result["decision"] == "inconclusive"
 
 
 @pytest.mark.parametrize("timestamp", ["2027-01-15T08:00:00.001Z", "2027-01-15T08:00:00.000999Z"])
@@ -688,6 +734,18 @@ def test_run_timestamp_must_exactly_bind_barrier(
     receipt["run_started_at_utc"] = timestamp
     with pytest.raises(ValueError, match="exactly bind"):
         evaluate_h24_receipt(preregistration, receipt)
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_scoring_elapsed_must_equal_the_frozen_window(
+    preregistration: dict[str, object], delta: int
+) -> None:
+    receipt = _receipt(preregistration)
+    receipt["scoring_elapsed_milliseconds"] = 19_800_000 + delta
+
+    result = evaluate_h24_receipt(preregistration, receipt)
+    assert result["gates"]["global_deadline"] is False
+    assert result["decision"] == "no_justified_change"
 
 
 @pytest.mark.parametrize("mode", ["missing", "duplicate", "extra"])
@@ -762,12 +820,6 @@ def test_easy_resource_cleanup_and_descriptor_gates(preregistration: dict[str, o
     receipt = _receipt(preregistration)
     receipt["cleanup"]["orphan_process_count"] = 1
     assert evaluate_h24_receipt(preregistration, receipt)["decision"] == "no_justified_change"
-
-    receipt = _receipt(preregistration)
-    receipt["runtime_descriptor_preflight"][0]["returned_model"] = "different"
-    result = evaluate_h24_receipt(preregistration, receipt)
-    assert result["gates"]["model_preflight"] is False
-    assert result["decision"] == "inconclusive"
 
 
 def test_provider_pair_failure_threshold_precedes_other_classification(
@@ -919,3 +971,5 @@ def test_model_identity_is_frozen_without_revision(preregistration: dict[str, ob
         }
         for arm in ARMS
     ]
+    assert preregistration["execution"]["model_visible_tools"] == list(H24_MODEL_VISIBLE_TOOLS)
+    assert "run_shell" not in preregistration["execution"]["model_visible_tools"]

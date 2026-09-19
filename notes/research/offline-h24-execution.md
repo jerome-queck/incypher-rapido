@@ -6,7 +6,7 @@ unsealed. This note records prospective rules, not a result.
 ## Frozen experiment
 
 `offline-h24-preregistration-v1.json` is the exact public contract. Its canonical SHA-256 is
-`5bb63172e5cab48569b3ca6bdc04e4979656c2ab4aabfbf3d13b43ab2aef922e` on these bytes. The public
+`24282c351cf6f2d6bf6b28d6d5e4838c4ef8aabd51b3c91471d7e7bd56b87440` on these bytes. The public
 order seed is `8a2ffd40fdeef877816275730e7bfce26eed11309b68136d2dcbbf4a4de4ede2`.
 Task order is ascending `HMAC-SHA256(bytes.fromhex(seed), ASCII task ID)`, then ASCII task ID.
 The explicit 24-ID result is committed in the preregistration.
@@ -21,7 +21,12 @@ candidate-free continuation after only `candidate_unobserved` or
 `verifier_requires_fixed_observation`. Both arms share the earlier of the task cap and one global
 19,800-second deadline. Repair gets no new budget. A host barrier starts the offline runner and
 benign soak together; the receipt binds its wall-clock start and deadline, exactly 19,800,000 ms
-apart. Cleanup is outside scoring, receives at most 190 seconds, and earns no score.
+apart. An allowed late child start consumes that immutable window: the child derives its monotonic
+deadline from the registered wall deadline and current wall time, never grants a fresh 19,800
+seconds, and fails closed beyond 1,000 ms lateness. Task budgets and scored spans cannot cross the
+common deadline. The evaluator accepts exactly 19,800,000 scored milliseconds, not a shorter or
+longer replacement window. Cleanup is outside scoring, receives at most 190 seconds, and earns no
+score.
 
 The 24 task records retain their fixture wall, CPU, memory, and artifact declarations. Per-task CPU
 and memory values are fixture-generation/reference-checker design bounds only: the container does
@@ -34,6 +39,9 @@ interval. Resource evidence is never synthesized.
 Target network is false. Provider transport is required only for the native model connection. No
 Board, challenge, target authority, submission, credential, vulnerable service, archived script,
 official-practice task, prior candidate, solution, raw digest, or peer answer is model-visible.
+The preregistered H24 tool surface is an exact whitelist of fixed offline artifact operations;
+`run_shell`, target tools, and network-capable tools are neither advertised nor dispatchable. This
+restriction is H24-only and does not alter other pilot experiments or the framework registry.
 
 ## Immutable post-merge registration
 
@@ -61,9 +69,11 @@ cancelled and inconclusive rows remain in the denominator.
 The adapter validates each native attempt one-to-one against task and arm, reconciles native
 outcome/tool counts/configured budget with the public row, and rejects repairs that are not an
 eligible same-thread candidate-free continuation. Runtime descriptors admit only bounded public
-labels. Runtime startup/preflight and task-pair spans must remain ordered inside their task and
-global deadlines. The run timestamp exactly equals the millisecond-aligned barrier; immutable
-source/image registration strictly precedes it.
+labels. Returned model and effort are the frozen enums or null failure observations. An unavailable
+revision is always null; an observed revision is a short public label with no authority, path,
+secret, or digest syntax. Runtime startup/preflight and task-pair spans must remain ordered inside
+their task and global deadlines. The run timestamp exactly equals the millisecond-aligned barrier;
+immutable source/image registration strictly precedes it.
 
 Rows expose only public identity, closed outcome labels, correctness/qualification booleans,
 nullable event times and usage, closed spans/counts, repair state, and artifact bytes. Candidate
@@ -134,16 +144,22 @@ private material, and evaluate it with the pure validator. Package only the sani
 next decision. Private oracle material and generated workspaces are deleted only after sanitized
 evidence is durable.
 
+A forced stop can end before the child emits a receipt. Preserve that missing artifact as an
+explicit failed/inconclusive run. Never synthesize 48 outcome rows or infer a score from partial
+container output.
+
 ## Touched seams and verification
 
 - `rapido/offline_h24_evaluation.py`: frozen contract builder, registration validator, exact final
   receipt validator, recomputation, gates and classifier;
 - `notes/research/offline-h24-preregistration-v1.json`: exact prospective contract;
 - `tests/test_offline_h24_evaluation.py`: synthetic adversarial contract tests;
+- `scripts/offline_oracle_pilot.py`: H24-only barrier budget and restricted offline registry;
+- `tests/test_offline_h24_pilot.py`: deadline, descriptor, tool-boundary and non-H24 regression tests;
 - `notes/research/offline-h24-execution.md`: prospective execution and evidence boundary.
 
 No production solver, routing, target tool, Board client, proof gate, scheduler, fixture generator,
-native runner, container, credential or live state is changed here. On 2026-09-19, Ruff passed for
-the evaluator and its tests; the evaluator/pilot/supervisor set passed 98 tests; the repository
-suite passed 1,290 tests with four skips. No native, Board, container, H24 outcome, or real-clock
+core tool registry, container, credential or live state is changed here. On 2026-09-19, Ruff passed
+for the H24 evaluator, runner and their tests; 92 focused evaluator/runner tests and 117 integrated
+evaluator/runner/supervisor tests passed. No native, Board, container, H24 outcome, or real-clock
 soak run occurred. No result is claimed in this document.

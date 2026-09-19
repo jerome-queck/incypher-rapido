@@ -277,18 +277,48 @@ def test_packaged_source_metadata_fails_closed(
 
 def test_h24_start_barrier_waits_only_for_bounded_future_window() -> None:
     sleeps: list[float] = []
+    wall_milliseconds = 1_000_000
 
     async def record_sleep(seconds: float) -> None:
+        nonlocal wall_milliseconds
         sleeps.append(seconds)
+        wall_milliseconds += int(seconds * 1_000)
 
-    asyncio.run(
+    deadline = asyncio.run(
         PILOT._wait_for_start_barrier(
             1_015_000,
-            wall_time_ns=lambda: 1_000_000_000_000,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
             sleep=record_sleep,
         )
     )
     assert sleeps == [15.0]
+    assert deadline == 20_815_000
+
+
+def test_h24_late_barrier_preserves_registered_absolute_deadline() -> None:
+    start = 1_000_000
+    wall_milliseconds = start + 500
+    deadline = asyncio.run(
+        PILOT._wait_for_start_barrier(
+            start,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+        )
+    )
+
+    assert deadline == start + int(PILOT.H24_GLOBAL_SECONDS * 1_000)
+    assert PILOT._global_deadline_from_barrier(
+        75.0,
+        deadline,
+        wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+    ) == pytest.approx(75.0 + PILOT.H24_GLOBAL_SECONDS - 0.5)
+
+    wall_milliseconds = start + PILOT.H24_BARRIER_MAX_LATENESS_MILLISECONDS + 1
+    with pytest.raises(ValueError, match="stale"):
+        PILOT._global_deadline_from_barrier(
+            75.0,
+            deadline,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+        )
 
 
 @pytest.mark.parametrize("start", (0, -1, 998_999, 1_300_001))
@@ -300,6 +330,22 @@ def test_h24_start_barrier_rejects_invalid_stale_or_unbounded_values(start: int)
                 wall_time_ns=lambda: 1_000_000_000_000,
             )
         )
+
+
+def test_h24_tool_registry_omits_and_rejects_arbitrary_execution(tmp_path: Path) -> None:
+    registry = PILOT._H24ToolRegistry(tmp_path, max_workspace_bytes=1024)
+    names = [spec["name"] for spec in registry.specs]
+    ordinary_names = [
+        spec["name"] for spec in PILOT.ToolRegistry(tmp_path, max_workspace_bytes=1024).specs
+    ]
+
+    assert names == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
+    assert "run_shell" not in names
+    assert "run_shell" in ordinary_names
+    with pytest.raises(PILOT.ToolError, match="unavailable"):
+        registry.dispatch("run_shell", {"command": "pwd", "source_paths": []})
+    with pytest.raises(PILOT.ToolError, match="unavailable"):
+        registry.dispatch("open_target", {"authority": "target.example.invalid"})
 
 
 def test_private_json_output_is_exclusive_and_mode_0600(tmp_path: Path) -> None:
@@ -447,6 +493,8 @@ def test_h24_descriptor_mismatch_fails_closed_with_48_rows_and_no_solve(
         pytest.param(["unexpected-model-list"], "unexpected-model-list", id="non-string"),
         pytest.param(object(), "non-json-model-object", id="non-json"),
         pytest.param("private-secret-token-model", "private-secret-token-model", id="secret-like"),
+        pytest.param("target.example.invalid", "target.example.invalid", id="hostname"),
+        pytest.param("example.invalid:443", "example.invalid:443", id="authority"),
     ],
 )
 def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
@@ -504,6 +552,22 @@ def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
             "revision": None,
             "revision_status": "unavailable",
         }
+
+
+@pytest.mark.parametrize("revision", ["target.example.invalid", "example.invalid:443", "a" * 40])
+def test_h24_descriptor_projection_redacts_authority_or_digest_revision(revision: str) -> None:
+    projected = PILOT._h24_descriptor_receipt(
+        SimpleNamespace(
+            name=PILOT._VERIFIER_MODEL,
+            reasoning_efforts=(PILOT._VERIFIER_EFFORT,),
+            raw={"revision": revision},
+        )
+    )
+
+    assert projected["returned_model"] == PILOT._VERIFIER_MODEL
+    assert projected["effort_supported"] is True
+    assert projected["revision_status"] == "unavailable"
+    assert projected["revision"] is None
 
 
 def test_h24_descriptor_preflight_uses_no_oracle_or_fixture(
@@ -623,6 +687,9 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
 
         async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
             nonlocal turn_active, turn_peak
+            registry = kwargs["tool_registry"]
+            assert isinstance(registry, PILOT._H24ToolRegistry)
+            assert [spec["name"] for spec in registry.specs] == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
             turn_active += 1
             turn_peak = max(turn_peak, turn_active)
             artifact_inodes = tuple(
@@ -661,6 +728,7 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
     assert len(receipt["protocol"]["preregistration_sha256"]) == 64
     assert receipt["protocol"]["target_network_enabled"] is False
     assert receipt["protocol"]["provider_transport_required"] is True
+    assert receipt["protocol"]["model_visible_tools"] == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
     fixture_specs = {fixture.id: fixture for fixture in PILOT._prepare_h24_fixtures(SEED)}
     assert receipt["protocol"]["task_resource_policies"] == [
         {
@@ -980,6 +1048,13 @@ def test_global_expiry_keeps_48_rows_without_late_solves(
         row["native_observability"]["budget"]["granted_milliseconds"] == 0
         for row in receipt["results"][2:]
     )
+    observed_ends = [
+        span["end_offset_milliseconds"]
+        for row in receipt["results"]
+        for span in row["native_observability"]["spans"]
+        if span["end_offset_milliseconds"] is not None
+    ]
+    assert max(observed_ends) <= int(PILOT.H24_GLOBAL_SECONDS * 1_000)
 
 
 def test_easy_gate_keeps_correctness_and_qualification_independent() -> None:
