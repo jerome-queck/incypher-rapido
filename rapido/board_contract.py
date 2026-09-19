@@ -13,6 +13,7 @@ import importlib.util
 import json
 import math
 import re
+import stat
 import sys
 import urllib.parse
 from collections import defaultdict, deque
@@ -66,6 +67,7 @@ _TOP_LEVEL_FIELDS = frozenset(
         "scenarios",
     }
 )
+_PACKAGED_OFFLINE_PILOT_DIRECTORY = Path("/opt/rapido-eval")
 _SCENARIO_FACT_FIELDS = {
     SCENARIO_IDS[0]: frozenset({"correct", "incorrect", "historical", "historical_not_current"}),
     SCENARIO_IDS[1]: frozenset({"writes", "reconciled", "second_write"}),
@@ -627,6 +629,26 @@ def _verifier_route(route: Any) -> Any:
     )
 
 
+def _regular_offline_pilot_source(source: Path, *, missing_ok: bool) -> Path | None:
+    try:
+        metadata = source.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise RuntimeError("offline pilot module is unavailable") from None
+    except OSError as exc:
+        raise RuntimeError("offline pilot module is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("offline pilot module is unavailable")
+    try:
+        boundary = source.parent.lstat()
+    except OSError as exc:
+        raise RuntimeError("offline pilot module is unavailable") from exc
+    if stat.S_ISLNK(boundary.st_mode) or not stat.S_ISDIR(boundary.st_mode):
+        raise RuntimeError("offline pilot module is unavailable")
+    return source
+
+
 class _PeakProbe:
     def __init__(self) -> None:
         self.active = 0
@@ -646,7 +668,14 @@ def _load_offline_pilot() -> Any:
     existing = sys.modules.get(name)
     if existing is not None:
         return existing
-    source = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
+    repository_source = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
+    source = _regular_offline_pilot_source(repository_source, missing_ok=True)
+    if source is None:
+        source = _regular_offline_pilot_source(
+            _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py",
+            missing_ok=False,
+        )
+    assert source is not None
     specification = importlib.util.spec_from_file_location(name, source)
     if specification is None or specification.loader is None:
         raise RuntimeError("offline pilot module is unavailable")

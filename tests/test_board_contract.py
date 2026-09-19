@@ -5,11 +5,13 @@ import copy
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import (
     CONTRACT_SCHEMA,
     SCENARIO_IDS,
@@ -17,6 +19,97 @@ from rapido.board_contract import (
     validate_public_receipt,
 )
 from rapido.clock import ManualClock, SystemClock
+
+OFFLINE_PILOT_MODULE = "_rapido_board_contract_offline_pilot"
+
+
+def test_offline_pilot_loader_prefers_repository_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'unused'\n")
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+    try:
+        loaded = BOARD_CONTRACT._load_offline_pilot()
+        expected = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
+        assert Path(loaded.__file__) == expected
+        assert not hasattr(loaded, "PACKAGED_MARKER")
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
+def test_offline_pilot_loader_falls_back_to_fixed_packaged_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
+    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        packaged,
+        raising=False,
+    )
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+    try:
+        loaded = BOARD_CONTRACT._load_offline_pilot()
+        assert loaded.PACKAGED_MARKER == "sealed"
+        assert Path(loaded.__file__) == packaged / "offline_oracle_pilot.py"
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
+def test_offline_pilot_loader_rejects_packaged_source_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    target = tmp_path / "offline_oracle_pilot.py"
+    target.write_text("PACKAGED_MARKER = 'unsealed'\n")
+    (packaged / "offline_oracle_pilot.py").symlink_to(target)
+    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+    try:
+        with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+            BOARD_CONTRACT._load_offline_pilot()
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
+def test_offline_pilot_loader_rejects_symlinked_packaged_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    real_packaged = tmp_path / "real-rapido-eval"
+    real_packaged.mkdir()
+    (real_packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'unsealed'\n")
+    packaged = tmp_path / "rapido-eval"
+    packaged.symlink_to(real_packaged, target_is_directory=True)
+    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+    try:
+        with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+            BOARD_CONTRACT._load_offline_pilot()
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
 
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(

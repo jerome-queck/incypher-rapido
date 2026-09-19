@@ -15,6 +15,10 @@ It copies only the H24 runner, benign soak runner, and committed preregistration
 `/opt/rapido-eval`; the two supplied SHAs are root-owned mode `0444`. The wrapper remains UID/GID
 10001 and inherits the production entrypoint, although the host supervisor overrides it with a
 fixed Python argv for each evaluation container.
+The benign contract prefers the checkout pilot during repository tests; an installed package may
+fall back only to `/opt/rapido-eval/offline_oracle_pilot.py`. There is no environment or arbitrary
+path override, and both that fixed directory boundary and source must be non-symlink directory and
+regular-file objects.
 
 Before execution, publish/register the exact protocol ID, clean source SHA, immutable wrapper
 reference, image ID, `linux/amd64` or `linux/arm64` platform, OCI revision and source label. The
