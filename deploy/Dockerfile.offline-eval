@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+
+# The caller must supply the immutable Rapido base reference (name@sha256:digest).
+# No floating/default base exists for the sealed evaluation wrapper.
+ARG RAPIDO_BASE_IMAGE
+FROM ${RAPIDO_BASE_IMAGE}
+
+ARG EVAL_BUILD_SHA
+ARG RAPIDO_SOURCE_SHA
+
+LABEL org.opencontainers.image.revision="${EVAL_BUILD_SHA}" \
+      io.incypher.rapido.source-revision="${RAPIDO_SOURCE_SHA}" \
+      io.incypher.rapido.evaluation="offline-h24-v1"
+
+USER 0:0
+RUN set -eu; \
+    printf '%s' "${EVAL_BUILD_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
+    printf '%s' "${RAPIDO_SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
+    install --directory --mode=0555 --owner=0 --group=0 /opt/rapido-eval; \
+    printf '%s\n' "${EVAL_BUILD_SHA}" > /opt/rapido-eval/build.sha; \
+    printf '%s\n' "${RAPIDO_SOURCE_SHA}" > /opt/rapido-eval/source.sha; \
+    chown 0:0 /opt/rapido-eval/build.sha /opt/rapido-eval/source.sha; \
+    chmod 0444 /opt/rapido-eval/build.sha /opt/rapido-eval/source.sha
+
+COPY --chown=0:0 --chmod=0555 scripts/offline_oracle_pilot.py /opt/rapido-eval/offline_oracle_pilot.py
+COPY --chown=0:0 --chmod=0555 scripts/board_contract_soak.py /opt/rapido-eval/board_contract_soak.py
+COPY --chown=0:0 --chmod=0444 notes/research/offline-h24-preregistration-v1.json /opt/rapido-eval/offline-h24-preregistration-v1.json
+
+USER 10001:10001
