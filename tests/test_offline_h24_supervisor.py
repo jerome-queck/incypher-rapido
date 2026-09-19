@@ -43,17 +43,31 @@ DESCRIPTOR_ID = "7" * 64
 IMAGE_VOLUME_DESTINATIONS = ("/auth/codex", "/state")
 
 
-def _anonymous_volume(destination: str, marker: str) -> dict[str, object]:
-    name = marker * 64
+def _anonymous_volume(
+    destination: str, marker: str, *, data_root: str = "/var/lib/docker/volumes"
+) -> dict[str, object]:
+    name = marker if len(marker) == 64 else marker * 64
     return {
         "Type": "volume",
         "Name": name,
-        "Source": f"/var/lib/docker/volumes/{name}/_data",
+        "Source": f"{data_root}/{name}/_data",
         "Destination": destination,
         "Driver": "local",
         "Mode": "",
         "RW": True,
         "Propagation": "",
+    }
+
+
+def _volume_metadata(mount: dict[str, object], *, anonymous: bool = True) -> dict[str, object]:
+    return {
+        "CreatedAt": "2026-09-19T19:57:14+08:00",
+        "Driver": "local",
+        "Labels": {"com.docker.volume.anonymous": ""} if anonymous else {},
+        "Mountpoint": mount["Source"],
+        "Name": mount["Name"],
+        "Options": None,
+        "Scope": "local",
     }
 
 
@@ -157,6 +171,7 @@ class DockerFake:
         self.running: set[str] = set()
         self.names: dict[str, str] = {}
         self.configs: dict[str, dict[str, object]] = {}
+        self.volumes: dict[str, dict[str, object]] = {}
 
     def _id_for_name(self, name: str) -> str:
         return {
@@ -214,9 +229,11 @@ class DockerFake:
                     }
                 )
             bound_destinations = {mount["Destination"] for mount in mounts}
-            for destination, marker in zip(IMAGE_VOLUME_DESTINATIONS, ("a", "b"), strict=True):
+            for index, destination in enumerate(IMAGE_VOLUME_DESTINATIONS):
                 if destination not in bound_destinations:
-                    mounts.append(_anonymous_volume(destination, marker))
+                    volume = _anonymous_volume(destination, f"{container_id[:-1]}{index:x}")
+                    mounts.append(volume)
+                    self.volumes[str(volume["Name"])] = _volume_metadata(volume)
             self.existing.add(container_id)
             self.names[container_id] = name
             self.configs[container_id] = {
@@ -225,6 +242,17 @@ class DockerFake:
                 "volumes": {destination: {} for destination in IMAGE_VOLUME_DESTINATIONS},
             }
             return SUPERVISOR.CommandResult(0, f"{container_id}\n")
+        if command[:3] == ("docker", "volume", "inspect"):
+            names = command[3:]
+            if any(name not in self.volumes for name in names):
+                return SUPERVISOR.CommandResult(1, "[]")
+            return SUPERVISOR.CommandResult(
+                0,
+                json.dumps([self.volumes[name] for name in names]),
+            )
+        if command[:4] == ("docker", "volume", "ls", "--quiet"):
+            expected = command[-1].removeprefix("name=^").removesuffix("$")
+            return SUPERVISOR.CommandResult(0, f"{expected}\n" if expected in self.volumes else "")
         if command[:2] == ("docker", "start") and "--attach" not in command:
             self.running.update(command[2:])
             return SUPERVISOR.CommandResult(0, "started\n")
@@ -283,6 +311,15 @@ class DockerFake:
             return SUPERVISOR.CommandResult(0, "private raw child log\n")
         if command[:2] == ("docker", "rm"):
             container_id = command[-1]
+            for mount in self.configs[container_id]["mounts"]:
+                if mount["Type"] != "volume":
+                    continue
+                name = str(mount["Name"])
+                metadata = self.volumes.get(name)
+                if metadata is not None and metadata["Labels"] == {
+                    "com.docker.volume.anonymous": ""
+                }:
+                    self.volumes.pop(name)
             self.existing.discard(container_id)
             self.running.discard(container_id)
             return SUPERVISOR.CommandResult(0, "removed\n")
@@ -695,6 +732,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             self.existing = False
             self.labels: dict[str, str] = {}
             self.mounts: list[dict[str, object]] = []
+            self.volumes: dict[str, dict[str, object]] = {}
             self.commands: list[tuple[str, ...]] = []
 
         def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
@@ -726,6 +764,9 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                         IMAGE_VOLUME_DESTINATIONS, ("c", "d"), strict=True
                     )
                 ]
+                self.volumes = {
+                    str(mount["Name"]): _volume_metadata(mount) for mount in self.mounts
+                }
                 return SUPERVISOR.CommandResult(
                     0,
                     "malformed\n" if self.malformed_id else f"{PROBE_ID}\n",
@@ -749,6 +790,20 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                             "Mounts": self.mounts,
                         }
                     ),
+                )
+            if command[:3] == ("docker", "volume", "inspect"):
+                names = command[3:]
+                if any(name not in self.volumes for name in names):
+                    return SUPERVISOR.CommandResult(1, "[]")
+                return SUPERVISOR.CommandResult(
+                    0,
+                    json.dumps([self.volumes[name] for name in names]),
+                )
+            if command[:4] == ("docker", "volume", "ls", "--quiet"):
+                expected = command[-1].removeprefix("name=^").removesuffix("$")
+                return SUPERVISOR.CommandResult(
+                    0,
+                    f"{expected}\n" if expected in self.volumes else "",
                 )
             if command[:2] == ("docker", "cp"):
                 source = command[2]
@@ -776,6 +831,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 assert command[-1] == PROBE_ID
                 if self.remove_fails:
                     return SUPERVISOR.CommandResult(1, "")
+                self.volumes.clear()
                 self.existing = False
                 return SUPERVISOR.CommandResult(0, "")
             raise AssertionError(command)
@@ -884,6 +940,14 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
     assert any(
         mount["Type"] == "bind" and mount["Destination"] == "/auth/codex" for mount in h24_mounts
     )
+    volume_inspects = [
+        command for command in runner.commands if command[:3] == ("docker", "volume", "inspect")
+    ]
+    assert len(volume_inspects) == 2
+    assert all(
+        runner.commands.index(command) < runner.commands.index(starts[0])
+        for command in volume_inspects
+    )
     assert (
         receipt["barrier"]["global_deadline_wall_epoch_milliseconds"]
         - receipt["barrier"]["start_wall_epoch_milliseconds"]
@@ -906,6 +970,8 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
     assert paths.auth.exists() and (paths.auth / "auth.json").exists()
     assert paths.output.exists() and (paths.output / SUPERVISOR.SUPERVISOR_RECEIPT).exists()
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths.output.iterdir())
+    assert runner.volumes == {}
+    assert any(command[:4] == ("docker", "volume", "ls", "--quiet") for command in runner.commands)
 
 
 def test_evaluation_tracks_exact_ids_and_does_not_remove_name_replacements(
@@ -1292,6 +1358,158 @@ def test_reconciled_create_rejects_anonymous_volume_drift(tmp_path: Path, mutati
     assert receipt["failure_class"] == "container_identity"
     assert not any(command[:2] == ("docker", "start") for command in runner.commands)
     assert runner.existing == set()
+
+
+def test_anonymous_volume_accepts_custom_docker_data_root(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class CustomRootFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+            ):
+                value = json.loads(result.stdout)
+                for mount in value["Mounts"]:
+                    if mount["Type"] != "volume":
+                        continue
+                    name = mount["Name"]
+                    source = f"/custom/docker-data/volumes/{name}/data"
+                    mount["Source"] = source
+                    self.volumes[name]["Mountpoint"] = source
+                return SUPERVISOR.CommandResult(0, json.dumps(value))
+            return result
+
+    runner = CustomRootFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "completed"
+    assert runner.volumes == {}
+
+
+def test_named_hex_volume_is_rejected_and_retention_blocks_cleanup_attestation(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class NamedVolumeFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create"):
+                container_id = result.stdout.strip()
+                for mount in self.configs[container_id]["mounts"]:
+                    if mount["Type"] == "volume":
+                        self.volumes[str(mount["Name"])]["Labels"] = {}
+            return result
+
+    runner = NamedVolumeFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
+    assert runner.existing == set()
+    assert runner.volumes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("created_at", "driver", "labels", "mountpoint", "name", "options", "scope", "extra"),
+)
+def test_anonymous_volume_metadata_drift_fails_before_start(tmp_path: Path, mutation: str) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class MetadataDriftFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:3] == ("docker", "volume", "inspect") and result.returncode == 0:
+                value = json.loads(result.stdout)
+                metadata = value[0]
+                if mutation == "created_at":
+                    metadata["CreatedAt"] = "2026-09-19T19:57:14"
+                elif mutation == "driver":
+                    metadata["Driver"] = "unexpected"
+                elif mutation == "labels":
+                    metadata["Labels"] = {"com.docker.volume.anonymous": "true"}
+                elif mutation == "mountpoint":
+                    metadata["Mountpoint"] = "/unexpected"
+                elif mutation == "name":
+                    metadata["Name"] = "unexpected"
+                elif mutation == "options":
+                    metadata["Options"] = {}
+                elif mutation == "scope":
+                    metadata["Scope"] = "global"
+                else:
+                    metadata["Unexpected"] = True
+                return SUPERVISOR.CommandResult(0, json.dumps(value))
+            return result
+
+    runner = MetadataDriftFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+    assert runner.volumes == {}
+
+
+def test_volume_inventory_error_blocks_clean_attestation(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class InventoryErrorFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            if command[:4] == ("docker", "volume", "ls", "--quiet"):
+                self.commands.append(command)
+                return SUPERVISOR.CommandResult(1, "")
+            return super().__call__(command, timeout=timeout)
+
+    runner = InventoryErrorFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "cleanup_incomplete"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
+    assert runner.volumes == {}
 
 
 def test_auth_integrity_rejects_structural_corruption_but_allows_safe_rotation(
