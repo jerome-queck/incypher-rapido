@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from rapido.evidence import project_tool_observation
+from rapido.offline_h24_evaluation import build_frozen_preregistration
 
 SPEC = importlib.util.spec_from_file_location(
     "offline_oracle_pilot_h24",
@@ -51,6 +52,7 @@ def _patch_identities(monkeypatch: pytest.MonkeyPatch) -> None:
             "observed": {"head_sha": supplied, "worktree": "clean"},
             "declared": {"sha": supplied},
             "declared_matches_head": True,
+            "identity_basis": "sealed_metadata_file",
         },
     )
     monkeypatch.setattr(
@@ -217,6 +219,145 @@ def test_supplied_source_sha_bypasses_git_but_unsupplied_checks_worktree(
     assert inspected["identity_basis"] == "git_worktree"
 
 
+def test_packaged_source_metadata_binds_declared_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = "d" * 40
+
+    class PackagedSource:
+        def lstat(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                st_mode=PILOT.stat.S_IFREG | 0o444,
+                st_uid=0,
+                st_size=len(declared) + 1,
+            )
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return declared + "\n"
+
+    monkeypatch.setattr(PILOT, "H24_PACKAGED_SOURCE_PATH", PackagedSource())
+    identity = PILOT._source_identity(declared.upper())
+
+    assert identity["declared_matches_head"] is True
+    assert identity["identity_basis"] == "sealed_metadata_file"
+    assert identity["observed"]["head_sha"] == declared
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "size", "content", "message"),
+    [
+        pytest.param(PILOT.stat.S_IFLNK | 0o444, 0, 41, "d" * 40, "immutable", id="link"),
+        pytest.param(PILOT.stat.S_IFREG | 0o644, 0, 41, "d" * 40, "immutable", id="writable"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 501, 41, "d" * 40, "immutable", id="owner"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 0, 129, "d" * 40, "immutable", id="large"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 0, 41, "e" * 40, "does not match", id="mismatch"),
+    ],
+)
+def test_packaged_source_metadata_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    uid: int,
+    size: int,
+    content: str,
+    message: str,
+) -> None:
+    class PackagedSource:
+        def lstat(self) -> SimpleNamespace:
+            return SimpleNamespace(st_mode=mode, st_uid=uid, st_size=size)
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return content
+
+    monkeypatch.setattr(PILOT, "H24_PACKAGED_SOURCE_PATH", PackagedSource())
+    with pytest.raises(ValueError, match=message):
+        PILOT._source_identity("d" * 40)
+
+
+def test_h24_start_barrier_waits_only_for_bounded_future_window() -> None:
+    sleeps: list[float] = []
+    wall_milliseconds = 1_000_000
+
+    async def record_sleep(seconds: float) -> None:
+        nonlocal wall_milliseconds
+        sleeps.append(seconds)
+        wall_milliseconds += int(seconds * 1_000)
+
+    deadline = asyncio.run(
+        PILOT._wait_for_start_barrier(
+            1_015_000,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+            sleep=record_sleep,
+        )
+    )
+    assert sleeps == [15.0]
+    assert deadline == 20_815_000
+
+
+def test_h24_late_barrier_preserves_registered_absolute_deadline() -> None:
+    start = 1_000_000
+    wall_milliseconds = start + 500
+    deadline = asyncio.run(
+        PILOT._wait_for_start_barrier(
+            start,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+        )
+    )
+
+    assert deadline == start + int(PILOT.H24_GLOBAL_SECONDS * 1_000)
+    assert PILOT._global_deadline_from_barrier(
+        75.0,
+        deadline,
+        wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+    ) == pytest.approx(75.0 + PILOT.H24_GLOBAL_SECONDS - 0.5)
+
+    wall_milliseconds = start + PILOT.H24_BARRIER_MAX_LATENESS_MILLISECONDS + 1
+    with pytest.raises(ValueError, match="stale"):
+        PILOT._global_deadline_from_barrier(
+            75.0,
+            deadline,
+            wall_time_ns=lambda: wall_milliseconds * 1_000_000,
+        )
+
+
+@pytest.mark.parametrize("start", (0, -1, 998_999, 1_300_001))
+def test_h24_start_barrier_rejects_invalid_stale_or_unbounded_values(start: int) -> None:
+    with pytest.raises(ValueError, match="start barrier"):
+        asyncio.run(
+            PILOT._wait_for_start_barrier(
+                start,
+                wall_time_ns=lambda: 1_000_000_000_000,
+            )
+        )
+
+
+def test_h24_tool_registry_omits_and_rejects_arbitrary_execution(tmp_path: Path) -> None:
+    registry = PILOT._H24ToolRegistry(tmp_path, max_workspace_bytes=1024)
+    names = [spec["name"] for spec in registry.specs]
+    ordinary_names = [
+        spec["name"] for spec in PILOT.ToolRegistry(tmp_path, max_workspace_bytes=1024).specs
+    ]
+
+    assert names == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
+    assert "run_shell" not in names
+    assert "run_shell" in ordinary_names
+    with pytest.raises(PILOT.ToolError, match="unavailable"):
+        registry.dispatch("run_shell", {"command": "pwd", "source_paths": []})
+    with pytest.raises(PILOT.ToolError, match="unavailable"):
+        registry.dispatch("open_target", {"authority": "target.example.invalid"})
+
+
+def test_private_json_output_is_exclusive_and_mode_0600(tmp_path: Path) -> None:
+    output = tmp_path / "receipt.json"
+    PILOT._write_json_output(output, {"schema": "test-receipt-v1"})
+
+    assert output.read_text() == '{"schema":"test-receipt-v1"}\n'
+    assert output.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        PILOT._write_json_output(output, {"schema": "replacement"})
+
+
 def test_h24_cli_selects_contextual_oracle_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,6 +493,8 @@ def test_h24_descriptor_mismatch_fails_closed_with_48_rows_and_no_solve(
         pytest.param(["unexpected-model-list"], "unexpected-model-list", id="non-string"),
         pytest.param(object(), "non-json-model-object", id="non-json"),
         pytest.param("private-secret-token-model", "private-secret-token-model", id="secret-like"),
+        pytest.param("target.example.invalid", "target.example.invalid", id="hostname"),
+        pytest.param("example.invalid:443", "example.invalid:443", id="authority"),
     ],
 )
 def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
@@ -411,6 +554,61 @@ def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
         }
 
 
+@pytest.mark.parametrize("revision", ["target.example.invalid", "example.invalid:443", "a" * 40])
+def test_h24_descriptor_projection_redacts_authority_or_digest_revision(revision: str) -> None:
+    projected = PILOT._h24_descriptor_receipt(
+        SimpleNamespace(
+            name=PILOT._VERIFIER_MODEL,
+            reasoning_efforts=(PILOT._VERIFIER_EFFORT,),
+            raw={"revision": revision},
+        )
+    )
+
+    assert projected["returned_model"] == PILOT._VERIFIER_MODEL
+    assert projected["effort_supported"] is True
+    assert projected["revision_status"] == "unavailable"
+    assert projected["revision"] is None
+
+
+def test_h24_descriptor_preflight_uses_no_oracle_or_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    preregistration = tmp_path / "preregistration.json"
+    preregistration.write_text(json.dumps(build_frozen_preregistration()))
+    config = replace(
+        config,
+        oracle_key_file=tmp_path / "does-not-exist.key",
+        h24_preregistration_file=preregistration,
+    )
+    _patch_identities(monkeypatch)
+    clients: list[object] = []
+
+    class DescriptorClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.arm = Path(str(kwargs["cwd"])).name
+            clients.append(self)
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            return SimpleNamespace(name=model, reasoning_efforts=(effort,), raw={"slug": model})
+
+        async def solve(self, *_: object, **__: object) -> object:
+            raise AssertionError("descriptor preflight must not solve")
+
+        async def close(self) -> None: ...
+
+    receipt = asyncio.run(
+        PILOT.run_h24_descriptor_preflight(config, client_factory=DescriptorClient)
+    )
+
+    assert [client.arm for client in clients] == ["one_shot", "evidence_repair"]
+    assert receipt["matched"] is True
+    assert receipt["descriptors"] == build_frozen_preregistration()["descriptor_preflight"]
+    assert list(config.work_root.iterdir()) == []
+
+
 def test_h24_observed_descriptor_revision_mismatch_fails_before_solve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -461,6 +659,10 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
+    preregistration = tmp_path / "preregistration.json"
+    frozen = build_frozen_preregistration()
+    preregistration.write_text(json.dumps(frozen))
+    config = replace(config, h24_preregistration_file=preregistration)
     _patch_identities(monkeypatch)
     startup_active = startup_peak = turn_active = turn_peak = 0
     calls: list[dict[str, object]] = []
@@ -480,11 +682,14 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
             return SimpleNamespace(
                 name=model,
                 reasoning_efforts=(effort,),
-                raw={"slug": model, "modelVersion": "daybreak-test-v1"},
+                raw={"slug": model},
             )
 
         async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
             nonlocal turn_active, turn_peak
+            registry = kwargs["tool_registry"]
+            assert isinstance(registry, PILOT._H24ToolRegistry)
+            assert [spec["name"] for spec in registry.specs] == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
             turn_active += 1
             turn_peak = max(turn_peak, turn_active)
             artifact_inodes = tuple(
@@ -518,6 +723,23 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
     assert len(receipt["results"]) == 48
     assert receipt["native_observability"]["attempt_count"] == 48
     assert receipt["native_observability"]["outcomes"]["inconclusive"] == 48
+    assert receipt["protocol"]["task_order"] == [task["id"] for task in frozen["tasks"]]
+    assert receipt["protocol"]["randomization"] == "hmac_sha256_sort_v1"
+    assert len(receipt["protocol"]["preregistration_sha256"]) == 64
+    assert receipt["protocol"]["target_network_enabled"] is False
+    assert receipt["protocol"]["provider_transport_required"] is True
+    assert receipt["protocol"]["model_visible_tools"] == list(PILOT.H24_MODEL_VISIBLE_TOOLS)
+    fixture_specs = {fixture.id: fixture for fixture in PILOT._prepare_h24_fixtures(SEED)}
+    assert receipt["protocol"]["task_resource_policies"] == [
+        {
+            "task_id": fixture.id,
+            "wall_seconds": fixture.wall_seconds,
+            "artifact_bytes_ceiling": fixture.artifact_bytes_ceiling,
+            "cpu_seconds_ceiling": fixture.cpu_seconds_ceiling,
+            "memory_bytes_ceiling": fixture.memory_bytes_ceiling,
+        }
+        for fixture in (fixture_specs[str(task["id"])] for task in frozen["tasks"])
+    ]
     assert {call["model"] for call in calls} == {PILOT._VERIFIER_MODEL}
     assert {call["effort"] for call in calls} == {PILOT._VERIFIER_EFFORT}
     assert {call["instructions"] for call in calls} == {PILOT.H24_DEVELOPER_INSTRUCTIONS}
@@ -826,6 +1048,13 @@ def test_global_expiry_keeps_48_rows_without_late_solves(
         row["native_observability"]["budget"]["granted_milliseconds"] == 0
         for row in receipt["results"][2:]
     )
+    observed_ends = [
+        span["end_offset_milliseconds"]
+        for row in receipt["results"]
+        for span in row["native_observability"]["spans"]
+        if span["end_offset_milliseconds"] is not None
+    ]
+    assert max(observed_ends) <= int(PILOT.H24_GLOBAL_SECONDS * 1_000)
 
 
 def test_easy_gate_keeps_correctness_and_qualification_independent() -> None:

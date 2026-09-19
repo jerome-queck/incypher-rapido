@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import zipfile
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -60,6 +60,16 @@ from rapido.offline_h24 import (
 from rapido.offline_h24 import (
     validate_catalogue as validate_h24_catalogue,
 )
+from rapido.offline_h24_evaluation import (
+    ARMS as H24_EVALUATION_ARMS,
+)
+from rapido.offline_h24_evaluation import H24_MODEL_VISIBLE_TOOLS
+from rapido.offline_h24_evaluation import (
+    preregistration_sha256 as h24_preregistration_sha256,
+)
+from rapido.offline_h24_evaluation import (
+    validate_preregistration as validate_h24_preregistration,
+)
 from rapido.orchestrator import _normalize_tool_calls
 from rapido.routing import baseline_route
 from rapido.solver import (
@@ -72,7 +82,7 @@ from rapido.solver import (
     challenge_candidate_prose,
 )
 from rapido.state import StateStore
-from rapido.tools import ToolRegistry
+from rapido.tools import ToolError, ToolRegistry
 
 TURN_TIMEOUT_SECONDS = 300.0
 MAX_WORKSPACE_BYTES = 192 * 1024 * 1024
@@ -84,6 +94,9 @@ MODEL_COMPARISON_EXPERIMENT = "model-comparison"
 VERIFIER_REPAIR_EXPERIMENT = "verifier-repair"
 H24_EXPERIMENT = "h24"
 H24_GLOBAL_SECONDS = 19_800.0
+H24_BARRIER_MAX_LATENESS_MILLISECONDS = 1_000
+H24_CLIENT_CLOSE_SECONDS = 120.0
+H24_PACKAGED_SOURCE_PATH = Path("/opt/rapido-eval/source.sha")
 _SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _ORACLE_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
@@ -230,6 +243,9 @@ class H24FixtureSpec:
     description: str
     artifact_names: tuple[str, ...]
     wall_seconds: int
+    artifact_bytes_ceiling: int
+    cpu_seconds_ceiling: int
+    memory_bytes_ceiling: int
     prepared: H24PreparedFixture = field(repr=False)
 
 
@@ -291,6 +307,8 @@ class PilotConfig:
     image_id: str | None = None
     oracle_id: str = ORACLE_SCHEMA
     max_workspace_bytes: int = MAX_WORKSPACE_BYTES
+    start_at_unix_ms: int | None = None
+    h24_preregistration_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -640,6 +658,9 @@ def _prepare_h24_fixtures(seed: bytes) -> tuple[H24FixtureSpec, ...]:
                 description=task.prompt,
                 artifact_names=tuple(artifact.path for artifact in fixture.artifacts),
                 wall_seconds=task.wall_seconds,
+                artifact_bytes_ceiling=task.artifact_bytes_ceiling,
+                cpu_seconds_ceiling=task.cpu_seconds_ceiling,
+                memory_bytes_ceiling=task.memory_bytes_ceiling,
                 prepared=fixture,
             )
         )
@@ -967,6 +988,33 @@ def _identity(value: str | None, pattern: re.Pattern[str], name: str) -> str | N
 def _source_identity(supplied: str | None) -> dict[str, object]:
     declared = _identity(supplied, _SHA_RE, "source SHA")
     if declared is not None:
+        packaged_basis = "supplied_full_sha"
+        try:
+            metadata = H24_PACKAGED_SOURCE_PATH.lstat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise ValueError("packaged source identity is unavailable") from exc
+        if metadata is not None:
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_mode & 0o222
+                or metadata.st_size > 128
+            ):
+                raise ValueError("packaged source identity metadata is not immutable")
+            try:
+                packaged = _identity(
+                    H24_PACKAGED_SOURCE_PATH.read_text(encoding="ascii"),
+                    _SHA_RE,
+                    "packaged source SHA",
+                )
+            except (OSError, UnicodeError) as exc:
+                raise ValueError("packaged source identity is unavailable") from exc
+            if packaged is None or not hmac.compare_digest(packaged, declared):
+                raise ValueError("declared source SHA does not match packaged metadata")
+            packaged_basis = "sealed_metadata_file"
         return {
             "observed": {
                 "head_sha": declared,
@@ -976,7 +1024,7 @@ def _source_identity(supplied: str | None) -> dict[str, object]:
             },
             "declared": {"sha": declared},
             "declared_matches_head": True,
-            "identity_basis": "supplied_full_sha",
+            "identity_basis": packaged_basis,
         }
     repository = Path(__file__).resolve().parents[1]
     try:
@@ -1017,6 +1065,69 @@ def _source_identity(supplied: str | None) -> dict[str, object]:
         ),
         "identity_basis": "git_worktree",
     }
+
+
+async def _wait_for_start_barrier(
+    start_at_unix_ms: int | None,
+    *,
+    wall_time_ns: Callable[[], int] = time.time_ns,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> int | None:
+    if start_at_unix_ms is None:
+        return None
+    if isinstance(start_at_unix_ms, bool) or start_at_unix_ms <= 0:
+        raise ValueError("start barrier must be a positive Unix millisecond")
+    while True:
+        remaining_ms = start_at_unix_ms - wall_time_ns() // 1_000_000
+        if remaining_ms < -H24_BARRIER_MAX_LATENESS_MILLISECONDS:
+            raise ValueError("start barrier is already stale")
+        if remaining_ms > 300_000:
+            raise ValueError("start barrier is too far in the future")
+        if remaining_ms <= 0:
+            break
+        await sleep(remaining_ms / 1_000)
+    return start_at_unix_ms + int(H24_GLOBAL_SECONDS * 1_000)
+
+
+def _global_deadline_from_barrier(
+    run_started: float,
+    registered_deadline_wall_milliseconds: int | None,
+    *,
+    wall_time_ns: Callable[[], int] = time.time_ns,
+) -> float:
+    if registered_deadline_wall_milliseconds is None:
+        return run_started + H24_GLOBAL_SECONDS
+    current_wall_milliseconds = wall_time_ns() // 1_000_000
+    registered_start = registered_deadline_wall_milliseconds - int(H24_GLOBAL_SECONDS * 1_000)
+    if current_wall_milliseconds < registered_start:
+        raise ValueError("start barrier has not been reached")
+    if current_wall_milliseconds - registered_start > H24_BARRIER_MAX_LATENESS_MILLISECONDS:
+        raise ValueError("start barrier is already stale")
+    remaining_milliseconds = max(
+        0,
+        registered_deadline_wall_milliseconds - current_wall_milliseconds,
+    )
+    return run_started + remaining_milliseconds / 1_000
+
+
+class _H24ToolRegistry(ToolRegistry):
+    """H24-only fixed offline artifact surface with no arbitrary execution."""
+
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        *,
+        max_workspace_bytes: int,
+    ) -> None:
+        super().__init__(workspace, max_workspace_bytes=max_workspace_bytes)
+        self._tools = tuple(
+            spec for spec in self._tools if str(spec.get("name")) in H24_MODEL_VISIBLE_TOOLS
+        )
+
+    def dispatch(self, name: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if name not in H24_MODEL_VISIBLE_TOOLS:
+            raise ToolError("unknown_tool", "tool is unavailable in the offline H24 surface")
+        return super().dispatch(name, arguments)
 
 
 def _image_identity(supplied: str | None) -> dict[str, object]:
@@ -1505,6 +1616,8 @@ async def _measure_verifier(
     deadline: PairDeadline | None = None,
     developer_instructions: str = OFFLINE_DEVELOPER_INSTRUCTIONS,
     repair_prompt_builder: Callable[[str, float | None], str] = build_verifier_repair_prompt,
+    tool_registry_factory: Callable[..., ToolRegistry] = ToolRegistry,
+    clamp_receipt_times_to_deadline: bool = False,
     clock: Callable[[], float] = time.monotonic,
     retain_child_cancellation: bool = False,
 ) -> VerifierMeasurement:
@@ -1553,7 +1666,12 @@ async def _measure_verifier(
         if first is not None:
             return None
         first = _evaluate_verifier_turn(turn, expected, challenge)
-        first_finished = clock()
+        observed_first_finished = clock()
+        first_finished = (
+            min(observed_first_finished, deadline.absolute)
+            if clamp_receipt_times_to_deadline
+            else observed_first_finished
+        )
         first_thread_id = getattr(turn, "thread_id", None)
         first_calls = _mapping_calls(getattr(turn, "current_turn_tool_calls", None))
         first_usage = _native_usage(turn)
@@ -1588,11 +1706,16 @@ async def _measure_verifier(
             reasoning_effort=_VERIFIER_EFFORT,
             output_schema=SOLVER_OUTPUT_SCHEMA,
             timeout=deadline.remaining_seconds(started),
-            tool_registry=ToolRegistry(workspace, max_workspace_bytes=max_workspace_bytes),
+            tool_registry=tool_registry_factory(workspace, max_workspace_bytes=max_workspace_bytes),
             continuation_callback=continue_once,
         )
     except asyncio.CancelledError as exc:
-        cancelled_at = clock()
+        observed_cancelled_at = clock()
+        cancelled_at = (
+            min(observed_cancelled_at, deadline.absolute)
+            if clamp_receipt_times_to_deadline
+            else observed_cancelled_at
+        )
         evidence = getattr(exc, "result", None)
         cancelled_calls = _mapping_calls(getattr(evidence, "tool_calls", None))
         cancelled_event = _raw_event(evidence)
@@ -1708,8 +1831,13 @@ async def _measure_verifier(
         terminal_override = VerifierTurnEvaluation("provider_failure", None)
         failure_class = "native_runtime"
 
-    finished = clock()
-    if finished > deadline.absolute:
+    observed_finished = clock()
+    finished = (
+        min(observed_finished, deadline.absolute)
+        if clamp_receipt_times_to_deadline
+        else observed_finished
+    )
+    if observed_finished > deadline.absolute:
         terminal_override = VerifierTurnEvaluation("timeout", None)
         failure_class = "timeout"
     if first is None:
@@ -2700,9 +2828,11 @@ async def run_verifier_repair_pilot(
     return receipt
 
 
-_DESCRIPTOR_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_DESCRIPTOR_REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _DESCRIPTOR_SENSITIVE_RE = re.compile(
-    r"(?:secret|credential|password|bearer|authorization|api[_-]?key|token)", re.IGNORECASE
+    r"(?:\b[0-9a-f]{40,64}\b|secret|credential|password|bearer|authorization|"
+    r"api[_-]?key|token)",
+    re.IGNORECASE,
 )
 
 
@@ -2722,7 +2852,7 @@ def _h24_descriptor_receipt(descriptor: object) -> dict[str, object]:
             value = raw.get(key)
             if (
                 isinstance(value, str)
-                and _DESCRIPTOR_VALUE_RE.fullmatch(value)
+                and _DESCRIPTOR_REVISION_RE.fullmatch(value)
                 and _DESCRIPTOR_SENSITIVE_RE.search(value) is None
             ):
                 revision = value
@@ -2736,6 +2866,45 @@ def _h24_descriptor_receipt(descriptor: object) -> dict[str, object]:
         "revision": revision,
         "revision_status": "observed" if revision is not None else "unavailable",
     }
+
+
+def _h24_evaluation_descriptor(arm: str, projected: Mapping[str, object]) -> dict[str, object]:
+    if arm not in H24_EVALUATION_ARMS:
+        raise ValueError("H24 descriptor arm is invalid")
+    return {
+        "arm": arm,
+        "returned_model": projected.get("returned_model"),
+        "returned_effort": (
+            _VERIFIER_EFFORT if projected.get("effort_supported") is True else None
+        ),
+        "revision_status": projected.get("revision_status"),
+        "revision": projected.get("revision"),
+    }
+
+
+def _load_h24_preregistration(path: Path | None) -> Mapping[str, object] | None:
+    if path is None:
+        return None
+    if not path.is_absolute():
+        raise ValueError("H24 preregistration path must be absolute")
+    try:
+        metadata = path.lstat()
+        payload = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("H24 preregistration is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > 128 * 1024
+    ):
+        raise ValueError("H24 preregistration file is invalid")
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("H24 preregistration is invalid JSON") from exc
+    validate_h24_preregistration(value)
+    assert isinstance(value, Mapping)
+    return value
 
 
 def _h24_summary(measurements: Sequence[VerifierMeasurement]) -> dict[str, object]:
@@ -2810,7 +2979,12 @@ def _h24_receipt(
     fixtures: Sequence[H24FixtureSpec],
     measurements: Sequence[VerifierMeasurement],
     runtime: Mapping[str, Mapping[str, object]],
+    preregistration: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    artifact_bytes = {
+        fixture.id: sum(len(artifact.data) for artifact in fixture.prepared.artifacts)
+        for fixture in fixtures
+    }
     native = summarize_native_attempt_receipts(
         [AttemptKey(fixture.id, arm.id) for fixture in fixtures for arm in VERIFIER_ARMS],
         [measurement.native_receipt for measurement in measurements],
@@ -2827,8 +3001,26 @@ def _h24_receipt(
             "fixture_count": 24,
             "arm_count": 2,
             "task_order": [fixture.id for fixture in fixtures],
-            "randomization": "none_frozen_catalogue_order",
+            "randomization": (
+                "hmac_sha256_sort_v1"
+                if preregistration is not None
+                else "none_frozen_catalogue_order"
+            ),
+            "preregistration_sha256": (
+                h24_preregistration_sha256(preregistration) if preregistration is not None else None
+            ),
+            "task_resource_policies": [
+                {
+                    "task_id": fixture.id,
+                    "wall_seconds": fixture.wall_seconds,
+                    "artifact_bytes_ceiling": fixture.artifact_bytes_ceiling,
+                    "cpu_seconds_ceiling": fixture.cpu_seconds_ceiling,
+                    "memory_bytes_ceiling": fixture.memory_bytes_ceiling,
+                }
+                for fixture in fixtures
+            ],
             "global_deadline_seconds": int(H24_GLOBAL_SECONDS),
+            "model_visible_tools": list(H24_MODEL_VISIBLE_TOOLS),
             "pair_deadline": "minimum_of_global_and_admission_plus_task_cap",
             "startup": "serialized_shared_home",
             "paired_turns": "concurrent",
@@ -2837,7 +3029,8 @@ def _h24_receipt(
             "repairable_rejections": sorted(_REPAIRABLE_VERIFIER_REJECTIONS),
             "board_enabled": False,
             "submissions_enabled": False,
-            "network_enabled": False,
+            "target_network_enabled": False,
+            "provider_transport_required": True,
             "fallback_allowed": False,
             "roster": [
                 {
@@ -2850,7 +3043,13 @@ def _h24_receipt(
             ],
         },
         "runtime": {name: dict(row) for name, row in runtime.items()},
-        "results": [measurement.public() for measurement in measurements],
+        "results": [
+            {
+                **measurement.public(),
+                "artifact_bytes": artifact_bytes[measurement.task_id],
+            }
+            for measurement in measurements
+        ],
         "summary": _h24_summary(measurements),
         "native_observability": native,
     }
@@ -2880,6 +3079,7 @@ async def run_h24_pilot(
     *,
     client_factory: Callable[..., Any] = CodexAppClient,
     clock: Callable[[], float] = time.monotonic,
+    wall_time_ns: Callable[[], int] = time.time_ns,
 ) -> dict[str, object]:
     """Run the frozen 24-task, two-arm offline comparison without external authority."""
     validate_codex_home(config.codex_home)
@@ -2899,11 +3099,43 @@ async def run_h24_pilot(
         raise ValueError("workspace byte limit is invalid")
 
     # This entire private preparation gate precedes client construction and workspace creation.
-    fixtures = _prepare_h24_fixtures(seed)
+    preregistration = _load_h24_preregistration(config.h24_preregistration_file)
+    prepared_fixtures = _prepare_h24_fixtures(seed)
+    if preregistration is None:
+        fixtures = prepared_fixtures
+        expected_descriptors: dict[str, Mapping[str, object]] = {}
+    else:
+        preregistered_tasks = preregistration["tasks"]
+        preregistered_descriptors = preregistration["descriptor_preflight"]
+        assert isinstance(preregistered_tasks, list)
+        assert isinstance(preregistered_descriptors, list)
+        by_id = {fixture.id: fixture for fixture in prepared_fixtures}
+        fixtures = tuple(by_id[str(row["id"])] for row in preregistered_tasks)
+        expected_descriptors = {str(row["arm"]): row for row in preregistered_descriptors}
     source = _source_identity(config.source_sha)
     image = _image_identity(config.image_id)
+    if preregistration is not None and source.get("identity_basis") != "sealed_metadata_file":
+        raise ValueError("preregistered H24 requires sealed source metadata")
+    registered_wall_deadline = await _wait_for_start_barrier(
+        config.start_at_unix_ms,
+        wall_time_ns=wall_time_ns,
+    )
     run_started = clock()
-    global_deadline = run_started + H24_GLOBAL_SECONDS
+    global_deadline = _global_deadline_from_barrier(
+        run_started,
+        registered_wall_deadline,
+        wall_time_ns=wall_time_ns,
+    )
+
+    def scoring_clock() -> float:
+        return min(clock(), global_deadline)
+
+    def scoring_timeout() -> float:
+        remaining = global_deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError("H24 common scoring deadline expired")
+        return min(TURN_TIMEOUT_SECONDS, remaining)
+
     measurements: list[VerifierMeasurement] = []
     runtime: dict[str, dict[str, object]] = {
         arm.id: {
@@ -2930,8 +3162,9 @@ async def run_h24_pilot(
             row = runtime[arm.id]
             spans = row["spans"]
             assert isinstance(spans, dict)
-            started = clock()
+            started = scoring_clock()
             try:
+                timeout = scoring_timeout()
                 arm_root = run_root / arm.id
                 arm_root.mkdir(mode=0o700)
                 client = client_factory(
@@ -2949,44 +3182,54 @@ async def run_h24_pilot(
                 if any(client is existing for existing in clients.values()):
                     raise RuntimeError("client factory reused a native process")
                 clients[arm] = client
-                await asyncio.wait_for(client.start(), timeout=TURN_TIMEOUT_SECONDS)
+                await asyncio.wait_for(client.start(), timeout=timeout)
             except asyncio.CancelledError:
-                spans["startup"] = _runtime_span("cancelled", run_started, started, clock())
+                spans["startup"] = _runtime_span("cancelled", run_started, started, scoring_clock())
                 row["status"] = "failed"
                 row["failure_class"] = "interrupted"
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["startup"] = _runtime_span("failed", run_started, started, clock())
+                spans["startup"] = _runtime_span("failed", run_started, started, scoring_clock())
                 row["status"] = "failed"
                 row["failure_class"] = "startup"
                 return
-            spans["startup"] = _runtime_span("completed", run_started, started, clock())
-            validated = clock()
+            spans["startup"] = _runtime_span("completed", run_started, started, scoring_clock())
+            validated = scoring_clock()
             try:
+                timeout = scoring_timeout()
                 descriptor = await asyncio.wait_for(
                     client.validate_model(_VERIFIER_MODEL, _VERIFIER_EFFORT),
-                    timeout=TURN_TIMEOUT_SECONDS,
+                    timeout=timeout,
                 )
                 projected = _h24_descriptor_receipt(descriptor)
                 row["descriptor"] = projected
                 if (
                     projected["model_status"] != "matched"
                     or projected["effort_supported"] is not True
+                    or (
+                        preregistration is not None
+                        and _h24_evaluation_descriptor(arm.id, projected)
+                        != expected_descriptors[arm.id]
+                    )
                 ):
                     raise ModelValidationError("native model descriptor does not match H24 roster")
             except asyncio.CancelledError:
                 spans["model_validation"] = _runtime_span(
-                    "cancelled", run_started, validated, clock()
+                    "cancelled", run_started, validated, scoring_clock()
                 )
                 row["status"] = "failed"
                 row["failure_class"] = "interrupted"
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["model_validation"] = _runtime_span("failed", run_started, validated, clock())
+                spans["model_validation"] = _runtime_span(
+                    "failed", run_started, validated, scoring_clock()
+                )
                 row["status"] = "failed"
                 row["failure_class"] = "model_validation"
                 return
-            spans["model_validation"] = _runtime_span("completed", run_started, validated, clock())
+            spans["model_validation"] = _runtime_span(
+                "completed", run_started, validated, scoring_clock()
+            )
             row["status"] = "ready"
 
         async def close_arm(arm: VerifierArm) -> None:
@@ -2998,7 +3241,7 @@ async def run_h24_pilot(
                 return
             started = clock()
             try:
-                await asyncio.wait_for(client.close(), timeout=TURN_TIMEOUT_SECONDS)
+                await asyncio.wait_for(client.close(), timeout=H24_CLIENT_CLOSE_SECONDS)
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
@@ -3086,12 +3329,12 @@ async def run_h24_pilot(
                 staged = active_staged
                 pair = active_pair
                 for arm in VERIFIER_ARMS:
-                    setup_started = clock()
+                    setup_started = scoring_clock()
                     workspace = run_root / arm.id / fixture.id
                     try:
                         _stage_h24_fixture(fixture, workspace)
                     except OSError:
-                        setup_finished = clock()
+                        setup_finished = scoring_clock()
                         pair[arm] = _h24_not_run_measurement(
                             fixture,
                             arm,
@@ -3104,7 +3347,7 @@ async def run_h24_pilot(
                             fixture_status="failed",
                         )
                         continue
-                    setup_finished = clock()
+                    setup_finished = scoring_clock()
                     staged[arm] = (workspace, setup_started, setup_finished)
 
                 dispatch_order = VERIFIER_ARMS if index % 2 == 0 else tuple(reversed(VERIFIER_ARMS))
@@ -3130,6 +3373,8 @@ async def run_h24_pilot(
                             deadline=deadline,
                             developer_instructions=H24_DEVELOPER_INSTRUCTIONS,
                             repair_prompt_builder=build_h24_repair_prompt,
+                            tool_registry_factory=_H24ToolRegistry,
+                            clamp_receipt_times_to_deadline=True,
                             clock=clock,
                             retain_child_cancellation=True,
                         )
@@ -3236,12 +3481,104 @@ async def run_h24_pilot(
                 return_exceptions=cancelled_error is not None,
             )
 
-    receipt = _h24_receipt(config, source, image, fixtures, measurements, runtime)
+    receipt = _h24_receipt(
+        config,
+        source,
+        image,
+        fixtures,
+        measurements,
+        runtime,
+        preregistration,
+    )
     _assert_h24_receipt_private(receipt, seed, fixtures)
     if cancelled_error is not None:
         cancelled_error.receipt = receipt
         raise cancelled_error
     return receipt
+
+
+async def run_h24_descriptor_preflight(
+    config: PilotConfig,
+    *,
+    client_factory: Callable[..., Any] = CodexAppClient,
+) -> dict[str, object]:
+    """Validate the frozen H24 runtime descriptor without preparing private fixtures."""
+    validate_codex_home(config.codex_home)
+    work_root = _private_directory(config.work_root)
+    preregistration = _load_h24_preregistration(config.h24_preregistration_file)
+    if preregistration is None:
+        raise ValueError("descriptor preflight requires the frozen H24 preregistration")
+    source = _source_identity(config.source_sha)
+    image = _image_identity(config.image_id)
+    if source.get("identity_basis") != "sealed_metadata_file":
+        raise ValueError("descriptor preflight requires sealed source metadata")
+    expected = preregistration["descriptor_preflight"]
+    assert isinstance(expected, list)
+    descriptors: list[dict[str, object]] = []
+    with tempfile.TemporaryDirectory(prefix="rapido-h24-descriptor-", dir=work_root) as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        for arm in VERIFIER_ARMS:
+            arm_root = root / arm.id
+            arm_root.mkdir(mode=0o700)
+            client = client_factory(
+                env={
+                    "CODEX_HOME": str(config.codex_home),
+                    "HOME": str(config.codex_home),
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "TERM": "dumb",
+                    "NO_COLOR": "1",
+                },
+                binary=config.codex_binary,
+                cwd=arm_root,
+                max_workspace_bytes=config.max_workspace_bytes,
+            )
+            try:
+                await asyncio.wait_for(client.start(), timeout=TURN_TIMEOUT_SECONDS)
+                descriptor = await asyncio.wait_for(
+                    client.validate_model(_VERIFIER_MODEL, _VERIFIER_EFFORT),
+                    timeout=TURN_TIMEOUT_SECONDS,
+                )
+                descriptors.append(
+                    _h24_evaluation_descriptor(arm.id, _h24_descriptor_receipt(descriptor))
+                )
+            finally:
+                await asyncio.wait_for(client.close(), timeout=H24_CLIENT_CLOSE_SECONDS)
+    return {
+        "schema": "rapido-offline-h24-descriptor-preflight-v1",
+        "preregistration_sha256": h24_preregistration_sha256(preregistration),
+        "source": source,
+        "image": image,
+        "descriptors": descriptors,
+        "matched": descriptors == expected,
+    }
+
+
+def _write_json_output(path: Path, value: Mapping[str, object]) -> None:
+    if not path.is_absolute():
+        raise ValueError("output path must be absolute")
+    try:
+        parent_metadata = path.parent.lstat()
+    except OSError as exc:
+        raise ValueError("output directory is unavailable") from exc
+    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise ValueError("output directory is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def parser() -> argparse.ArgumentParser:
@@ -3254,21 +3591,29 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--codex-binary", required=True)
     result.add_argument("--codex-home", required=True, type=Path)
     result.add_argument("--work-root", required=True, type=Path)
-    result.add_argument("--oracle-key-file", required=True, type=Path)
+    result.add_argument("--oracle-key-file", type=Path)
     result.add_argument("--oracle-id")
     result.add_argument("--source-sha")
     result.add_argument("--image-id")
     result.add_argument("--max-workspace-bytes", type=int, default=MAX_WORKSPACE_BYTES)
+    result.add_argument("--start-at-unix-ms", type=int)
+    result.add_argument("--h24-preregistration-file", type=Path)
+    result.add_argument("--descriptor-preflight", action="store_true")
+    result.add_argument("--output-file", type=Path)
     return result
 
 
 def main() -> int:
     arguments = parser().parse_args()
+    if arguments.descriptor_preflight and arguments.experiment != H24_EXPERIMENT:
+        raise SystemExit("--descriptor-preflight requires --experiment h24")
+    if not arguments.descriptor_preflight and arguments.oracle_key_file is None:
+        raise SystemExit("--oracle-key-file is required for evaluation")
     config = PilotConfig(
         codex_binary=arguments.codex_binary,
         codex_home=arguments.codex_home,
         work_root=arguments.work_root,
-        oracle_key_file=arguments.oracle_key_file,
+        oracle_key_file=arguments.oracle_key_file or Path("/dev/null"),
         source_sha=arguments.source_sha,
         image_id=arguments.image_id,
         oracle_id=(
@@ -3276,14 +3621,22 @@ def main() -> int:
             or (H24_ORACLE_SCHEMA if arguments.experiment == H24_EXPERIMENT else ORACLE_SCHEMA)
         ),
         max_workspace_bytes=arguments.max_workspace_bytes,
+        start_at_unix_ms=arguments.start_at_unix_ms,
+        h24_preregistration_file=arguments.h24_preregistration_file,
     )
-    if arguments.experiment == H24_EXPERIMENT:
+    if arguments.descriptor_preflight:
+        pilot = run_h24_descriptor_preflight(config)
+    elif arguments.experiment == H24_EXPERIMENT:
         pilot = run_h24_pilot(config)
     elif arguments.experiment == VERIFIER_REPAIR_EXPERIMENT:
         pilot = run_verifier_repair_pilot(config)
     else:
         pilot = run_pilot(config)
-    print(json.dumps(asyncio.run(pilot), sort_keys=True, separators=(",", ":")))
+    receipt = asyncio.run(pilot)
+    if arguments.output_file is None:
+        print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    else:
+        _write_json_output(arguments.output_file, receipt)
     return 0
 
 
