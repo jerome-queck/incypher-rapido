@@ -2022,6 +2022,7 @@ def _cleanup_owned_containers(
             return False
         discovered = inventory - state.created
         if discovered:
+            state.unresolved_volume_intents.update(discovered)
             state.created.update(discovered)
             state.ownership_ambiguous = True
         if inventory:

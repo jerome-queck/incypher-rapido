@@ -1212,11 +1212,15 @@ def test_ambiguous_owned_create_fails_closed_and_cleans_every_exact_id(
     assert removed == {H24_ID, second_id}
 
 
-def test_late_same_label_replacement_is_removed_and_fails_closed(tmp_path: Path) -> None:
+def test_late_same_label_replacement_with_retained_volume_denies_clean_attestation(
+    tmp_path: Path,
+) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
     _seed_child_receipts(paths.output, protocol)
     late_id = "c" * 64
+    retained_volume = _anonymous_volume("/state", "d" * 64)
+    retained_volume_name = str(retained_volume["Name"])
 
     class LateReplacementFake(DockerFake):
         injected = False
@@ -1228,7 +1232,15 @@ def test_late_same_label_replacement_is_removed_and_fails_closed(tmp_path: Path)
                 self.injected = True
                 self.existing.add(late_id)
                 self.names[late_id] = SUPERVISOR._H24_NAME
-                self.configs[late_id] = self.configs[H24_ID]
+                self.configs[late_id] = {
+                    "labels": dict(self.configs[H24_ID]["labels"]),
+                    "mounts": [retained_volume],
+                    "volumes": {destination: {} for destination in IMAGE_VOLUME_DESTINATIONS},
+                }
+                self.volumes[retained_volume_name] = _volume_metadata(
+                    retained_volume,
+                    anonymous=False,
+                )
             return result
 
     clock = FakeClock()
@@ -1243,7 +1255,10 @@ def test_late_same_label_replacement_is_removed_and_fails_closed(tmp_path: Path)
 
     assert receipt["status"] == "failed"
     assert receipt["failure_class"] == "container_ownership_ambiguous"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
     assert runner.existing == set()
+    assert set(runner.volumes) == {retained_volume_name}
     assert ("docker", "rm", "--volumes", late_id) in runner.commands
 
 
