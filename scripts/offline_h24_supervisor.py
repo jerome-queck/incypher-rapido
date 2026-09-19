@@ -66,6 +66,7 @@ _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_REFERENCE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _BASE_REFERENCE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})\Z")
 _RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
+_ANONYMOUS_VOLUME_NAME = re.compile(r"[0-9a-f]{64}\Z")
 _CLOSED_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 _CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
 _FORBIDDEN_ENV = frozenset(
@@ -87,6 +88,7 @@ _ROLE_LABEL = "io.incypher.rapido.offline-h24-role"
 _OWNER_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _ORACLE_ID = "rapido-offline-h24-oracle-v1"
 _INSTALLED_RAPIDO = "/opt/venv/lib/python3.12/site-packages/rapido"
+_SEALED_IMAGE_VOLUMES = frozenset({"/auth/codex", "/state"})
 _WRAPPER_SOURCES = {
     "offline_oracle_pilot.py": Path("scripts/offline_oracle_pilot.py"),
     "board_contract_soak.py": Path("scripts/board_contract_soak.py"),
@@ -467,6 +469,24 @@ def validate_source(
         raise SupervisorError("source_dirty")
 
 
+def _declared_volume_destinations(config: Mapping[str, object], label: str) -> frozenset[str]:
+    volumes = _mapping(config.get("Volumes"), label)
+    destinations: set[str] = set()
+    for destination, metadata in volumes.items():
+        if (
+            type(destination) is not str
+            or not destination.startswith("/")
+            or destination == "/"
+            or "//" in destination
+            or destination.endswith("/")
+            or not isinstance(metadata, Mapping)
+            or metadata
+        ):
+            raise SupervisorError(label)
+        destinations.add(destination)
+    return frozenset(destinations)
+
+
 def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     result = _run(
         runner,
@@ -486,6 +506,8 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     config = _mapping(row.get("Config"), "image_identity")
     labels = _mapping(config.get("Labels"), "image_identity")
     _string(labels.get("io.incypher.rapido.base-reference"), _BASE_REFERENCE, "image_identity")
+    if _declared_volume_destinations(config, "image_identity") != _SEALED_IMAGE_VOLUMES:
+        raise SupervisorError("image_identity")
     image_os = row.get("Os")
     architecture = row.get("Architecture")
     if (
@@ -546,6 +568,38 @@ def _owned_container_ids(ownership_token: str, runner: Runner, *, timeout: float
     return set(values)
 
 
+def _anonymous_local_volume_destination(
+    mount: Mapping[str, object], allowed: frozenset[str]
+) -> str:
+    if set(mount) != {
+        "Type",
+        "Name",
+        "Source",
+        "Destination",
+        "Driver",
+        "Mode",
+        "RW",
+        "Propagation",
+    }:
+        raise SupervisorError("container_identity")
+    name = mount.get("Name")
+    source = mount.get("Source")
+    destination = mount.get("Destination")
+    if (
+        type(name) is not str
+        or _ANONYMOUS_VOLUME_NAME.fullmatch(name) is None
+        or source != f"/var/lib/docker/volumes/{name}/_data"
+        or type(destination) is not str
+        or destination not in allowed
+        or mount.get("Driver") != "local"
+        or mount.get("Mode") != ""
+        or mount.get("RW") is not True
+        or mount.get("Propagation") != ""
+    ):
+        raise SupervisorError("container_identity")
+    return destination
+
+
 def _inspect_container_intent(
     container_id: str,
     intent: ContainerIntent,
@@ -574,6 +628,9 @@ def _inspect_container_intent(
         raise SupervisorError("container_identity") from exc
     config = _mapping(row.get("Config"), "container_identity")
     labels = _mapping(config.get("Labels"), "container_identity")
+    declared_volumes = _declared_volume_destinations(config, "container_identity")
+    if declared_volumes != _SEALED_IMAGE_VOLUMES:
+        raise SupervisorError("container_identity")
     state = _mapping(row.get("State"), "container_identity")
     if (
         row.get("Id") != container_id
@@ -588,23 +645,35 @@ def _inspect_container_intent(
     mounts = row.get("Mounts")
     if not isinstance(mounts, list):
         raise SupervisorError("container_identity")
-    actual: dict[str, tuple[Path, bool]] = {}
+    actual_binds: dict[str, tuple[Path, bool]] = {}
+    actual_volumes: set[str] = set()
+    seen_destinations: set[str] = set()
     for value in mounts:
         mount = _mapping(value, "container_identity")
-        if mount.get("Type") != "bind":
+        mount_type = mount.get("Type")
+        if mount_type == "volume":
+            destination = _anonymous_local_volume_destination(mount, declared_volumes)
+            if destination in seen_destinations:
+                raise SupervisorError("container_identity")
+            seen_destinations.add(destination)
+            actual_volumes.add(destination)
+            continue
+        if mount_type != "bind":
             raise SupervisorError("container_identity")
         source = mount.get("Source")
         destination = mount.get("Destination")
         writable = mount.get("RW")
         if type(source) is not str or type(destination) is not str or type(writable) is not bool:
             raise SupervisorError("container_identity")
-        if destination in actual:
+        if destination in seen_destinations:
             raise SupervisorError("container_identity")
-        actual[destination] = (Path(source), not writable)
-    expected = {
+        seen_destinations.add(destination)
+        actual_binds[destination] = (Path(source), not writable)
+    expected_binds = {
         destination: (source, readonly) for source, destination, readonly in intent.bind_mounts
     }
-    if actual != expected:
+    expected_volumes = declared_volumes - expected_binds.keys()
+    if actual_binds != expected_binds or actual_volumes != expected_volumes:
         raise SupervisorError("container_identity")
 
 

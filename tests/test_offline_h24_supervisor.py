@@ -40,6 +40,21 @@ PROBE_ID = "4" * 64
 H24_ID = "5" * 64
 SOAK_ID = "6" * 64
 DESCRIPTOR_ID = "7" * 64
+IMAGE_VOLUME_DESTINATIONS = ("/auth/codex", "/state")
+
+
+def _anonymous_volume(destination: str, marker: str) -> dict[str, object]:
+    name = marker * 64
+    return {
+        "Type": "volume",
+        "Name": name,
+        "Source": f"/var/lib/docker/volumes/{name}/_data",
+        "Destination": destination,
+        "Driver": "local",
+        "Mode": "",
+        "RW": True,
+        "Propagation": "",
+    }
 
 
 def _private_directory(path: Path) -> Path:
@@ -198,9 +213,17 @@ class DockerFake:
                         "RW": "readonly" not in fields,
                     }
                 )
+            bound_destinations = {mount["Destination"] for mount in mounts}
+            for destination, marker in zip(IMAGE_VOLUME_DESTINATIONS, ("a", "b"), strict=True):
+                if destination not in bound_destinations:
+                    mounts.append(_anonymous_volume(destination, marker))
             self.existing.add(container_id)
             self.names[container_id] = name
-            self.configs[container_id] = {"labels": labels, "mounts": mounts}
+            self.configs[container_id] = {
+                "labels": labels,
+                "mounts": mounts,
+                "volumes": {destination: {} for destination in IMAGE_VOLUME_DESTINATIONS},
+            }
             return SUPERVISOR.CommandResult(0, f"{container_id}\n")
         if command[:2] == ("docker", "start") and "--attach" not in command:
             self.running.update(command[2:])
@@ -246,6 +269,7 @@ class DockerFake:
                         "Config": {
                             "User": SUPERVISOR.CONTAINER_USER,
                             "Labels": self.configs[container_id]["labels"],
+                            "Volumes": self.configs[container_id]["volumes"],
                         },
                         "State": state,
                         "Mounts": self.configs[container_id]["mounts"],
@@ -595,6 +619,7 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
                     "Architecture": "arm64",
                     "Config": {
                         "User": "10001:10001",
+                        "Volumes": {destination: {} for destination in IMAGE_VOLUME_DESTINATIONS},
                         "Labels": {
                             "org.opencontainers.image.revision": SOURCE_SHA,
                             "io.incypher.rapido.source-revision": SOURCE_SHA,
@@ -639,6 +664,14 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
         SUPERVISOR.inspect_image(protocol, floating_base)
 
+    def declared_volume_drift(argv: Any, *, timeout: float | None = None) -> Any:
+        value = json.loads(runner(argv, timeout=timeout).stdout)
+        value["Config"]["Volumes"]["/unexpected"] = {}
+        return SUPERVISOR.CommandResult(0, json.dumps(value))
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
+        SUPERVISOR.inspect_image(protocol, declared_volume_drift)
+
 
 def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     tmp_path: Path,
@@ -661,6 +694,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             self.malformed_id = malformed_id
             self.existing = False
             self.labels: dict[str, str] = {}
+            self.mounts: list[dict[str, object]] = []
             self.commands: list[tuple[str, ...]] = []
 
         def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
@@ -686,6 +720,12 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                     if value == "--label":
                         key, label_value = command[index + 1].split("=", 1)
                         self.labels[key] = label_value
+                self.mounts = [
+                    _anonymous_volume(destination, marker)
+                    for destination, marker in zip(
+                        IMAGE_VOLUME_DESTINATIONS, ("c", "d"), strict=True
+                    )
+                ]
                 return SUPERVISOR.CommandResult(
                     0,
                     "malformed\n" if self.malformed_id else f"{PROBE_ID}\n",
@@ -701,9 +741,12 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                             "Config": {
                                 "User": SUPERVISOR.CONTAINER_USER,
                                 "Labels": self.labels,
+                                "Volumes": {
+                                    destination: {} for destination in IMAGE_VOLUME_DESTINATIONS
+                                },
                             },
                             "State": {"Running": False},
-                            "Mounts": [],
+                            "Mounts": self.mounts,
                         }
                     ),
                 )
@@ -749,6 +792,8 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     assert create[create.index("--name") + 1] == SUPERVISOR._SOURCE_PROBE_NAME
     assert create[create.index("--network") + 1] == "none"
     assert "--mount" not in create and "--volume" not in create and "-v" not in create
+    assert {mount["Destination"] for mount in matching.mounts} == set(IMAGE_VOLUME_DESTINATIONS)
+    assert all(mount["Type"] == "volume" for mount in matching.mounts)
     assert not any(command[:2] == ("docker", "start") for command in matching.commands)
     assert all(
         command[2].startswith(f"{PROBE_ID}:")
@@ -830,6 +875,15 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
     creates = [command for command in runner.commands if command[:2] == ("docker", "create")]
     barriers = {command[command.index("--start-at-unix-ms") + 1] for command in creates}
     assert len(barriers) == 1
+    h24_mounts = runner.configs[H24_ID]["mounts"]
+    soak_mounts = runner.configs[SOAK_ID]["mounts"]
+    assert {mount["Destination"] for mount in h24_mounts if mount["Type"] == "volume"} == {"/state"}
+    assert {mount["Destination"] for mount in soak_mounts if mount["Type"] == "volume"} == set(
+        IMAGE_VOLUME_DESTINATIONS
+    )
+    assert any(
+        mount["Type"] == "bind" and mount["Destination"] == "/auth/codex" for mount in h24_mounts
+    )
     assert (
         receipt["barrier"]["global_deadline_wall_epoch_milliseconds"]
         - receipt["barrier"]["start_wall_epoch_milliseconds"]
@@ -1163,7 +1217,23 @@ def test_reconciled_create_rejects_mount_drift_before_start_and_cleans_exact_id(
     assert runner.existing == set()
 
 
-def test_reconciled_create_rejects_unexpected_nonbind_mount(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "extra",
+        "duplicate",
+        "type",
+        "destination",
+        "name",
+        "source",
+        "driver",
+        "mode",
+        "rw",
+        "propagation",
+        "declared",
+    ),
+)
+def test_reconciled_create_rejects_anonymous_volume_drift(tmp_path: Path, mutation: str) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     paths = _paths(tmp_path, preregistration, registration)
     _seed_child_receipts(paths.output, protocol)
@@ -1178,14 +1248,34 @@ def test_reconciled_create_rejects_unexpected_nonbind_mount(tmp_path: Path) -> N
                 and command[-1] == H24_ID
             ):
                 value = json.loads(result.stdout)
-                value["Mounts"].append(
-                    {
-                        "Type": "volume",
-                        "Source": "/var/lib/docker/volumes/unexpected",
-                        "Destination": "/unexpected",
-                        "RW": True,
-                    }
+                volume = next(
+                    mount
+                    for mount in value["Mounts"]
+                    if mount["Type"] == "volume" and mount["Destination"] == "/state"
                 )
+                if mutation == "extra":
+                    value["Mounts"].append(_anonymous_volume("/unexpected", "e"))
+                elif mutation == "duplicate":
+                    duplicate = _anonymous_volume("/state", "e")
+                    value["Mounts"].append(duplicate)
+                elif mutation == "type":
+                    volume["Type"] = "tmpfs"
+                elif mutation == "destination":
+                    volume["Destination"] = "/unexpected"
+                elif mutation == "name":
+                    volume["Name"] = "short"
+                elif mutation == "source":
+                    volume["Source"] = "/var/lib/docker/volumes/unexpected/_data"
+                elif mutation == "driver":
+                    volume["Driver"] = "unexpected"
+                elif mutation == "mode":
+                    volume["Mode"] = "z"
+                elif mutation == "rw":
+                    volume["RW"] = False
+                elif mutation == "propagation":
+                    volume["Propagation"] = "rprivate"
+                else:
+                    value["Config"]["Volumes"]["/unexpected"] = {}
                 return SUPERVISOR.CommandResult(0, json.dumps(value))
             return result
 
@@ -1514,9 +1604,8 @@ def test_descriptor_preflight_emits_only_frozen_closed_rows(
                 return SUPERVISOR.CommandResult(0, "")
             return super().__call__(command, timeout=timeout)
 
-    result = SUPERVISOR.run_descriptor_preflight(
-        protocol, paths, runner=DescriptorFake(paths.output), clock=FakeClock()
-    )
+    runner = DescriptorFake(paths.output)
+    result = SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner, clock=FakeClock())
     assert result == {
         "schema": SUPERVISOR.DESCRIPTOR_SCHEMA,
         "protocol_id": SUPERVISOR.PREREGISTRATION_SCHEMA,
@@ -1527,6 +1616,11 @@ def test_descriptor_preflight_emits_only_frozen_closed_rows(
     assert "source" not in encoded_commands
     assert "image" not in encoded_commands
     assert "oracle" not in encoded_commands
+    mounts = runner.configs[DESCRIPTOR_ID]["mounts"]
+    assert {mount["Destination"] for mount in mounts if mount["Type"] == "volume"} == {"/state"}
+    assert any(
+        mount["Type"] == "bind" and mount["Destination"] == "/auth/codex" for mount in mounts
+    )
 
 
 @pytest.mark.parametrize(
