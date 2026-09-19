@@ -113,11 +113,20 @@ class FakeClock:
 
 
 class DockerFake:
-    def __init__(self, output: Path, *, keep_soak_running: bool = False, oom: bool = False) -> None:
+    def __init__(
+        self,
+        output: Path,
+        *,
+        keep_soak_running: bool = False,
+        oom: bool = False,
+        clock: FakeClock | None = None,
+    ) -> None:
         self.output = output
         self.keep_soak_running = keep_soak_running
         self.oom = oom
+        self.clock = clock
         self.commands: list[tuple[str, ...]] = []
+        self.command_times: list[tuple[tuple[str, ...], float]] = []
         self.existing: set[str] = set()
         self.running: set[str] = set()
 
@@ -125,6 +134,7 @@ class DockerFake:
         del timeout
         command = tuple(argv)
         self.commands.append(command)
+        self.command_times.append((command, self.clock.monotonic() if self.clock else -1.0))
         if command[:3] == ("docker", "ps", "--all") and "--quiet" not in command:
             name = command[command.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
             return SUPERVISOR.CommandResult(0, f"{name}\n" if name in self.existing else "")
@@ -171,9 +181,9 @@ class DockerFake:
             return SUPERVISOR.CommandResult(0, "stopped\n")
         if command[:2] == ("docker", "logs"):
             return SUPERVISOR.CommandResult(0, "private raw child log\n")
-        if command[:3] == ("docker", "rm", "--force"):
-            self.existing.discard(command[3])
-            self.running.discard(command[3])
+        if command[:2] == ("docker", "rm"):
+            self.existing.discard(command[-1])
+            self.running.discard(command[-1])
             return SUPERVISOR.CommandResult(0, "removed\n")
         raise AssertionError(command)
 
@@ -390,6 +400,7 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
         "peak_pids": 17,
         "oom_killed": False,
     }
+    assert clock.monotonic() == 1_000 + 30 + 19_800
     assert not paths.work.exists()
     assert not paths.seed.exists()
     assert paths.auth.exists() and (paths.auth / "auth.json").exists()
@@ -402,17 +413,26 @@ def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Pa
     protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
     paths = _paths(tmp_path, preregistration, registration)
     _seed_child_receipts(paths.output)
-    runner = DockerFake(paths.output, keep_soak_running=True)
-    SUPERVISOR.run_evaluation(protocol, paths, runner=runner, clock=FakeClock(), finalize=False)
+    clock = FakeClock()
+    runner = DockerFake(paths.output, keep_soak_running=True, clock=clock)
+    SUPERVISOR.run_evaluation(protocol, paths, runner=runner, clock=clock, finalize=False)
 
     scoring_stops = [
-        command
-        for command in runner.commands
-        if command[:4] == ("docker", "stop", "--time", "190") and command[-1] == protocol.soak_name
+        (command, timestamp)
+        for command, timestamp in runner.command_times
+        if command[:4] == ("docker", "stop", "--time", "0")
     ]
-    assert scoring_stops
-    assert all(protocol.h24_name not in command[4:] for command in scoring_stops[:1])
-    assert not any("offline_oracle_pilot.py" in command for command in runner.commands[3:])
+    assert scoring_stops == [(("docker", "stop", "--time", "0", protocol.soak_name), 1_193.0)]
+    assert not any(
+        command[:4] == ("docker", "stop", "--time", "190") for command in runner.commands
+    )
+    assert (
+        sum(
+            any("offline_oracle_pilot.py" in argument for argument in command)
+            for command in runner.commands
+        )
+        == 1
+    )
 
 
 def test_oom_and_child_failures_are_retained_not_dropped(tmp_path: Path) -> None:
@@ -554,6 +574,8 @@ def test_finalizer_joins_sanitized_facts_and_writes_private_evaluation(
         cleanup_started_offset_milliseconds=19_800_000,
         cleanup_elapsed_milliseconds=1_000,
         containers_absent=True,
+        cleanup_completed=True,
+        workspace_residue_bytes=0,
     )
     assert len(calls) == 2
     assert calls[-1]["runtime_resources"] == {
@@ -580,10 +602,12 @@ def test_cleanup_span_includes_private_deletion_and_first_persistence_pass(
     _seed_child_receipts(paths.output)
     clock = FakeClock()
     observed: list[int] = []
+    private_inputs_present: list[tuple[bool, bool]] = []
 
     def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
         del args
         observed.append(int(kwargs["cleanup_elapsed_milliseconds"]))
+        private_inputs_present.append((paths.work.exists(), paths.seed.exists()))
         clock.sleep(5)
         for name, schema in (
             (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
@@ -598,11 +622,76 @@ def test_cleanup_span_includes_private_deletion_and_first_persistence_pass(
     receipt = SUPERVISOR.run_evaluation(
         protocol,
         paths,
-        runner=DockerFake(paths.output, keep_soak_running=True),
+        runner=DockerFake(paths.output),
         clock=clock,
     )
-    assert observed == [0, 5_000]
+    assert observed == [0, 5_000, 10_000]
+    assert private_inputs_present == [(True, True), (False, False), (False, False)]
     assert receipt["status"] == "completed"
+
+
+def test_assembly_failure_preserves_private_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+
+    def reject(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        del args, kwargs
+        raise SUPERVISOR.SupervisorError("privacy_scan")
+
+    monkeypatch.setattr(SUPERVISOR, "finalize_evaluation", reject)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=DockerFake(paths.output),
+        clock=FakeClock(),
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "privacy_scan"
+    assert paths.work.exists()
+    assert paths.seed.exists()
+    assert not (paths.output / SUPERVISOR.FINAL_RECEIPT).exists()
+    assert not (paths.output / SUPERVISOR.EVALUATION_RESULT).exists()
+
+
+def test_late_persistence_records_failed_cleanup_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+    clock = FakeClock()
+    observed: list[int] = []
+
+    def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        del args
+        observed.append(int(kwargs["cleanup_elapsed_milliseconds"]))
+        clock.sleep(70)
+        for name, schema in (
+            (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
+            (SUPERVISOR.EVALUATION_RESULT, "rapido-offline-h24-evaluation-v1"),
+        ):
+            path = paths.output / name
+            path.write_text(json.dumps({"schema": schema}))
+            path.chmod(0o600)
+        return {}, {}
+
+    monkeypatch.setattr(SUPERVISOR, "finalize_evaluation", finalize)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=DockerFake(paths.output),
+        clock=clock,
+    )
+
+    assert observed == [0, 70_000, 140_000, 210_000]
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "cleanup_timeout"
 
 
 def test_no_shell_true_and_only_exact_container_removal() -> None:

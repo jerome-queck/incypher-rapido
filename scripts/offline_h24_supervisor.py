@@ -811,6 +811,11 @@ def _atomic_private_write(path: Path, data: str) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         path.chmod(0o600)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
@@ -915,6 +920,8 @@ def finalize_evaluation(
     cleanup_started_offset_milliseconds: int,
     cleanup_elapsed_milliseconds: int,
     containers_absent: bool,
+    cleanup_completed: bool,
+    workspace_residue_bytes: int,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Join only sanitized receipts, validate the exact envelope, and persist it privately."""
     raw_h24 = _load_private_json(paths.output / H24_RECEIPT, "h24_receipt_invalid")
@@ -926,11 +933,11 @@ def finalize_evaluation(
     cleanup = {
         "started_offset_milliseconds": max(0, cleanup_started_offset_milliseconds),
         "elapsed_milliseconds": max(0, cleanup_elapsed_milliseconds),
-        "completed": containers_absent and not paths.work.exists(),
+        "completed": cleanup_completed,
         "orphan_process_count": 0 if containers_absent else 1,
         "fake_instance_count": owned,
         "pending_write_count": pending,
-        "workspace_residue_bytes": 0,
+        "workspace_residue_bytes": workspace_residue_bytes,
         "privacy_scan_passed": False,
         "source_database_mutation_detected": False,
     }
@@ -970,19 +977,22 @@ def finalize_evaluation(
         raise SupervisorError("evaluation_assembly") from exc
     if final.get("schema") != EVALUATION_RECEIPT_SCHEMA:
         raise SupervisorError("evaluation_assembly")
-    _atomic_private_write(
-        paths.output / FINAL_RECEIPT,
-        json.dumps(final, sort_keys=True, separators=(",", ":")) + "\n",
-    )
-    _atomic_private_write(
-        paths.output / EVALUATION_RESULT,
-        json.dumps(evaluation, sort_keys=True, separators=(",", ":")) + "\n",
-    )
+    try:
+        _atomic_private_write(
+            paths.output / FINAL_RECEIPT,
+            json.dumps(final, sort_keys=True, separators=(",", ":")) + "\n",
+        )
+        _atomic_private_write(
+            paths.output / EVALUATION_RESULT,
+            json.dumps(evaluation, sort_keys=True, separators=(",", ":")) + "\n",
+        )
+    except OSError as exc:
+        raise SupervisorError("evaluation_persistence") from exc
     return final, evaluation
 
 
 def _remove_container(name: str, runner: Runner, state: EvaluationState) -> None:
-    result = runner(("docker", "rm", "--force", name), timeout=30)
+    result = runner(("docker", "rm", name), timeout=30)
     if result.returncode == 0 or _container_absent(name, runner):
         state.removed.add(name)
         return
@@ -994,6 +1004,29 @@ def _cleanup_private(paths: Paths, protocol: Protocol) -> None:
         shutil.rmtree(paths.work)
     if protocol.cleanup_seed:
         paths.seed.unlink()
+
+
+def _workspace_residue_bytes(path: Path) -> int:
+    """Measure residue without following links or reading private contents."""
+    if not path.exists():
+        return 0
+    total = 0
+    stack = [path]
+    try:
+        while stack:
+            current = stack.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        stack.append(Path(entry.path))
+                    elif stat.S_ISREG(metadata.st_mode):
+                        total += metadata.st_size
+                    else:
+                        raise SupervisorError("workspace_residue_invalid")
+    except OSError as exc:
+        raise SupervisorError("workspace_residue_invalid") from exc
+    return total
 
 
 def _public_receipt(
@@ -1074,6 +1107,7 @@ def run_evaluation(
     barrier_mono: float | None = None
     cleanup_started_mono: float | None = None
     cleanup_finished_mono: float | None = None
+    running: set[str] = set()
     cleanup = {
         "containers_absent": False,
         "auth_preserved": False,
@@ -1091,14 +1125,15 @@ def run_evaluation(
         try:
             _validate_container_absence(protocol, runner)
             _validate_auth_unmounted(paths.auth, runner)
-            barrier_mono = clock.monotonic() + protocol.barrier_delay_seconds
+            barrier_origin_mono = clock.monotonic()
+            barrier_origin_wall = clock.time()
             barrier_wall_milliseconds = math.ceil(
-                (clock.time() + protocol.barrier_delay_seconds) * 1000
+                (barrier_origin_wall + protocol.barrier_delay_seconds) * 1000
             )
-            # The workers each own the exact 19,800-second window from the
-            # shared barrier. The host allows at most one second of wake skew
-            # before enforcing the outer stop.
-            deadline_mono = barrier_mono + protocol.scoring_seconds + 1
+            barrier_mono = barrier_origin_mono + (
+                barrier_wall_milliseconds / 1000 - barrier_origin_wall
+            )
+            scoring_deadline_mono = barrier_mono + protocol.scoring_seconds
             deadline_wall_milliseconds = barrier_wall_milliseconds + protocol.scoring_seconds * 1000
             barrier_receipt = {
                 "start_wall_epoch_milliseconds": barrier_wall_milliseconds,
@@ -1141,24 +1176,38 @@ def run_evaluation(
                 clock.sleep(remaining)
 
             running = {protocol.h24_name, protocol.soak_name}
-            while running and clock.monotonic() < deadline_mono:
-                _sample(sorted(running), runner, peaks)
+            while clock.monotonic() < scoring_deadline_mono:
+                if running:
+                    _sample(sorted(running), runner, peaks)
+                    for name in tuple(running):
+                        container = _container_state(name, runner)
+                        if container.get("Running") is not True:
+                            running.remove(name)
+                remaining = scoring_deadline_mono - clock.monotonic()
+                if remaining > 0:
+                    clock.sleep(min(SAMPLE_SECONDS, remaining) if running else remaining)
+
+            cleanup_started_mono = clock.monotonic()
+            cleanup_deadline_mono = cleanup_started_mono + CLEANUP_SECONDS
+            # Let workers honor their own graceful teardown for the complete
+            # cleanup window. A host stop is a last resort at its boundary.
+            while running and clock.monotonic() < cleanup_deadline_mono:
                 for name in tuple(running):
                     container = _container_state(name, runner)
                     if container.get("Running") is not True:
                         running.remove(name)
-                if running:
-                    clock.sleep(min(SAMPLE_SECONDS, max(0.0, deadline_mono - clock.monotonic())))
-
-            cleanup_started_mono = clock.monotonic()
+                remaining = cleanup_deadline_mono - clock.monotonic()
+                if running and remaining > 0:
+                    clock.sleep(min(SAMPLE_SECONDS, remaining))
             if running:
                 _run(
                     runner,
-                    ("docker", "stop", "--time", str(CLEANUP_SECONDS), *sorted(running)),
+                    ("docker", "stop", "--time", "0", *sorted(running)),
                     "container_stop",
-                    timeout=CLEANUP_SECONDS + 10,
+                    timeout=30,
                 )
                 state.stopped.update(running)
+                running.clear()
 
             for role, name in (("h24", protocol.h24_name), ("soak", protocol.soak_name)):
                 container = _container_state(name, runner)
@@ -1174,12 +1223,11 @@ def run_evaluation(
                 if name not in state.removed:
                     with contextlib.suppress(SupervisorError):
                         if not _container_absent(name, runner):
-                            result = runner(
-                                ("docker", "stop", "--time", str(CLEANUP_SECONDS), name),
-                                timeout=CLEANUP_SECONDS + 10,
-                            )
-                            if result.returncode == 0:
-                                state.stopped.add(name)
+                            container = _container_state(name, runner)
+                            if container.get("Running") is True:
+                                result = runner(("docker", "stop", "--time", "0", name), timeout=30)
+                                if result.returncode == 0:
+                                    state.stopped.add(name)
                         _remove_container(name, runner, state)
             cleanup["containers_absent"] = all(
                 _container_absent(name, runner) for name in (protocol.h24_name, protocol.soak_name)
@@ -1192,19 +1240,38 @@ def run_evaluation(
         "soak": _receipt_projection(paths.output / SOAK_RECEIPT),
     }
     cleanup["private_receipts_preserved"] = all(row["present"] for row in receipts.values())
-    try:
-        _cleanup_private(paths, protocol)
-        cleanup["work_removed"] = not paths.work.exists()
-        cleanup["seed_removed"] = not paths.seed.exists()
-    except OSError:
-        failure_class = failure_class or "private_cleanup"
     if finalize:
         try:
             if barrier_mono is None or cleanup_started_mono is None:
                 raise SupervisorError("evaluation_assembly")
             cleanup_start_offset = max(0, int((cleanup_started_mono - barrier_mono) * 1000))
-            # First persist a complete envelope, then include that deletion and
-            # persistence tail in the measured replacement.
+            # Persist and validate a sanitized provisional envelope before
+            # deleting its private source material. Failed assembly or privacy
+            # checks therefore leave the inputs intact for diagnosis.
+            provisional_finish = clock.monotonic()
+            finalize_evaluation(
+                protocol,
+                paths,
+                barrier=barrier_receipt,
+                h24_peak=peaks[protocol.h24_name],
+                cleanup_started_offset_milliseconds=cleanup_start_offset,
+                cleanup_elapsed_milliseconds=max(
+                    0, int((provisional_finish - cleanup_started_mono) * 1000)
+                ),
+                containers_absent=cleanup["containers_absent"],
+                cleanup_completed=False,
+                workspace_residue_bytes=_workspace_residue_bytes(paths.work),
+            )
+            try:
+                _cleanup_private(paths, protocol)
+            except OSError:
+                failure_class = failure_class or "private_cleanup"
+            cleanup["work_removed"] = not paths.work.exists()
+            cleanup["seed_removed"] = not paths.seed.exists()
+
+            # The second pass records deletion. The third records the first
+            # completed persistence pass, avoiding a claim based only on work
+            # performed after the recorded timestamp.
             for _ in range(2):
                 observed_finish = clock.monotonic()
                 finalize_evaluation(
@@ -1217,12 +1284,37 @@ def run_evaluation(
                         0, int((observed_finish - cleanup_started_mono) * 1000)
                     ),
                     containers_absent=cleanup["containers_absent"],
+                    cleanup_completed=all(cleanup.values()),
+                    workspace_residue_bytes=_workspace_residue_bytes(paths.work),
                 )
             cleanup_finished_mono = clock.monotonic()
+            if cleanup_finished_mono - cleanup_started_mono > CLEANUP_SECONDS:
+                # Never leave a passing cleanup envelope if the replacement
+                # itself crossed the registered outer grace.
+                finalize_evaluation(
+                    protocol,
+                    paths,
+                    barrier=barrier_receipt,
+                    h24_peak=peaks[protocol.h24_name],
+                    cleanup_started_offset_milliseconds=cleanup_start_offset,
+                    cleanup_elapsed_milliseconds=max(
+                        0, int((cleanup_finished_mono - cleanup_started_mono) * 1000)
+                    ),
+                    containers_absent=cleanup["containers_absent"],
+                    cleanup_completed=all(cleanup.values()),
+                    workspace_residue_bytes=_workspace_residue_bytes(paths.work),
+                )
+                cleanup_finished_mono = clock.monotonic()
         except SupervisorError as exc:
             failure_class = failure_class or exc.failure_class
             cleanup_finished_mono = clock.monotonic()
     else:
+        try:
+            _cleanup_private(paths, protocol)
+        except OSError:
+            failure_class = failure_class or "private_cleanup"
+        cleanup["work_removed"] = not paths.work.exists()
+        cleanup["seed_removed"] = not paths.seed.exists()
         cleanup_finished_mono = clock.monotonic()
     if (
         cleanup_started_mono is not None

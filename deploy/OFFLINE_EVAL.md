@@ -46,10 +46,18 @@ work and private output plus read-only seed/protocol. The soak mounts only priva
 read-only protocol. Neither receives a repository or Board environment.
 
 Ten-second bounded samples retain peak CPU, RSS, PID and OOM observations; unavailable fields stay
-null. H24 completion starts no filler calls. At the common deadline, exact still-running containers
-receive the 190-second stop contract. Both exit codes, private receipts, failures and raw logs are
-retained; only the exact created containers, fresh work and seed are removed. Container absence and
-auth preservation are verified.
+null. H24 completion starts no filler calls, and the scoring phase remains open until the exact
+common deadline even when both workers finish early. The deadline starts one 190-second cleanup
+window. Workers may drain naturally for that whole window; only containers still running at its
+boundary receive an immediate stop, followed by exact-name removal. Both exit codes, private
+receipts, failures and raw logs are retained. Container absence and auth preservation are verified.
+
+Before fresh work or seed deletion, the supervisor assembles, privacy-scans, evaluates and durably
+persists a sanitized provisional envelope. Assembly, privacy or persistence failure preserves both
+private inputs. After successful provisional persistence it removes only fresh work and seed, then
+rewrites the sanitized envelope twice: first with observed deletion and again with the elapsed cost
+of that completed persistence pass. An over-grace replacement is explicitly persisted as a failed
+cleanup gate; it is never left as a passing claim.
 
 Run secret-free unit tests first. Native H24 and the real-clock soak remain separately authorized
 execution steps and must use a committed, externally registered protocol and immutable image.
