@@ -1,7 +1,9 @@
 # H24 preregistration and execution boundary
 
-Status: protocol frozen; no H24 outcome or 19,800-second real-clock soak has run or been
-unsealed. This note records prospective rules, not a result.
+Status: frozen prospective protocol. The terminal native attempt and 19,800-second real-clock
+soak are recorded separately in
+[`offline-h24-final-evidence-2026-09-20.md`](offline-h24-final-evidence-2026-09-20.md); historical
+no-run statements below remain scoped to the implementation PR that created this note.
 
 ## Frozen experiment
 

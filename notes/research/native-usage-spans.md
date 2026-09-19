@@ -1,6 +1,8 @@
 # Native usage and span receipt contract
 
-Status: implemented for the benign offline pilot. No native H24 outcome was run or unsealed.
+Status: implemented accounting contract. Native results are recorded separately in
+[`offline-h24-final-evidence-2026-09-20.md`](offline-h24-final-evidence-2026-09-20.md); historical
+no-run statements below remain scoped to this implementation PR.
 
 `rapido.native_receipts` is a pure accounting module. Its small interface builds one
 `rapido-native-attempt-receipt-v1` row and summarizes an exact expected set as
