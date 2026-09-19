@@ -422,7 +422,7 @@ def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Pa
         for command, timestamp in runner.command_times
         if command[:4] == ("docker", "stop", "--time", "0")
     ]
-    assert scoring_stops == [(("docker", "stop", "--time", "0", protocol.soak_name), 1_193.0)]
+    assert scoring_stops == [(("docker", "stop", "--time", "0", protocol.soak_name), 1_183.0)]
     assert not any(
         command[:4] == ("docker", "stop", "--time", "190") for command in runner.commands
     )
@@ -671,7 +671,7 @@ def test_late_persistence_records_failed_cleanup_gate(
     def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
         del args
         observed.append(int(kwargs["cleanup_elapsed_milliseconds"]))
-        clock.sleep(70)
+        clock.sleep(4)
         for name, schema in (
             (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
             (SUPERVISOR.EVALUATION_RESULT, "rapido-offline-h24-evaluation-v1"),
@@ -685,13 +685,51 @@ def test_late_persistence_records_failed_cleanup_gate(
     receipt = SUPERVISOR.run_evaluation(
         protocol,
         paths,
-        runner=DockerFake(paths.output),
+        runner=DockerFake(paths.output, keep_soak_running=True),
         clock=clock,
     )
 
-    assert observed == [0, 70_000, 140_000, 210_000]
+    assert observed == [180_000, 184_000, 188_000, 192_000]
     assert receipt["status"] == "failed"
     assert receipt["failure_class"] == "cleanup_timeout"
+
+
+def test_worker_drain_leaves_tail_inside_outer_cleanup_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, scoring_seconds=2, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+    clock = FakeClock()
+    observed: list[int] = []
+
+    def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        del args
+        observed.append(int(kwargs["cleanup_elapsed_milliseconds"]))
+        clock.sleep((3, 3, 4)[len(observed) - 1])
+        for name, schema in (
+            (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
+            (SUPERVISOR.EVALUATION_RESULT, "rapido-offline-h24-evaluation-v1"),
+        ):
+            path = paths.output / name
+            path.write_text(json.dumps({"schema": schema}))
+            path.chmod(0o600)
+        return {}, {}
+
+    monkeypatch.setattr(SUPERVISOR, "finalize_evaluation", finalize)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=DockerFake(paths.output, keep_soak_running=True),
+        clock=clock,
+    )
+
+    assert observed == [180_000, 183_000, 186_000]
+    assert clock.monotonic() == 1_000 + 1 + 2 + 190
+    assert receipt["status"] == "completed"
+    assert receipt["protocol"]["worker_drain_seconds"] == 180
+    assert receipt["protocol"]["cleanup_grace_seconds"] == 190
 
 
 def test_no_shell_true_and_only_exact_container_removal() -> None:

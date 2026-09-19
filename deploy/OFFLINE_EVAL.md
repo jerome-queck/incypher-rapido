@@ -48,9 +48,10 @@ read-only protocol. Neither receives a repository or Board environment.
 Ten-second bounded samples retain peak CPU, RSS, PID and OOM observations; unavailable fields stay
 null. H24 completion starts no filler calls, and the scoring phase remains open until the exact
 common deadline even when both workers finish early. The deadline starts one 190-second cleanup
-window. Workers may drain naturally for that whole window; only containers still running at its
-boundary receive an immediate stop, followed by exact-name removal. Both exit codes, private
-receipts, failures and raw logs are retained. Container absence and auth preservation are verified.
+window. Workers may drain naturally for 180 seconds; only containers still running at that boundary
+receive an immediate stop. The remaining outer grace covers inspection, logs, exact-name removal,
+private cleanup, and evidence persistence. Both exit codes, private receipts, failures and raw logs
+are retained. Container absence and auth preservation are verified.
 
 Before fresh work or seed deletion, the supervisor assembles, privacy-scans, evaluates and durably
 persists a sanitized provisional envelope. Assembly, privacy or persistence failure preserves both

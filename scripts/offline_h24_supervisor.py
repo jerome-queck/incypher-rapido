@@ -42,6 +42,7 @@ DESCRIPTOR_SCHEMA = "rapido-offline-h24-descriptor-preflight-v1"
 SUPERVISOR_SCHEMA = "rapido-offline-h24-supervisor-v1"
 SCORING_SECONDS = GLOBAL_SCORING_SECONDS
 CLEANUP_SECONDS = CLEANUP_GRACE_SECONDS
+WORKER_DRAIN_SECONDS = 180
 SAMPLE_SECONDS = 10.0
 CONTAINER_UID = 10_001
 H24_RECEIPT = "h24-receipt.json"
@@ -1054,6 +1055,7 @@ def _public_receipt(
             "common_start_barrier": True,
             "scoring_seconds": protocol.scoring_seconds,
             "cleanup_grace_seconds": CLEANUP_SECONDS,
+            "worker_drain_seconds": WORKER_DRAIN_SECONDS,
             "h24_target_network_authorized": False,
             "h24_provider_transport": "ordinary",
             "soak_network": "none",
@@ -1189,14 +1191,15 @@ def run_evaluation(
 
             cleanup_started_mono = clock.monotonic()
             cleanup_deadline_mono = cleanup_started_mono + CLEANUP_SECONDS
-            # Let workers honor their own graceful teardown for the complete
-            # cleanup window. A host stop is a last resort at its boundary.
-            while running and clock.monotonic() < cleanup_deadline_mono:
+            worker_drain_deadline_mono = cleanup_started_mono + WORKER_DRAIN_SECONDS
+            # The registered outer grace reserves its final ten seconds for
+            # forced stop, inspection, removal, and evidence persistence.
+            while running and clock.monotonic() < worker_drain_deadline_mono:
                 for name in tuple(running):
                     container = _container_state(name, runner)
                     if container.get("Running") is not True:
                         running.remove(name)
-                remaining = cleanup_deadline_mono - clock.monotonic()
+                remaining = worker_drain_deadline_mono - clock.monotonic()
                 if running and remaining > 0:
                     clock.sleep(min(SAMPLE_SECONDS, remaining))
             if running:
@@ -1288,7 +1291,7 @@ def run_evaluation(
                     workspace_residue_bytes=_workspace_residue_bytes(paths.work),
                 )
             cleanup_finished_mono = clock.monotonic()
-            if cleanup_finished_mono - cleanup_started_mono > CLEANUP_SECONDS:
+            if cleanup_finished_mono > cleanup_deadline_mono:
                 # Never leave a passing cleanup envelope if the replacement
                 # itself crossed the registered outer grace.
                 finalize_evaluation(
@@ -1318,7 +1321,7 @@ def run_evaluation(
         cleanup_finished_mono = clock.monotonic()
     if (
         cleanup_started_mono is not None
-        and cleanup_finished_mono - cleanup_started_mono > CLEANUP_SECONDS
+        and cleanup_finished_mono > cleanup_started_mono + CLEANUP_SECONDS
     ):
         failure_class = failure_class or "cleanup_timeout"
     receipts["final"] = _receipt_projection(paths.output / FINAL_RECEIPT)
