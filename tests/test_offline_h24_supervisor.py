@@ -511,6 +511,7 @@ def test_fixed_argv_boundaries_and_resources(tmp_path: Path) -> None:
     assert "/seed/oracle.key" in h24
     assert "--network" in soak and soak[soak.index("--network") + 1] == "none"
     assert soak[soak.index("--duration-seconds") + 1] == "19800"
+    assert soak[soak.index("--source-sha") + 1] == protocol.source_sha
     assert "/auth/codex" not in soak
     assert "--descriptor-preflight" in descriptor
     assert "--oracle-key-file" not in descriptor

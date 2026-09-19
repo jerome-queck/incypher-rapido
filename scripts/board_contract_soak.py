@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import run_contract
 from rapido.clock import ManualClock, SystemClock
 
@@ -27,6 +28,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--accelerated", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--start-at-unix-ms", type=int)
+    parser.add_argument("--source-sha")
     return parser.parse_args()
 
 
@@ -99,7 +101,12 @@ def _write_private_output(path: Path, encoded: str) -> None:
 
 
 def main() -> int:
+    pilot_directory = Path(__file__).resolve().parent
+    BOARD_CONTRACT._PACKAGED_OFFLINE_PILOT_DIRECTORY = pilot_directory
     arguments = _arguments()
+    sealed = pilot_directory == Path("/opt/rapido-eval")
+    if sealed is not (arguments.source_sha is not None):
+        raise SystemExit("--source-sha is required only for the sealed soak")
     if not 0 < arguments.duration_seconds <= 19_800:
         raise SystemExit("--duration-seconds must be within 0..19800")
     if arguments.start_at_unix_ms is not None and arguments.duration_seconds != H24_SOAK_SECONDS:
@@ -125,6 +132,7 @@ def main() -> int:
                 soak_seconds=arguments.duration_seconds,
                 absolute_origin=absolute_origin,
                 absolute_deadline=absolute_deadline,
+                registered_source_sha=arguments.source_sha,
             )
         ).public()
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"

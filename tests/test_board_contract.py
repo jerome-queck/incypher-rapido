@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.util
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import (
     CONTRACT_SCHEMA,
     SCENARIO_IDS,
@@ -17,6 +20,123 @@ from rapido.board_contract import (
     validate_public_receipt,
 )
 from rapido.clock import ManualClock, SystemClock
+
+OFFLINE_PILOT_MODULE = "_rapido_board_contract_offline_pilot"
+pytestmark = pytest.mark.usefixtures("checkout_offline_pilot")
+
+
+def test_offline_pilot_loader_uses_explicit_test_fixture() -> None:
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    expected = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
+    assert Path(loaded.__file__) == expected
+
+
+def test_offline_pilot_loader_ignores_module_sibling_for_fixed_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    injected = installed_package.parent / "scripts"
+    injected.mkdir()
+    (injected / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'injected'\n")
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        packaged,
+        raising=False,
+    )
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    assert loaded.PACKAGED_MARKER == "sealed"
+    assert Path(loaded.__file__) == packaged / "offline_oracle_pilot.py"
+
+
+def test_offline_pilot_loader_rejects_packaged_source_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    target = tmp_path / "offline_oracle_pilot.py"
+    target.write_text("PACKAGED_MARKER = 'unsealed'\n")
+    (packaged / "offline_oracle_pilot.py").symlink_to(target)
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+        BOARD_CONTRACT._load_offline_pilot()
+
+
+def test_offline_pilot_loader_rejects_symlinked_packaged_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_packaged = tmp_path / "real-rapido-eval"
+    real_packaged.mkdir()
+    (real_packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'unsealed'\n")
+    packaged = tmp_path / "rapido-eval"
+    packaged.symlink_to(real_packaged, target_is_directory=True)
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+        BOARD_CONTRACT._load_offline_pilot()
+
+
+def test_offline_pilot_loader_removes_partial_module_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    source = packaged / "offline_oracle_pilot.py"
+    source.write_text("PARTIAL_MARKER = True\nraise RuntimeError('first import failed')\n")
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    with pytest.raises(RuntimeError, match="first import failed"):
+        BOARD_CONTRACT._load_offline_pilot()
+    source.write_text("RETRY_MARKER = 'complete'\n" + "#" * 200)
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    assert loaded.RETRY_MARKER == "complete"
+    assert not hasattr(loaded, "PARTIAL_MARKER")
+
+
+def test_offline_pilot_loader_rejects_cached_module_from_other_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
+    injected = mock.Mock()
+    injected.__file__ = str(tmp_path / "injected.py")
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules[OFFLINE_PILOT_MODULE] = injected
+
+    with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+        BOARD_CONTRACT._load_offline_pilot()
+
+
+def test_offline_pilot_loader_rejects_foreign_cache_claiming_expected_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    source = packaged / "offline_oracle_pilot.py"
+    source.write_text("PACKAGED_MARKER = 'sealed'\n")
+    specification = importlib.util.spec_from_file_location(OFFLINE_PILOT_MODULE, source)
+    assert specification is not None
+    injected = importlib.util.module_from_spec(specification)
+    injected.FORGED_MARKER = True
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules[OFFLINE_PILOT_MODULE] = injected
+
+    with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+        BOARD_CONTRACT._load_offline_pilot()
+
+
+def test_offline_pilot_loader_reuses_validated_real_module() -> None:
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    assert BOARD_CONTRACT._load_offline_pilot() is loaded
 
 
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(
@@ -289,6 +409,32 @@ def test_contract_rejects_invalid_private_seed_and_duration(tmp_path: Path) -> N
         asyncio.run(run_contract(tmp_path, private_seed=b"short"))
     with pytest.raises(ValueError, match="19800"):
         asyncio.run(run_contract(tmp_path, private_seed=os.urandom(32), soak_seconds=19_801))
+
+
+def test_contract_binds_registered_source_only_to_sealed_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path("/opt/rapido-eval"),
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        asyncio.run(run_contract(tmp_path, private_seed=os.urandom(32)))
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path(__file__).resolve().parents[1] / "scripts",
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        asyncio.run(
+            run_contract(
+                tmp_path,
+                private_seed=os.urandom(32),
+                registered_source_sha="a" * 40,
+            )
+        )
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import run_contract
 from rapido.clock import ManualClock
 
@@ -19,6 +20,7 @@ assert SPEC is not None and SPEC.loader is not None
 SOAK = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = SOAK
 SPEC.loader.exec_module(SOAK)
+pytestmark = pytest.mark.usefixtures("checkout_offline_pilot")
 
 
 def test_start_barrier_waits_only_for_bounded_future_window() -> None:
@@ -37,6 +39,41 @@ def test_start_barrier_waits_only_for_bounded_future_window() -> None:
     )
     assert sleeps == [15.0]
     assert deadline == 20_815_000
+
+
+def test_main_binds_pilot_to_resolved_entrypoint_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, Path] = {}
+
+    def arguments() -> object:
+        observed["directory"] = BOARD_CONTRACT._PACKAGED_OFFLINE_PILOT_DIRECTORY
+        raise SystemExit(0)
+
+    monkeypatch.setattr(SOAK, "_arguments", arguments)
+    with pytest.raises(SystemExit, match="0"):
+        SOAK.main()
+    assert observed["directory"] == Path(SOAK.__file__).resolve().parent
+
+
+def test_source_sha_is_rejected_outside_sealed_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = type(
+        "Arguments",
+        (),
+        {
+            "source_sha": "a" * 40,
+            "duration_seconds": 2.0,
+            "start_at_unix_ms": None,
+            "accelerated": True,
+            "output": None,
+        },
+    )()
+    monkeypatch.setattr(SOAK, "_arguments", lambda: arguments)
+    with pytest.raises(SystemExit, match="required only for the sealed soak"):
+        SOAK.main()
 
 
 def test_start_barrier_accepts_small_scheduling_lag_without_sleep() -> None:

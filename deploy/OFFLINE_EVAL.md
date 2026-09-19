@@ -15,6 +15,17 @@ It copies only the H24 runner, benign soak runner, and committed preregistration
 `/opt/rapido-eval`; the two supplied SHAs are root-owned mode `0444`. The wrapper remains UID/GID
 10001 and inherits the production entrypoint, although the host supervisor overrides it with a
 fixed Python argv for each evaluation container.
+The benign soak entrypoint derives the pilot directory only from its own resolved location: the
+sealed image therefore uses `/opt/rapido-eval/offline_oracle_pilot.py`, while the documented
+repository CLI uses its tracked `scripts/offline_oracle_pilot.py`. Direct installed-package calls
+default to the sealed location, and tests explicitly replace the internal directory with their
+tracked fixture directory. No path-name inference, environment, CLI, or arbitrary path override
+exists. Both the selected directory boundary and source must be non-symlink directory and
+regular-file objects. A cached pilot is reused only by identity after this loader executed it
+successfully; pre-execution or foreign cache objects fail closed.
+The supervisor supplies the independently registered source SHA to the sealed benign contract. The
+pilot then requires it to match adjacent root-owned immutable `source.sha`; repository execution
+rejects a supplied SHA and always retains Git identity.
 
 Before execution, publish/register the exact protocol ID, clean source SHA, immutable wrapper
 reference, image ID, `linux/amd64` or `linux/arm64` platform, OCI revision and source label. The
