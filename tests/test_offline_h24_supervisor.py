@@ -32,6 +32,7 @@ SPEC.loader.exec_module(SUPERVISOR)
 SOURCE_SHA = "1" * 40
 TREE_SHA = "2" * 40
 IMAGE_ID = "sha256:" + "3" * 64
+PROBE_ID = "4" * 64
 
 
 def _private_directory(path: Path) -> Path:
@@ -377,9 +378,18 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     paths = _paths(tmp_path, preregistration, registration)
 
     class SourceProbeFake:
-        def __init__(self, *, mutate: bool = False, remove_fails: bool = False) -> None:
+        def __init__(
+            self,
+            *,
+            mutate: bool = False,
+            remove_fails: bool = False,
+            create_fails: bool = False,
+            malformed_id: bool = False,
+        ) -> None:
             self.mutate = mutate
             self.remove_fails = remove_fails
+            self.create_fails = create_fails
+            self.malformed_id = malformed_id
             self.existing = False
             self.commands: list[tuple[str, ...]] = []
 
@@ -388,13 +398,22 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             command = tuple(argv)
             self.commands.append(command)
             if command[:3] == ("docker", "ps", "--all"):
+                filter_value = command[command.index("--filter") + 1]
+                value = (
+                    PROBE_ID if filter_value.startswith("id=") else SUPERVISOR._SOURCE_PROBE_NAME
+                )
                 return SUPERVISOR.CommandResult(
                     0,
-                    f"{SUPERVISOR._SOURCE_PROBE_NAME}\n" if self.existing else "",
+                    f"{value}\n" if self.existing else "",
                 )
             if command[:2] == ("docker", "create"):
                 self.existing = True
-                return SUPERVISOR.CommandResult(0, "probe-id\n")
+                if self.create_fails:
+                    return SUPERVISOR.CommandResult(1, "")
+                return SUPERVISOR.CommandResult(
+                    0,
+                    "malformed\n" if self.malformed_id else f"{PROBE_ID}\n",
+                )
             if command[:2] == ("docker", "cp"):
                 source = command[2]
                 destination = Path(command[3])
@@ -410,6 +429,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                     )
                 return SUPERVISOR.CommandResult(0, "")
             if command[:3] == ("docker", "rm", "--volumes"):
+                assert command[-1] == PROBE_ID
                 if self.remove_fails:
                     return SUPERVISOR.CommandResult(1, "")
                 self.existing = False
@@ -428,6 +448,11 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     assert create[create.index("--network") + 1] == "none"
     assert "--mount" not in create and "--volume" not in create and "-v" not in create
     assert not any(command[:2] == ("docker", "start") for command in matching.commands)
+    assert all(
+        command[2].startswith(f"{PROBE_ID}:")
+        for command in matching.commands
+        if command[:2] == ("docker", "cp")
+    )
     assert matching.existing is False
 
     mismatched = SourceProbeFake(mutate=True)
@@ -439,7 +464,9 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             mismatched,
         )
     assert mismatched.existing is False
-    assert any(command[:3] == ("docker", "rm", "--volumes") for command in mismatched.commands)
+    assert any(
+        command == ("docker", "rm", "--volumes", PROBE_ID) for command in mismatched.commands
+    )
 
     removal_failure = SourceProbeFake(remove_fails=True)
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_probe_cleanup"):
@@ -449,6 +476,19 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             paths.output,
             removal_failure,
         )
+
+    for unsafe in (SourceProbeFake(create_fails=True), SourceProbeFake(malformed_id=True)):
+        with pytest.raises(
+            SUPERVISOR.SupervisorError,
+            match="image_source_probe_create|image_source_probe_identity",
+        ):
+            SUPERVISOR.verify_image_source(
+                protocol,
+                ROOT,
+                paths.output,
+                unsafe,
+            )
+        assert not any(command[:2] == ("docker", "rm") for command in unsafe.commands)
     assert not any(path.name.startswith(".rapido-image-source-") for path in paths.output.iterdir())
 
 

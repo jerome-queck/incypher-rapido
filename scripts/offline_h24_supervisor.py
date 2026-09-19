@@ -54,6 +54,7 @@ FINAL_RECEIPT = "h24-evaluation-receipt.json"
 EVALUATION_RESULT = "h24-evaluation-result.json"
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_REFERENCE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _CLOSED_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 _CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
@@ -439,15 +440,14 @@ def verify_image_source(
     runner: Runner,
 ) -> None:
     """Compare installed image sources without executing image-provided code."""
-    ownership_confirmed = False
+    owned_container_id: str | None = None
     cleanup_failed = False
     probe_root = Path(tempfile.mkdtemp(prefix=".rapido-image-source-", dir=output))
     probe_root.chmod(0o700)
     try:
         if not _container_absent(_SOURCE_PROBE_NAME, runner):
             raise SupervisorError("image_source_probe_in_use")
-        ownership_confirmed = True
-        _run(
+        created = _run(
             runner,
             (
                 "docker",
@@ -464,10 +464,14 @@ def verify_image_source(
             "image_source_probe_create",
             timeout=120,
         )
+        candidate_id = created.stdout.strip()
+        if _CONTAINER_ID.fullmatch(candidate_id) is None:
+            raise SupervisorError("image_source_probe_identity")
+        owned_container_id = candidate_id
         installed = probe_root / "rapido"
         _run(
             runner,
-            ("docker", "cp", f"{_SOURCE_PROBE_NAME}:{_INSTALLED_RAPIDO}", str(installed)),
+            ("docker", "cp", f"{owned_container_id}:{_INSTALLED_RAPIDO}", str(installed)),
             "image_source_probe_copy",
             timeout=120,
         )
@@ -479,7 +483,7 @@ def verify_image_source(
                 (
                     "docker",
                     "cp",
-                    f"{_SOURCE_PROBE_NAME}:/opt/rapido-eval/{name}",
+                    f"{owned_container_id}:/opt/rapido-eval/{name}",
                     str(wrapper / name),
                 ),
                 "image_source_probe_copy",
@@ -499,12 +503,14 @@ def verify_image_source(
     except OSError as exc:
         raise SupervisorError("image_source_mismatch") from exc
     finally:
-        if ownership_confirmed:
+        if owned_container_id is not None:
             try:
-                if not _container_absent(_SOURCE_PROBE_NAME, runner):
-                    result = runner(("docker", "rm", "--volumes", _SOURCE_PROBE_NAME), timeout=30)
+                if not _container_id_absent(owned_container_id, runner):
+                    result = runner(("docker", "rm", "--volumes", owned_container_id), timeout=30)
                     cleanup_failed = result.returncode != 0
-                cleanup_failed = cleanup_failed or not _container_absent(_SOURCE_PROBE_NAME, runner)
+                cleanup_failed = cleanup_failed or not _container_id_absent(
+                    owned_container_id, runner
+                )
             except SupervisorError:
                 cleanup_failed = True
         try:
@@ -803,6 +809,29 @@ def _container_absent(name: str, runner: Runner, *, timeout: float = 30) -> bool
     if result.returncode != 0:
         raise SupervisorError("docker_inventory")
     return not result.stdout.strip()
+
+
+def _container_id_absent(container_id: str, runner: Runner, *, timeout: float = 30) -> bool:
+    if _CONTAINER_ID.fullmatch(container_id) is None:
+        raise SupervisorError("image_source_probe_identity")
+    result = runner(
+        (
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"id={container_id}",
+        ),
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise SupervisorError("docker_inventory")
+    values = result.stdout.split()
+    if any(value != container_id for value in values):
+        raise SupervisorError("docker_inventory")
+    return not values
 
 
 def _validate_container_absence(protocol: Protocol, runner: Runner) -> None:

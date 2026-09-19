@@ -19,8 +19,10 @@ supervisor compares Docker's inspected OS and architecture and rejects a mismatc
 not source proof: a fixed, never-started, networkless probe container receives no host mounts. The
 supervisor copies its installed Rapido package and three evaluation artifacts into a private
 temporary directory, rejects links or any missing/extra/changed Python source, byte-compares the
-artifacts with the validated clean repository, then removes the exact probe and its anonymous
-volumes in `finally`. Image-provided code is never executed during this check. Descriptor
+artifacts with the validated clean repository, then removes the exact probe ID and its anonymous
+volumes in `finally`. The probe is owned only after create returns a validated full Docker ID; a
+name race, failed create, or malformed ID cannot authorize removal. Image-provided code is never
+executed during this check. Descriptor
 preflight is a separate fixed-argv mode: it mounts no seed/oracle, requests only the frozen
 Daybreak/xhigh catalogue descriptors, and emits an allowlisted receipt. The H24 runner must expose
 `--descriptor-preflight` and `--output-file`; these are the intentionally narrow integration seam.
