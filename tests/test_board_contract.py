@@ -23,26 +23,27 @@ from rapido.clock import ManualClock, SystemClock
 OFFLINE_PILOT_MODULE = "_rapido_board_contract_offline_pilot"
 
 
-def test_offline_pilot_loader_prefers_repository_source(
-    tmp_path: Path,
+@pytest.fixture(autouse=True)
+def _checkout_offline_pilot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    packaged = tmp_path / "rapido-eval"
-    packaged.mkdir()
-    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'unused'\n")
-    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path(__file__).resolve().parents[1] / "scripts",
+    )
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+    yield
     sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
-    try:
-        loaded = BOARD_CONTRACT._load_offline_pilot()
-        expected = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
-        assert Path(loaded.__file__) == expected
-        assert not hasattr(loaded, "PACKAGED_MARKER")
-    finally:
-        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+def test_offline_pilot_loader_uses_explicit_test_fixture() -> None:
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    expected = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
+    assert Path(loaded.__file__) == expected
 
 
-def test_offline_pilot_loader_ignores_site_packages_sibling_for_fixed_wrapper(
+def test_offline_pilot_loader_ignores_module_sibling_for_fixed_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -54,7 +55,6 @@ def test_offline_pilot_loader_ignores_site_packages_sibling_for_fixed_wrapper(
     packaged = tmp_path / "rapido-eval"
     packaged.mkdir()
     (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
-    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
     monkeypatch.setattr(
         BOARD_CONTRACT,
         "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
@@ -82,7 +82,6 @@ def test_offline_pilot_loader_rejects_packaged_source_symlink(
     target = tmp_path / "offline_oracle_pilot.py"
     target.write_text("PACKAGED_MARKER = 'unsealed'\n")
     (packaged / "offline_oracle_pilot.py").symlink_to(target)
-    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
     monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
     sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
@@ -104,7 +103,6 @@ def test_offline_pilot_loader_rejects_symlinked_packaged_boundary(
     (real_packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'unsealed'\n")
     packaged = tmp_path / "rapido-eval"
     packaged.symlink_to(real_packaged, target_is_directory=True)
-    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
     monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
     sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
@@ -125,7 +123,6 @@ def test_offline_pilot_loader_removes_partial_module_before_retry(
     packaged.mkdir()
     source = packaged / "offline_oracle_pilot.py"
     source.write_text("PARTIAL_MARKER = True\nraise RuntimeError('first import failed')\n")
-    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
     monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
     sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
@@ -151,7 +148,6 @@ def test_offline_pilot_loader_rejects_cached_module_from_other_origin(
     (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
     injected = mock.Mock()
     injected.__file__ = str(tmp_path / "injected.py")
-    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
     monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
     sys.modules[OFFLINE_PILOT_MODULE] = injected
 
@@ -160,6 +156,28 @@ def test_offline_pilot_loader_rejects_cached_module_from_other_origin(
             BOARD_CONTRACT._load_offline_pilot()
     finally:
         sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
+def test_offline_pilot_loader_rejects_foreign_cache_claiming_expected_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    source = packaged / "offline_oracle_pilot.py"
+    source.write_text("PACKAGED_MARKER = 'sealed'\n")
+    injected = mock.Mock()
+    injected.__file__ = str(source)
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules[OFFLINE_PILOT_MODULE] = injected
+
+    with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+        BOARD_CONTRACT._load_offline_pilot()
+
+
+def test_offline_pilot_loader_reuses_validated_real_module() -> None:
+    loaded = BOARD_CONTRACT._load_offline_pilot()
+    assert BOARD_CONTRACT._load_offline_pilot() is loaded
 
 
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import importlib.machinery
 import importlib.util
 import json
 import math
@@ -20,7 +21,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from .board import BoardClient, BoardError, BoardTransportError, HttpResponse
@@ -666,23 +667,27 @@ class _PeakProbe:
 def _load_offline_pilot() -> Any:
     name = "_rapido_board_contract_offline_pilot"
     existing = sys.modules.get(name)
-    module_source = Path(__file__).resolve()
-    installed = any(
-        part.casefold() in {"site-packages", "dist-packages"} for part in module_source.parts
+    source = _regular_offline_pilot_source(
+        _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py",
+        missing_ok=False,
     )
-    source = None
-    if not installed:
-        repository_source = module_source.parents[1] / "scripts" / "offline_oracle_pilot.py"
-        source = _regular_offline_pilot_source(repository_source, missing_ok=True)
-    if source is None:
-        source = _regular_offline_pilot_source(
-            _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py",
-            missing_ok=False,
-        )
     assert source is not None
     if existing is not None:
         existing_source = getattr(existing, "__file__", None)
-        if type(existing_source) is not str or Path(existing_source) != source:
+        specification = getattr(existing, "__spec__", None)
+        loader = getattr(specification, "loader", None)
+        if (
+            not isinstance(existing, ModuleType)
+            or type(existing_source) is not str
+            or Path(existing_source) != source
+            or getattr(existing, "__name__", None) != name
+            or getattr(existing, "__loader__", None) is not loader
+            or getattr(specification, "name", None) != name
+            or getattr(specification, "origin", None) != str(source)
+            or not isinstance(loader, importlib.machinery.SourceFileLoader)
+            or loader.name != name
+            or Path(loader.path) != source
+        ):
             raise RuntimeError("offline pilot module is unavailable")
         return existing
     specification = importlib.util.spec_from_file_location(name, source)

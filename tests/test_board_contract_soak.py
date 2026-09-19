@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import rapido.board_contract as BOARD_CONTRACT
 from rapido.board_contract import run_contract
 from rapido.clock import ManualClock
 
@@ -19,6 +20,19 @@ assert SPEC is not None and SPEC.loader is not None
 SOAK = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = SOAK
 SPEC.loader.exec_module(SOAK)
+
+
+@pytest.fixture(autouse=True)
+def _checkout_offline_pilot(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_name = "_rapido_board_contract_offline_pilot"
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path(__file__).resolve().parents[1] / "scripts",
+    )
+    sys.modules.pop(module_name, None)
+    yield
+    sys.modules.pop(module_name, None)
 
 
 def test_start_barrier_waits_only_for_bounded_future_window() -> None:
