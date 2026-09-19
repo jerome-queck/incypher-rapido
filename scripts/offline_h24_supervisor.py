@@ -1272,12 +1272,15 @@ def run_descriptor_preflight(
         _validate_auth_unmounted(paths.auth, runner)
         _run(runner, descriptor_preflight_argv(protocol, paths), "preflight_create", timeout=120)
         try:
-            result = _run(
-                runner, ("docker", "start", "--attach", name), "preflight_run", timeout=600
+            result = runner(
+                ("docker", "start", "--attach", name),
+                timeout=600,
             )
             _atomic_private_write(
                 paths.output / "descriptor.docker.log", result.stdout + result.stderr
             )
+            if result.returncode != 0:
+                raise SupervisorError("preflight_run")
         finally:
             _remove_container(name, runner, EvaluationState(created={name}))
     projection = _receipt_projection(paths.output / DESCRIPTOR_RECEIPT)
@@ -1335,8 +1338,6 @@ def main() -> int:
     arguments = _arguments()
     if arguments.mode == "execute" and arguments.seed is None:
         raise SystemExit("--seed is required for execute")
-    protocol = load_protocol(arguments.preregistration)
-    protocol = bind_registration(arguments.registration, protocol)
     paths = validate_paths(
         Paths(
             arguments.repository,
@@ -1354,6 +1355,8 @@ def main() -> int:
         ),
         require_seed=arguments.mode == "execute",
     )
+    protocol = load_protocol(paths.preregistration)
+    protocol = bind_registration(paths.registration, protocol)
     validate_environment(os.environ)
     validate_source(
         paths.repository,

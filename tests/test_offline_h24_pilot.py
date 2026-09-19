@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from rapido.evidence import project_tool_observation
+from rapido.offline_h24_evaluation import build_frozen_preregistration
 
 SPEC = importlib.util.spec_from_file_location(
     "offline_oracle_pilot_h24",
@@ -51,6 +52,7 @@ def _patch_identities(monkeypatch: pytest.MonkeyPatch) -> None:
             "observed": {"head_sha": supplied, "worktree": "clean"},
             "declared": {"sha": supplied},
             "declared_matches_head": True,
+            "identity_basis": "sealed_metadata_file",
         },
     )
     monkeypatch.setattr(
@@ -215,6 +217,99 @@ def test_supplied_source_sha_bypasses_git_but_unsupplied_checks_worktree(
         "untracked_file_count": 1,
     }
     assert inspected["identity_basis"] == "git_worktree"
+
+
+def test_packaged_source_metadata_binds_declared_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = "d" * 40
+
+    class PackagedSource:
+        def lstat(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                st_mode=PILOT.stat.S_IFREG | 0o444,
+                st_uid=0,
+                st_size=len(declared) + 1,
+            )
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return declared + "\n"
+
+    monkeypatch.setattr(PILOT, "H24_PACKAGED_SOURCE_PATH", PackagedSource())
+    identity = PILOT._source_identity(declared.upper())
+
+    assert identity["declared_matches_head"] is True
+    assert identity["identity_basis"] == "sealed_metadata_file"
+    assert identity["observed"]["head_sha"] == declared
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "size", "content", "message"),
+    [
+        pytest.param(PILOT.stat.S_IFLNK | 0o444, 0, 41, "d" * 40, "immutable", id="link"),
+        pytest.param(PILOT.stat.S_IFREG | 0o644, 0, 41, "d" * 40, "immutable", id="writable"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 501, 41, "d" * 40, "immutable", id="owner"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 0, 129, "d" * 40, "immutable", id="large"),
+        pytest.param(PILOT.stat.S_IFREG | 0o444, 0, 41, "e" * 40, "does not match", id="mismatch"),
+    ],
+)
+def test_packaged_source_metadata_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    uid: int,
+    size: int,
+    content: str,
+    message: str,
+) -> None:
+    class PackagedSource:
+        def lstat(self) -> SimpleNamespace:
+            return SimpleNamespace(st_mode=mode, st_uid=uid, st_size=size)
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return content
+
+    monkeypatch.setattr(PILOT, "H24_PACKAGED_SOURCE_PATH", PackagedSource())
+    with pytest.raises(ValueError, match=message):
+        PILOT._source_identity("d" * 40)
+
+
+def test_h24_start_barrier_waits_only_for_bounded_future_window() -> None:
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        PILOT._wait_for_start_barrier(
+            1_015_000,
+            wall_time_ns=lambda: 1_000_000_000_000,
+            sleep=record_sleep,
+        )
+    )
+    assert sleeps == [15.0]
+
+
+@pytest.mark.parametrize("start", (0, -1, 998_999, 1_300_001))
+def test_h24_start_barrier_rejects_invalid_stale_or_unbounded_values(start: int) -> None:
+    with pytest.raises(ValueError, match="start barrier"):
+        asyncio.run(
+            PILOT._wait_for_start_barrier(
+                start,
+                wall_time_ns=lambda: 1_000_000_000_000,
+            )
+        )
+
+
+def test_private_json_output_is_exclusive_and_mode_0600(tmp_path: Path) -> None:
+    output = tmp_path / "receipt.json"
+    PILOT._write_json_output(output, {"schema": "test-receipt-v1"})
+
+    assert output.read_text() == '{"schema":"test-receipt-v1"}\n'
+    assert output.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        PILOT._write_json_output(output, {"schema": "replacement"})
 
 
 def test_h24_cli_selects_contextual_oracle_default(
@@ -411,6 +506,45 @@ def test_h24_descriptor_projection_rejects_and_redacts_adversarial_names(
         }
 
 
+def test_h24_descriptor_preflight_uses_no_oracle_or_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    preregistration = tmp_path / "preregistration.json"
+    preregistration.write_text(json.dumps(build_frozen_preregistration()))
+    config = replace(
+        config,
+        oracle_key_file=tmp_path / "does-not-exist.key",
+        h24_preregistration_file=preregistration,
+    )
+    _patch_identities(monkeypatch)
+    clients: list[object] = []
+
+    class DescriptorClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.arm = Path(str(kwargs["cwd"])).name
+            clients.append(self)
+
+        async def start(self) -> None: ...
+
+        async def validate_model(self, model: str, effort: str) -> SimpleNamespace:
+            return SimpleNamespace(name=model, reasoning_efforts=(effort,), raw={"slug": model})
+
+        async def solve(self, *_: object, **__: object) -> object:
+            raise AssertionError("descriptor preflight must not solve")
+
+        async def close(self) -> None: ...
+
+    receipt = asyncio.run(
+        PILOT.run_h24_descriptor_preflight(config, client_factory=DescriptorClient)
+    )
+
+    assert [client.arm for client in clients] == ["one_shot", "evidence_repair"]
+    assert receipt["matched"] is True
+    assert receipt["descriptors"] == build_frozen_preregistration()["descriptor_preflight"]
+    assert list(config.work_root.iterdir()) == []
+
+
 def test_h24_observed_descriptor_revision_mismatch_fails_before_solve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -461,6 +595,10 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
+    preregistration = tmp_path / "preregistration.json"
+    frozen = build_frozen_preregistration()
+    preregistration.write_text(json.dumps(frozen))
+    config = replace(config, h24_preregistration_file=preregistration)
     _patch_identities(monkeypatch)
     startup_active = startup_peak = turn_active = turn_peak = 0
     calls: list[dict[str, object]] = []
@@ -480,7 +618,7 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
             return SimpleNamespace(
                 name=model,
                 reasoning_efforts=(effort,),
-                raw={"slug": model, "modelVersion": "daybreak-test-v1"},
+                raw={"slug": model},
             )
 
         async def solve(self, workspace: Path, prompt: str, **kwargs: object) -> object:
@@ -518,6 +656,22 @@ def test_h24_runner_serializes_startup_overlaps_pairs_and_retains_all_rows(
     assert len(receipt["results"]) == 48
     assert receipt["native_observability"]["attempt_count"] == 48
     assert receipt["native_observability"]["outcomes"]["inconclusive"] == 48
+    assert receipt["protocol"]["task_order"] == [task["id"] for task in frozen["tasks"]]
+    assert receipt["protocol"]["randomization"] == "hmac_sha256_sort_v1"
+    assert len(receipt["protocol"]["preregistration_sha256"]) == 64
+    assert receipt["protocol"]["target_network_enabled"] is False
+    assert receipt["protocol"]["provider_transport_required"] is True
+    fixture_specs = {fixture.id: fixture for fixture in PILOT._prepare_h24_fixtures(SEED)}
+    assert receipt["protocol"]["task_resource_policies"] == [
+        {
+            "task_id": fixture.id,
+            "wall_seconds": fixture.wall_seconds,
+            "artifact_bytes_ceiling": fixture.artifact_bytes_ceiling,
+            "cpu_seconds_ceiling": fixture.cpu_seconds_ceiling,
+            "memory_bytes_ceiling": fixture.memory_bytes_ceiling,
+        }
+        for fixture in (fixture_specs[str(task["id"])] for task in frozen["tasks"])
+    ]
     assert {call["model"] for call in calls} == {PILOT._VERIFIER_MODEL}
     assert {call["effort"] for call in calls} == {PILOT._VERIFIER_EFFORT}
     assert {call["instructions"] for call in calls} == {PILOT.H24_DEVELOPER_INSTRUCTIONS}
