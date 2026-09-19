@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1.7
 
-# The caller must supply the immutable Rapido base reference (name@sha256:digest).
+# The caller must supply an immutable Rapido base (name@sha256:digest or sha256:image-id).
 # No floating/default base exists for the sealed evaluation wrapper.
 ARG RAPIDO_BASE_IMAGE
 FROM ${RAPIDO_BASE_IMAGE}
 
+ARG RAPIDO_BASE_IMAGE
 ARG EVAL_BUILD_SHA
 ARG RAPIDO_SOURCE_SHA
 
 LABEL org.opencontainers.image.revision="${EVAL_BUILD_SHA}" \
       io.incypher.rapido.source-revision="${RAPIDO_SOURCE_SHA}" \
+      io.incypher.rapido.base-reference="${RAPIDO_BASE_IMAGE}" \
       io.incypher.rapido.evaluation="offline-h24-v1"
 
 USER 0:0
 RUN set -eu; \
+    printf '%s' "${RAPIDO_BASE_IMAGE}" | grep -Eq '^(sha256:[0-9a-f]{64}|[^[:space:]@]+@sha256:[0-9a-f]{64})$'; \
     printf '%s' "${EVAL_BUILD_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
     printf '%s' "${RAPIDO_SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
     find /opt/venv/lib/python3.12/site-packages/rapido -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete; \

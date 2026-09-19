@@ -6,8 +6,11 @@ No native, H24, Board, or soak result is collected by building or testing these 
 
 ## Seal and registration
 
-Build `deploy/Dockerfile.offline-eval` with an exact Rapido base `name@sha256:digest`, the full
-evaluation-build SHA, and the full Rapido source SHA. The Dockerfile has no floating base default.
+Build `deploy/Dockerfile.offline-eval` with an exact Rapido base `name@sha256:digest` or local
+`sha256:image-id`, the full evaluation-build SHA, and the full Rapido source SHA. The Dockerfile
+rejects every floating or malformed base and persists the exact immutable base reference in an OCI
+label; the supervisor inspects that label through the same closed grammar. There is no floating
+base default.
 It copies only the H24 runner, benign soak runner, and committed preregistration into
 `/opt/rapido-eval`; the two supplied SHAs are root-owned mode `0444`. The wrapper remains UID/GID
 10001 and inherits the production entrypoint, although the host supervisor overrides it with a
@@ -28,6 +31,11 @@ including errors and timeouts, and adopts exactly one full-ID container only aft
 label, role, name, image, user and bind-mount intent match. Zero, multiple or mismatched candidates
 fail closed; every discovered owned ID is removed by exact ID. A rename or unrelated same-name
 replacement is never cleanup authority. Image-provided code is never executed during this check.
+After a failed or timed-out create, reconciliation polls the exact private label only until its
+precomputed deadline. Every source-probe, descriptor and scored-run cleanup then re-inventories the
+label through a bounded one-second quiet window, adopts and removes all newly visible full IDs, and
+requires a final empty label inventory. A late or additional same-label ID fails the run even after
+successful exact-ID cleanup; a different-label replacement is untouched.
 Descriptor
 preflight is a separate fixed-argv mode: it mounts no seed/oracle, requests only the frozen
 Daybreak/xhigh catalogue descriptors, and emits an allowlisted receipt. The H24 runner must expose
@@ -36,13 +44,21 @@ That private receipt binds the exact preregistration hash, observed and declared
 declared and observed image ID, and both frozen descriptors. Execute validates and consumes that
 exact binding before creating any scored container.
 
+The external RFC3339 UTC registration timestamp is parsed by the supervisor. It must be strictly
+earlier than the already-computed scored barrier before any scored create or start. Descriptor
+preflight and execute also reject a future registration before any Docker access.
+
 ## Private paths
 
 Prepare disjoint private paths outside the repository. Authentication, fresh work and output are
 mode `0700`; `auth.json` and the fresh oracle seed are mode `0600`; owner is UID 10001. The auth
 home must contain no `config.toml`, `config.json`, or `mcp.json`. Work and output begin empty. The
 supervisor refuses a Board/token environment, an existing evaluation name, or another container
-mounting the auth home. It creates a nonblocking auth lease and preserves auth. A private baseline
+mounting the auth home. Its nonblocking auth lease opens the auth directory and lock relative to a
+no-follow directory descriptor. A lock must be a same-owner, mode-0600, single-link regular file;
+symlinks, hard links, public modes and replacements fail without chmod or deletion. A busy lock is
+left in place, and release removes the path only while it still names the exact locked inode. A
+private baseline
 pins the auth directory identity, owner and mode and the original `auth.json` key set. Post-run,
 the directory must be unchanged; `auth.json` must be a nonempty valid JSON regular non-symlink,
 UID-10001 mode-0600 single-link file containing every original key; capability files must remain
@@ -84,8 +100,9 @@ and the scoring phase remains open until the exact
 common deadline even when both workers finish early. The deadline starts one 190-second cleanup
 window. Workers may drain naturally for 180 seconds; only containers still running at that boundary
 receive an immediate stop. The remaining outer grace covers inspection, logs, exact-ID removal,
-private cleanup, and evidence persistence. Both exit codes, private receipts, failures and raw logs
-are retained. Container absence and auth preservation are verified.
+the ownership-label quiet window, private cleanup, and evidence persistence. The quiet window
+consumes the existing grace and never moves its deadline. Both exit codes, private receipts,
+failures and raw logs are retained. Container absence and auth preservation are verified.
 
 The scoring, worker-drain and outer-cleanup cutoffs are all derived once from the registered common
 barrier. A late sampling wake consumes the existing cleanup grace; it cannot move any cutoff.

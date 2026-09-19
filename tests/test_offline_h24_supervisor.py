@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
 import os
 import shutil
 import stat
 import sys
+import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -326,10 +330,85 @@ def test_registration_mismatch_fails_closed(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("registration_offset", [30, 60])
+def test_nonpreceding_registration_is_rejected_before_any_docker_call(
+    tmp_path: Path, registration_offset: int
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    clock = FakeClock()
+    protocol = replace(
+        protocol,
+        registration_time=datetime.fromtimestamp(clock.time() + registration_offset, tz=UTC),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def no_docker(argv: Any, *, timeout: float | None = None) -> Any:
+        del timeout
+        calls.append(tuple(argv))
+        raise AssertionError("registration time must fail before Docker access")
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="registration_timing"):
+        SUPERVISOR.run_evaluation(
+            protocol,
+            paths,
+            runner=no_docker,
+            clock=clock,
+            finalize=False,
+        )
+    assert calls == []
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="registration_timing"):
+        SUPERVISOR.run_descriptor_preflight(
+            protocol,
+            paths,
+            runner=no_docker,
+            clock=clock,
+        )
+    assert calls == []
+
+
+def test_cli_rejects_future_registration_before_source_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    protocol = replace(
+        protocol,
+        registration_time=datetime.fromtimestamp(time.time() + 60, tz=UTC),
+    )
+    arguments = SimpleNamespace(
+        mode="execute",
+        repository=paths.repository,
+        preregistration=paths.preregistration,
+        registration=paths.registration,
+        auth=paths.auth,
+        work=paths.work,
+        seed=paths.seed,
+        output=paths.output,
+    )
+    monkeypatch.setattr(SUPERVISOR, "_arguments", lambda: arguments)
+    monkeypatch.setattr(SUPERVISOR, "validate_paths", lambda *_args, **_kwargs: paths)
+    monkeypatch.setattr(SUPERVISOR, "load_protocol", lambda _path: protocol)
+    monkeypatch.setattr(SUPERVISOR, "bind_registration", lambda _path, _protocol: protocol)
+    monkeypatch.setattr(SUPERVISOR, "validate_environment", lambda _environment: None)
+    monkeypatch.setattr(
+        SUPERVISOR,
+        "validate_source",
+        lambda *_args: pytest.fail("source validation must follow timing validation"),
+    )
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="registration_timing"):
+        SUPERVISOR.main()
+
+
 def test_wrapper_dockerfile_is_separate_pinned_and_minimal() -> None:
     text = (ROOT / "deploy" / "Dockerfile.offline-eval").read_text()
     assert "ARG RAPIDO_BASE_IMAGE" in text
     assert "FROM ${RAPIDO_BASE_IMAGE}" in text
+    assert 'io.incypher.rapido.base-reference="${RAPIDO_BASE_IMAGE}"' in text
+    assert "grep -Eq '^(sha256:[0-9a-f]{64}|[^[:space:]@]+@sha256:[0-9a-f]{64})$'" in text
     assert "org.opencontainers.image.revision" in text
     assert "USER 10001:10001" in text
     assert "ENTRYPOINT" not in text
@@ -408,6 +487,70 @@ def test_external_registration_requires_material_immutability(tmp_path: Path) ->
         SUPERVISOR.validate_paths(paths, owner_uid=os.getuid())
 
 
+def test_auth_lease_rejects_symlink_and_hardlink_without_mutating_targets(
+    tmp_path: Path,
+) -> None:
+    _, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    lock = paths.auth / ".offline-h24-supervisor.lock"
+    victim = tmp_path / "victim"
+    victim.write_text("unchanged")
+    victim.chmod(0o644)
+    lock.symlink_to(victim)
+
+    with (
+        pytest.raises(SUPERVISOR.SupervisorError, match="auth_lease_invalid"),
+        SUPERVISOR.auth_lease(paths.auth),
+    ):
+        pass
+    assert lock.is_symlink()
+    assert victim.read_text() == "unchanged"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+
+    lock.unlink()
+    lock.write_text("lock")
+    lock.chmod(0o600)
+    second_link = paths.auth / "second-lock-link"
+    os.link(lock, second_link)
+    with (
+        pytest.raises(SUPERVISOR.SupervisorError, match="auth_lease_invalid"),
+        SUPERVISOR.auth_lease(paths.auth),
+    ):
+        pass
+    assert lock.exists() and second_link.exists()
+
+
+def test_auth_lease_busy_and_replacement_paths_are_never_unlinked(tmp_path: Path) -> None:
+    _, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    lock = paths.auth / ".offline-h24-supervisor.lock"
+    lock.write_text("lock")
+    lock.chmod(0o600)
+    held = os.open(lock, os.O_RDWR)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with (
+            pytest.raises(SUPERVISOR.SupervisorError, match="auth_lease_busy"),
+            SUPERVISOR.auth_lease(paths.auth),
+        ):
+            pass
+        assert lock.exists()
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    lock.unlink()
+
+    replacement_contents = "replacement"
+    with (
+        pytest.raises(SUPERVISOR.SupervisorError, match="auth_lease_integrity"),
+        SUPERVISOR.auth_lease(paths.auth),
+    ):
+        lock.unlink()
+        lock.write_text(replacement_contents)
+        lock.chmod(0o600)
+    assert lock.read_text() == replacement_contents
+
+
 def test_board_environment_fails_closed() -> None:
     SUPERVISOR.validate_environment({"PATH": "/bin"})
     with pytest.raises(SUPERVISOR.SupervisorError, match="board_environment_present"):
@@ -455,6 +598,7 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
                         "Labels": {
                             "org.opencontainers.image.revision": SOURCE_SHA,
                             "io.incypher.rapido.source-revision": SOURCE_SHA,
+                            "io.incypher.rapido.base-reference": "rapido@sha256:" + "b" * 64,
                         },
                     },
                 }
@@ -486,6 +630,14 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
 
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
         SUPERVISOR.inspect_image(protocol, wrong_user)
+
+    def floating_base(argv: Any, *, timeout: float | None = None) -> Any:
+        value = json.loads(runner(argv, timeout=timeout).stdout)
+        value["Config"]["Labels"]["io.incypher.rapido.base-reference"] = "rapido:latest"
+        return SUPERVISOR.CommandResult(0, json.dumps(value))
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
+        SUPERVISOR.inspect_image(protocol, floating_base)
 
 
 def test_image_source_probe_rejects_mismatched_base_and_always_removes(
@@ -591,6 +743,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
         ROOT,
         paths.output,
         matching,
+        clock=FakeClock(),
     )
     create = next(command for command in matching.commands if command[:2] == ("docker", "create"))
     assert create[create.index("--name") + 1] == SUPERVISOR._SOURCE_PROBE_NAME
@@ -612,6 +765,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 ROOT,
                 paths.output,
                 mismatched,
+                clock=FakeClock(),
             )
         assert mismatched.existing is False
         assert any(
@@ -625,6 +779,7 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             ROOT,
             paths.output,
             removal_failure,
+            clock=FakeClock(),
         )
 
     for unsafe in (SourceProbeFake(create_fails=True),):
@@ -637,10 +792,11 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 ROOT,
                 paths.output,
                 unsafe,
+                clock=FakeClock(),
             )
         assert not any(command[:2] == ("docker", "rm") for command in unsafe.commands)
     reconciled = SourceProbeFake(malformed_id=True)
-    SUPERVISOR.verify_image_source(protocol, ROOT, paths.output, reconciled)
+    SUPERVISOR.verify_image_source(protocol, ROOT, paths.output, reconciled, clock=FakeClock())
     assert reconciled.existing is False
     assert not any(path.name.startswith(".rapido-image-source-") for path in paths.output.iterdir())
 
@@ -690,7 +846,7 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
         "coverage_complete": True,
         "observation_status": "observed",
     }
-    assert clock.monotonic() == 1_000 + 30 + 19_800
+    assert clock.monotonic() == 1_000 + 30 + 19_800 + SUPERVISOR.OWNER_QUIET_SECONDS
     assert not paths.work.exists()
     assert not paths.seed.exists()
     assert paths.auth.exists() and (paths.auth / "auth.json").exists()
@@ -717,7 +873,10 @@ def test_evaluation_tracks_exact_ids_and_does_not_remove_name_replacements(
                     self.names[original] = f"{expected_name}-renamed"
                     self.existing.add(replacement)
                     self.names[replacement] = expected_name
-                    self.configs[replacement] = self.configs[original]
+                    self.configs[replacement] = {
+                        "labels": {},
+                        "mounts": self.configs[original]["mounts"],
+                    }
             return super().__call__(command, timeout=timeout)
 
     runner = ReplacementFake(paths.output)
@@ -771,6 +930,81 @@ def test_timed_out_create_is_reconciled_by_private_label_and_exact_intent(
     assert ("docker", "rm", "--volumes", H24_ID) in runner.commands
 
 
+def test_timed_out_create_polls_for_delayed_daemon_visibility(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class DelayedVisibilityFake(DockerFake):
+        timed_out = False
+        owner_inventories = 0
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.timed_out:
+                self.timed_out = True
+                return SUPERVISOR.CommandResult(124)
+            if self.timed_out and any(
+                value.startswith(f"label={SUPERVISOR._OWNER_LABEL}=") for value in command
+            ):
+                self.owner_inventories += 1
+                if self.owner_inventories == 1:
+                    return SUPERVISOR.CommandResult(0, "")
+            return result
+
+    clock = FakeClock()
+    runner = DelayedVisibilityFake(paths.output, clock=clock)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=clock,
+        finalize=False,
+    )
+
+    assert receipt["status"] == "completed"
+    assert runner.owner_inventories >= 2
+    assert runner.existing == set()
+
+
+def test_create_intent_inspection_cannot_extend_barrier_deadline(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    clock = FakeClock()
+
+    class SlowInspectFake(DockerFake):
+        inspect_timeout: float | None = None
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+            ):
+                self.inspect_timeout = timeout
+                assert timeout is not None
+                clock.sleep(timeout)
+            return super().__call__(command, timeout=timeout)
+
+    runner = SlowInspectFake(paths.output, clock=clock)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=clock,
+        finalize=False,
+    )
+
+    assert runner.inspect_timeout == pytest.approx(1.0)
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_create"
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+
+
 def test_ambiguous_owned_create_fails_closed_and_cleans_every_exact_id(
     tmp_path: Path,
 ) -> None:
@@ -811,6 +1045,41 @@ def test_ambiguous_owned_create_fails_closed_and_cleans_every_exact_id(
     assert removed == {H24_ID, second_id}
 
 
+def test_late_same_label_replacement_is_removed_and_fails_closed(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    late_id = "c" * 64
+
+    class LateReplacementFake(DockerFake):
+        injected = False
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command == ("docker", "rm", "--volumes", H24_ID) and not self.injected:
+                self.injected = True
+                self.existing.add(late_id)
+                self.names[late_id] = SUPERVISOR._H24_NAME
+                self.configs[late_id] = self.configs[H24_ID]
+            return result
+
+    clock = FakeClock()
+    runner = LateReplacementFake(paths.output, clock=clock)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=clock,
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_ownership_ambiguous"
+    assert runner.existing == set()
+    assert ("docker", "rm", "--volumes", late_id) in runner.commands
+
+
 def test_reconciled_create_rejects_mount_drift_before_start_and_cleans_exact_id(
     tmp_path: Path,
 ) -> None:
@@ -833,6 +1102,47 @@ def test_reconciled_create_rejects_mount_drift_before_start_and_cleans_exact_id(
             return result
 
     runner = MountDriftFake(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_identity"
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+
+
+def test_reconciled_create_rejects_unexpected_nonbind_mount(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+
+    class VolumeDriftFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if (
+                command[:3] == ("docker", "container", "inspect")
+                and command[3] == "--format={{json .}}"
+                and command[-1] == H24_ID
+            ):
+                value = json.loads(result.stdout)
+                value["Mounts"].append(
+                    {
+                        "Type": "volume",
+                        "Source": "/var/lib/docker/volumes/unexpected",
+                        "Destination": "/unexpected",
+                        "RW": True,
+                    }
+                )
+                return SUPERVISOR.CommandResult(0, json.dumps(value))
+            return result
+
+    runner = VolumeDriftFake(paths.output)
     receipt = SUPERVISOR.run_evaluation(
         protocol,
         paths,
@@ -1158,7 +1468,7 @@ def test_descriptor_preflight_emits_only_frozen_closed_rows(
             return super().__call__(command, timeout=timeout)
 
     result = SUPERVISOR.run_descriptor_preflight(
-        protocol, paths, runner=DescriptorFake(paths.output)
+        protocol, paths, runner=DescriptorFake(paths.output), clock=FakeClock()
     )
     assert result == {
         "schema": SUPERVISOR.DESCRIPTOR_SCHEMA,
@@ -1231,7 +1541,7 @@ def test_descriptor_preflight_reconciles_timed_out_create_and_removes_exact_id(
             return result
 
     runner = DescriptorTimeoutFake(paths.output)
-    result = SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner)
+    result = SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner, clock=FakeClock())
 
     assert result["status"] == "matched"
     assert runner.existing == set()
@@ -1260,7 +1570,7 @@ def test_descriptor_preflight_rejects_ambiguous_create_and_cleans_all_owned_ids(
 
     runner = DescriptorAmbiguousFake(paths.output)
     with pytest.raises(SUPERVISOR.SupervisorError, match="preflight_create_ambiguous"):
-        SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner)
+        SUPERVISOR.run_descriptor_preflight(protocol, paths, runner=runner, clock=FakeClock())
 
     assert runner.existing == set()
     assert not any(command[:2] == ("docker", "start") for command in runner.commands)
@@ -1377,7 +1687,7 @@ def test_cleanup_span_includes_private_deletion_and_first_persistence_pass(
         runner=DockerFake(paths.output),
         clock=clock,
     )
-    assert observed == [0, 5_000, 10_000]
+    assert observed == [1_000, 6_000, 11_000]
     assert private_inputs_present == [(True, True), (False, False), (False, False)]
     assert receipt["status"] == "completed"
 
@@ -1441,7 +1751,7 @@ def test_late_persistence_records_failed_cleanup_gate(
         clock=clock,
     )
 
-    assert observed == [180_000, 184_000, 188_000, 192_000]
+    assert observed == [181_000, 185_000, 189_000, 193_000]
     assert receipt["status"] == "failed"
     assert receipt["failure_class"] == "cleanup_timeout"
 
@@ -1459,7 +1769,7 @@ def test_worker_drain_leaves_tail_inside_outer_cleanup_grace(
     def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
         del args
         observed.append(int(kwargs["cleanup_elapsed_milliseconds"]))
-        clock.sleep((3, 3, 4)[len(observed) - 1])
+        clock.sleep((3, 3, 3)[len(observed) - 1])
         for name, schema in (
             (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
             (SUPERVISOR.EVALUATION_RESULT, "rapido-offline-h24-evaluation-v1"),
@@ -1477,7 +1787,7 @@ def test_worker_drain_leaves_tail_inside_outer_cleanup_grace(
         clock=clock,
     )
 
-    assert observed == [180_000, 183_000, 186_000]
+    assert observed == [181_000, 184_000, 187_000]
     assert clock.monotonic() == 1_000 + 1 + 2 + 190
     assert receipt["status"] == "completed"
     assert receipt["protocol"]["worker_drain_seconds"] == 180

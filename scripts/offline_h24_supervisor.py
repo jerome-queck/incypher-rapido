@@ -48,6 +48,10 @@ CLEANUP_SECONDS = CLEANUP_GRACE_SECONDS
 WORKER_DRAIN_SECONDS = 180
 SAMPLE_TARGET_SECONDS = 5.0
 CLEANUP_POLL_SECONDS = 10.0
+OWNER_POLL_SECONDS = 0.25
+OWNER_QUIET_SECONDS = 1.0
+CREATE_RECONCILIATION_SECONDS = 5.0
+OWNER_CLEANUP_SECONDS = 10.0
 CONTAINER_UID = 10_001
 CONTAINER_USER = "10001:10001"
 H24_RECEIPT = "h24-receipt.json"
@@ -60,6 +64,8 @@ _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_REFERENCE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_BASE_REFERENCE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})\Z")
+_RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
 _CLOSED_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 _CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
 _FORBIDDEN_ENV = frozenset(
@@ -159,6 +165,7 @@ class Protocol:
     cleanup_work: bool
     cleanup_seed: bool
     oracle_id: str
+    registration_time: datetime | None
     preregistration: Mapping[str, object] = field(repr=False)
     registration: Mapping[str, object] = field(repr=False)
 
@@ -264,6 +271,7 @@ class EvaluationState:
     started: set[str] = field(default_factory=set)
     stopped: set[str] = field(default_factory=set)
     removed: set[str] = field(default_factory=set)
+    ownership_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -361,6 +369,7 @@ def load_protocol(path: Path) -> Protocol:
         cleanup_work=True,
         cleanup_seed=True,
         oracle_id=_ORACLE_ID,
+        registration_time=None,
         preregistration=dict(row),
         registration={},
     )
@@ -385,6 +394,13 @@ def bind_registration(path: Path, protocol: Protocol) -> Protocol:
     if image_platform not in {"linux/amd64", "linux/arm64"}:
         raise SupervisorError("registration_invalid")
     assert isinstance(image_platform, str)
+    registered_at = validated.get("registered_at_utc")
+    if type(registered_at) is not str or _RFC3339_UTC.fullmatch(registered_at) is None:
+        raise SupervisorError("registration_invalid")
+    try:
+        registration_time = datetime.fromisoformat(registered_at.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise SupervisorError("registration_invalid") from exc
     return replace(
         protocol,
         source_sha=source_sha,
@@ -393,6 +409,7 @@ def bind_registration(path: Path, protocol: Protocol) -> Protocol:
         image_id=image_id,
         image_revision=source_sha,
         image_platform=image_platform,
+        registration_time=registration_time,
         registration=dict(validated),
     )
 
@@ -404,6 +421,16 @@ def _run(
     if result.returncode != 0:
         raise SupervisorError(failure)
     return result
+
+
+def _validate_registration_timing(protocol: Protocol, cutoff_epoch_seconds: float) -> None:
+    registration_time = protocol.registration_time
+    if (
+        registration_time is None
+        or registration_time.tzinfo is None
+        or registration_time >= datetime.fromtimestamp(cutoff_epoch_seconds, tz=UTC)
+    ):
+        raise SupervisorError("registration_timing")
 
 
 def validate_source(
@@ -457,6 +484,7 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
         raise SupervisorError("image_identity") from exc
     config = _mapping(row.get("Config"), "image_identity")
     labels = _mapping(config.get("Labels"), "image_identity")
+    _string(labels.get("io.incypher.rapido.base-reference"), _BASE_REFERENCE, "image_identity")
     image_os = row.get("Os")
     architecture = row.get("Architecture")
     if (
@@ -563,7 +591,7 @@ def _inspect_container_intent(
     for value in mounts:
         mount = _mapping(value, "container_identity")
         if mount.get("Type") != "bind":
-            continue
+            raise SupervisorError("container_identity")
         source = mount.get("Source")
         destination = mount.get("Destination")
         writable = mount.get("RW")
@@ -588,14 +616,49 @@ def _create_owned_container(
     *,
     failure: str,
     timeout: float = 120,
+    clock: Clock | None = None,
+    deadline: float | None = None,
 ) -> str:
+    clock = clock or SystemClock()
+    operation_deadline = clock.monotonic() + timeout
+    if deadline is not None:
+        operation_deadline = min(operation_deadline, deadline)
+    available = operation_deadline - clock.monotonic()
+    reconciliation_reserve = min(CREATE_RECONCILIATION_SECONDS, available / 2)
+    command_timeout = available - reconciliation_reserve
+    if command_timeout <= 0:
+        raise SupervisorError(failure)
     known = set(state.created)
-    result = runner(tuple(argv), timeout=timeout)
-    inventory = _owned_container_ids(ownership_token, runner, timeout=30)
+    result = runner(tuple(argv), timeout=command_timeout)
+    if clock.monotonic() >= operation_deadline:
+        raise SupervisorError(failure)
+    reconciliation_deadline = min(
+        operation_deadline,
+        clock.monotonic() + CREATE_RECONCILIATION_SECONDS,
+    )
+    inventory = _owned_container_ids(
+        ownership_token,
+        runner,
+        timeout=min(30, max(reconciliation_deadline - clock.monotonic(), 0.001)),
+    )
     new_ids = inventory - known
+    while result.returncode != 0 and not new_ids and clock.monotonic() < reconciliation_deadline:
+        remaining = reconciliation_deadline - clock.monotonic()
+        if remaining <= 0:
+            break
+        clock.sleep(min(OWNER_POLL_SECONDS, remaining))
+        inventory = _owned_container_ids(
+            ownership_token,
+            runner,
+            timeout=min(30, max(reconciliation_deadline - clock.monotonic(), 0.001)),
+        )
+        new_ids = inventory - known
     state.created.update(new_ids)
+    if clock.monotonic() >= operation_deadline:
+        raise SupervisorError(failure)
     returned_id = result.stdout.strip()
     if len(new_ids) != 1:
+        state.ownership_ambiguous = len(new_ids) > 1
         raise SupervisorError(failure if not new_ids else f"{failure}_ambiguous")
     container_id = next(iter(new_ids))
     if (
@@ -603,8 +666,17 @@ def _create_owned_container(
         and _CONTAINER_ID.fullmatch(returned_id) is not None
         and returned_id != container_id
     ):
+        state.ownership_ambiguous = True
         raise SupervisorError(f"{failure}_ambiguous")
-    _inspect_container_intent(container_id, intent, ownership_token, runner)
+    _inspect_container_intent(
+        container_id,
+        intent,
+        ownership_token,
+        runner,
+        timeout=min(30, operation_deadline - clock.monotonic()),
+    )
+    if clock.monotonic() >= operation_deadline:
+        raise SupervisorError(failure)
     state.by_role[intent.role] = container_id
     return container_id
 
@@ -688,12 +760,14 @@ def verify_image_source(
     repository: Path,
     output: Path,
     runner: Runner,
+    *,
+    clock: Clock | None = None,
 ) -> None:
     """Compare installed image sources without executing image-provided code."""
+    clock = clock or SystemClock()
     ownership_token = _ownership_token()
     state = EvaluationState()
     owned_container_id: str | None = None
-    cleanup_failed = False
     probe_root = Path(tempfile.mkdtemp(prefix=".rapido-image-source-", dir=output))
     probe_root.chmod(0o700)
     try:
@@ -729,6 +803,7 @@ def verify_image_source(
             runner,
             state,
             failure="image_source_probe_create",
+            clock=clock,
         )
         installed = probe_root / "rapido"
         _run(
@@ -771,20 +846,21 @@ def verify_image_source(
     except OSError as exc:
         raise SupervisorError("image_source_mismatch") from exc
     finally:
-        for container_id in sorted(state.created):
-            try:
-                if not _container_id_absent(container_id, runner):
-                    result = runner(("docker", "rm", "--volumes", container_id), timeout=30)
-                    cleanup_failed = cleanup_failed or result.returncode != 0
-                cleanup_failed = cleanup_failed or not _container_id_absent(container_id, runner)
-            except SupervisorError:
-                cleanup_failed = True
+        cleanup_failed = not _cleanup_owned_containers(
+            ownership_token,
+            state,
+            runner,
+            clock,
+            clock.monotonic() + OWNER_CLEANUP_SECONDS,
+        )
         try:
             shutil.rmtree(probe_root)
         except OSError:
             cleanup_failed = True
         if cleanup_failed:
             raise SupervisorError("image_source_probe_cleanup")
+    if state.ownership_ambiguous:
+        raise SupervisorError("container_ownership_ambiguous")
 
 
 def validate_host_budget(runner: Runner) -> None:
@@ -1243,21 +1319,112 @@ def _validate_auth_unmounted(auth: Path, runner: Runner) -> None:
 
 @contextlib.contextmanager
 def auth_lease(auth: Path) -> Iterator[None]:
-    path = auth / ".offline-h24-supervisor.lock"
-    descriptor = os.open(path, os.O_CREAT | os.O_CLOEXEC | os.O_RDWR, 0o600)
+    name = ".offline-h24-supervisor.lock"
+    directory_descriptor: int | None = None
+    descriptor: int | None = None
+    lock_metadata: os.stat_result | None = None
+    acquired = False
+    remove_created = False
+    integrity_failed = False
     try:
-        os.fchmod(descriptor, 0o600)
+        try:
+            directory_descriptor = os.open(
+                auth,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            directory_metadata = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+            ):
+                raise SupervisorError("auth_lease_invalid")
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_RDWR
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                remove_created = True
+            except FileExistsError:
+                descriptor = os.open(
+                    name,
+                    os.O_CLOEXEC | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_descriptor,
+                )
+            lock_metadata = os.fstat(descriptor)
+            path_metadata = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except SupervisorError:
+            raise
+        except OSError as exc:
+            raise SupervisorError("auth_lease_invalid") from exc
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+            or lock_metadata.st_uid != directory_metadata.st_uid
+            or lock_metadata.st_nlink != 1
+            or (path_metadata.st_dev, path_metadata.st_ino)
+            != (lock_metadata.st_dev, lock_metadata.st_ino)
+        ):
+            raise SupervisorError("auth_lease_invalid")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            remove_created = False
             raise SupervisorError("auth_lease_busy") from exc
+        except OSError as exc:
+            remove_created = False
+            raise SupervisorError("auth_lease_invalid") from exc
+        acquired = True
+        remove_created = False
         yield
     finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-        with contextlib.suppress(OSError):
-            path.unlink()
+        if (
+            (acquired or remove_created)
+            and directory_descriptor is not None
+            and lock_metadata is not None
+        ):
+            try:
+                observed = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                current = os.fstat(descriptor) if descriptor is not None else lock_metadata
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or stat.S_IMODE(observed.st_mode) != 0o600
+                    or observed.st_uid != lock_metadata.st_uid
+                    or observed.st_nlink != 1
+                    or current.st_nlink != 1
+                    or (observed.st_dev, observed.st_ino)
+                    != (lock_metadata.st_dev, lock_metadata.st_ino)
+                ):
+                    integrity_failed = True
+                else:
+                    os.unlink(name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                integrity_failed = True
+            except OSError:
+                integrity_failed = True
+        if acquired and descriptor is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if integrity_failed:
+            raise SupervisorError("auth_lease_integrity")
 
 
 def _container_state(name: str, runner: Runner, *, timeout: float = 30) -> dict[str, object]:
@@ -1637,6 +1804,80 @@ def _remove_container(
     raise SupervisorError("container_remove")
 
 
+def _cleanup_owned_containers(
+    ownership_token: str,
+    state: EvaluationState,
+    runner: Runner,
+    clock: Clock,
+    deadline: float,
+) -> bool:
+    cleanup_failed = False
+    quiet_since: float | None = None
+    while clock.monotonic() < deadline:
+        timeout = _remaining_timeout(clock, deadline)
+        if timeout is None:
+            break
+        try:
+            inventory = _owned_container_ids(ownership_token, runner, timeout=timeout)
+        except SupervisorError:
+            cleanup_failed = True
+            inventory = set()
+        if clock.monotonic() > deadline:
+            return False
+        discovered = inventory - state.created
+        if discovered:
+            state.created.update(discovered)
+            state.ownership_ambiguous = True
+        if inventory:
+            quiet_since = None
+            iteration_failed = False
+            for container_id in sorted(inventory):
+                try:
+                    timeout = _remaining_timeout(clock, deadline)
+                    if timeout is None:
+                        cleanup_failed = True
+                        iteration_failed = True
+                        break
+                    container = _container_state(container_id, runner, timeout=timeout)
+                    if container.get("Running") is True:
+                        timeout = _remaining_timeout(clock, deadline)
+                        if timeout is None:
+                            cleanup_failed = True
+                            iteration_failed = True
+                            break
+                        result = runner(
+                            ("docker", "stop", "--time", "0", container_id),
+                            timeout=timeout,
+                        )
+                        if result.returncode != 0:
+                            cleanup_failed = True
+                            iteration_failed = True
+                        else:
+                            state.stopped.add(container_id)
+                    _remove_container(
+                        container_id,
+                        runner,
+                        state,
+                        clock=clock,
+                        deadline=deadline,
+                    )
+                except SupervisorError:
+                    cleanup_failed = True
+                    iteration_failed = True
+            if not iteration_failed:
+                quiet_since = clock.monotonic()
+        else:
+            observed_at = clock.monotonic()
+            quiet_since = observed_at if quiet_since is None else quiet_since
+            if observed_at - quiet_since >= OWNER_QUIET_SECONDS:
+                return not cleanup_failed
+        remaining = deadline - clock.monotonic()
+        if remaining <= 0:
+            break
+        clock.sleep(min(OWNER_POLL_SECONDS, remaining))
+    return False
+
+
 def _cleanup_private(paths: Paths, protocol: Protocol) -> None:
     if protocol.cleanup_work:
         shutil.rmtree(paths.work)
@@ -1747,11 +1988,18 @@ def run_evaluation(
     exits: dict[str, int | None] = {"h24": None, "soak": None}
     failure_class: str | None = None
     started_at = clock.monotonic()
-    barrier_mono: float | None = None
-    scoring_deadline_mono: float | None = None
+    barrier_origin_wall = clock.time()
+    barrier_wall_milliseconds = math.ceil(
+        (barrier_origin_wall + protocol.barrier_delay_seconds) * 1000
+    )
+    _validate_registration_timing(protocol, barrier_wall_milliseconds / 1000)
+    barrier_mono: float | None = started_at + (
+        barrier_wall_milliseconds / 1000 - barrier_origin_wall
+    )
+    scoring_deadline_mono: float | None = barrier_mono + protocol.scoring_seconds
     cleanup_started_mono: float | None = None
-    worker_drain_deadline_mono: float | None = None
-    cleanup_deadline_mono: float | None = None
+    worker_drain_deadline_mono: float | None = scoring_deadline_mono + WORKER_DRAIN_SECONDS
+    cleanup_deadline_mono: float | None = scoring_deadline_mono + CLEANUP_SECONDS
     cleanup_finished_mono: float | None = None
     running: dict[str, str] = {}
     cleanup = {
@@ -1762,32 +2010,16 @@ def run_evaluation(
         "private_receipts_preserved": False,
         "no_orphan_containers": False,
     }
+    deadline_wall_milliseconds = barrier_wall_milliseconds + protocol.scoring_seconds * 1000
     barrier_receipt: dict[str, object] = {
-        "start_wall_epoch_milliseconds": None,
-        "global_deadline_wall_epoch_milliseconds": None,
+        "start_wall_epoch_milliseconds": barrier_wall_milliseconds,
+        "global_deadline_wall_epoch_milliseconds": deadline_wall_milliseconds,
         "creation_before_barrier": False,
     }
     with auth_lease(paths.auth):
         try:
             _validate_container_absence(protocol, runner)
             _validate_auth_unmounted(paths.auth, runner)
-            barrier_origin_mono = clock.monotonic()
-            barrier_origin_wall = clock.time()
-            barrier_wall_milliseconds = math.ceil(
-                (barrier_origin_wall + protocol.barrier_delay_seconds) * 1000
-            )
-            barrier_mono = barrier_origin_mono + (
-                barrier_wall_milliseconds / 1000 - barrier_origin_wall
-            )
-            scoring_deadline_mono = barrier_mono + protocol.scoring_seconds
-            worker_drain_deadline_mono = scoring_deadline_mono + WORKER_DRAIN_SECONDS
-            cleanup_deadline_mono = scoring_deadline_mono + CLEANUP_SECONDS
-            deadline_wall_milliseconds = barrier_wall_milliseconds + protocol.scoring_seconds * 1000
-            barrier_receipt = {
-                "start_wall_epoch_milliseconds": barrier_wall_milliseconds,
-                "global_deadline_wall_epoch_milliseconds": deadline_wall_milliseconds,
-                "creation_before_barrier": False,
-            }
             for name, argv in (
                 (
                     protocol.h24_name,
@@ -1846,6 +2078,8 @@ def run_evaluation(
                     runner,
                     state,
                     failure="container_create",
+                    clock=clock,
+                    deadline=barrier_mono,
                 )
 
             if clock.monotonic() >= barrier_mono:
@@ -1948,44 +2182,12 @@ def run_evaluation(
             failure_class = exc.failure_class
         finally:
             operation_deadline = cleanup_deadline_mono or clock.monotonic() + CLEANUP_SECONDS
-            for container_id in sorted(state.created):
-                if container_id not in state.removed:
-                    with contextlib.suppress(SupervisorError):
-                        timeout = _remaining_timeout(clock, operation_deadline)
-                        if timeout is None:
-                            break
-                        if not _container_id_absent(container_id, runner, timeout=timeout):
-                            timeout = _remaining_timeout(clock, operation_deadline)
-                            if timeout is None:
-                                break
-                            container = _container_state(container_id, runner, timeout=timeout)
-                            if container.get("Running") is True:
-                                timeout = _remaining_timeout(clock, operation_deadline)
-                                if timeout is None:
-                                    break
-                                result = runner(
-                                    ("docker", "stop", "--time", "0", container_id),
-                                    timeout=timeout,
-                                )
-                                if result.returncode == 0:
-                                    state.stopped.add(container_id)
-                        _remove_container(
-                            container_id,
-                            runner,
-                            state,
-                            clock=clock,
-                            deadline=operation_deadline,
-                        )
-            absent: list[bool] = []
-            for container_id in sorted(state.created):
-                timeout = _remaining_timeout(clock, operation_deadline)
-                if timeout is None:
-                    absent.append(False)
-                    continue
-                with contextlib.suppress(SupervisorError):
-                    absent.append(_container_id_absent(container_id, runner, timeout=timeout))
-            cleanup["containers_absent"] = (
-                len(state.by_role) == 2 and len(absent) == len(state.created) and all(absent)
+            cleanup["containers_absent"] = _cleanup_owned_containers(
+                ownership_token,
+                state,
+                runner,
+                clock,
+                operation_deadline,
             )
             cleanup["no_orphan_containers"] = cleanup["containers_absent"]
             cleanup["auth_preserved"] = _auth_matches_baseline(paths.auth, auth_baseline)
@@ -1996,6 +2198,8 @@ def run_evaluation(
     }
     if not cleanup["auth_preserved"]:
         failure_class = failure_class or "auth_integrity"
+    if state.ownership_ambiguous:
+        failure_class = failure_class or "container_ownership_ambiguous"
     cleanup["private_receipts_preserved"] = all(row["present"] for row in receipts.values())
     if finalize:
         try:
@@ -2116,7 +2320,10 @@ def run_descriptor_preflight(
     paths: Paths,
     *,
     runner: Runner = subprocess_runner,
+    clock: Clock | None = None,
 ) -> dict[str, object]:
+    clock = clock or SystemClock()
+    _validate_registration_timing(protocol, clock.time())
     name = f"{protocol.h24_name}-descriptor"
     ownership_token = _ownership_token()
     state = EvaluationState()
@@ -2125,6 +2332,7 @@ def run_descriptor_preflight(
         _validate_container_absence(protocol, runner)
         _validate_auth_unmounted(paths.auth, runner)
         container_id: str | None = None
+        create_deadline = clock.monotonic() + 120
         try:
             container_id = _create_owned_container(
                 descriptor_preflight_argv(
@@ -2151,6 +2359,8 @@ def run_descriptor_preflight(
                 runner,
                 state,
                 failure="preflight_create",
+                clock=clock,
+                deadline=create_deadline,
             )
             result = runner(
                 ("docker", "start", "--attach", container_id),
@@ -2162,25 +2372,16 @@ def run_descriptor_preflight(
             if result.returncode != 0:
                 raise SupervisorError("preflight_run")
         finally:
-            cleanup_failed = False
-            if container_id is not None:
-                try:
-                    container = _container_state(container_id, runner)
-                    if container.get("Running") is True:
-                        _run(
-                            runner,
-                            ("docker", "stop", "--time", "0", container_id),
-                            "preflight_stop",
-                        )
-                except SupervisorError:
-                    cleanup_failed = True
-            for owned_id in sorted(state.created):
-                try:
-                    _remove_container(owned_id, runner, state)
-                except SupervisorError:
-                    cleanup_failed = True
-            if cleanup_failed:
+            if not _cleanup_owned_containers(
+                ownership_token,
+                state,
+                runner,
+                clock,
+                clock.monotonic() + OWNER_CLEANUP_SECONDS,
+            ):
                 raise SupervisorError("preflight_cleanup")
+        if state.ownership_ambiguous:
+            raise SupervisorError("container_ownership_ambiguous")
         if not _auth_matches_baseline(paths.auth, auth_baseline):
             raise SupervisorError("auth_integrity")
     projection = _receipt_projection(paths.output / DESCRIPTOR_RECEIPT)
@@ -2232,6 +2433,7 @@ def main() -> int:
     protocol = load_protocol(paths.preregistration)
     protocol = bind_registration(paths.registration, protocol)
     validate_environment(os.environ)
+    _validate_registration_timing(protocol, time.time())
     validate_source(
         paths.repository,
         protocol.source_sha,
