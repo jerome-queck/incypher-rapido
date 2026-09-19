@@ -127,6 +127,12 @@ MAX_TURN_TAINT_CANDIDATES = 512
 MAX_TURN_TAINT_STATE_VALUES = 128
 MAX_TURN_TAINT_STATE_BYTES = 256 * 1024
 MAX_TURN_CANDIDATE_HASHES = 512
+_NATIVE_USAGE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("input_tokens", "inputTokens"),
+    ("output_tokens", "outputTokens"),
+    ("cached_input_tokens", "cachedInputTokens"),
+    ("reasoning_tokens", "reasoningOutputTokens"),
+)
 
 _RETRYABLE_TOOL_ERRORS = frozenset(
     {
@@ -432,6 +438,7 @@ class TurnResult:
     process_fenced: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     current_turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    cumulative_native_usage: dict[str, int | None] | None = None
 
     @property
     def text(self) -> str:
@@ -443,6 +450,7 @@ class _CancelledTurnEvidence:
     """Sanitized completed-tool evidence retained across task cancellation."""
 
     tool_calls: list[dict[str, Any]]
+    cumulative_native_usage: dict[str, int | None] | None
 
 
 def _cancelled_turn_evidence(state: _TurnState) -> _CancelledTurnEvidence:
@@ -451,18 +459,25 @@ def _cancelled_turn_evidence(state: _TurnState) -> _CancelledTurnEvidence:
         observation = call.get("host_observation")
         if not isinstance(observation, HostObservation):
             continue
-        tool_calls.append(
-            {
-                "name": observation.tool,
-                "success": observation.success,
-                "source_bound": observation.source_bound,
-                "candidate_sensitive": observation.candidate_sensitive,
-                "candidate_sha256s": list(observation.candidate_sha256s),
-                "supplied_candidate_sha256s": list(observation.supplied_candidate_sha256s),
-                "host_observation": observation,
-            }
-        )
-    return _CancelledTurnEvidence(tool_calls=tool_calls)
+        projected: dict[str, Any] = {
+            "name": observation.tool,
+            "success": observation.success,
+            "source_bound": observation.source_bound,
+            "candidate_sensitive": observation.candidate_sensitive,
+            "candidate_sha256s": list(observation.candidate_sha256s),
+            "supplied_candidate_sha256s": list(observation.supplied_candidate_sha256s),
+            "host_observation": observation,
+        }
+        duration = call.get("duration_milliseconds")
+        if observation.success and type(duration) is int and 0 <= duration <= 2**63 - 1:
+            projected["duration_milliseconds"] = duration
+        tool_calls.append(projected)
+    return _CancelledTurnEvidence(
+        tool_calls=tool_calls,
+        cumulative_native_usage=(
+            None if state.cumulative_native_usage is None else dict(state.cumulative_native_usage)
+        ),
+    )
 
 
 def _turn_failure_class(completed: Mapping[str, Any]) -> str | None:
@@ -540,6 +555,22 @@ class _TurnState:
     tool_request_active: bool = False
     progress_callback: Callable[[HostObservation | None], None] | None = None
     last_event: dict[str, Any] = field(default_factory=dict)
+    cumulative_native_usage: dict[str, int | None] | None = None
+
+
+def _bounded_cumulative_native_usage(params: Mapping[str, Any]) -> dict[str, int | None] | None:
+    """Project the app-server's cumulative total to four receipt-only nullable fields."""
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, Mapping):
+        return None
+    total = token_usage.get("total")
+    if not isinstance(total, Mapping):
+        return None
+    snapshot: dict[str, int | None] = {}
+    for public_name, wire_name in _NATIVE_USAGE_FIELDS:
+        value = total.get(wire_name)
+        snapshot[public_name] = value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+    return snapshot
 
 
 def _json_text(value: Any, *, limit: int) -> str:
@@ -1669,6 +1700,12 @@ class CodexAppClient:
                     source_taint_complete = False
             if call_record is not None:
                 call_record["success"] = True
+                # Receipt-only timing: retain the controller's monotonic delta on the
+                # TurnResult call record.  Do not place it in the RPC response or the
+                # HostObservation, where it could reach the model or evidence memory.
+                call_record["duration_milliseconds"] = max(
+                    0, int((time.monotonic() - tool_started_at) * 1_000)
+                )
                 if observation_result is not None and canonical_name in _SOURCE_OBSERVATION_TOOLS:
                     result_scan = _argument_scan(observation_result)
                     if not result_scan.invalid_unicode:
@@ -1844,6 +1881,24 @@ class CodexAppClient:
         await self._send_response(message_id, result=payload)
 
     async def _handle_notification(self, method: str, params: Any) -> None:
+        if method == "thread/tokenUsage/updated":
+            if not isinstance(params, Mapping):
+                return
+            thread_id = params.get("threadId")
+            turn_id = params.get("turnId")
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            # Usage authority is exact-turn scoped.  Do not use the looser pending-turn
+            # fallback accepted for message events: a mismatched notification must not
+            # be attributed to another concurrent turn on the same thread.
+            state = self._thread_turns.get((thread_id, turn_id))
+            if state is None:
+                return
+            snapshot = _bounded_cumulative_native_usage(params)
+            if snapshot is not None:
+                state.cumulative_native_usage = snapshot
+            return
+
         if method == "model/rerouted":
             if not isinstance(params, Mapping):
                 return
@@ -2347,6 +2402,11 @@ class CodexAppClient:
             process_fenced=process_fenced,
             tool_calls=[dict(call) for call in state.tool_calls],
             current_turn_tool_calls=[dict(call) for call in state.tool_calls],
+            cumulative_native_usage=(
+                None
+                if state.cumulative_native_usage is None
+                else dict(state.cumulative_native_usage)
+            ),
         )
 
     def _state_for(self, thread_id: str | None, turn_id: str | None) -> _TurnState | None:

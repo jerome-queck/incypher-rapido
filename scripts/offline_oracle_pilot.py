@@ -35,6 +35,13 @@ from rapido.codex_app import (
 from rapido.config import validate_codex_home
 from rapido.evidence import EvidenceBatch, RunEvidence
 from rapido.memory import MemoryTarget, project_memory
+from rapido.native_receipts import (
+    AttemptKey,
+    Budget,
+    Span,
+    build_native_attempt_receipt,
+    summarize_native_attempt_receipts,
+)
 from rapido.orchestrator import _normalize_tool_calls
 from rapido.routing import baseline_route
 from rapido.solver import (
@@ -52,13 +59,12 @@ from rapido.tools import ToolRegistry
 TURN_TIMEOUT_SECONDS = 300.0
 MAX_WORKSPACE_BYTES = 192 * 1024 * 1024
 ORACLE_SCHEMA = "rapido-offline-oracle-v1"
-RECEIPT_SCHEMA = "rapido-offline-oracle-pilot-v1"
-VERIFIER_REPAIR_RECEIPT_SCHEMA = "rapido-offline-verifier-repair-v1"
+RECEIPT_SCHEMA = "rapido-offline-oracle-pilot-v2"
+VERIFIER_REPAIR_RECEIPT_SCHEMA = "rapido-offline-verifier-repair-v2"
 MODEL_COMPARISON_EXPERIMENT = "model-comparison"
 VERIFIER_REPAIR_EXPERIMENT = "verifier-repair"
 _SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
-_CLOSED_LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ORACLE_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 
 Outcome = Literal["correct", "wrong", "unverifiable", "timeout", "provider_failure"]
@@ -85,6 +91,69 @@ _REPAIRABLE_VERIFIER_REJECTIONS = frozenset(
 )
 _VERIFIER_MODEL = "gpt-daybreak-blue-latest"
 _VERIFIER_EFFORT = "xhigh"
+_PUBLIC_FAILURE_CLASSES = frozenset(
+    {
+        "active_turn_not_steerable",
+        "bad_request",
+        "cleanup",
+        "context_window_exceeded",
+        "cyber_policy",
+        "fixture_setup",
+        "http_connection_failed",
+        "internal_server_error",
+        "interrupted",
+        "misalignment_policy_violation",
+        "model_validation",
+        "native_runtime",
+        "other",
+        "rate_limit_exceeded",
+        "response_stream_connection_failed",
+        "response_stream_disconnected",
+        "response_too_many_failed_attempts",
+        "sandbox_error",
+        "server_overloaded",
+        "session_budget_exceeded",
+        "solver_output",
+        "startup",
+        "thread_rollback_failed",
+        "timeout",
+        "unauthorized",
+        "unknown",
+        "usage_limit_exceeded",
+    }
+)
+_PUBLIC_TOOL_CONSTRAINTS = frozenset(
+    {
+        "additional_properties",
+        "bounded_ascii",
+        "bounded_identifier",
+        "cursor_binding",
+        "cursor_encoding",
+        "cursor_forbidden_for_format_view",
+        "enum",
+        "forbidden",
+        "internal_error",
+        "invalid_argument",
+        "invalid_result",
+        "max_bytes",
+        "nonempty_text",
+        "not_a_file",
+        "nul_forbidden",
+        "path_grammar",
+        "property_names",
+        "range",
+        "required",
+        "required_text",
+        "selection_range",
+        "selection_syntax",
+        "type",
+        "unicode",
+        "unsupported_for_format_view",
+        "unsupported_text_encoding",
+        "valid_unicode",
+        "view_selection_mismatch",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -150,6 +219,7 @@ class Measurement:
     tool_calls: int
     tool_errors: Mapping[str, object]
     native_usage: Mapping[str, object]
+    native_receipt: Mapping[str, object]
 
     def public(self) -> dict[str, object]:
         return {
@@ -170,6 +240,7 @@ class Measurement:
             "tool_calls": self.tool_calls,
             "tool_errors": dict(self.tool_errors),
             "native_usage": dict(self.native_usage),
+            "native_observability": dict(self.native_receipt),
         }
 
 
@@ -209,6 +280,7 @@ class VerifierMeasurement:
     first_native_usage: Mapping[str, object]
     final_native_usage: Mapping[str, object]
     failure_class: str | None
+    native_receipt: Mapping[str, object]
 
     def public(self) -> dict[str, object]:
         return {
@@ -244,6 +316,7 @@ class VerifierMeasurement:
                 "final_turn": dict(self.final_native_usage),
             },
             "failure_class": self.failure_class,
+            "native_observability": dict(self.native_receipt),
         }
 
 
@@ -396,8 +469,8 @@ def _candidate_is_source_proved(value: str | None, calls: Sequence[Mapping[str, 
     return observed and not supplied
 
 
-def _closed_label(value: object, default: str) -> str:
-    return value if isinstance(value, str) and _CLOSED_LABEL_RE.fullmatch(value) else default
+def _closed_member(value: object, allowed: frozenset[str], default: str) -> str:
+    return value if isinstance(value, str) and value in allowed else default
 
 
 def closed_tool_error_counts(calls: Sequence[Mapping[str, Any]]) -> dict[str, object]:
@@ -414,10 +487,10 @@ def closed_tool_error_counts(calls: Sequence[Mapping[str, Any]]) -> dict[str, ob
         if facts is None and isinstance(observation, Mapping):
             facts = observation.get("facts")
         facts = facts if isinstance(facts, Mapping) else {}
-        stage = _closed_label(facts.get("failure_stage"), "untyped")
-        constraint = _closed_label(facts.get("constraint"), "untyped")
-        if stage not in {"arguments", "execution", "result"}:
-            stage = "untyped"
+        stage = _closed_member(
+            facts.get("failure_stage"), frozenset({"arguments", "execution", "result"}), "untyped"
+        )
+        constraint = _closed_member(facts.get("constraint"), _PUBLIC_TOOL_CONSTRAINTS, "untyped")
         if stage == "untyped" or constraint == "untyped":
             untyped += 1
         stages[stage] += 1
@@ -762,37 +835,106 @@ def _image_identity(supplied: str | None) -> dict[str, object]:
 def _safe_failure(value: object) -> str | None:
     if value is None:
         return None
-    return _closed_label(value, "unknown")
+    return _closed_member(value, _PUBLIC_FAILURE_CLASSES, "unknown")
+
+
+def _offset_milliseconds(origin: float, observed: float) -> int:
+    return max(0, int((observed - origin) * 1_000))
+
+
+def _runtime_span(
+    status: str,
+    origin: float,
+    started: float | None = None,
+    finished: float | None = None,
+) -> dict[str, object]:
+    if started is None or finished is None:
+        return {
+            "status": status,
+            "start_offset_milliseconds": None,
+            "end_offset_milliseconds": None,
+            "elapsed_seconds": 0.0,
+        }
+    return {
+        "status": status,
+        "start_offset_milliseconds": _offset_milliseconds(origin, started),
+        "end_offset_milliseconds": _offset_milliseconds(origin, finished),
+        "elapsed_seconds": round(finished - started, 3),
+    }
+
+
+def _remaining_milliseconds(value: float | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(value * 1_000))
+
+
+def _native_terminal_outcome(outcome: str) -> str:
+    if outcome == "timeout":
+        return "timeout"
+    if outcome == "provider_failure":
+        return "provider_failure"
+    if outcome in {
+        "unverifiable",
+        "no_candidate",
+        "solver_output",
+        "rejected_correct",
+        "rejected_wrong",
+    }:
+        return "inconclusive"
+    return "completed"
+
+
+def _raw_event(turn: object | None) -> Mapping[str, object] | None:
+    cumulative = getattr(turn, "cumulative_native_usage", None)
+    if isinstance(cumulative, Mapping):
+        return {"usage": dict(cumulative)}
+    raw = getattr(turn, "raw", None)
+    return raw if isinstance(raw, Mapping) else None
 
 
 def _native_usage(turn: object | None) -> dict[str, object]:
-    raw = getattr(turn, "raw", None)
-    if not isinstance(raw, Mapping):
-        return {"status": "unavailable"}
+    fields = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+    }
     source: Mapping[str, object] | None = None
-    for key in ("usage", "tokenUsage", "token_usage"):
-        value = raw.get(key)
-        if isinstance(value, Mapping):
-            source = value
-            break
+    cumulative = getattr(turn, "cumulative_native_usage", None)
+    if isinstance(cumulative, Mapping):
+        source = cumulative
+    else:
+        raw = getattr(turn, "raw", None)
+        if isinstance(raw, Mapping):
+            for key in ("usage", "tokenUsage", "token_usage"):
+                value = raw.get(key)
+                if isinstance(value, Mapping):
+                    source = value
+                    break
     if source is None:
-        return {"status": "unavailable"}
+        return {"status": "unavailable", **fields}
     aliases = {
         "input_tokens": ("input_tokens", "inputTokens"),
         "cached_input_tokens": ("cached_input_tokens", "cachedInputTokens"),
         "output_tokens": ("output_tokens", "outputTokens"),
-        "reasoning_output_tokens": (
+        "reasoning_tokens": (
+            "reasoning_tokens",
+            "reasoningTokens",
             "reasoning_output_tokens",
             "reasoningOutputTokens",
         ),
-        "total_tokens": ("total_tokens", "totalTokens"),
     }
-    observed: dict[str, object] = {"status": "observed"}
     for public, names in aliases.items():
         value = next((source[name] for name in names if name in source), None)
         if type(value) is int and 0 <= value <= 2**63 - 1:
-            observed[public] = value
-    return observed if len(observed) > 1 else {"status": "unavailable"}
+            fields[public] = value
+    return {
+        "status": "observed"
+        if any(value is not None for value in fields.values())
+        else "unavailable",
+        **fields,
+    }
 
 
 async def _measure(
@@ -804,6 +946,9 @@ async def _measure(
     expected: str,
     max_workspace_bytes: int,
     fixture_elapsed_seconds: float,
+    run_started: float,
+    fixture_started: float,
+    fixture_finished: float,
 ) -> Measurement:
     started = time.monotonic()
     calls: list[Mapping[str, Any]] = []
@@ -811,8 +956,10 @@ async def _measure(
     failure: str | None = None
     source_proved = False
     usage: Mapping[str, object] = {"status": "unavailable"}
+    result: object | None = None
+
     try:
-        turn = await client.solve(
+        result = await client.solve(
             workspace,
             prompt,
             developer_instructions=OFFLINE_DEVELOPER_INSTRUCTIONS,
@@ -822,16 +969,16 @@ async def _measure(
             timeout=TURN_TIMEOUT_SECONDS,
             tool_registry=ToolRegistry(workspace, max_workspace_bytes=max_workspace_bytes),
         )
-        usage = _native_usage(turn)
-        calls = [call for call in turn.tool_calls if isinstance(call, Mapping)]
-        if turn.status != "completed":
-            outcome = "timeout" if turn.timed_out else "provider_failure"
+        usage = _native_usage(result)
+        calls = [call for call in result.tool_calls if isinstance(call, Mapping)]
+        if result.status != "completed":
+            outcome = "timeout" if result.timed_out else "provider_failure"
             failure = (
-                "timeout" if turn.timed_out else _safe_failure(turn.failure_class) or "unknown"
+                "timeout" if result.timed_out else _safe_failure(result.failure_class) or "unknown"
             )
         else:
             try:
-                finding = SolverFinding.from_message(turn.text)
+                finding = SolverFinding.from_message(result.text)
             except SolverOutputError:
                 outcome = "unverifiable"
                 failure = "solver_output"
@@ -842,7 +989,50 @@ async def _measure(
                     observed=finding.candidate,
                     source_proved=source_proved,
                 )
+    except asyncio.CancelledError as exc:
+        finished = time.monotonic()
+        evidence = getattr(exc, "result", None)
+        cancelled_calls = _mapping_calls(getattr(evidence, "tool_calls", None))
+        cancelled_event = _raw_event(evidence)
+        exc.native_receipt = build_native_attempt_receipt(
+            key=AttemptKey(fixture.id, arm.id),
+            outcome="cancelled",
+            spans=(
+                Span(
+                    "fixture_setup",
+                    "completed",
+                    _offset_milliseconds(run_started, fixture_started),
+                    _offset_milliseconds(run_started, fixture_finished),
+                ),
+                Span(
+                    "first_turn",
+                    "cancelled",
+                    _offset_milliseconds(run_started, started),
+                    _offset_milliseconds(run_started, finished),
+                ),
+            ),
+            budget=Budget(
+                int(TURN_TIMEOUT_SECONDS * 1_000),
+                int(TURN_TIMEOUT_SECONDS * 1_000),
+                max(
+                    0,
+                    int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, finished),
+                ),
+                max(
+                    0,
+                    int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, finished),
+                ),
+            ),
+            first_event=cancelled_event,
+            final_event=cancelled_event,
+            first_turn_calls=cancelled_calls,
+            repair_turn_calls=(),
+            cumulative_calls=cancelled_calls,
+            repair_attempted=False,
+        )
+        raise
     except TurnTimeoutError as exc:
+        result = exc.result
         usage = _native_usage(exc.result)
         calls = [call for call in exc.result.tool_calls if isinstance(call, Mapping)]
         outcome = "timeout"
@@ -854,27 +1044,62 @@ async def _measure(
         outcome = "provider_failure"
         failure = "model_validation"
     except CodexAppError as exc:
-        evidence = getattr(exc, "result", None)
-        usage = _native_usage(evidence)
-        raw_calls = getattr(evidence, "tool_calls", ())
+        result = getattr(exc, "result", None)
+        usage = _native_usage(result)
+        raw_calls = getattr(result, "tool_calls", ())
         calls = [call for call in raw_calls if isinstance(call, Mapping)]
         outcome = "provider_failure"
-        failure = _safe_failure(getattr(evidence, "failure_class", None)) or "native_runtime"
+        failure = _safe_failure(getattr(result, "failure_class", None)) or "native_runtime"
     except (OSError, RuntimeError, TypeError, ValueError):
         outcome = "provider_failure"
         failure = "native_runtime"
+    finished = time.monotonic()
+    terminal_remaining = max(
+        0, int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, finished)
+    )
+    native_receipt = build_native_attempt_receipt(
+        key=AttemptKey(fixture.id, arm.id),
+        outcome=_native_terminal_outcome(outcome),
+        spans=(
+            Span(
+                "fixture_setup",
+                "completed",
+                _offset_milliseconds(run_started, fixture_started),
+                _offset_milliseconds(run_started, fixture_finished),
+            ),
+            Span(
+                "first_turn",
+                "completed" if outcome not in {"timeout", "provider_failure"} else "failed",
+                _offset_milliseconds(run_started, started),
+                _offset_milliseconds(run_started, finished),
+            ),
+        ),
+        budget=Budget(
+            int(TURN_TIMEOUT_SECONDS * 1_000),
+            int(TURN_TIMEOUT_SECONDS * 1_000),
+            terminal_remaining,
+            terminal_remaining,
+        ),
+        first_event=_raw_event(result),
+        final_event=_raw_event(result),
+        first_turn_calls=calls,
+        repair_turn_calls=(),
+        cumulative_calls=calls,
+        repair_attempted=False,
+    )
     return Measurement(
         task_id=fixture.id,
         family=fixture.family,
         arm=arm,
         outcome=outcome,
         fixture_elapsed_seconds=fixture_elapsed_seconds,
-        turn_elapsed_seconds=time.monotonic() - started,
+        turn_elapsed_seconds=finished - started,
         failure_class=failure,
         source_proved=source_proved,
         tool_calls=len(calls),
         tool_errors=closed_tool_error_counts(calls),
         native_usage=usage,
+        native_receipt=native_receipt,
     )
 
 
@@ -884,7 +1109,30 @@ def _provider_failure_measurement(
     *,
     fixture_elapsed_seconds: float,
     failure_class: str,
+    run_started: float,
+    fixture_started: float,
+    fixture_finished: float,
 ) -> Measurement:
+    native_receipt = build_native_attempt_receipt(
+        key=AttemptKey(fixture.id, arm.id),
+        outcome="provider_failure",
+        spans=(
+            Span(
+                "fixture_setup",
+                "failed" if failure_class == "fixture_setup" else "completed",
+                _offset_milliseconds(run_started, fixture_started),
+                _offset_milliseconds(run_started, fixture_finished),
+            ),
+            Span("first_turn", "not_run", None, None),
+        ),
+        budget=Budget(int(TURN_TIMEOUT_SECONDS * 1_000), 0, None, None),
+        first_event=None,
+        final_event=None,
+        first_turn_calls=(),
+        repair_turn_calls=(),
+        cumulative_calls=(),
+        repair_attempted=False,
+    )
     return Measurement(
         task_id=fixture.id,
         family=fixture.family,
@@ -896,7 +1144,8 @@ def _provider_failure_measurement(
         source_proved=False,
         tool_calls=0,
         tool_errors={"total": 0, "untyped": 0, "by_stage": {}, "by_constraint": {}},
-        native_usage={"status": "unavailable"},
+        native_usage=_native_usage(None),
+        native_receipt=native_receipt,
     )
 
 
@@ -910,8 +1159,32 @@ def _failed_verifier_measurement(
     *,
     fixture_elapsed_seconds: float,
     failure_class: str,
+    run_started: float,
+    fixture_started: float,
+    fixture_finished: float,
 ) -> VerifierMeasurement:
     failed = VerifierTurnEvaluation("provider_failure", None)
+    native_receipt = build_native_attempt_receipt(
+        key=AttemptKey(fixture.id, arm.id),
+        outcome="provider_failure",
+        spans=(
+            Span(
+                "fixture_setup",
+                "failed" if failure_class == "fixture_setup" else "completed",
+                _offset_milliseconds(run_started, fixture_started),
+                _offset_milliseconds(run_started, fixture_finished),
+            ),
+            Span("first_turn", "not_run", None, None),
+            Span("repair_turn", "not_run", None, None),
+        ),
+        budget=Budget(int(TURN_TIMEOUT_SECONDS * 1_000), 0, None, None),
+        first_event=None,
+        final_event=None,
+        first_turn_calls=(),
+        repair_turn_calls=(),
+        cumulative_calls=(),
+        repair_attempted=False,
+    )
     return VerifierMeasurement(
         task_id=fixture.id,
         family=fixture.family,
@@ -929,9 +1202,10 @@ def _failed_verifier_measurement(
         final_tool_calls=0,
         cumulative_tool_calls=0,
         tool_errors={"total": 0, "untyped": 0, "by_stage": {}, "by_constraint": {}},
-        first_native_usage={"status": "unavailable"},
-        final_native_usage={"status": "unavailable"},
+        first_native_usage=_native_usage(None),
+        final_native_usage=_native_usage(None),
         failure_class=failure_class,
+        native_receipt=native_receipt,
     )
 
 
@@ -944,6 +1218,9 @@ async def _measure_verifier(
     expected: str,
     max_workspace_bytes: int,
     fixture_elapsed_seconds: float,
+    run_started: float,
+    fixture_started: float,
+    fixture_finished: float,
 ) -> VerifierMeasurement:
     started = time.monotonic()
     challenge = _challenge(fixture)
@@ -952,12 +1229,17 @@ async def _measure_verifier(
     first_thread_id: str | None = None
     first_calls: list[Mapping[str, Any]] = []
     first_usage: Mapping[str, object] = {"status": "unavailable"}
+    first_event: Mapping[str, object] | None = None
+    remaining_after_first_seconds: float | None = None
+    terminal_remaining_seconds: float | None = None
     continuation_count = 0
     continuation_prompt_candidate_free = True
 
     def continue_once(turn: object, remaining_seconds: float | None) -> str | None:
         nonlocal first, first_finished, first_thread_id, first_calls, first_usage
+        nonlocal first_event, remaining_after_first_seconds, terminal_remaining_seconds
         nonlocal continuation_count, continuation_prompt_candidate_free
+        terminal_remaining_seconds = remaining_seconds
         if first is not None:
             return None
         first = _evaluate_verifier_turn(turn, expected, challenge)
@@ -965,6 +1247,8 @@ async def _measure_verifier(
         first_thread_id = getattr(turn, "thread_id", None)
         first_calls = _mapping_calls(getattr(turn, "current_turn_tool_calls", None))
         first_usage = _native_usage(turn)
+        first_event = _raw_event(turn)
+        remaining_after_first_seconds = remaining_seconds
         if (
             not arm.continuation
             or first.candidate is None
@@ -993,8 +1277,67 @@ async def _measure_verifier(
             output_schema=SOLVER_OUTPUT_SCHEMA,
             timeout=TURN_TIMEOUT_SECONDS,
             tool_registry=ToolRegistry(workspace, max_workspace_bytes=max_workspace_bytes),
-            continuation_callback=continue_once if arm.continuation else None,
+            continuation_callback=continue_once,
         )
+    except asyncio.CancelledError as exc:
+        cancelled_at = time.monotonic()
+        evidence = getattr(exc, "result", None)
+        cancelled_calls = _mapping_calls(getattr(evidence, "tool_calls", None))
+        cancelled_event = _raw_event(evidence)
+        cancelled_first_calls = cancelled_calls if first is None else first_calls
+        cancelled_repair_calls = (
+            cancelled_calls[len(first_calls) :]
+            if first is not None and len(cancelled_calls) >= len(first_calls)
+            else []
+        )
+        first_terminal = cancelled_at if first_finished is None else first_finished
+        remaining_first = max(
+            0,
+            int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, first_terminal),
+        )
+        remaining_terminal = max(
+            0,
+            int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, cancelled_at),
+        )
+        exc.native_receipt = build_native_attempt_receipt(
+            key=AttemptKey(fixture.id, arm.id),
+            outcome="cancelled",
+            spans=(
+                Span(
+                    "fixture_setup",
+                    "completed",
+                    _offset_milliseconds(run_started, fixture_started),
+                    _offset_milliseconds(run_started, fixture_finished),
+                ),
+                Span(
+                    "first_turn",
+                    "cancelled" if first is None else "completed",
+                    _offset_milliseconds(run_started, started),
+                    _offset_milliseconds(run_started, first_terminal),
+                ),
+                Span(
+                    "repair_turn",
+                    "cancelled",
+                    _offset_milliseconds(run_started, first_terminal),
+                    _offset_milliseconds(run_started, cancelled_at),
+                )
+                if first is not None
+                else Span("repair_turn", "not_run", None, None),
+            ),
+            budget=Budget(
+                int(TURN_TIMEOUT_SECONDS * 1_000),
+                int(TURN_TIMEOUT_SECONDS * 1_000),
+                remaining_first,
+                remaining_terminal,
+            ),
+            first_event=first_event if first is not None else cancelled_event,
+            final_event=cancelled_event,
+            first_turn_calls=cancelled_first_calls,
+            repair_turn_calls=cancelled_repair_calls,
+            cumulative_calls=cancelled_calls,
+            repair_attempted=first is not None,
+        )
+        raise
     except TurnTimeoutError as exc:
         result = exc.result
         terminal_override = VerifierTurnEvaluation("timeout", None)
@@ -1027,6 +1370,7 @@ async def _measure_verifier(
             getattr(result, "current_turn_tool_calls", getattr(result, "tool_calls", None))
         )
         first_usage = _native_usage(result)
+        first_event = _raw_event(result)
     final = (
         terminal_override
         if terminal_override is not None
@@ -1034,13 +1378,72 @@ async def _measure_verifier(
         if result is not None
         else VerifierTurnEvaluation("provider_failure", None)
     )
-    cumulative_calls = _mapping_calls(getattr(result, "tool_calls", None))
-    final_calls = _mapping_calls(
-        getattr(result, "current_turn_tool_calls", getattr(result, "tool_calls", None))
-    )
+    if result is None and continuation_count and first is not None:
+        # A continuation can fail before Codex returns a terminal TurnResult.  The
+        # first callback is still a complete, real turn and remains the cumulative
+        # prefix; the failed repair contributes no completed tool calls.
+        cumulative_calls = list(first_calls)
+        final_calls: list[Mapping[str, Any]] = []
+    else:
+        cumulative_calls = _mapping_calls(getattr(result, "tool_calls", None))
+        final_calls = _mapping_calls(
+            getattr(result, "current_turn_tool_calls", getattr(result, "tool_calls", None))
+        )
     assert first_finished is not None
     same_thread = continuation_count == 0 or (
         isinstance(first_thread_id, str) and first_thread_id == getattr(result, "thread_id", None)
+    )
+    remaining_after_first = _remaining_milliseconds(remaining_after_first_seconds)
+    if remaining_after_first is None:
+        remaining_after_first = max(
+            0,
+            int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, first_finished),
+        )
+    terminal_remaining = _remaining_milliseconds(terminal_remaining_seconds)
+    derived_terminal_remaining = max(
+        0, int(TURN_TIMEOUT_SECONDS * 1_000) - _offset_milliseconds(started, finished)
+    )
+    if result is None and continuation_count and terminal_override is not None:
+        terminal_remaining = min(remaining_after_first, derived_terminal_remaining)
+    elif terminal_remaining is None:
+        terminal_remaining = derived_terminal_remaining
+    native_receipt = build_native_attempt_receipt(
+        key=AttemptKey(fixture.id, arm.id),
+        outcome=_native_terminal_outcome(final.outcome),
+        spans=(
+            Span(
+                "fixture_setup",
+                "completed",
+                _offset_milliseconds(run_started, fixture_started),
+                _offset_milliseconds(run_started, fixture_finished),
+            ),
+            Span(
+                "first_turn",
+                "failed" if first.outcome in {"timeout", "provider_failure"} else "completed",
+                _offset_milliseconds(run_started, started),
+                _offset_milliseconds(run_started, first_finished),
+            ),
+            Span(
+                "repair_turn",
+                ("failed" if final.outcome in {"timeout", "provider_failure"} else "completed"),
+                _offset_milliseconds(run_started, first_finished),
+                _offset_milliseconds(run_started, finished),
+            )
+            if continuation_count
+            else Span("repair_turn", "not_run", None, None),
+        ),
+        budget=Budget(
+            int(TURN_TIMEOUT_SECONDS * 1_000),
+            int(TURN_TIMEOUT_SECONDS * 1_000),
+            remaining_after_first,
+            terminal_remaining,
+        ),
+        first_event=first_event,
+        final_event=_raw_event(result),
+        first_turn_calls=first_calls,
+        repair_turn_calls=final_calls if continuation_count else (),
+        cumulative_calls=cumulative_calls,
+        repair_attempted=continuation_count == 1,
     )
     return VerifierMeasurement(
         task_id=fixture.id,
@@ -1062,6 +1465,7 @@ async def _measure_verifier(
         first_native_usage=first_usage,
         final_native_usage=_native_usage(result),
         failure_class=failure_class,
+        native_receipt=native_receipt,
     )
 
 
@@ -1118,6 +1522,10 @@ def _receipt(
     measurements: Sequence[Measurement],
     runtime: Mapping[str, object],
 ) -> dict[str, object]:
+    native_observability = summarize_native_attempt_receipts(
+        [AttemptKey(fixture.id, arm.id) for fixture in fixture_catalogue() for arm in ARMS],
+        [measurement.native_receipt for measurement in measurements],
+    )
     return {
         "schema": RECEIPT_SCHEMA,
         "source": dict(source),
@@ -1140,6 +1548,7 @@ def _receipt(
         "runtime": dict(runtime),
         "results": [measurement.public() for measurement in measurements],
         "summary": _aggregate(measurements),
+        "native_observability": native_observability,
     }
 
 
@@ -1423,6 +1832,14 @@ def _verifier_receipt(
     measurements: Sequence[VerifierMeasurement],
     runtime: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
+    native_observability = summarize_native_attempt_receipts(
+        [
+            AttemptKey(fixture.id, arm.id)
+            for fixture in fixture_catalogue()
+            for arm in VERIFIER_ARMS
+        ],
+        [measurement.native_receipt for measurement in measurements],
+    )
     return {
         "schema": VERIFIER_REPAIR_RECEIPT_SCHEMA,
         "source": dict(source),
@@ -1465,6 +1882,7 @@ def _verifier_receipt(
         "runtime": {name: dict(row) for name, row in runtime.items()},
         "results": [measurement.public() for measurement in measurements],
         "summary": _verifier_summary(measurements),
+        "native_observability": native_observability,
         "gate": _verifier_gate(
             measurements,
             runtime,
@@ -1498,6 +1916,7 @@ async def run_pilot(
     source = _source_identity(config.source_sha)
     image = _image_identity(config.image_id)
     measurements: list[Measurement] = []
+    run_started = time.monotonic()
     runtime: dict[str, dict[str, object]] = {
         arm.id: {
             "model": arm.model,
@@ -1505,9 +1924,9 @@ async def run_pilot(
             "status": "pending",
             "failure_class": None,
             "spans": {
-                "startup": {"status": "not_run", "elapsed_seconds": 0.0},
-                "model_validation": {"status": "not_run", "elapsed_seconds": 0.0},
-                "cleanup": {"status": "not_run", "elapsed_seconds": 0.0},
+                "startup": _runtime_span("not_run", run_started),
+                "model_validation": _runtime_span("not_run", run_started),
+                "cleanup": _runtime_span("not_run", run_started),
             },
         }
         for arm in ARMS
@@ -1545,17 +1964,11 @@ async def run_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["startup"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
+                spans["startup"] = _runtime_span("failed", run_started, started, time.monotonic())
                 row["status"] = "failed"
                 row["failure_class"] = "startup"
                 return
-            spans["startup"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
+            spans["startup"] = _runtime_span("completed", run_started, started, time.monotonic())
             validated = time.monotonic()
             try:
                 descriptor = await asyncio.wait_for(
@@ -1571,17 +1984,15 @@ async def run_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["model_validation"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - validated, 3),
-                }
+                spans["model_validation"] = _runtime_span(
+                    "failed", run_started, validated, time.monotonic()
+                )
                 row["status"] = "failed"
                 row["failure_class"] = "model_validation"
                 return
-            spans["model_validation"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - validated, 3),
-            }
+            spans["model_validation"] = _runtime_span(
+                "completed", run_started, validated, time.monotonic()
+            )
             row["status"] = "ready"
 
         async def close_arm(arm: Arm) -> None:
@@ -1597,17 +2008,11 @@ async def run_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["cleanup"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
+                spans["cleanup"] = _runtime_span("failed", run_started, started, time.monotonic())
                 row["status"] = "failed"
                 row["failure_class"] = row["failure_class"] or "cleanup"
                 return
-            spans["cleanup"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
+            spans["cleanup"] = _runtime_span("completed", run_started, started, time.monotonic())
             if row["status"] == "ready":
                 row["status"] = "completed"
 
@@ -1622,7 +2027,7 @@ async def run_pilot(
                 expected = oracle_answer(key, fixture.id)
                 material = fixture.material(expected)
                 prompt = _specialist_prompt(fixture)
-                prepared: dict[Arm, tuple[Path, float]] = {}
+                prepared: dict[Arm, tuple[Path, float, float]] = {}
                 pair: dict[Arm, Measurement] = {}
                 for arm in ARMS:
                     setup_started = time.monotonic()
@@ -1633,20 +2038,26 @@ async def run_pilot(
                         artifact.write_bytes(material)
                         artifact.chmod(0o600)
                     except OSError:
+                        setup_finished = time.monotonic()
                         pair[arm] = _provider_failure_measurement(
                             fixture,
                             arm,
-                            fixture_elapsed_seconds=time.monotonic() - setup_started,
+                            fixture_elapsed_seconds=setup_finished - setup_started,
                             failure_class="fixture_setup",
+                            run_started=run_started,
+                            fixture_started=setup_started,
+                            fixture_finished=setup_finished,
                         )
                         continue
-                    prepared[arm] = (workspace, time.monotonic() - setup_started)
+                    setup_finished = time.monotonic()
+                    prepared[arm] = (workspace, setup_started, setup_finished)
 
                 tasks: dict[Arm, asyncio.Task[Measurement]] = {}
                 for arm in ARMS:
                     if arm in pair:
                         continue
-                    workspace, setup_elapsed = prepared[arm]
+                    workspace, setup_started, setup_finished = prepared[arm]
+                    setup_elapsed = setup_finished - setup_started
                     client = clients.get(arm)
                     failure = runtime[arm.id]["failure_class"]
                     if client is None or runtime[arm.id]["status"] != "ready":
@@ -1655,6 +2066,9 @@ async def run_pilot(
                             arm,
                             fixture_elapsed_seconds=setup_elapsed,
                             failure_class=str(failure or "startup"),
+                            run_started=run_started,
+                            fixture_started=setup_started,
+                            fixture_finished=setup_finished,
                         )
                         continue
                     tasks[arm] = asyncio.create_task(
@@ -1667,6 +2081,9 @@ async def run_pilot(
                             expected,
                             config.max_workspace_bytes,
                             setup_elapsed,
+                            run_started,
+                            setup_started,
+                            setup_finished,
                         )
                     )
                 if tasks:
@@ -1675,12 +2092,15 @@ async def run_pilot(
                         if isinstance(result, asyncio.CancelledError):
                             raise result
                         if isinstance(result, BaseException):
-                            _, setup_elapsed = prepared[arm]
+                            _, setup_started, setup_finished = prepared[arm]
                             pair[arm] = _provider_failure_measurement(
                                 fixture,
                                 arm,
-                                fixture_elapsed_seconds=setup_elapsed,
+                                fixture_elapsed_seconds=setup_finished - setup_started,
                                 failure_class="native_runtime",
+                                run_started=run_started,
+                                fixture_started=setup_started,
+                                fixture_finished=setup_finished,
                             )
                         else:
                             pair[arm] = result
@@ -1714,6 +2134,7 @@ async def run_verifier_repair_pilot(
     source = _source_identity(config.source_sha)
     image = _image_identity(config.image_id)
     measurements: list[VerifierMeasurement] = []
+    run_started = time.monotonic()
     runtime: dict[str, dict[str, object]] = {
         arm.id: {
             "model": _VERIFIER_MODEL,
@@ -1721,9 +2142,9 @@ async def run_verifier_repair_pilot(
             "status": "pending",
             "failure_class": None,
             "spans": {
-                "startup": {"status": "not_run", "elapsed_seconds": 0.0},
-                "model_validation": {"status": "not_run", "elapsed_seconds": 0.0},
-                "cleanup": {"status": "not_run", "elapsed_seconds": 0.0},
+                "startup": _runtime_span("not_run", run_started),
+                "model_validation": _runtime_span("not_run", run_started),
+                "cleanup": _runtime_span("not_run", run_started),
             },
         }
         for arm in VERIFIER_ARMS
@@ -1763,17 +2184,11 @@ async def run_verifier_repair_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["startup"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
+                spans["startup"] = _runtime_span("failed", run_started, started, time.monotonic())
                 row["status"] = "failed"
                 row["failure_class"] = "startup"
                 return
-            spans["startup"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
+            spans["startup"] = _runtime_span("completed", run_started, started, time.monotonic())
             validated = time.monotonic()
             try:
                 descriptor = await asyncio.wait_for(
@@ -1791,17 +2206,15 @@ async def run_verifier_repair_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["model_validation"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - validated, 3),
-                }
+                spans["model_validation"] = _runtime_span(
+                    "failed", run_started, validated, time.monotonic()
+                )
                 row["status"] = "failed"
                 row["failure_class"] = "model_validation"
                 return
-            spans["model_validation"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - validated, 3),
-            }
+            spans["model_validation"] = _runtime_span(
+                "completed", run_started, validated, time.monotonic()
+            )
             row["status"] = "ready"
 
         async def close_arm(arm: VerifierArm) -> None:
@@ -1817,17 +2230,11 @@ async def run_verifier_repair_pilot(
             except asyncio.CancelledError:
                 raise
             except (CodexAppError, OSError, TimeoutError, RuntimeError, TypeError, ValueError):
-                spans["cleanup"] = {
-                    "status": "failed",
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
+                spans["cleanup"] = _runtime_span("failed", run_started, started, time.monotonic())
                 row["status"] = "failed"
                 row["failure_class"] = row["failure_class"] or "cleanup"
                 return
-            spans["cleanup"] = {
-                "status": "completed",
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
+            spans["cleanup"] = _runtime_span("completed", run_started, started, time.monotonic())
             if row["status"] == "ready":
                 row["status"] = "completed"
 
@@ -1841,7 +2248,7 @@ async def run_verifier_repair_pilot(
                 expected = oracle_answer(key, fixture.id)
                 material = fixture.material(expected)
                 prompt = _verifier_prompt(fixture)
-                prepared: dict[VerifierArm, tuple[Path, float]] = {}
+                prepared: dict[VerifierArm, tuple[Path, float, float]] = {}
                 pair: dict[VerifierArm, VerifierMeasurement] = {}
                 for arm in VERIFIER_ARMS:
                     setup_started = time.monotonic()
@@ -1852,20 +2259,26 @@ async def run_verifier_repair_pilot(
                         artifact.write_bytes(material)
                         artifact.chmod(0o600)
                     except OSError:
+                        setup_finished = time.monotonic()
                         pair[arm] = _failed_verifier_measurement(
                             fixture,
                             arm,
-                            fixture_elapsed_seconds=time.monotonic() - setup_started,
+                            fixture_elapsed_seconds=setup_finished - setup_started,
                             failure_class="fixture_setup",
+                            run_started=run_started,
+                            fixture_started=setup_started,
+                            fixture_finished=setup_finished,
                         )
                         continue
-                    prepared[arm] = (workspace, time.monotonic() - setup_started)
+                    setup_finished = time.monotonic()
+                    prepared[arm] = (workspace, setup_started, setup_finished)
 
                 tasks: dict[VerifierArm, asyncio.Task[VerifierMeasurement]] = {}
                 for arm in VERIFIER_ARMS:
                     if arm in pair:
                         continue
-                    workspace, setup_elapsed = prepared[arm]
+                    workspace, setup_started, setup_finished = prepared[arm]
+                    setup_elapsed = setup_finished - setup_started
                     client = clients.get(arm)
                     failure = runtime[arm.id]["failure_class"]
                     if client is None or runtime[arm.id]["status"] != "ready":
@@ -1874,6 +2287,9 @@ async def run_verifier_repair_pilot(
                             arm,
                             fixture_elapsed_seconds=setup_elapsed,
                             failure_class=str(failure or "startup"),
+                            run_started=run_started,
+                            fixture_started=setup_started,
+                            fixture_finished=setup_finished,
                         )
                         continue
                     tasks[arm] = asyncio.create_task(
@@ -1886,6 +2302,9 @@ async def run_verifier_repair_pilot(
                             expected,
                             config.max_workspace_bytes,
                             setup_elapsed,
+                            run_started,
+                            setup_started,
+                            setup_finished,
                         )
                     )
                 if tasks:
@@ -1894,12 +2313,15 @@ async def run_verifier_repair_pilot(
                         if isinstance(result, asyncio.CancelledError):
                             raise result
                         if isinstance(result, BaseException):
-                            _, setup_elapsed = prepared[arm]
+                            _, setup_started, setup_finished = prepared[arm]
                             pair[arm] = _failed_verifier_measurement(
                                 fixture,
                                 arm,
-                                fixture_elapsed_seconds=setup_elapsed,
+                                fixture_elapsed_seconds=setup_finished - setup_started,
                                 failure_class="native_runtime",
+                                run_started=run_started,
+                                fixture_started=setup_started,
+                                fixture_finished=setup_finished,
                             )
                         else:
                             pair[arm] = result
