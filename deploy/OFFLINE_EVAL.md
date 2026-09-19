@@ -14,7 +14,13 @@ It copies only the H24 runner, benign soak runner, and committed preregistration
 fixed Python argv for each evaluation container.
 
 Before execution, publish/register the exact protocol ID, clean source SHA, immutable wrapper
-reference, image ID, OCI revision and source label. The supervisor rejects a mismatch. Descriptor
+reference, image ID, `linux/amd64` or `linux/arm64` platform, OCI revision and source label. The
+supervisor compares Docker's inspected OS and architecture and rejects a mismatch. Labels alone are
+not source proof: a fixed, never-started, networkless probe container receives no host mounts. The
+supervisor copies its installed Rapido package and three evaluation artifacts into a private
+temporary directory, rejects links or any missing/extra/changed Python source, byte-compares the
+artifacts with the validated clean repository, then removes the exact probe and its anonymous
+volumes in `finally`. Image-provided code is never executed during this check. Descriptor
 preflight is a separate fixed-argv mode: it mounts no seed/oracle, requests only the frozen
 Daybreak/xhigh catalogue descriptors, and emits an allowlisted receipt. The H24 runner must expose
 `--descriptor-preflight` and `--output-file`; these are the intentionally narrow integration seam.
@@ -52,6 +58,11 @@ window. Workers may drain naturally for 180 seconds; only containers still runni
 receive an immediate stop. The remaining outer grace covers inspection, logs, exact-name removal,
 private cleanup, and evidence persistence. Both exit codes, private receipts, failures and raw logs
 are retained. Container absence and auth preservation are verified.
+
+The scoring, worker-drain and outer-cleanup cutoffs are all derived once from the registered common
+barrier. A late sampling wake consumes the existing cleanup grace; it cannot move any cutoff.
+Docker sampling, inspection, stop, log and removal calls receive only the time remaining before the
+applicable absolute cutoff. Cleanup offset remains exactly 19,800,000 milliseconds.
 
 Before fresh work or seed deletion, the supervisor assembles, privacy-scans, evaluates and durably
 persists a sanitized provisional envelope. Assembly, privacy or persistence failure preserves both

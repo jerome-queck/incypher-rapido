@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import sys
 from dataclasses import replace
@@ -204,6 +205,7 @@ def test_loader_uses_frozen_preregistration_and_external_registration(tmp_path: 
     assert protocol.source_tree_sha == TREE_SHA
     assert protocol.image_reference == IMAGE_ID
     assert protocol.image_id == IMAGE_ID
+    assert protocol.image_platform == "linux/arm64"
     assert protocol.scoring_seconds == 19_800
     assert protocol.h24 == SUPERVISOR.Resources(10, 20, 256)
     assert protocol.soak == SUPERVISOR.Resources(1, 2, 64)
@@ -337,6 +339,8 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
             json.dumps(
                 {
                     "Id": IMAGE_ID,
+                    "Os": "linux",
+                    "Architecture": "arm64",
                     "Config": {
                         "Labels": {
                             "org.opencontainers.image.revision": SOURCE_SHA,
@@ -356,6 +360,96 @@ def test_image_requires_id_and_both_revision_labels(tmp_path: Path) -> None:
 
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
         SUPERVISOR.inspect_image(protocol, wrong)
+
+    def wrong_platform(argv: Any, *, timeout: float | None = None) -> Any:
+        value = json.loads(runner(argv, timeout=timeout).stdout)
+        value["Architecture"] = "amd64"
+        return SUPERVISOR.CommandResult(0, json.dumps(value))
+
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_identity"):
+        SUPERVISOR.inspect_image(protocol, wrong_platform)
+
+
+def test_image_source_probe_rejects_mismatched_base_and_always_removes(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+
+    class SourceProbeFake:
+        def __init__(self, *, mutate: bool = False, remove_fails: bool = False) -> None:
+            self.mutate = mutate
+            self.remove_fails = remove_fails
+            self.existing = False
+            self.commands: list[tuple[str, ...]] = []
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            del timeout
+            command = tuple(argv)
+            self.commands.append(command)
+            if command[:3] == ("docker", "ps", "--all"):
+                return SUPERVISOR.CommandResult(
+                    0,
+                    f"{SUPERVISOR._SOURCE_PROBE_NAME}\n" if self.existing else "",
+                )
+            if command[:2] == ("docker", "create"):
+                self.existing = True
+                return SUPERVISOR.CommandResult(0, "probe-id\n")
+            if command[:2] == ("docker", "cp"):
+                source = command[2]
+                destination = Path(command[3])
+                if source.endswith(SUPERVISOR._INSTALLED_RAPIDO):
+                    shutil.copytree(ROOT / "rapido", destination)
+                    if self.mutate:
+                        target = min(destination.rglob("*.py"))
+                        target.write_bytes(target.read_bytes() + b"\n# drift\n")
+                else:
+                    shutil.copy2(
+                        ROOT / SUPERVISOR._WRAPPER_SOURCES[Path(source).name],
+                        destination,
+                    )
+                return SUPERVISOR.CommandResult(0, "")
+            if command[:3] == ("docker", "rm", "--volumes"):
+                if self.remove_fails:
+                    return SUPERVISOR.CommandResult(1, "")
+                self.existing = False
+                return SUPERVISOR.CommandResult(0, "")
+            raise AssertionError(command)
+
+    matching = SourceProbeFake()
+    SUPERVISOR.verify_image_source(
+        protocol,
+        ROOT,
+        paths.output,
+        matching,
+    )
+    create = next(command for command in matching.commands if command[:2] == ("docker", "create"))
+    assert create[create.index("--name") + 1] == SUPERVISOR._SOURCE_PROBE_NAME
+    assert create[create.index("--network") + 1] == "none"
+    assert "--mount" not in create and "--volume" not in create and "-v" not in create
+    assert not any(command[:2] == ("docker", "start") for command in matching.commands)
+    assert matching.existing is False
+
+    mismatched = SourceProbeFake(mutate=True)
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_mismatch"):
+        SUPERVISOR.verify_image_source(
+            protocol,
+            ROOT,
+            paths.output,
+            mismatched,
+        )
+    assert mismatched.existing is False
+    assert any(command[:3] == ("docker", "rm", "--volumes") for command in mismatched.commands)
+
+    removal_failure = SourceProbeFake(remove_fails=True)
+    with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_probe_cleanup"):
+        SUPERVISOR.verify_image_source(
+            protocol,
+            ROOT,
+            paths.output,
+            removal_failure,
+        )
+    assert not any(path.name.startswith(".rapido-image-source-") for path in paths.output.iterdir())
 
 
 def test_host_budget_enforces_registered_envelope() -> None:
@@ -433,6 +527,73 @@ def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Pa
         )
         == 1
     )
+
+
+def test_late_sampling_consumes_registered_cleanup_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+    clock = FakeClock()
+    offsets: list[int] = []
+    blocking_calls: list[tuple[tuple[str, ...], float, float]] = []
+
+    class SlowDockerFake(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            if (
+                command[:2] in {("docker", "stats"), ("docker", "stop"), ("docker", "logs")}
+                or command[:3] == ("docker", "container", "inspect")
+                or command[:2] == ("docker", "rm")
+            ):
+                assert timeout is not None and timeout > 0
+                blocking_calls.append((command, clock.monotonic(), timeout))
+            if command[:2] == ("docker", "stats") or command[:3] == (
+                "docker",
+                "container",
+                "inspect",
+            ):
+                clock.sleep(30)
+            return super().__call__(command, timeout=timeout)
+
+    def finalize(*args: object, **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        del args
+        offsets.append(int(kwargs["cleanup_started_offset_milliseconds"]))
+        for name, schema in (
+            (SUPERVISOR.FINAL_RECEIPT, SUPERVISOR.EVALUATION_RECEIPT_SCHEMA),
+            (SUPERVISOR.EVALUATION_RESULT, "rapido-offline-h24-evaluation-v1"),
+        ):
+            path = paths.output / name
+            path.write_text(json.dumps({"schema": schema}))
+            path.chmod(0o600)
+        return {}, {}
+
+    monkeypatch.setattr(SUPERVISOR, "finalize_evaluation", finalize)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=SlowDockerFake(paths.output, keep_soak_running=True, clock=clock),
+        clock=clock,
+    )
+
+    registered_outer_deadline = 1_000 + 30 + 19_800 + 190
+    scoring_deadline = 1_000 + 30 + 19_800
+    worker_drain_deadline = scoring_deadline + 180
+    assert clock.monotonic() >= registered_outer_deadline
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "cleanup_timeout"
+    assert offsets and set(offsets) == {19_800_000}
+    assert blocking_calls
+    for command, started, timeout in blocking_calls:
+        if command[:2] == ("docker", "stats") or started < scoring_deadline:
+            deadline = scoring_deadline
+        elif command[:3] == ("docker", "container", "inspect") and started < worker_drain_deadline:
+            deadline = worker_drain_deadline
+        else:
+            deadline = registered_outer_deadline
+        assert started + timeout <= deadline
+    assert any(timeout < 30 for _, _, timeout in blocking_calls)
 
 
 def test_oom_and_child_failures_are_retained_not_dropped(tmp_path: Path) -> None:

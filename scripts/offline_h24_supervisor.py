@@ -18,6 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -69,7 +70,16 @@ _FORBIDDEN_ENV = frozenset(
 _CAPABILITY_FILES = frozenset({"config.toml", "config.json", "mcp.json"})
 _H24_NAME = "rapido-h24-eval"
 _SOAK_NAME = "rapido-h24-soak"
+_SOURCE_PROBE_NAME = "rapido-h24-source-probe"
 _ORACLE_ID = "rapido-offline-h24-oracle-v1"
+_INSTALLED_RAPIDO = "/opt/venv/lib/python3.12/site-packages/rapido"
+_WRAPPER_SOURCES = {
+    "offline_oracle_pilot.py": Path("scripts/offline_oracle_pilot.py"),
+    "board_contract_soak.py": Path("scripts/board_contract_soak.py"),
+    "offline-h24-preregistration-v1.json": Path(
+        "notes/research/offline-h24-preregistration-v1.json"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -103,13 +113,16 @@ class SystemClock:
 
 
 def subprocess_runner(argv: Sequence[str], *, timeout: float | None = None) -> CommandResult:
-    completed = subprocess.run(
-        list(argv),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        completed = subprocess.run(
+            list(argv),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return CommandResult(124)
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 
@@ -128,6 +141,7 @@ class Protocol:
     image_reference: str
     image_id: str
     image_revision: str
+    image_platform: str
     scoring_seconds: int
     barrier_delay_seconds: int
     h24_name: str
@@ -158,6 +172,7 @@ class ImageIdentity:
     reference: str
     revision: str
     source_revision: str
+    platform: str
 
 
 @dataclass
@@ -261,6 +276,7 @@ def load_protocol(path: Path) -> Protocol:
         image_reference="",
         image_id="",
         image_revision="",
+        image_platform="",
         scoring_seconds=_exact_int(
             row.get("global_scoring_seconds"), SCORING_SECONDS, "preregistration_invalid"
         ),
@@ -292,6 +308,10 @@ def bind_registration(path: Path, protocol: Protocol) -> Protocol:
     source_sha = _string(source.get("commit_sha"), _SHA, "registration_invalid")
     source_tree = _string(source.get("tree_sha"), _SHA, "registration_invalid")
     image_id = _string(image.get("id"), _IMAGE_ID, "registration_invalid")
+    image_platform = image.get("platform")
+    if image_platform not in {"linux/amd64", "linux/arm64"}:
+        raise SupervisorError("registration_invalid")
+    assert isinstance(image_platform, str)
     return replace(
         protocol,
         source_sha=source_sha,
@@ -299,6 +319,7 @@ def bind_registration(path: Path, protocol: Protocol) -> Protocol:
         image_reference=image_id,
         image_id=image_id,
         image_revision=source_sha,
+        image_platform=image_platform,
         registration=dict(validated),
     )
 
@@ -362,19 +383,136 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     except json.JSONDecodeError as exc:
         raise SupervisorError("image_identity") from exc
     labels = _mapping(_mapping(row.get("Config"), "image_identity").get("Labels"), "image_identity")
+    image_os = row.get("Os")
+    architecture = row.get("Architecture")
+    if image_os != "linux" or architecture not in {"amd64", "arm64"}:
+        raise SupervisorError("image_identity")
+    assert isinstance(architecture, str)
     identity = ImageIdentity(
         _string(row.get("Id"), _IMAGE_ID, "image_identity"),
         protocol.image_reference,
         _string(labels.get("org.opencontainers.image.revision"), _SHA, "image_identity"),
         _string(labels.get("io.incypher.rapido.source-revision"), _SHA, "image_identity"),
+        f"{image_os}/{architecture}",
     )
     if (
         identity.image_id != protocol.image_id
         or identity.revision != protocol.image_revision
         or identity.source_revision != protocol.source_sha
+        or identity.platform != protocol.image_platform
     ):
         raise SupervisorError("image_identity")
     return identity
+
+
+def _regular_python_sources(root: Path) -> dict[str, bytes]:
+    sources: dict[str, bytes] = {}
+    stack = [root]
+    try:
+        root_metadata = root.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+            raise SupervisorError("image_source_mismatch")
+        while stack:
+            current = stack.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    metadata = entry.stat(follow_symlinks=False)
+                    path = Path(entry.path)
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise SupervisorError("image_source_mismatch")
+                    if stat.S_ISDIR(metadata.st_mode):
+                        stack.append(path)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise SupervisorError("image_source_mismatch")
+                    if path.suffix == ".py":
+                        sources[path.relative_to(root).as_posix()] = path.read_bytes()
+    except OSError as exc:
+        raise SupervisorError("image_source_mismatch") from exc
+    return sources
+
+
+def verify_image_source(
+    protocol: Protocol,
+    repository: Path,
+    output: Path,
+    runner: Runner,
+) -> None:
+    """Compare installed image sources without executing image-provided code."""
+    ownership_confirmed = False
+    cleanup_failed = False
+    probe_root = Path(tempfile.mkdtemp(prefix=".rapido-image-source-", dir=output))
+    probe_root.chmod(0o700)
+    try:
+        if not _container_absent(_SOURCE_PROBE_NAME, runner):
+            raise SupervisorError("image_source_probe_in_use")
+        ownership_confirmed = True
+        _run(
+            runner,
+            (
+                "docker",
+                "create",
+                "--name",
+                _SOURCE_PROBE_NAME,
+                "--network",
+                "none",
+                "--read-only",
+                "--entrypoint",
+                "/bin/false",
+                protocol.image_reference,
+            ),
+            "image_source_probe_create",
+            timeout=120,
+        )
+        installed = probe_root / "rapido"
+        _run(
+            runner,
+            ("docker", "cp", f"{_SOURCE_PROBE_NAME}:{_INSTALLED_RAPIDO}", str(installed)),
+            "image_source_probe_copy",
+            timeout=120,
+        )
+        wrapper = probe_root / "wrapper"
+        wrapper.mkdir(mode=0o700)
+        for name in _WRAPPER_SOURCES:
+            _run(
+                runner,
+                (
+                    "docker",
+                    "cp",
+                    f"{_SOURCE_PROBE_NAME}:/opt/rapido-eval/{name}",
+                    str(wrapper / name),
+                ),
+                "image_source_probe_copy",
+                timeout=30,
+            )
+        if _regular_python_sources(installed) != _regular_python_sources(repository / "rapido"):
+            raise SupervisorError("image_source_mismatch")
+        for name, relative in _WRAPPER_SOURCES.items():
+            copied = wrapper / name
+            metadata = copied.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or copied.read_bytes() != (repository / relative).read_bytes()
+            ):
+                raise SupervisorError("image_source_mismatch")
+    except OSError as exc:
+        raise SupervisorError("image_source_mismatch") from exc
+    finally:
+        if ownership_confirmed:
+            try:
+                if not _container_absent(_SOURCE_PROBE_NAME, runner):
+                    result = runner(("docker", "rm", "--volumes", _SOURCE_PROBE_NAME), timeout=30)
+                    cleanup_failed = result.returncode != 0
+                cleanup_failed = cleanup_failed or not _container_absent(_SOURCE_PROBE_NAME, runner)
+            except SupervisorError:
+                cleanup_failed = True
+        try:
+            shutil.rmtree(probe_root)
+        except OSError:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise SupervisorError("image_source_probe_cleanup")
 
 
 def validate_host_budget(runner: Runner) -> None:
@@ -650,7 +788,7 @@ def soak_create_argv(
     return tuple(argv)
 
 
-def _container_absent(name: str, runner: Runner) -> bool:
+def _container_absent(name: str, runner: Runner, *, timeout: float = 30) -> bool:
     result = runner(
         (
             "docker",
@@ -660,7 +798,7 @@ def _container_absent(name: str, runner: Runner) -> bool:
             f"name=^/{name}$",
             "--format={{.Names}}",
         ),
-        timeout=30,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise SupervisorError("docker_inventory")
@@ -668,7 +806,12 @@ def _container_absent(name: str, runner: Runner) -> bool:
 
 
 def _validate_container_absence(protocol: Protocol, runner: Runner) -> None:
-    for name in (protocol.h24_name, protocol.soak_name, f"{protocol.h24_name}-descriptor"):
+    for name in (
+        protocol.h24_name,
+        protocol.soak_name,
+        f"{protocol.h24_name}-descriptor",
+        _SOURCE_PROBE_NAME,
+    ):
         if not _container_absent(name, runner):
             raise SupervisorError("container_name_in_use")
 
@@ -717,7 +860,7 @@ def auth_lease(auth: Path) -> Iterator[None]:
             path.unlink()
 
 
-def _container_state(name: str, runner: Runner) -> dict[str, object]:
+def _container_state(name: str, runner: Runner, *, timeout: float = 30) -> dict[str, object]:
     result = _run(
         runner,
         (
@@ -728,6 +871,7 @@ def _container_state(name: str, runner: Runner) -> dict[str, object]:
             name,
         ),
         "container_inspect",
+        timeout=timeout,
     )
     try:
         row = _mapping(json.loads(result.stdout), "container_inspect")
@@ -736,7 +880,13 @@ def _container_state(name: str, runner: Runner) -> dict[str, object]:
     return dict(row)
 
 
-def _sample(names: Sequence[str], runner: Runner, peaks: Mapping[str, ResourcePeak]) -> None:
+def _sample(
+    names: Sequence[str],
+    runner: Runner,
+    peaks: Mapping[str, ResourcePeak],
+    *,
+    timeout: float = 30,
+) -> None:
     if not names:
         return
     result = runner(
@@ -747,7 +897,7 @@ def _sample(names: Sequence[str], runner: Runner, peaks: Mapping[str, ResourcePe
             "--format={{json .}}",
             *names,
         ),
-        timeout=30,
+        timeout=timeout,
     )
     if result.returncode != 0:
         return
@@ -822,8 +972,10 @@ def _atomic_private_write(path: Path, data: str) -> None:
             temporary.unlink()
 
 
-def _retain_logs(name: str, role: str, output: Path, runner: Runner) -> None:
-    result = runner(("docker", "logs", name), timeout=30)
+def _retain_logs(
+    name: str, role: str, output: Path, runner: Runner, *, timeout: float = 30
+) -> None:
+    result = runner(("docker", "logs", name), timeout=timeout)
     _atomic_private_write(
         output / f"{role}.docker.log",
         result.stdout + ("\n[stderr]\n" + result.stderr if result.stderr else ""),
@@ -992,9 +1144,32 @@ def finalize_evaluation(
     return final, evaluation
 
 
-def _remove_container(name: str, runner: Runner, state: EvaluationState) -> None:
-    result = runner(("docker", "rm", name), timeout=30)
-    if result.returncode == 0 or _container_absent(name, runner):
+def _remaining_timeout(clock: Clock, deadline: float, maximum: float = 30) -> float | None:
+    remaining = deadline - clock.monotonic()
+    return min(maximum, remaining) if remaining > 0 else None
+
+
+def _remove_container(
+    name: str,
+    runner: Runner,
+    state: EvaluationState,
+    *,
+    clock: Clock | None = None,
+    deadline: float | None = None,
+) -> None:
+    timeout = (
+        _remaining_timeout(clock, deadline) if clock is not None and deadline is not None else 30
+    )
+    if timeout is None:
+        raise SupervisorError("cleanup_timeout")
+    result = runner(("docker", "rm", name), timeout=timeout)
+    if result.returncode == 0:
+        state.removed.add(name)
+        return
+    timeout = (
+        _remaining_timeout(clock, deadline) if clock is not None and deadline is not None else 30
+    )
+    if timeout is not None and _container_absent(name, runner, timeout=timeout):
         state.removed.add(name)
         return
     raise SupervisorError("container_remove")
@@ -1051,6 +1226,7 @@ def _public_receipt(
             "image_reference": protocol.image_reference,
             "image_id": protocol.image_id,
             "image_revision": protocol.image_revision,
+            "image_platform": protocol.image_platform,
             "external_registration_validated": True,
             "common_start_barrier": True,
             "scoring_seconds": protocol.scoring_seconds,
@@ -1107,7 +1283,10 @@ def run_evaluation(
     failure_class: str | None = None
     started_at = clock.monotonic()
     barrier_mono: float | None = None
+    scoring_deadline_mono: float | None = None
     cleanup_started_mono: float | None = None
+    worker_drain_deadline_mono: float | None = None
+    cleanup_deadline_mono: float | None = None
     cleanup_finished_mono: float | None = None
     running: set[str] = set()
     cleanup = {
@@ -1136,6 +1315,8 @@ def run_evaluation(
                 barrier_wall_milliseconds / 1000 - barrier_origin_wall
             )
             scoring_deadline_mono = barrier_mono + protocol.scoring_seconds
+            worker_drain_deadline_mono = scoring_deadline_mono + WORKER_DRAIN_SECONDS
+            cleanup_deadline_mono = scoring_deadline_mono + CLEANUP_SECONDS
             deadline_wall_milliseconds = barrier_wall_milliseconds + protocol.scoring_seconds * 1000
             barrier_receipt = {
                 "start_wall_epoch_milliseconds": barrier_wall_milliseconds,
@@ -1180,61 +1361,101 @@ def run_evaluation(
             running = {protocol.h24_name, protocol.soak_name}
             while clock.monotonic() < scoring_deadline_mono:
                 if running:
-                    _sample(sorted(running), runner, peaks)
+                    timeout = _remaining_timeout(clock, scoring_deadline_mono)
+                    if timeout is None:
+                        break
+                    _sample(sorted(running), runner, peaks, timeout=timeout)
                     for name in tuple(running):
-                        container = _container_state(name, runner)
+                        timeout = _remaining_timeout(clock, scoring_deadline_mono)
+                        if timeout is None:
+                            break
+                        container = _container_state(name, runner, timeout=timeout)
                         if container.get("Running") is not True:
                             running.remove(name)
                 remaining = scoring_deadline_mono - clock.monotonic()
                 if remaining > 0:
                     clock.sleep(min(SAMPLE_SECONDS, remaining) if running else remaining)
 
-            cleanup_started_mono = clock.monotonic()
-            cleanup_deadline_mono = cleanup_started_mono + CLEANUP_SECONDS
-            worker_drain_deadline_mono = cleanup_started_mono + WORKER_DRAIN_SECONDS
+            cleanup_started_mono = scoring_deadline_mono
             # The registered outer grace reserves its final ten seconds for
             # forced stop, inspection, removal, and evidence persistence.
             while running and clock.monotonic() < worker_drain_deadline_mono:
                 for name in tuple(running):
-                    container = _container_state(name, runner)
+                    timeout = _remaining_timeout(clock, worker_drain_deadline_mono)
+                    if timeout is None:
+                        break
+                    container = _container_state(name, runner, timeout=timeout)
                     if container.get("Running") is not True:
                         running.remove(name)
                 remaining = worker_drain_deadline_mono - clock.monotonic()
                 if running and remaining > 0:
                     clock.sleep(min(SAMPLE_SECONDS, remaining))
             if running:
+                timeout = _remaining_timeout(clock, cleanup_deadline_mono)
+                if timeout is None:
+                    raise SupervisorError("cleanup_timeout")
                 _run(
                     runner,
                     ("docker", "stop", "--time", "0", *sorted(running)),
                     "container_stop",
-                    timeout=30,
+                    timeout=timeout,
                 )
                 state.stopped.update(running)
                 running.clear()
 
             for role, name in (("h24", protocol.h24_name), ("soak", protocol.soak_name)):
-                container = _container_state(name, runner)
+                timeout = _remaining_timeout(clock, cleanup_deadline_mono)
+                if timeout is None:
+                    raise SupervisorError("cleanup_timeout")
+                container = _container_state(name, runner, timeout=timeout)
                 exits[role] = _integer(container.get("ExitCode"))
                 peaks[name].oom_killed = (
                     container.get("OOMKilled") if type(container.get("OOMKilled")) is bool else None
                 )
-                _retain_logs(name, role, paths.output, runner)
+                timeout = _remaining_timeout(clock, cleanup_deadline_mono)
+                if timeout is None:
+                    raise SupervisorError("cleanup_timeout")
+                _retain_logs(name, role, paths.output, runner, timeout=timeout)
         except SupervisorError as exc:
             failure_class = exc.failure_class
         finally:
+            operation_deadline = cleanup_deadline_mono or clock.monotonic() + CLEANUP_SECONDS
             for name in sorted(state.created):
                 if name not in state.removed:
                     with contextlib.suppress(SupervisorError):
-                        if not _container_absent(name, runner):
-                            container = _container_state(name, runner)
+                        timeout = _remaining_timeout(clock, operation_deadline)
+                        if timeout is None:
+                            break
+                        if not _container_absent(name, runner, timeout=timeout):
+                            timeout = _remaining_timeout(clock, operation_deadline)
+                            if timeout is None:
+                                break
+                            container = _container_state(name, runner, timeout=timeout)
                             if container.get("Running") is True:
-                                result = runner(("docker", "stop", "--time", "0", name), timeout=30)
+                                timeout = _remaining_timeout(clock, operation_deadline)
+                                if timeout is None:
+                                    break
+                                result = runner(
+                                    ("docker", "stop", "--time", "0", name), timeout=timeout
+                                )
                                 if result.returncode == 0:
                                     state.stopped.add(name)
-                        _remove_container(name, runner, state)
-            cleanup["containers_absent"] = all(
-                _container_absent(name, runner) for name in (protocol.h24_name, protocol.soak_name)
-            )
+                        _remove_container(
+                            name,
+                            runner,
+                            state,
+                            clock=clock,
+                            deadline=operation_deadline,
+                        )
+            absent: list[bool] = []
+            for name in (protocol.h24_name, protocol.soak_name):
+                timeout = _remaining_timeout(clock, operation_deadline)
+                if timeout is None:
+                    absent.append(False)
+                    continue
+                with contextlib.suppress(SupervisorError):
+                    absent.append(_container_absent(name, runner, timeout=timeout))
+            cleanup["containers_absent"] = len(absent) == 2 and all(absent)
             cleanup["no_orphan_containers"] = cleanup["containers_absent"]
             cleanup["auth_preserved"] = paths.auth.is_dir() and (paths.auth / "auth.json").is_file()
 
@@ -1245,9 +1466,14 @@ def run_evaluation(
     cleanup["private_receipts_preserved"] = all(row["present"] for row in receipts.values())
     if finalize:
         try:
-            if barrier_mono is None or cleanup_started_mono is None:
+            if (
+                barrier_mono is None
+                or scoring_deadline_mono is None
+                or cleanup_started_mono is None
+                or cleanup_deadline_mono is None
+            ):
                 raise SupervisorError("evaluation_assembly")
-            cleanup_start_offset = max(0, int((cleanup_started_mono - barrier_mono) * 1000))
+            cleanup_start_offset = protocol.scoring_seconds * 1000
             # Persist and validate a sanitized provisional envelope before
             # deleting its private source material. Failed assembly or privacy
             # checks therefore leave the inputs intact for diagnosis.
@@ -1319,10 +1545,7 @@ def run_evaluation(
         cleanup["work_removed"] = not paths.work.exists()
         cleanup["seed_removed"] = not paths.seed.exists()
         cleanup_finished_mono = clock.monotonic()
-    if (
-        cleanup_started_mono is not None
-        and cleanup_finished_mono > cleanup_started_mono + CLEANUP_SECONDS
-    ):
+    if cleanup_deadline_mono is not None and cleanup_finished_mono > cleanup_deadline_mono:
         failure_class = failure_class or "cleanup_timeout"
     receipts["final"] = _receipt_projection(paths.output / FINAL_RECEIPT)
     receipts["evaluation"] = _receipt_projection(paths.output / EVALUATION_RESULT)
@@ -1460,6 +1683,7 @@ def main() -> int:
         subprocess_runner,
     )
     inspect_image(protocol, subprocess_runner)
+    verify_image_source(protocol, paths.repository, paths.output, subprocess_runner)
     validate_host_budget(subprocess_runner)
     if arguments.mode == "descriptor-preflight":
         receipt = run_descriptor_preflight(protocol, paths)
