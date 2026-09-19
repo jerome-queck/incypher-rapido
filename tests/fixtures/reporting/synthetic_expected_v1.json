@@ -1,0 +1,89 @@
+{
+  "archive": {
+    "attempt_count": 4,
+    "attempt_job_join_count": 4,
+    "current_verification_view_policy": "rapido-current-verification-view-5d17fab-v1",
+    "evidence_item_count": 3,
+    "evidence_object_count": 2,
+    "native_usage": null,
+    "proof_backed_proposal_attempt_count": 4,
+    "submission_intent_join_count": 42,
+    "timing": {
+      "average_active_lanes": 1.416667,
+      "clipped_attempt_count": 2,
+      "concurrent_lane_seconds": 25.0,
+      "elapsed_seconds": 60.0,
+      "lane_seconds": 85.0,
+      "semantics": "lane intervals clipped to one run t0/tf; overlaps remain additive",
+      "wall_active_seconds": 60.0
+    }
+  },
+  "interpretation": {
+    "already_solved_upgrades_correctness": false,
+    "axes_are_independent": true,
+    "evidence_items_equal_distinct_objects": false,
+    "proof_backed_proposals_depend_on_attempt_candidate_column": false,
+    "runtime_qualification_equals_external_validation": false
+  },
+  "metrics": {
+    "already_solved_history": {
+      "axis": "account_history",
+      "policy_version": "rapido-board-outcomes-v1",
+      "source": "submission_outcome_already_solved",
+      "unit": "submission_identity",
+      "value": 42
+    },
+    "board_new_correct": {
+      "axis": "board_current_run_correctness",
+      "policy_version": "rapido-board-outcomes-v1",
+      "source": "submission_outcome_correct",
+      "unit": "task",
+      "value": 0
+    },
+    "postrun_correctness": {
+      "axis": "retrospective_correctness",
+      "denominator": 15,
+      "policy_version": "policy.synthetic_accepted_grade.v1",
+      "source": "external_row_level_evaluation",
+      "unit": "task",
+      "value": 15
+    },
+    "postrun_correctness_qualification_matrix": {
+      "correct": {
+        "not_qualified": 5,
+        "qualified": 5,
+        "unknown": 5
+      },
+      "incorrect": {
+        "not_qualified": 0,
+        "qualified": 0,
+        "unknown": 0
+      },
+      "unverifiable": {
+        "not_qualified": 0,
+        "qualified": 0,
+        "unknown": 0
+      }
+    },
+    "runtime_current_verification": {
+      "axis": "runtime_qualification",
+      "policy_version": "rapido-runtime-current-verification-v1",
+      "source": "current_candidate_verifications",
+      "unit": "task",
+      "value": 2
+    },
+    "strict_evaluator": {
+      "axis": "external_evaluator_validation",
+      "denominator": 2,
+      "exclusion_reasons": {
+        "rule.synthetic_policy_scope_excluded.v1": 2
+      },
+      "policy_version": "policy.synthetic_strict_evaluator.v1",
+      "source": "external_per_runtime_identity_decisions",
+      "unit": "task",
+      "value": 0
+    }
+  },
+  "policy_version": "rapido-accounting-policy-v1",
+  "schema": "rapido-reconciled-report-v1"
+}
