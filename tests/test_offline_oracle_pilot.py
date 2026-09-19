@@ -583,13 +583,14 @@ def test_fake_pilot_uses_isolated_concurrent_processes_and_sanitizes_receipt(
 
     assert receipt["source"] == {
         "observed": {
-            "head_sha": "c" * 40,
-            "worktree": "dirty",
-            "tracked_change_count": 1,
-            "untracked_file_count": 1,
+            "head_sha": "a" * 40,
+            "worktree": "packaged_source",
+            "tracked_change_count": None,
+            "untracked_file_count": None,
         },
         "declared": {"sha": "a" * 40},
-        "declared_matches_head": False,
+        "declared_matches_head": True,
+        "identity_basis": "supplied_full_sha",
     }
     assert receipt["image"] == {
         "observed": {"id": "sha256:" + "d" * 64},
