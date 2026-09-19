@@ -52,17 +52,126 @@ _SAFE_NATIVE_ENV = {
     "HOME": ".",
     "TMPDIR": ".",
 }
+_ERROR_DETAIL_STAGES = frozenset({"arguments", "execution", "result"})
+_ERROR_DETAIL_KINDS = frozenset(
+    {"array", "boolean", "bytes", "integer", "missing", "null", "object", "other", "string"}
+)
+_ERROR_DETAIL_FIELDS = frozenset({"arguments", "cursor", "path", "selection", "view"})
+_ERROR_DETAIL_CONSTRAINTS = frozenset(
+    [
+        "additional_properties",
+        "bounded_ascii",
+        "bounded_identifier",
+        "cursor_alignment",
+        "cursor_binding",
+        "cursor_forbidden_for_format_view",
+        "cursor_forbidden_for_selection",
+        "cursor_range",
+        "cursor_section_binding",
+        "cursor_shape",
+        "enum",
+        "forbidden",
+        "max_bytes",
+        "required_text",
+        "selection_range",
+        "selection_syntax",
+        "unicode",
+        "unsupported_for_format_view",
+        "unsupported_text_encoding",
+        "view_selection_mismatch",
+        "dependency_unavailable",
+        "input_too_large",
+        "internal_error",
+        "invalid_argument",
+        "invalid_artifact",
+        "invalid_cursor",
+        "invalid_encoding",
+        "limit_exceeded",
+        "not_a_file",
+        "output_too_large",
+        "read_failed",
+        "resource_limit",
+        "source_changed",
+        "stale_cursor",
+        "tool_cleanup_failed",
+        "tool_failed",
+        "tool_unavailable",
+        "unsupported_format",
+        "unsupported_platform",
+    ]
+)
+_ERROR_DETAIL_ALLOWED_VALUES = frozenset(
+    {
+        "bitplane:<R|G|B|A>:<0-7>",
+        "bytes",
+        "channel:<R|G|B|A>",
+        "disassembly",
+        "disassembly:0x<address>",
+        "encoding:cp1252",
+        "encoding:latin-1",
+        "encoding:utf-16-be",
+        "encoding:utf-16-le",
+        "encoding:utf-8",
+        "exports",
+        "imports",
+        "metadata",
+        "next_cursor",
+        "ocr",
+        "page:<index>",
+        "section:<index>",
+        "structure",
+        "summary",
+        "text",
+    }
+)
 
 
 class WorkerError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, details: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = _closed_error_details(details)
 
 
-def _fail(code: str, message: str) -> WorkerError:
-    return WorkerError(code, message)
+def _closed_error_details(details: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project only fixed structural diagnostics across the worker boundary."""
+    source = details if isinstance(details, Mapping) else {}
+    projected: dict[str, Any] = {}
+    if source.get("schema_version") == 1:
+        projected["schema_version"] = 1
+    if source.get("contract_version") == 1:
+        projected["contract_version"] = 1
+    stage = source.get("failure_stage")
+    if isinstance(stage, str) and stage in _ERROR_DETAIL_STAGES:
+        projected["failure_stage"] = stage
+    field_path = source.get("field_path")
+    if isinstance(field_path, str) and field_path in _ERROR_DETAIL_FIELDS:
+        projected["field_path"] = field_path
+    constraint = source.get("constraint")
+    if isinstance(constraint, str) and constraint in _ERROR_DETAIL_CONSTRAINTS:
+        projected["constraint"] = constraint
+    actual_kind = source.get("actual_kind")
+    if isinstance(actual_kind, str) and actual_kind in _ERROR_DETAIL_KINDS:
+        projected["actual_kind"] = actual_kind
+    allowed_values = source.get("allowed_values")
+    if isinstance(allowed_values, (list, tuple)) and len(allowed_values) <= 32:
+        safe = [
+            value
+            for value in allowed_values
+            if isinstance(value, str) and value in _ERROR_DETAIL_ALLOWED_VALUES
+        ]
+        if safe or not allowed_values:
+            projected["allowed_values"] = safe
+    for key in ("actual_size", "count", "limit", "size"):
+        value = source.get(key)
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            projected[key] = value
+    return projected
+
+
+def _fail(code: str, message: str, details: Mapping[str, Any] | None = None) -> WorkerError:
+    return WorkerError(code, message, details)
 
 
 def _set_limit(kind: int, soft: int, hard: int | None = None) -> None:
@@ -425,6 +534,7 @@ def _dispatch(
     assert adapter is not None
     inspector, ToolError = adapter
     try:
+        inspector._validate_format_request(base["format"], base["view"], base["selection"], cursor)
         if operation == "disassembly":
             return inspector._disassembly_view(descriptor, size, cursor, dict(base))
         function = {
@@ -436,7 +546,7 @@ def _dispatch(
         }[operation]
         return function(descriptor, size, cursor, dict(base))
     except ToolError as exc:
-        raise _fail(exc.code, exc.message) from exc
+        raise _fail(exc.code, exc.message, exc.details) from exc
 
 
 def _facts(descriptor: int) -> tuple[int, int, int, int, int]:
@@ -484,6 +594,8 @@ def main() -> int:
         error = {"code": "resource_limit", "message": "artifact worker exceeded memory limit"}
     except WorkerError as exc:
         error = {"code": exc.code, "message": exc.message}
+        if exc.details:
+            error["details"] = exc.details
     except Exception:  # noqa: BLE001 - boundary hides all parser internals
         error = {"code": "tool_failed", "message": "artifact worker failed safely"}
     try:

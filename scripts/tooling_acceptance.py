@@ -677,9 +677,7 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     if archive["format"] != "zip" or archive["data"].get("entry_count") != 1:
         raise AssertionError("artifact archive view did not inventory the inert fixture")
 
-    tar = registry.dispatch(
-        "inspect_artifact", {"path": "archive.tar", "view": "structure", "selection": "entries"}
-    )
+    tar = registry.dispatch("inspect_artifact", {"path": "archive.tar", "view": "structure"})
     checks["artifact_tar"] = _assert_result(tar, "artifact_tar", coverage=True)
     if (
         tar["format"] != "tar"
@@ -689,7 +687,7 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
         raise AssertionError("TAR worker did not inventory the inert fixture")
 
     gzip_artifact = registry.dispatch(
-        "inspect_artifact", {"path": "payload.gz", "view": "structure", "selection": "entries"}
+        "inspect_artifact", {"path": "payload.gz", "view": "structure"}
     )
     checks["artifact_gzip"] = _assert_result(gzip_artifact, "artifact_gzip", coverage=True)
     if (
@@ -710,9 +708,7 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     ):
         raise AssertionError("PDF worker did not extract the expected one-page text")
 
-    pcap = registry.dispatch(
-        "inspect_artifact", {"path": "fixture.pcap", "view": "text", "selection": "packets"}
-    )
+    pcap = registry.dispatch("inspect_artifact", {"path": "fixture.pcap", "view": "text"})
     checks["artifact_pcap"] = _assert_result(pcap, "artifact_pcap", coverage=True)
     packets = pcap.get("data", {}).get("packets", [])
     if (
@@ -724,9 +720,7 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     ):
         raise AssertionError("PCAP worker did not decode the expected TCP packet")
 
-    pcapng = registry.dispatch(
-        "inspect_artifact", {"path": "fixture.pcapng", "view": "text", "selection": "packets"}
-    )
+    pcapng = registry.dispatch("inspect_artifact", {"path": "fixture.pcapng", "view": "text"})
     checks["artifact_pcapng"] = _assert_result(pcapng, "artifact_pcapng", coverage=True)
     packet_blocks = pcapng.get("data", {}).get("packet_blocks", [])
     if (
@@ -813,9 +807,7 @@ def _operations(registry: Any, root: Path) -> dict[str, Any]:
     ):
         raise AssertionError("WAV production path did not report the expected PCM metadata")
 
-    dicom = registry.dispatch(
-        "inspect_artifact", {"path": "fixture.dcm", "view": "structure", "selection": "metadata"}
-    )
+    dicom = registry.dispatch("inspect_artifact", {"path": "fixture.dcm", "view": "structure"})
     checks["artifact_dicom"] = _assert_result(dicom, "artifact_dicom", coverage=True)
     dicom_data = dicom.get("data", {})
     if (

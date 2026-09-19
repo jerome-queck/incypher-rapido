@@ -69,6 +69,13 @@ _UTF16LE_STRING = re.compile(rb"(?:[\x20-\x7e]\x00){4,}")
 _UTF16BE_STRING = re.compile(rb"(?:\x00[\x20-\x7e]){4,}")
 _SIGNAL = re.compile(r"(?:INCYPHER|flag)\{[^{}\r\n]{1,512}\}")
 _TEXT_ENCODINGS = frozenset({"utf-8", "utf-16-le", "utf-16-be", "latin-1", "cp1252"})
+_VIEWS = ("summary", "text", "structure", "bytes")
+_IMAGE_FORMATS = frozenset({"png", "jpeg", "gif", "bmp", "tiff", "webp"})
+_PAGE_SELECTION = re.compile(r"page:-?[0-9]+\Z")
+_SECTION_SELECTION = re.compile(r"section:-?[0-9]+\Z")
+_DISASSEMBLY_SELECTION = re.compile(r"disassembly:0x[0-9A-Fa-f]{1,16}\Z")
+_CHANNEL_SELECTION = re.compile(r"channel:[RGBArgba]\Z")
+_BITPLANE_SELECTION = re.compile(r"bitplane:[RGBArgba]:[0-7]\Z")
 _IMAGE_SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", "png"),
     (b"\xff\xd8\xff", "jpeg"),
@@ -90,7 +97,7 @@ def _error(code: str, message: str, **details: Any) -> Exception:
 
     stage = (
         "arguments"
-        if code in {"invalid_argument", "invalid_cursor", "input_too_large"}
+        if code in {"invalid_argument", "invalid_cursor", "stale_cursor", "input_too_large"}
         else ("result" if code in {"output_too_large", "internal_error"} else "execution")
     )
     return ToolError(
@@ -103,6 +110,36 @@ def _error(code: str, message: str, **details: Any) -> Exception:
             "constraint": code,
             **details,
         },
+    )
+
+
+def _semantic_argument_error(
+    message: str,
+    *,
+    field_path: str,
+    constraint: str,
+    actual: Any,
+    allowed_values: tuple[str, ...] | list[str],
+) -> Exception:
+    """Describe a semantic rejection without retaining the rejected value."""
+    return _error(
+        "invalid_argument",
+        message,
+        field_path=field_path,
+        constraint=constraint,
+        actual_kind=_value_kind(actual),
+        allowed_values=list(allowed_values),
+    )
+
+
+def _cursor_error(code: str, message: str, constraint: str) -> Exception:
+    return _error(
+        code,
+        message,
+        field_path="cursor",
+        constraint=constraint,
+        actual_kind="string",
+        allowed_values=["next_cursor"],
     )
 
 
@@ -186,6 +223,7 @@ def _arguments(arguments: Mapping[str, Any]) -> tuple[str, str, str | None, str 
             field_path="view",
             constraint="enum",
             actual_kind=_value_kind(view),
+            allowed_values=list(_VIEWS),
         )
     selection = arguments.get("selection")
     if selection is not None and (
@@ -216,6 +254,7 @@ def _arguments(arguments: Mapping[str, Any]) -> tuple[str, str, str | None, str 
             field_path="cursor",
             constraint="forbidden",
             actual_kind="string",
+            allowed_values=[],
         )
     return path, view, selection, cursor
 
@@ -274,7 +313,9 @@ def _source(workspace: Workspace, relative: str) -> Iterator[tuple[int, int]]:
 
 def _pread(descriptor: int, length: int, offset: int, size: int) -> bytes:
     if offset < 0 or length < 0 or offset > size:
-        raise _error("invalid_cursor", "artifact cursor is outside the source")
+        raise _cursor_error(
+            "invalid_cursor", "artifact cursor is outside the source", "cursor_range"
+        )
     length = min(length, size - offset)
     try:
         data = os.pread(descriptor, length, offset)
@@ -336,9 +377,13 @@ def _cursor_offset(
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         payload = json.loads(raw)
     except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError) as exc:
-        raise _error("invalid_cursor", "cursor is not a valid artifact continuation") from exc
+        raise _cursor_error(
+            "invalid_cursor",
+            "cursor is not a valid artifact continuation",
+            "cursor_encoding",
+        ) from exc
     if not isinstance(payload, dict) or set(payload) != {"v", "o", "h", "f", "w", "s"}:
-        raise _error("invalid_cursor", "cursor shape is invalid")
+        raise _cursor_error("invalid_cursor", "cursor shape is invalid", "cursor_shape")
     if (
         payload["v"] != 1
         or payload["h"] != digest
@@ -346,11 +391,162 @@ def _cursor_offset(
         or payload["w"] != view
         or payload["s"] != selection
     ):
-        raise _error("stale_cursor", "cursor does not match this artifact and view")
+        raise _cursor_error(
+            "stale_cursor", "cursor does not match this artifact and view", "cursor_binding"
+        )
     offset = payload["o"]
     if type(offset) is not int or not 0 <= offset <= maximum:
-        raise _error("invalid_cursor", "cursor position is outside the bounded view")
+        raise _cursor_error(
+            "invalid_cursor",
+            "cursor position is outside the bounded view",
+            "cursor_range",
+        )
     return offset
+
+
+def _selection_capabilities(format_name: str) -> dict[str, list[str]]:
+    """Return selectors that change the selected adapter path for each view."""
+    result = {view: [] for view in _VIEWS}
+
+    def allow(values: tuple[str, ...], *views: str) -> None:
+        for view in views:
+            result[view].extend(values)
+
+    if format_name == "text":
+        allow(
+            tuple(f"encoding:{item}" for item in sorted(_TEXT_ENCODINGS)),
+            "summary",
+            "text",
+            "structure",
+        )
+    elif format_name == "pdf":
+        allow(("metadata", "page:<index>"), "text", "structure")
+    elif format_name == "elf":
+        allow(("section:<index>",), "summary", "structure")
+        allow(("disassembly", "disassembly:0x<address>"), "text", "structure")
+    elif format_name == "pe":
+        allow(
+            ("disassembly", "disassembly:0x<address>", "exports", "imports"),
+            "text",
+            "structure",
+        )
+    elif format_name in _IMAGE_FORMATS:
+        allow(
+            ("channel:<R|G|B|A>", "bitplane:<R|G|B|A>:<0-7>"),
+            "text",
+            "structure",
+        )
+        allow(("ocr",), "text")
+    return result
+
+
+def _supported_views(format_name: str) -> list[str]:
+    if format_name == "binary":
+        return ["text", "bytes"]
+    return list(_VIEWS)
+
+
+def _cursor_supported(format_name: str, view: str, selection: str | None) -> bool:
+    if view == "bytes":
+        return selection is None
+    if view == "summary":
+        return False
+    if format_name in {"gzip", "wav", "dicom"} or format_name in _IMAGE_FORMATS:
+        return False
+    if format_name == "pdf":
+        return selection is None
+    if format_name == "elf" and isinstance(selection, str) and selection.startswith("section:"):
+        return False
+    if format_name == "pe":
+        if selection in {"imports", "exports"}:
+            return False
+        if view == "structure" and selection is None:
+            return False
+    return format_name != "binary" or view == "text"
+
+
+def _cursor_views(format_name: str) -> list[str]:
+    capabilities = _selection_capabilities(format_name)
+    return [
+        view
+        for view in _VIEWS
+        if _cursor_supported(format_name, view, None)
+        or any(_cursor_supported(format_name, view, selection) for selection in capabilities[view])
+    ]
+
+
+def _artifact_capabilities(format_name: str) -> dict[str, Any]:
+    return {
+        "supported_views": _supported_views(format_name),
+        "supported_selections_by_view": _selection_capabilities(format_name),
+        "cursor_views": _cursor_views(format_name),
+    }
+
+
+def _selection_matches(selection: str, advertised: str) -> bool:
+    if selection == advertised:
+        return True
+    return bool(
+        (advertised == "page:<index>" and _PAGE_SELECTION.fullmatch(selection))
+        or (advertised == "section:<index>" and _SECTION_SELECTION.fullmatch(selection))
+        or (advertised == "disassembly:0x<address>" and _DISASSEMBLY_SELECTION.fullmatch(selection))
+        or (advertised == "channel:<R|G|B|A>" and _CHANNEL_SELECTION.fullmatch(selection))
+        or (advertised == "bitplane:<R|G|B|A>:<0-7>" and _BITPLANE_SELECTION.fullmatch(selection))
+    )
+
+
+def _validate_format_request(
+    format_name: str, view: str, selection: str | None, cursor: str | None
+) -> None:
+    """Reject known semantic mismatches before an isolated parser drops diagnostics."""
+    if selection is not None:
+        capabilities = _selection_capabilities(format_name)
+        allowed = capabilities[view]
+        if not any(_selection_matches(selection, item) for item in allowed):
+            matching_views = [
+                candidate_view
+                for candidate_view in _VIEWS
+                if any(_selection_matches(selection, item) for item in capabilities[candidate_view])
+            ]
+            if matching_views:
+                raise _semantic_argument_error(
+                    "selection is not supported with this view",
+                    field_path="view",
+                    constraint="view_selection_mismatch",
+                    actual=view,
+                    allowed_values=matching_views,
+                )
+            malformed_prefix = selection.split(":", 1)[0] in {
+                "page",
+                "section",
+                "disassembly",
+                "channel",
+                "bitplane",
+                "encoding",
+            }
+            raise _semantic_argument_error(
+                "selection is not supported for this artifact format and view",
+                field_path="selection",
+                constraint=(
+                    "selection_syntax" if malformed_prefix else "unsupported_for_format_view"
+                ),
+                actual=selection,
+                allowed_values=allowed,
+            )
+    if cursor is None:
+        return
+    if not _cursor_supported(format_name, view, selection):
+        raise _semantic_argument_error(
+            "this artifact format, view, and selection do not use continuation cursors",
+            field_path="cursor",
+            constraint=(
+                "cursor_forbidden_for_selection"
+                if selection is not None
+                else "cursor_forbidden_for_format_view"
+            ),
+            actual=cursor,
+            allowed_values=[],
+        )
 
 
 def _base(
@@ -381,7 +577,13 @@ def _finish(
 ) -> dict[str, Any]:
     if coverage not in {"complete", "partial", "unsupported"}:
         raise _error("internal_error", "invalid artifact coverage state")
-    result = {**base, "coverage": coverage, "stop_reason": stop_reason, "data": data}
+    result = {
+        **base,
+        "capabilities": _artifact_capabilities(base["format"]),
+        "coverage": coverage,
+        "stop_reason": stop_reason,
+        "data": data,
+    }
     if next_offset is not None:
         result["next_cursor"] = _encode_cursor(
             next_offset,
@@ -481,13 +683,25 @@ def _selection_encoding(selection: str | None) -> str | None:
         return None
     encoding = selection.removeprefix("encoding:")
     if encoding not in _TEXT_ENCODINGS:
-        raise _error("invalid_argument", "selection names an unsupported text encoding")
+        raise _semantic_argument_error(
+            "selection names an unsupported text encoding",
+            field_path="selection",
+            constraint="unsupported_text_encoding",
+            actual=selection,
+            allowed_values=[f"encoding:{item}" for item in sorted(_TEXT_ENCODINGS)],
+        )
     return encoding
 
 
 def _check_selection(selection: str | None, allowed: set[str]) -> None:
     if selection is not None and selection not in allowed:
-        raise _error("invalid_argument", "selection is not supported for this format and view")
+        raise _semantic_argument_error(
+            "selection is not supported for this format and view",
+            field_path="selection",
+            constraint="unsupported_for_format_view",
+            actual=selection,
+            allowed_values=sorted(allowed),
+        )
 
 
 def _disassembly_address(selection: str | None) -> int | None:
@@ -495,9 +709,12 @@ def _disassembly_address(selection: str | None) -> int | None:
         return None
     match = re.fullmatch(r"disassembly:0x([0-9A-Fa-f]{1,16})", selection or "")
     if match is None:
-        raise _error(
-            "invalid_argument",
+        raise _semantic_argument_error(
             "disassembly selection must be disassembly or disassembly:0x<address>",
+            field_path="selection",
+            constraint="selection_syntax",
+            actual=selection,
+            allowed_values=["disassembly", "disassembly:0x<address>"],
         )
     return int(match.group(1), 16)
 
@@ -572,7 +789,11 @@ def _text_view(
     if cursor is None:
         offset = bom_bytes
     if encoding.startswith("utf-16") and offset % 2:
-        raise _error("invalid_cursor", "UTF-16 continuation is not code-unit aligned")
+        raise _cursor_error(
+            "invalid_cursor",
+            "UTF-16 continuation is not code-unit aligned",
+            "cursor_alignment",
+        )
     raw = _pread(descriptor, MAX_TEXT_PAGE_BYTES + 4, offset, size)
     text, consumed = _decode_page(raw, encoding)
     if not consumed and offset < size:
@@ -870,7 +1091,13 @@ def _gzip_view(
 ) -> dict[str, Any]:
     _check_selection(base["selection"], {"entries"})
     if cursor is not None:
-        raise _error("invalid_argument", "single-stream gzip inventory has no continuation")
+        raise _semantic_argument_error(
+            "single-stream gzip inventory has no continuation",
+            field_path="cursor",
+            constraint="cursor_forbidden_for_format_view",
+            actual=cursor,
+            allowed_values=[],
+        )
     metadata = _gzip_metadata(descriptor, size)
     if base["view"] == "text":
         data: Any = {key: metadata[key] for key in ("original_name", "comment") if key in metadata}
@@ -903,9 +1130,21 @@ def _pdf_view(
         try:
             page_selection = int(base["selection"].removeprefix("page:"))
         except ValueError as exc:
-            raise _error("invalid_argument", "PDF page selection is invalid") from exc
+            raise _semantic_argument_error(
+                "PDF page selection is invalid",
+                field_path="selection",
+                constraint="selection_syntax",
+                actual=base["selection"],
+                allowed_values=["metadata", "page:<index>"],
+            ) from exc
     elif base["selection"] is not None and base["selection"] not in allowed:
-        raise _error("invalid_argument", "PDF selection must be metadata or page:<index>")
+        raise _semantic_argument_error(
+            "PDF selection must be metadata or page:<index>",
+            field_path="selection",
+            constraint="unsupported_for_format_view",
+            actual=base["selection"],
+            allowed_values=["metadata", "page:<index>"],
+        )
     if _pypdf is None:
         version = (
             _pread(descriptor, min(size, 16), 0, size).splitlines()[0].decode("ascii", "replace")
@@ -977,7 +1216,13 @@ def _pdf_view(
             )
         if page_selection is not None:
             if not 0 <= page_selection < page_count:
-                raise _error("invalid_argument", "selected PDF page is outside the document")
+                raise _semantic_argument_error(
+                    "selected PDF page is outside the document",
+                    field_path="selection",
+                    constraint="selection_range",
+                    actual=base["selection"],
+                    allowed_values=["page:<index>"],
+                )
             start, stop = page_selection, page_selection + 1
         else:
             start = _cursor_offset(
@@ -1208,7 +1453,11 @@ def _pcapng_cursor_position(
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         payload = json.loads(raw)
     except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError) as exc:
-        raise _error("invalid_cursor", "cursor is not a valid artifact continuation") from exc
+        raise _cursor_error(
+            "invalid_cursor",
+            "cursor is not a valid artifact continuation",
+            "cursor_encoding",
+        ) from exc
     if not isinstance(payload, dict) or set(payload) != {
         "v",
         "o",
@@ -1219,7 +1468,7 @@ def _pcapng_cursor_position(
         "e",
         "q",
     }:
-        raise _error("invalid_cursor", "PCAPNG cursor shape is invalid")
+        raise _cursor_error("invalid_cursor", "PCAPNG cursor shape is invalid", "cursor_shape")
     if (
         payload["v"] != 1
         or payload["h"] != base["source_sha256"]
@@ -1227,7 +1476,9 @@ def _pcapng_cursor_position(
         or payload["w"] != base["view"]
         or payload["s"] != base["selection"]
     ):
-        raise _error("stale_cursor", "cursor does not match this artifact and view")
+        raise _cursor_error(
+            "stale_cursor", "cursor does not match this artifact and view", "cursor_binding"
+        )
     position, section_offset, endian = payload["o"], payload["q"], payload["e"]
     if (
         type(position) is not int
@@ -1236,10 +1487,14 @@ def _pcapng_cursor_position(
         or endian not in {"<", ">"}
         or not 0 <= section_offset < position < size
     ):
-        raise _error("invalid_cursor", "PCAPNG cursor position is invalid")
+        raise _cursor_error("invalid_cursor", "PCAPNG cursor position is invalid", "cursor_range")
     section = _pread(descriptor, 12, section_offset, size)
     if section[:4] != b"\x0a\x0d\x0d\x0a" or _pcapng_section_endian(section) != endian:
-        raise _error("invalid_cursor", "PCAPNG cursor section binding is invalid")
+        raise _cursor_error(
+            "invalid_cursor",
+            "PCAPNG cursor section binding is invalid",
+            "cursor_section_binding",
+        )
     section_length = struct.unpack_from(endian + "I", section, 4)[0]
     if (
         section_length < 28
@@ -1247,10 +1502,16 @@ def _pcapng_cursor_position(
         or section_offset + section_length > position
         or section_offset + section_length > size
     ):
-        raise _error("invalid_cursor", "PCAPNG cursor section is invalid")
+        raise _cursor_error(
+            "invalid_cursor", "PCAPNG cursor section is invalid", "cursor_section_binding"
+        )
     trailer = _pread(descriptor, 4, section_offset + section_length - 4, size)
     if struct.unpack(endian + "I", trailer)[0] != section_length:
-        raise _error("invalid_cursor", "PCAPNG cursor section trailer is invalid")
+        raise _cursor_error(
+            "invalid_cursor",
+            "PCAPNG cursor section trailer is invalid",
+            "cursor_section_binding",
+        )
     return position, endian, section_offset
 
 
@@ -1407,23 +1668,47 @@ def _elf_view(
         base["selection"] == "disassembly" or base["selection"].startswith("disassembly:")
     ):
         if base["view"] not in {"text", "structure"}:
-            raise _error("invalid_argument", "ELF disassembly requires text or structure view")
+            raise _semantic_argument_error(
+                "ELF disassembly requires text or structure view",
+                field_path="view",
+                constraint="view_selection_mismatch",
+                actual=base["view"],
+                allowed_values=["text", "structure"],
+            )
         return _disassembly_view(descriptor, size, cursor, base)
     section_selection = None
     if base["selection"] and base["selection"].startswith("section:"):
         try:
             section_selection = int(base["selection"].removeprefix("section:"))
         except ValueError as exc:
-            raise _error("invalid_argument", "ELF section selection is invalid") from exc
+            raise _semantic_argument_error(
+                "ELF section selection is invalid",
+                field_path="selection",
+                constraint="selection_syntax",
+                actual=base["selection"],
+                allowed_values=["section:<index>"],
+            ) from exc
     elif base["selection"] is not None:
-        raise _error("invalid_argument", "ELF selection must be section:<index> or disassembly")
+        raise _semantic_argument_error(
+            "ELF selection must be section:<index> or disassembly",
+            field_path="selection",
+            constraint="unsupported_for_format_view",
+            actual=base["selection"],
+            allowed_values=["section:<index>", "disassembly", "disassembly:0x<address>"],
+        )
     if base["view"] == "text":
         return _binary_strings(descriptor, size, cursor, base)
     header = binary_tools._header(descriptor, size)
     maximum = header["shnum"]
     if section_selection is not None:
         if not 0 <= section_selection < maximum:
-            raise _error("invalid_argument", "selected ELF section is outside the table")
+            raise _semantic_argument_error(
+                "selected ELF section is outside the table",
+                field_path="selection",
+                constraint="selection_range",
+                actual=base["selection"],
+                allowed_values=["section:<index>"],
+            )
         start, limit = section_selection, 1
     elif base["view"] == "summary":
         start, limit = 0, min(10, MAX_RECORDS)
@@ -1583,11 +1868,29 @@ def _pe_view(
         base["selection"] == "disassembly" or base["selection"].startswith("disassembly:")
     ):
         if base["view"] not in {"text", "structure"}:
-            raise _error("invalid_argument", "PE disassembly requires text or structure view")
+            raise _semantic_argument_error(
+                "PE disassembly requires text or structure view",
+                field_path="view",
+                constraint="view_selection_mismatch",
+                actual=base["view"],
+                allowed_values=["text", "structure"],
+            )
         return _disassembly_view(descriptor, size, cursor, base)
     if base["selection"] in {"imports", "exports"}:
         if cursor is not None or base["view"] == "summary":
-            raise _error("invalid_argument", "PE directory selection is one structure/text request")
+            field_path = "cursor" if cursor is not None else "view"
+            actual = cursor if cursor is not None else base["view"]
+            raise _semantic_argument_error(
+                "PE directory selection is one structure/text request",
+                field_path=field_path,
+                constraint=(
+                    "cursor_forbidden_for_selection"
+                    if cursor is not None
+                    else "view_selection_mismatch"
+                ),
+                actual=actual,
+                allowed_values=[] if cursor is not None else ["text", "structure"],
+            )
         rows, available, limited = _pe_symbols(descriptor, size, base["selection"])
         return _finish(
             base,
@@ -1600,7 +1903,13 @@ def _pe_view(
             else "dependency_unavailable",
         )
     if base["selection"] is not None:
-        raise _error("invalid_argument", "PE selection must be imports, exports, or disassembly")
+        raise _semantic_argument_error(
+            "PE selection must be imports, exports, or disassembly",
+            field_path="selection",
+            constraint="unsupported_for_format_view",
+            actual=base["selection"],
+            allowed_values=["imports", "exports", "disassembly", "disassembly:0x<address>"],
+        )
     if base["view"] == "text":
         return _binary_strings(descriptor, size, cursor, base)
     headers, sections = _pe_headers(descriptor, size)
@@ -1910,7 +2219,13 @@ def _image_pixels(image: Any, selection: str | None) -> dict[str, Any]:
     if selection and selection.startswith("channel:"):
         channel_selection = selection.removeprefix("channel:").upper()
         if channel_selection not in channels:
-            raise _error("invalid_argument", "image channel selection must be R, G, B, or A")
+            raise _semantic_argument_error(
+                "image channel selection must be R, G, B, or A",
+                field_path="selection",
+                constraint="selection_syntax",
+                actual=selection,
+                allowed_values=["channel:<R|G|B|A>"],
+            )
     if selection and selection.startswith("bitplane:"):
         parts = selection.split(":")
         if (
@@ -1918,7 +2233,13 @@ def _image_pixels(image: Any, selection: str | None) -> dict[str, Any]:
             or parts[1].upper() not in channels
             or parts[2] not in {str(bit) for bit in range(8)}
         ):
-            raise _error("invalid_argument", "image bitplane selection is invalid")
+            raise _semantic_argument_error(
+                "image bitplane selection is invalid",
+                field_path="selection",
+                constraint="selection_syntax",
+                actual=selection,
+                allowed_values=["bitplane:<R|G|B|A>:<0-7>"],
+            )
         plane_selection = (parts[1].upper(), int(parts[2]))
         channel = plane_selection[0]
         bit = plane_selection[1]
@@ -1991,16 +2312,39 @@ def _image_view(
     base: dict[str, Any],
 ) -> dict[str, Any]:
     if cursor is not None:
-        raise _error("invalid_argument", "image views do not use continuation cursors")
+        raise _semantic_argument_error(
+            "image views do not use continuation cursors",
+            field_path="cursor",
+            constraint="cursor_forbidden_for_format_view",
+            actual=cursor,
+            allowed_values=[],
+        )
     if base["selection"] == "ocr":
         if base["view"] != "text":
-            raise _error("invalid_argument", "OCR selection requires text view")
+            raise _semantic_argument_error(
+                "OCR selection requires text view",
+                field_path="view",
+                constraint="view_selection_mismatch",
+                actual=base["view"],
+                allowed_values=["text"],
+            )
     elif base["selection"] is not None and not (
         base["selection"].startswith("channel:")
         or base["selection"].startswith("bitplane:")
         or base["selection"] == "metadata"
     ):
-        raise _error("invalid_argument", "image selection is unsupported")
+        raise _semantic_argument_error(
+            "image selection is unsupported",
+            field_path="selection",
+            constraint="unsupported_for_format_view",
+            actual=base["selection"],
+            allowed_values=[
+                "metadata",
+                "ocr",
+                "channel:<R|G|B|A>",
+                "bitplane:<R|G|B|A>:<0-7>",
+            ],
+        )
     prefix = _pread(descriptor, min(size, 4096), 0, size)
     if _PILImage is None:
         return _finish(
@@ -2077,7 +2421,13 @@ def _media_view(
     base: dict[str, Any],
 ) -> dict[str, Any]:
     if cursor is not None:
-        raise _error("invalid_argument", "media metadata views do not use continuations")
+        raise _semantic_argument_error(
+            "media metadata views do not use continuations",
+            field_path="cursor",
+            constraint="cursor_forbidden_for_format_view",
+            actual=cursor,
+            allowed_values=[],
+        )
     if base["format"] == "wav":
         _check_selection(base["selection"], {"metadata", "signals"})
         result = wav_analyze_from_descriptor(descriptor, size, {"path": base["path"]})
@@ -2141,7 +2491,13 @@ def _unsupported_view(
         return _binary_strings(descriptor, size, cursor, base)
     _check_selection(base["selection"], set())
     if cursor is not None:
-        raise _error("invalid_argument", "unsupported summary has no continuation")
+        raise _semantic_argument_error(
+            "unsupported summary has no continuation",
+            field_path="cursor",
+            constraint="cursor_forbidden_for_format_view",
+            actual=cursor,
+            allowed_values=[],
+        )
     prefix = _pread(descriptor, min(size, 256), 0, size)
     return _finish(
         base,
@@ -2170,6 +2526,7 @@ def _inspect_artifact(
             digest = _identity(descriptor, size)
             prefix = _pread(descriptor, min(size, 64 * 1024), 0, size)
             format_name, detection = _detect_format(prefix, size, selection)
+            _validate_format_request(format_name, view, selection, cursor)
             base = _base(path, size, digest, format_name, view, selection)
             if view == "bytes":
                 return _bytes_view(descriptor, size, cursor, base)
@@ -2180,7 +2537,7 @@ def _inspect_artifact(
                 operation = "pdf"
             elif format_name == "pcap":
                 operation = "pcap"
-            elif format_name in {"png", "jpeg", "gif", "bmp", "tiff", "webp"}:
+            elif format_name in _IMAGE_FORMATS:
                 operation = "image"
             elif format_name == "pe" and selection in {"imports", "exports"}:
                 operation = "pe"
@@ -2225,7 +2582,7 @@ def _inspect_artifact(
                 return _elf_view(descriptor, size, cursor, base)
             if format_name == "pe":
                 return _pe_view(descriptor, size, cursor, base)
-            if format_name in {"png", "jpeg", "gif", "bmp", "tiff", "webp"}:
+            if format_name in _IMAGE_FORMATS:
                 return _image_view(descriptor, size, cursor, base)
             if format_name in {"wav", "dicom"}:
                 result = _media_view(descriptor, size, cursor, base)
@@ -2255,7 +2612,8 @@ def artifact_tool_spec() -> dict[str, Any]:
         "name": "inspect_artifact",
         "description": (
             "Inspect one bounded source-bound summary, text, structure, or byte view; "
-            "never execute or extract the artifact."
+            "never execute or extract the artifact. A successful result reports the detected "
+            "format's supported views, selectors, and continuation views."
         ),
         "inputSchema": {
             "type": "object",
@@ -2277,13 +2635,19 @@ def artifact_tool_spec() -> dict[str, Any]:
                     "maxLength": 64,
                     "pattern": "^[A-Za-z0-9_.:-]+$",
                     "description": (
-                        "Optional format selector: encoding:<name>, entries, metadata, "
-                        "page:<index>, packets, blocks, section:<index>, imports, exports, "
+                        "Optional format selector: encoding:<name>, metadata, page:<index>, "
+                        "section:<index>, imports, exports, "
                         "disassembly, disassembly:0x<address>, channel:<RGBA>, "
-                        "bitplane:<RGBA>:<0-7>, ocr, or signals."
+                        "bitplane:<RGBA>:<0-7>, or ocr. Omit this on the first call and "
+                        "use the returned format-specific capabilities."
                     ),
                 },
-                "cursor": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "cursor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "description": "Use only next_cursor returned for the same artifact request.",
+                },
             },
             "required": ["path"],
             "additionalProperties": False,

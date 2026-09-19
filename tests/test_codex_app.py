@@ -231,6 +231,7 @@ class ToolStub:
                     "constraint": "type",
                     "actual_kind": "integer",
                     "actual_size": 1,
+                    "allowed_values": ["summary", "INCYPHER{raw-allowed-value}"],
                     "raw_value": "must-not-survive",
                 },
             )
@@ -1299,6 +1300,8 @@ async def test_tool_call_and_structured_tool_error(
         }.items()
     )
     assert "must-not-survive" not in responses[91]["result"]["contentItems"][0]["text"]
+    assert '"allowed_values":["summary"]' in responses[91]["result"]["contentItems"][0]["text"]
+    assert "raw-allowed-value" not in responses[91]["result"]["contentItems"][0]["text"]
     assert "raw-rejected-tool-message" not in responses[91]["result"]["contentItems"][0]["text"]
     assert "raw-rejected-code" not in responses[91]["result"]["contentItems"][0]["text"]
     await client.close()

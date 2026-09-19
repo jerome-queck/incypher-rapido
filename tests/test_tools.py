@@ -93,6 +93,10 @@ class ToolFixture(unittest.TestCase):
         filesystem_schema = specs["inspect_filesystem"]["inputSchema"]
         self.assertEqual(filesystem_schema["required"], ["path"])
         self.assertEqual(filesystem_schema["oneOf"][1]["required"], ["action", "filesystem_path"])
+        self.assertEqual(
+            filesystem_schema["properties"]["filesystem_path"]["pattern"],
+            r"^/(?:[A-Za-z0-9._+@,:=-]+/?)*$",
+        )
         self.assertEqual(registry.dispatch("hash", {"path": "note.txt"})["path"], "note.txt")
 
     def test_validation_error_has_bounded_structural_attribution(self) -> None:
@@ -114,6 +118,18 @@ class ToolFixture(unittest.TestCase):
             call_tool(self.workspace, "read_text", {"path": "bad-\ud800"})
         self.assertEqual(invalid_unicode.exception.details["field_path"], "path")
         self.assertEqual(invalid_unicode.exception.details["constraint"], "unicode")
+
+    def test_filesystem_path_grammar_is_discoverable_and_closed(self) -> None:
+        with self.assertRaises(ToolError) as caught:
+            call_tool(
+                self.workspace,
+                "inspect_filesystem",
+                {"path": "note.txt", "action": "list", "filesystem_path": "relative path"},
+            )
+        self.assertEqual(caught.exception.code, "invalid_argument")
+        self.assertEqual(caught.exception.details["field_path"], "filesystem_path")
+        self.assertEqual(caught.exception.details["constraint"], "path_grammar")
+        self.assertEqual(caught.exception.details["allowed_values"], ["strict_absolute_path"])
 
     def test_shell_binds_command_to_hashed_challenge_sources(self) -> None:
         worker_result = {
