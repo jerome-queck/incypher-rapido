@@ -36,8 +36,9 @@ Simulator state and work directories are disposable.
 7. `changed_bytes_reset_context`: two different artifact-byte generations at the same Board file
    reference run through `_probe_material_contexts` and `_admit_catalogue_revisions`; the actual
    `_typed_same_run_memory` and `build_turn_prompt` path excludes old observations and private data.
-8. `watch_change_original_deadline`: the watcher starts at t0, observes a scripted mid-window HTTP
-   502 and distinct late catalogue change, then drains under the unchanged original deadline.
+8. `watch_change_original_deadline`: setup and scenarios 1–7 consume the common window. The watcher
+   observes a scripted HTTP 502 and distinct late catalogue change within the remaining interval,
+   then drains under the unchanged barrier-derived deadline.
 9. `deadline_cancel_cleanup`: actual `DurableJobControl.drive` creates a benign dynamic-instance
    lease, cancels a blocking model-free target phase at deadline, deletes that lease, and leaves no
    active/queued work, pending writes, owned instances, or workspace data. One create and one delete
@@ -53,9 +54,20 @@ Simulator state and work directories are disposable.
 only at construction; production defaults are unchanged. `DurableJobControl.drive` forwards this
 optional seam for tests.
 
-The 19,800-second preregistered schedule freezes the transient at 9,900 seconds and the late change
-at 18,900 seconds. Short smoke runs use explicitly compressed quarter/three-quarter offsets so the
-production read guard can observe both events without weakening the full-duration schedule.
+With no setup latency, the 19,800-second schedule places the transient at 9,900 seconds and the late
+change at 18,900 seconds. With a registered H24 barrier, wait, setup, and scenarios 1–7 consume the
+same window; scenario 8 places both events within the remaining interval and reports their offsets
+from the original barrier. It never refreshes the deadline. Short smoke runs use explicitly
+compressed quarter/three-quarter offsets.
+
+`--start-at-unix-ms` requires the exact 19,800-second duration. It derives one monotonic origin and
+deadline from the registered wall barrier and current wall remainder. A barrier over one second
+late, a stale deadline, or wall rollback before the registered start fails closed. The soak performs
+no read or scenario wait beyond that common scoring deadline. Scenarios 9–10 finish their bounded
+setup before scenario 8 consumes the remaining interval; receipt order remains the frozen ten-row
+order. Final receipt serialization is outside scoring. A forced stop may leave no receipt and is
+retained as a failed/inconclusive run; no rows are fabricated. Soak results remain outside the H24
+correctness denominator.
 
 Run the accelerated suite, then the short separately labelled real-clock smoke:
 
@@ -65,9 +77,9 @@ PYTHONPATH=. python scripts/board_contract_soak.py --accelerated --duration-seco
 PYTHONPATH=. python scripts/board_contract_soak.py --duration-seconds 2
 ```
 
-PR6 will run the preregistered real-clock command with `--duration-seconds 19800` in parallel with
-H24. It must retain failures/inconclusive results and use the declared cleanup grace; this PR does
-not claim that soak has run.
+PR6 will run the preregistered real-clock command with `--duration-seconds 19800` and the shared
+`--start-at-unix-ms` barrier in parallel with H24. It must retain failures/inconclusive results and
+use the declared cleanup grace; this PR does not claim that soak has run.
 
 ## Touched seams and verification
 
@@ -82,13 +94,10 @@ not claim that soak has run.
 Focused verification on macOS, Python 3.11.15, Ruff 0.16.8, pytest 9.1.1:
 
 - Ruff check/format: pass for touched Python files.
-- Contract suite with `RuntimeWarning` promoted to error: 21 passed. This includes all accelerated
-  transitions and one separately labelled 2-second real-clock smoke; no unhandled task warning.
-- `tests/test_board_contract.py`, `tests/test_board.py`, `tests/test_state.py`,
-  `tests/test_orchestrator.py`, `tests/test_control.py`, and `tests/test_offline_oracle_pilot.py`:
-  289 passed.
-- Standalone accelerated 19,800-second simulation and separately labelled 2-second real-clock smoke:
-  10/10 passed each. The deferred item is the 19,800-second **real-clock** PR6 soak.
+- Board-contract and soak-launcher suites: 34 passed, including the separately labelled 2-second
+  real-clock smoke and a fake-clock oversleep/setup mutation that reaches exactly the common
+  deadline without extending it.
+- Combined Board-contract, soak-launcher, H24 evaluator, H24 pilot, and supervisor suites: 153
+  passed.
 - `git diff --check`: pass.
-- Full repository pytest: 1,163 passed, 4 Linux-only skips.
-- 96-cycle synthetic sustainability: passed.
+- Deferred: the 19,800-second real-clock soak and all native H24 outcomes.

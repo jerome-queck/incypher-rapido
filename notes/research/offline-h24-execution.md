@@ -24,9 +24,10 @@ benign soak together; the receipt binds its wall-clock start and deadline, exact
 apart. An allowed late child start consumes that immutable window: the child derives its monotonic
 deadline from the registered wall deadline and current wall time, never grants a fresh 19,800
 seconds, and fails closed beyond 1,000 ms lateness. Task budgets and scored spans cannot cross the
-common deadline. The evaluator accepts exactly 19,800,000 scored milliseconds, not a shorter or
-longer replacement window. Cleanup is outside scoring, receives at most 190 seconds, and earns no
-score.
+common deadline. The benign soak likewise spends barrier wait, setup, and scenarios 1–7 from that
+window; its idle watch uses only the remainder, and all ten rows are retained only if the receipt
+finishes. The evaluator accepts exactly 19,800,000 scored milliseconds, not a shorter or longer
+replacement window. Cleanup is outside scoring, receives at most 190 seconds, and earns no score.
 
 The 24 task records retain their fixture wall, CPU, memory, and artifact declarations. Per-task CPU
 and memory values are fixture-generation/reference-checker design bounds only: the container does

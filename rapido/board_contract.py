@@ -771,12 +771,85 @@ async def _run_deadline_controller(
     )
 
 
+async def _tail_scenario_receipts(
+    root: Path, private_seed: bytes
+) -> tuple[ScenarioReceipt, ScenarioReceipt]:
+    (
+        deadline_status,
+        active_jobs,
+        queued_jobs,
+        pending_writes,
+        owned_instances,
+        workspace_entries,
+        instance_creates,
+        instance_deletes,
+        runtime_cancelled,
+        runtime_closed,
+    ) = await _run_deadline_controller(root / "deadline-controller")
+    deadline_receipt = _scenario(
+        SCENARIO_IDS[8],
+        passed=(
+            deadline_status == "deadline"
+            and active_jobs == 0
+            and queued_jobs == 0
+            and pending_writes == 0
+            and owned_instances == 0
+            and workspace_entries == 0
+            and instance_creates == 1
+            and instance_deletes == 1
+            and runtime_cancelled
+            and runtime_closed
+        ),
+        status=deadline_status,
+        active_jobs=active_jobs,
+        queued_jobs=queued_jobs,
+        pending_writes=pending_writes,
+        owned_instances=owned_instances,
+        workspace_entries=workspace_entries,
+        instance_creates=instance_creates,
+        instance_deletes=instance_deletes,
+        runtime_cancelled=runtime_cancelled,
+        runtime_closed=runtime_closed,
+    )
+
+    startup_peak, turn_peak, pilot_result_rows = await _run_offline_pilot_contract(
+        root / "offline-pilot", private_seed
+    )
+    private_detail = _private_value(private_seed, "diagnostic")
+    diagnostic = _error("invalid_argument", "benign", field_path=private_detail)
+    observation = project_tool_observation(
+        "inspect_file",
+        success=False,
+        source_bound=False,
+        result=diagnostic.details,
+    )
+    projected_diagnostic = repr(observation.facts)
+    pilot_receipt = _scenario(
+        SCENARIO_IDS[9],
+        passed=(
+            startup_peak == 1
+            and turn_peak == 2
+            and pilot_result_rows == 24
+            and private_detail not in projected_diagnostic
+        ),
+        startup_peak=startup_peak,
+        turn_peak=turn_peak,
+        pilot_result_rows=pilot_result_rows,
+        diagnostics_redacted=private_detail not in projected_diagnostic,
+        startup_contract="pr71_serialized",
+        diagnostics_contract="pr70_closed_labels",
+    )
+    return deadline_receipt, pilot_receipt
+
+
 async def run_contract(
     root: Path,
     *,
     private_seed: bytes,
     clock: AsyncClock | None = None,
     soak_seconds: float = 19_800.0,
+    absolute_origin: float | None = None,
+    absolute_deadline: float | None = None,
 ) -> ContractReceipt:
     """Run all ten scenarios and return one sanitized receipt."""
 
@@ -788,6 +861,35 @@ async def run_contract(
     root.chmod(0o700)
     selected_clock = ManualClock() if clock is None else clock
     clock_mode = "accelerated" if isinstance(selected_clock, ManualClock) else "real"
+    if (absolute_origin is None) is not (absolute_deadline is None):
+        raise ValueError("absolute soak origin and deadline must be supplied together")
+    if absolute_origin is not None and absolute_deadline is not None:
+        if (
+            not math.isfinite(absolute_origin)
+            or not math.isfinite(absolute_deadline)
+            or absolute_origin < 0
+            or not math.isclose(
+                absolute_deadline - absolute_origin,
+                soak_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError("absolute soak window does not match the requested duration")
+        observed_start = selected_clock.monotonic()
+        if observed_start < absolute_origin:
+            raise ValueError("soak monotonic clock moved before the registered origin")
+        if observed_start >= absolute_deadline:
+            raise ValueError("soak common deadline is already stale")
+
+    def setup_deadline(seconds: float = 10.0) -> float:
+        proposed = selected_clock.monotonic() + seconds
+        if absolute_deadline is None:
+            return proposed
+        if selected_clock.monotonic() >= absolute_deadline:
+            raise ValueError("soak common deadline expired during setup")
+        return min(proposed, absolute_deadline)
+
     config = _runtime_config(root)
     transport = BenignBoardTransport()
     board = BoardClient(
@@ -862,9 +964,7 @@ async def run_contract(
         transport.queue("GET", "/api/v1/challenges", HttpResponse(502, b""))
         transport.challenge_rows = [{"id": 101}]
         orchestrator = Orchestrator(config, board, store, _NullRuntime(), clock=selected_clock)
-        rows = await orchestrator._board_read(
-            selected_clock.monotonic() + 10.0, board.list_challenges
-        )
+        rows = await orchestrator._board_read(setup_deadline(), board.list_challenges)
         attempts_before = int(
             store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
         )
@@ -872,7 +972,7 @@ async def run_contract(
         auth_error = "none"
         auth_http_status = 0
         try:
-            await orchestrator._board_read(selected_clock.monotonic() + 10.0, board.identity)
+            await orchestrator._board_read(setup_deadline(), board.identity)
         except BoardError as exc:
             if str(exc) == "identity returned HTTP 401":
                 auth_error = "board_http_401"
@@ -1099,7 +1199,7 @@ async def run_contract(
         old_contexts = await orchestrator._probe_material_contexts(
             material_probe_root,
             [material_challenge],
-            selected_clock.monotonic() + 10,
+            setup_deadline(),
         )
         old_context = old_contexts[107]
         store.initialize_control_catalogue(
@@ -1125,13 +1225,13 @@ async def run_contract(
         new_contexts = await orchestrator._probe_material_contexts(
             material_probe_root,
             [refreshed_challenge],
-            selected_clock.monotonic() + 10,
+            setup_deadline(),
         )
         new_context = new_contexts[107]
         changed_ids = orchestrator._admit_catalogue_revisions(
             run_id,
             [refreshed_challenge],
-            selected_clock.monotonic() + 10,
+            setup_deadline(),
             {},
             new_contexts,
         )
@@ -1191,6 +1291,9 @@ async def run_contract(
             )
         )
 
+        # Finish bounded setup scenarios before the idle watch consumes the remaining window.
+        tail_receipts = await _tail_scenario_receipts(root, private_seed)
+
         # 8. The real idle-watch seam observes a late change under its original deadline.
         def detail(challenge_id: int, revision: int) -> dict[str, object]:
             return {
@@ -1210,14 +1313,20 @@ async def run_contract(
         transport.challenge_rows = [{"id": 101}]
         current = [board.challenge(101)]
         watch_start = selected_clock.monotonic()
-        original_deadline = watch_start + soak_seconds
+        window_origin = watch_start if absolute_origin is None else absolute_origin
+        original_deadline = (
+            watch_start + soak_seconds if absolute_deadline is None else absolute_deadline
+        )
+        remaining_seconds = original_deadline - watch_start
+        if remaining_seconds <= 0:
+            raise ValueError("soak common deadline expired during setup")
         transport.details[108] = detail(108, 2)
         if soak_seconds == 19_800:
-            transient_threshold = soak_seconds / 2
-            change_threshold = soak_seconds * 21 / 22
+            transient_threshold = remaining_seconds / 2
+            change_threshold = remaining_seconds * 21 / 22
         else:
-            transient_threshold = soak_seconds / 4
-            change_threshold = soak_seconds * 3 / 4
+            transient_threshold = remaining_seconds / 4
+            change_threshold = remaining_seconds * 3 / 4
         transient_offset: float | None = None
         change_offset: float | None = None
 
@@ -1227,18 +1336,18 @@ async def run_contract(
                 return None
             elapsed = selected_clock.monotonic() - watch_start
             if transient_offset is None and elapsed >= transient_threshold:
-                transient_offset = elapsed
+                transient_offset = selected_clock.monotonic() - window_origin
                 return HttpResponse(502, b"")
             if change_offset is None and elapsed >= change_threshold:
-                change_offset = elapsed
+                change_offset = selected_clock.monotonic() - window_origin
                 transport.challenge_rows = [{"id": 101}, {"id": 108, "revision": 2}]
             return None
 
         transport.request_hook = watch_hook
         watch_config = replace(
             config,
-            board_watch_seconds=max(0.0001, soak_seconds / 100),
-            board_full_refresh_seconds=max(0.0002, soak_seconds * 2),
+            board_watch_seconds=max(0.0001, remaining_seconds / 100),
+            board_full_refresh_seconds=max(0.0002, remaining_seconds * 2),
         )
         watch_orchestrator = Orchestrator(
             watch_config, board, store, _NullRuntime(), clock=selected_clock
@@ -1261,7 +1370,8 @@ async def run_contract(
             (1, 2),
             observed,
         )
-        elapsed_to_deadline = selected_clock.monotonic() - watch_start
+        elapsed_to_deadline = selected_clock.monotonic() - window_origin
+        ended_at_deadline = selected_clock.monotonic() >= original_deadline
         receipts.append(
             _scenario(
                 SCENARIO_IDS[7],
@@ -1271,88 +1381,25 @@ async def run_contract(
                     and change_offset is not None
                     and transient_offset >= transient_threshold
                     and change_offset >= change_threshold
+                    and transient_offset <= soak_seconds
+                    and change_offset <= soak_seconds
                     and drained is None
-                    and selected_clock.monotonic() >= original_deadline
+                    and ended_at_deadline
                 ),
                 change_observed=any(item.id == 108 for item in observed),
                 transient_offset_seconds=round(transient_offset or 0.0, 3),
                 change_offset_seconds=round(change_offset or 0.0, 3),
                 deadline_seconds=round(elapsed_to_deadline, 3),
-                deadline_unchanged=original_deadline == watch_start + soak_seconds,
+                deadline_unchanged=math.isclose(
+                    original_deadline,
+                    window_origin + soak_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ),
             )
         )
 
-        # 9. The actual durable controller cancels blocked work and cleans its own state.
-        (
-            deadline_status,
-            active_jobs,
-            queued_jobs,
-            pending_writes,
-            owned_instances,
-            workspace_entries,
-            instance_creates,
-            instance_deletes,
-            runtime_cancelled,
-            runtime_closed,
-        ) = await _run_deadline_controller(root / "deadline-controller")
-        receipts.append(
-            _scenario(
-                SCENARIO_IDS[8],
-                passed=(
-                    deadline_status == "deadline"
-                    and active_jobs == 0
-                    and queued_jobs == 0
-                    and pending_writes == 0
-                    and owned_instances == 0
-                    and workspace_entries == 0
-                    and instance_creates == 1
-                    and instance_deletes == 1
-                    and runtime_cancelled
-                    and runtime_closed
-                ),
-                status=deadline_status,
-                active_jobs=active_jobs,
-                queued_jobs=queued_jobs,
-                pending_writes=pending_writes,
-                owned_instances=owned_instances,
-                workspace_entries=workspace_entries,
-                instance_creates=instance_creates,
-                instance_deletes=instance_deletes,
-                runtime_cancelled=runtime_cancelled,
-                runtime_closed=runtime_closed,
-            )
-        )
-
-        # 10. Reuse PR71 concurrency and PR70 diagnostic projection contracts.
-        startup_peak, turn_peak, pilot_result_rows = await _run_offline_pilot_contract(
-            root / "offline-pilot", private_seed
-        )
-        private_detail = _private_value(private_seed, "diagnostic")
-        diagnostic = _error("invalid_argument", "benign", field_path=private_detail)
-        observation = project_tool_observation(
-            "inspect_file",
-            success=False,
-            source_bound=False,
-            result=diagnostic.details,
-        )
-        projected_diagnostic = repr(observation.facts)
-        receipts.append(
-            _scenario(
-                SCENARIO_IDS[9],
-                passed=(
-                    startup_peak == 1
-                    and turn_peak == 2
-                    and pilot_result_rows == 24
-                    and private_detail not in projected_diagnostic
-                ),
-                startup_peak=startup_peak,
-                turn_peak=turn_peak,
-                pilot_result_rows=pilot_result_rows,
-                diagnostics_redacted=private_detail not in projected_diagnostic,
-                startup_contract="pr71_serialized",
-                diagnostics_contract="pr70_closed_labels",
-            )
-        )
+        receipts.extend(tail_receipts)
         board.instance("DELETE", 105)
         store.mark_instance(run_id, 105, "cleanup_pending")
         store.mark_instance(run_id, 105, "removed")

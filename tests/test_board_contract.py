@@ -231,3 +231,32 @@ def test_contract_rejects_invalid_private_seed_and_duration(tmp_path: Path) -> N
         asyncio.run(run_contract(tmp_path, private_seed=b"short"))
     with pytest.raises(ValueError, match="19800"):
         asyncio.run(run_contract(tmp_path, private_seed=os.urandom(32), soak_seconds=19_801))
+
+
+@pytest.mark.parametrize(
+    ("initial", "origin", "deadline", "message"),
+    [
+        (10.0, 10.0, None, "supplied together"),
+        (10.0, 10.0, 41.0, "does not match"),
+        (9.999, 10.0, 40.0, "moved before"),
+        (40.0, 10.0, 40.0, "already stale"),
+    ],
+)
+def test_contract_rejects_invalid_absolute_soak_windows(
+    tmp_path: Path,
+    initial: float,
+    origin: float,
+    deadline: float | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            run_contract(
+                tmp_path,
+                private_seed=os.urandom(32),
+                clock=ManualClock(initial),
+                soak_seconds=30,
+                absolute_origin=origin,
+                absolute_deadline=deadline,
+            )
+        )
