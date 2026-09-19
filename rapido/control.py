@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .clock import AsyncClock
 from .config import RuntimeConfig
 from .orchestrator import NativeRuntime, Orchestrator, RunReport
 from .routing import DISPOSITIONS, FAILURE_KINDS, ROUTE_AXES
@@ -249,10 +250,16 @@ class DurableJobControl:
     """Own one production run and expose only sanitized durable facts."""
 
     @staticmethod
-    async def drive(config: RuntimeConfig, *, board: Any, runtime: NativeRuntime) -> RunReport:
+    async def drive(
+        config: RuntimeConfig,
+        *,
+        board: Any,
+        runtime: NativeRuntime,
+        clock: AsyncClock | None = None,
+    ) -> RunReport:
         state = StateStore(config.state_path)
         try:
-            return await _AdaptiveOrchestrator(config, board, state, runtime).run()
+            return await _AdaptiveOrchestrator(config, board, state, runtime, clock=clock).run()
         finally:
             state.close()
 
