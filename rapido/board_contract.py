@@ -646,26 +646,6 @@ def _regular_offline_pilot_source(source: Path) -> Path:
     return source
 
 
-def _offline_pilot_source_sha() -> str | None:
-    source = _PACKAGED_OFFLINE_PILOT_DIRECTORY / "source.sha"
-    try:
-        metadata = source.lstat()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise RuntimeError("offline pilot source identity is unavailable") from exc
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_size > 128
-    ):
-        raise RuntimeError("offline pilot source identity is unavailable")
-    try:
-        return source.read_text(encoding="ascii")
-    except (OSError, UnicodeError) as exc:
-        raise RuntimeError("offline pilot source identity is unavailable") from exc
-
-
 class _PeakProbe:
     def __init__(self) -> None:
         self.active = 0
@@ -706,7 +686,11 @@ def _load_offline_pilot() -> Any:
     return module
 
 
-async def _run_offline_pilot_contract(root: Path, private_seed: bytes) -> tuple[int, int, int]:
+async def _run_offline_pilot_contract(
+    root: Path,
+    private_seed: bytes,
+    registered_source_sha: str | None,
+) -> tuple[int, int, int]:
     pilot = _load_offline_pilot()
     codex_home = root / "auth"
     codex_home.mkdir(mode=0o700, parents=True)
@@ -763,7 +747,7 @@ async def _run_offline_pilot_contract(root: Path, private_seed: bytes) -> tuple[
         codex_home,
         work_root,
         key_file,
-        source_sha=_offline_pilot_source_sha(),
+        source_sha=registered_source_sha,
     )
     receipt = await pilot.run_verifier_repair_pilot(
         config, client_factory=lambda **_: ModelFreeClient()
@@ -925,7 +909,9 @@ async def _run_deadline_controller(
 
 
 async def _tail_scenario_receipts(
-    root: Path, private_seed: bytes
+    root: Path,
+    private_seed: bytes,
+    registered_source_sha: str | None,
 ) -> tuple[ScenarioReceipt, ScenarioReceipt]:
     (
         deadline_status,
@@ -966,7 +952,9 @@ async def _tail_scenario_receipts(
     )
 
     startup_peak, turn_peak, pilot_result_rows = await _run_offline_pilot_contract(
-        root / "offline-pilot", private_seed
+        root / "offline-pilot",
+        private_seed,
+        registered_source_sha,
     )
     private_detail = _private_value(private_seed, "diagnostic")
     diagnostic = _error("invalid_argument", "benign", field_path=private_detail)
@@ -1003,6 +991,7 @@ async def run_contract(
     soak_seconds: float = 19_800.0,
     absolute_origin: float | None = None,
     absolute_deadline: float | None = None,
+    registered_source_sha: str | None = None,
 ) -> ContractReceipt:
     """Run all ten scenarios and return one sanitized receipt."""
 
@@ -1010,6 +999,9 @@ async def run_contract(
         raise ValueError("private seed must contain 32..1024 bytes")
     if not 0 < soak_seconds <= 19_800:
         raise ValueError("soak duration must be within 0..19800 seconds")
+    packaged = _PACKAGED_OFFLINE_PILOT_DIRECTORY == Path("/opt/rapido-eval")
+    if packaged is not (registered_source_sha is not None):
+        raise ValueError("sealed soak source identity must be supplied only by its supervisor")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     selected_clock = ManualClock() if clock is None else clock
@@ -1445,7 +1437,11 @@ async def run_contract(
         )
 
         # Finish bounded setup scenarios before the idle watch consumes the remaining window.
-        tail_receipts = await _tail_scenario_receipts(root, private_seed)
+        tail_receipts = await _tail_scenario_receipts(
+            root,
+            private_seed,
+            registered_source_sha,
+        )
 
         # 8. The real idle-watch seam observes a late change under its original deadline.
         def detail(challenge_id: int, revision: int) -> dict[str, object]:

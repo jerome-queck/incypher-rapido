@@ -20,19 +20,7 @@ assert SPEC is not None and SPEC.loader is not None
 SOAK = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = SOAK
 SPEC.loader.exec_module(SOAK)
-
-
-@pytest.fixture(autouse=True)
-def _checkout_offline_pilot(monkeypatch: pytest.MonkeyPatch) -> None:
-    module_name = "_rapido_board_contract_offline_pilot"
-    monkeypatch.setattr(
-        BOARD_CONTRACT,
-        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
-        Path(__file__).resolve().parents[1] / "scripts",
-    )
-    sys.modules.pop(module_name, None)
-    yield
-    sys.modules.pop(module_name, None)
+pytestmark = pytest.mark.usefixtures("checkout_offline_pilot")
 
 
 def test_start_barrier_waits_only_for_bounded_future_window() -> None:
@@ -67,6 +55,25 @@ def test_main_binds_pilot_to_resolved_entrypoint_directory(
     with pytest.raises(SystemExit, match="0"):
         SOAK.main()
     assert observed["directory"] == Path(SOAK.__file__).resolve().parent
+
+
+def test_source_sha_is_rejected_outside_sealed_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = type(
+        "Arguments",
+        (),
+        {
+            "source_sha": "a" * 40,
+            "duration_seconds": 2.0,
+            "start_at_unix_ms": None,
+            "accelerated": True,
+            "output": None,
+        },
+    )()
+    monkeypatch.setattr(SOAK, "_arguments", lambda: arguments)
+    with pytest.raises(SystemExit, match="required only for the sealed soak"):
+        SOAK.main()
 
 
 def test_start_barrier_accepts_small_scheduling_lag_without_sleep() -> None:

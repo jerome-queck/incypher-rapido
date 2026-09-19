@@ -1392,6 +1392,8 @@ def soak_create_argv(
             str(protocol.scoring_seconds),
             "--output",
             f"/output/{SOAK_RECEIPT}",
+            "--source-sha",
+            protocol.source_sha,
         ]
     )
     if start_wall_epoch_milliseconds is not None:

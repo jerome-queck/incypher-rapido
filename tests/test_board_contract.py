@@ -22,20 +22,7 @@ from rapido.board_contract import (
 from rapido.clock import ManualClock, SystemClock
 
 OFFLINE_PILOT_MODULE = "_rapido_board_contract_offline_pilot"
-
-
-@pytest.fixture(autouse=True)
-def _checkout_offline_pilot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        BOARD_CONTRACT,
-        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
-        Path(__file__).resolve().parents[1] / "scripts",
-    )
-    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
-    yield
-    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+pytestmark = pytest.mark.usefixtures("checkout_offline_pilot")
 
 
 def test_offline_pilot_loader_uses_explicit_test_fixture() -> None:
@@ -181,21 +168,6 @@ def test_offline_pilot_loader_rejects_foreign_cache_claiming_expected_path(
 def test_offline_pilot_loader_reuses_validated_real_module() -> None:
     loaded = BOARD_CONTRACT._load_offline_pilot()
     assert BOARD_CONTRACT._load_offline_pilot() is loaded
-
-
-def test_offline_pilot_source_sha_uses_bounded_regular_sealed_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", tmp_path)
-    assert BOARD_CONTRACT._offline_pilot_source_sha() is None
-    source = tmp_path / "source.sha"
-    source.write_text("a" * 40 + "\n", encoding="ascii")
-    assert BOARD_CONTRACT._offline_pilot_source_sha() == "a" * 40 + "\n"
-    source.unlink()
-    source.symlink_to(tmp_path / "missing")
-    with pytest.raises(RuntimeError, match="source identity is unavailable"):
-        BOARD_CONTRACT._offline_pilot_source_sha()
 
 
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(
@@ -468,6 +440,32 @@ def test_contract_rejects_invalid_private_seed_and_duration(tmp_path: Path) -> N
         asyncio.run(run_contract(tmp_path, private_seed=b"short"))
     with pytest.raises(ValueError, match="19800"):
         asyncio.run(run_contract(tmp_path, private_seed=os.urandom(32), soak_seconds=19_801))
+
+
+def test_contract_binds_registered_source_only_to_sealed_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path("/opt/rapido-eval"),
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        asyncio.run(run_contract(tmp_path, private_seed=os.urandom(32)))
+    monkeypatch.setattr(
+        BOARD_CONTRACT,
+        "_PACKAGED_OFFLINE_PILOT_DIRECTORY",
+        Path(__file__).resolve().parents[1] / "scripts",
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        asyncio.run(
+            run_contract(
+                tmp_path,
+                private_seed=os.urandom(32),
+                registered_source_sha="a" * 40,
+            )
+        )
 
 
 @pytest.mark.parametrize(
