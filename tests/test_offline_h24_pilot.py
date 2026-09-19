@@ -700,6 +700,15 @@ def test_h24_startup_or_validation_cancellation_attaches_terminal_receipt(
     assert list(config.work_root.iterdir()) == []
 
 
+def test_pair_deadline_preserves_full_grant_at_large_monotonic_offsets() -> None:
+    admitted = 4_194_183.9739414086
+    deadline = PILOT.PairDeadline.admit(300.0, admitted, admitted + 19_800.0)
+
+    assert deadline.configured_milliseconds == 300_000
+    assert deadline.granted_milliseconds == 300_000
+    assert deadline.absolute == admitted + 300.0
+
+
 def test_shared_deadline_repair_is_one_solve_same_thread_and_decreasing(tmp_path: Path) -> None:
     fixture = PILOT._prepare_h24_fixtures(SEED)[0]
     workspace = tmp_path / "workspace"

@@ -249,17 +249,26 @@ class PairDeadline:
         admitted_at: float,
         global_deadline: float,
     ) -> PairDeadline:
+        configured_milliseconds = max(0, int(configured_seconds * 1000))
+        configured_deadline = admitted_at + configured_seconds
         if configured_seconds <= 0 or global_deadline < admitted_at:
             granted = 0
+        elif global_deadline >= configured_deadline:
+            # Preserve the exact configured grant. Subtracting two large monotonic
+            # floats can otherwise turn 300_000 ms into 299_999 ms on Linux.
+            granted = configured_milliseconds
         else:
             granted = max(
                 0,
-                int((min(global_deadline, admitted_at + configured_seconds) - admitted_at) * 1000),
+                min(
+                    configured_milliseconds,
+                    int((global_deadline - admitted_at) * 1000),
+                ),
             )
         return cls(
-            configured_milliseconds=max(0, int(configured_seconds * 1000)),
+            configured_milliseconds=configured_milliseconds,
             granted_milliseconds=granted,
-            absolute=min(global_deadline, admitted_at + configured_seconds),
+            absolute=min(global_deadline, configured_deadline),
         )
 
     def remaining_milliseconds(self, observed_at: float) -> int:
