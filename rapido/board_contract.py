@@ -668,8 +668,14 @@ def _load_offline_pilot() -> Any:
     existing = sys.modules.get(name)
     if existing is not None:
         return existing
-    repository_source = Path(__file__).resolve().parents[1] / "scripts" / "offline_oracle_pilot.py"
-    source = _regular_offline_pilot_source(repository_source, missing_ok=True)
+    module_source = Path(__file__).resolve()
+    installed = any(
+        part.casefold() in {"site-packages", "dist-packages"} for part in module_source.parts
+    )
+    source = None
+    if not installed:
+        repository_source = module_source.parents[1] / "scripts" / "offline_oracle_pilot.py"
+        source = _regular_offline_pilot_source(repository_source, missing_ok=True)
     if source is None:
         source = _regular_offline_pilot_source(
             _PACKAGED_OFFLINE_PILOT_DIRECTORY / "offline_oracle_pilot.py",
@@ -681,7 +687,12 @@ def _load_offline_pilot() -> Any:
         raise RuntimeError("offline pilot module is unavailable")
     module = importlib.util.module_from_spec(specification)
     sys.modules[name] = module
-    specification.loader.exec_module(module)
+    try:
+        specification.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(name) is module:
+            del sys.modules[name]
+        raise
     return module
 
 

@@ -42,12 +42,15 @@ def test_offline_pilot_loader_prefers_repository_source(
         sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
 
-def test_offline_pilot_loader_falls_back_to_fixed_packaged_wrapper(
+def test_offline_pilot_loader_ignores_site_packages_sibling_for_fixed_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     installed_package = tmp_path / "venv" / "site-packages" / "rapido"
     installed_package.mkdir(parents=True)
+    injected = installed_package.parent / "scripts"
+    injected.mkdir()
+    (injected / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'injected'\n")
     packaged = tmp_path / "rapido-eval"
     packaged.mkdir()
     (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
@@ -108,6 +111,31 @@ def test_offline_pilot_loader_rejects_symlinked_packaged_boundary(
     try:
         with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
             BOARD_CONTRACT._load_offline_pilot()
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
+def test_offline_pilot_loader_removes_partial_module_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    source = packaged / "offline_oracle_pilot.py"
+    source.write_text("PARTIAL_MARKER = True\nraise RuntimeError('first import failed')\n")
+    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+    try:
+        with pytest.raises(RuntimeError, match="first import failed"):
+            BOARD_CONTRACT._load_offline_pilot()
+        source.write_text("RETRY_MARKER = 'complete'\n" + "#" * 200)
+        loaded = BOARD_CONTRACT._load_offline_pilot()
+        assert loaded.RETRY_MARKER == "complete"
+        assert not hasattr(loaded, "PARTIAL_MARKER")
     finally:
         sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
