@@ -1612,7 +1612,11 @@ async def run_pilot(
                 row["status"] = "completed"
 
         try:
-            await asyncio.gather(*(start_arm(arm) for arm in ARMS))
+            # Both native clients share one fresh CODEX_HOME. Its first-use SQLite
+            # bootstrap is not concurrency-safe, so initialize each process before
+            # running the paired fixture turns concurrently below.
+            for arm in ARMS:
+                await start_arm(arm)
 
             for fixture in fixture_catalogue():
                 expected = oracle_answer(key, fixture.id)
@@ -1828,7 +1832,11 @@ async def run_verifier_repair_pilot(
                 row["status"] = "completed"
 
         try:
-            await asyncio.gather(*(start_arm(arm) for arm in VERIFIER_ARMS))
+            # Both native clients share one fresh CODEX_HOME. Its first-use SQLite
+            # bootstrap is not concurrency-safe, so initialize each process before
+            # running the paired fixture turns concurrently below.
+            for arm in VERIFIER_ARMS:
+                await start_arm(arm)
             for fixture in fixture_catalogue():
                 expected = oracle_answer(key, fixture.id)
                 material = fixture.material(expected)

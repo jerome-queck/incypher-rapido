@@ -462,6 +462,26 @@ class _VerifierFakeClient:
         self.closed = True
 
 
+class _StartupRaceVerifierClient(_VerifierFakeClient):
+    def __init__(
+        self,
+        key: bytes,
+        startup_probe: _ConcurrencyProbe,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(key, **kwargs)
+        self.startup_probe = startup_probe
+
+    async def start(self) -> None:
+        await self.startup_probe.enter()
+        try:
+            if self.startup_probe.active > 1:
+                raise RuntimeError("synthetic shared CODEX_HOME bootstrap race")
+            self.started = True
+        finally:
+            self.startup_probe.leave()
+
+
 def _factory(
     key: bytes,
     probe: _ConcurrencyProbe,
@@ -699,6 +719,28 @@ def test_fake_verifier_repair_pilot_reuses_thread_and_emits_candidate_free_metri
             for follow_up in repair_client.follow_ups
         )
     assert list(work_root.iterdir()) == []
+
+
+def test_verifier_clients_initialize_shared_codex_home_sequentially(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_source_observation(monkeypatch, clean=True)
+    codex_home, work_root, key_file = _roots(tmp_path)
+    key = key_file.read_bytes()
+    startup_probe = _ConcurrencyProbe()
+    clients: list[_StartupRaceVerifierClient] = []
+
+    def factory(**kwargs: object) -> _StartupRaceVerifierClient:
+        client = _StartupRaceVerifierClient(key, startup_probe, **kwargs)
+        clients.append(client)
+        return client
+
+    config = PILOT.PilotConfig("codex", codex_home, work_root, key_file, source_sha="c" * 40)
+    receipt = asyncio.run(PILOT.run_verifier_repair_pilot(config, client_factory=factory))
+
+    assert startup_probe.peak == 1
+    assert all(client.started and client.closed for client in clients)
+    assert receipt["gate"]["status"] == "passed"
 
 
 def test_verifier_repair_does_not_continue_supplied_candidate(tmp_path: Path) -> None:
