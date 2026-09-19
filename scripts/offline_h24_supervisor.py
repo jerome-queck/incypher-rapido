@@ -272,6 +272,7 @@ class EvaluationState:
     stopped: set[str] = field(default_factory=set)
     removed: set[str] = field(default_factory=set)
     ownership_ambiguous: bool = False
+    create_outcome_unresolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -629,6 +630,7 @@ def _create_owned_container(
     if command_timeout <= 0:
         raise SupervisorError(failure)
     known = set(state.created)
+    state.create_outcome_unresolved = True
     result = runner(tuple(argv), timeout=command_timeout)
     if clock.monotonic() >= operation_deadline:
         raise SupervisorError(failure)
@@ -654,6 +656,8 @@ def _create_owned_container(
         )
         new_ids = inventory - known
     state.created.update(new_ids)
+    if len(new_ids) == 1:
+        state.create_outcome_unresolved = False
     if clock.monotonic() >= operation_deadline:
         raise SupervisorError(failure)
     returned_id = result.stdout.strip()
@@ -857,7 +861,7 @@ def verify_image_source(
             shutil.rmtree(probe_root)
         except OSError:
             cleanup_failed = True
-        if cleanup_failed:
+        if cleanup_failed and not state.create_outcome_unresolved:
             raise SupervisorError("image_source_probe_cleanup")
     if state.ownership_ambiguous:
         raise SupervisorError("container_ownership_ambiguous")
@@ -1811,10 +1815,15 @@ def _cleanup_owned_containers(
     clock: Clock,
     deadline: float,
 ) -> bool:
+    cleanup_deadline = deadline
+    if state.create_outcome_unresolved:
+        # An empty inventory cannot prove a timed-out create never reached the daemon.
+        # Exhaust the bounded owner window and refuse a clean attestation even if empty.
+        cleanup_deadline = min(deadline, clock.monotonic() + OWNER_CLEANUP_SECONDS)
     cleanup_failed = False
     quiet_since: float | None = None
-    while clock.monotonic() < deadline:
-        timeout = _remaining_timeout(clock, deadline)
+    while clock.monotonic() < cleanup_deadline:
+        timeout = _remaining_timeout(clock, cleanup_deadline)
         if timeout is None:
             break
         try:
@@ -1822,7 +1831,7 @@ def _cleanup_owned_containers(
         except SupervisorError:
             cleanup_failed = True
             inventory = set()
-        if clock.monotonic() > deadline:
+        if clock.monotonic() > cleanup_deadline:
             return False
         discovered = inventory - state.created
         if discovered:
@@ -1833,14 +1842,14 @@ def _cleanup_owned_containers(
             iteration_failed = False
             for container_id in sorted(inventory):
                 try:
-                    timeout = _remaining_timeout(clock, deadline)
+                    timeout = _remaining_timeout(clock, cleanup_deadline)
                     if timeout is None:
                         cleanup_failed = True
                         iteration_failed = True
                         break
                     container = _container_state(container_id, runner, timeout=timeout)
                     if container.get("Running") is True:
-                        timeout = _remaining_timeout(clock, deadline)
+                        timeout = _remaining_timeout(clock, cleanup_deadline)
                         if timeout is None:
                             cleanup_failed = True
                             iteration_failed = True
@@ -1859,7 +1868,7 @@ def _cleanup_owned_containers(
                         runner,
                         state,
                         clock=clock,
-                        deadline=deadline,
+                        deadline=cleanup_deadline,
                     )
                 except SupervisorError:
                     cleanup_failed = True
@@ -1869,9 +1878,12 @@ def _cleanup_owned_containers(
         else:
             observed_at = clock.monotonic()
             quiet_since = observed_at if quiet_since is None else quiet_since
-            if observed_at - quiet_since >= OWNER_QUIET_SECONDS:
+            if (
+                not state.create_outcome_unresolved
+                and observed_at - quiet_since >= OWNER_QUIET_SECONDS
+            ):
                 return not cleanup_failed
-        remaining = deadline - clock.monotonic()
+        remaining = cleanup_deadline - clock.monotonic()
         if remaining <= 0:
             break
         clock.sleep(min(OWNER_POLL_SECONDS, remaining))
@@ -2372,13 +2384,14 @@ def run_descriptor_preflight(
             if result.returncode != 0:
                 raise SupervisorError("preflight_run")
         finally:
-            if not _cleanup_owned_containers(
+            cleanup_attested = _cleanup_owned_containers(
                 ownership_token,
                 state,
                 runner,
                 clock,
                 clock.monotonic() + OWNER_CLEANUP_SECONDS,
-            ):
+            )
+            if not cleanup_attested and not state.create_outcome_unresolved:
                 raise SupervisorError("preflight_cleanup")
         if state.ownership_ambiguous:
             raise SupervisorError("container_ownership_ambiguous")

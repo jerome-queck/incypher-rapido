@@ -968,6 +968,53 @@ def test_timed_out_create_polls_for_delayed_daemon_visibility(tmp_path: Path) ->
     assert runner.existing == set()
 
 
+def test_unresolved_create_polls_full_cleanup_bound_without_clean_attestation(
+    tmp_path: Path,
+) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output, protocol)
+    clock = FakeClock()
+
+    class VeryDelayedVisibilityFake(DockerFake):
+        timed_out = False
+        visible_at: float | None = None
+
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            command = tuple(argv)
+            result = super().__call__(command, timeout=timeout)
+            if command[:2] == ("docker", "create") and not self.timed_out:
+                self.timed_out = True
+                self.visible_at = clock.monotonic() + 7
+                return SUPERVISOR.CommandResult(124)
+            if (
+                self.visible_at is not None
+                and clock.monotonic() < self.visible_at
+                and any(value.startswith(f"label={SUPERVISOR._OWNER_LABEL}=") for value in command)
+            ):
+                return SUPERVISOR.CommandResult(0, "")
+            return result
+
+    runner = VeryDelayedVisibilityFake(paths.output, clock=clock)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=runner,
+        clock=clock,
+        finalize=False,
+    )
+
+    assert runner.visible_at == 1_007
+    assert clock.monotonic() == 1_015
+    assert receipt["status"] == "failed"
+    assert receipt["failure_class"] == "container_create"
+    assert receipt["cleanup"]["containers_absent"] is False
+    assert receipt["cleanup"]["no_orphan_containers"] is False
+    assert not any(command[:2] == ("docker", "start") for command in runner.commands)
+    assert runner.existing == set()
+    assert ("docker", "rm", "--volumes", H24_ID) in runner.commands
+
+
 def test_create_intent_inspection_cannot_extend_barrier_deadline(tmp_path: Path) -> None:
     protocol, preregistration, registration = _protocol_files(tmp_path)
     protocol = replace(protocol, barrier_delay_seconds=1)
