@@ -18,8 +18,11 @@ reference, image ID, `linux/amd64` or `linux/arm64` platform, OCI revision and s
 supervisor compares Docker's inspected OS and architecture and rejects a mismatch. Labels alone are
 not source proof: a fixed, never-started, networkless probe container receives no host mounts. The
 supervisor copies its installed Rapido package and three evaluation artifacts into a private
-temporary directory, rejects links or any missing/extra/changed Python source, byte-compares the
-artifacts with the validated clean repository, then removes the exact probe ID and its anonymous
+temporary directory. The wrapper deletes installed `.pyc`/`.pyo` files and empty `__pycache__`
+directories as root. The supervisor permits only the exact tracked directory and regular `.py`
+file set: extra bytecode, extensions, metadata, links, devices, missing files, or changed bytes all
+fail. It byte-compares the artifacts with the validated clean repository, then removes the exact
+probe ID and its anonymous
 volumes in `finally`. The probe is owned only after create returns a validated full Docker ID; a
 name race, failed create, or malformed ID cannot authorize removal. Image-provided code is never
 executed during this check. Descriptor
@@ -53,8 +56,12 @@ no-new-privileges, omit `--init`, and use a 190-second stop grace. H24 mounts wr
 work and private output plus read-only seed/protocol. The soak mounts only private output and the
 read-only protocol. Neither receives a repository or Board environment.
 
-Ten-second bounded samples retain peak CPU, RSS, PID and OOM observations; unavailable fields stay
-null. H24 completion starts no filler calls, and the scoring phase remains open until the exact
+Resource sampling targets each barrier-relative five-second cadence point and retains peak CPU,
+RSS, PID and OOM observations; unavailable fields stay null. The recorded interval is the actual
+maximum coverage gap, including start-to-first-observation and last-observation-to-exit/deadline,
+never the target cadence. Missing endpoints remain partial/unavailable, and an observed gap above
+the frozen ten-second maximum fails its independent gate. H24 completion starts no filler calls,
+and the scoring phase remains open until the exact
 common deadline even when both workers finish early. The deadline starts one 190-second cleanup
 window. Workers may drain naturally for 180 seconds; only containers still running at that boundary
 receive an immediate stop. The remaining outer grace covers inspection, logs, exact-name removal,

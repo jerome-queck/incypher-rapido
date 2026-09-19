@@ -16,6 +16,8 @@ USER 0:0
 RUN set -eu; \
     printf '%s' "${EVAL_BUILD_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
     printf '%s' "${RAPIDO_SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$|^[0-9a-f]{64}$'; \
+    find /opt/venv/lib/python3.12/site-packages/rapido -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete; \
+    find /opt/venv/lib/python3.12/site-packages/rapido -depth -type d -name __pycache__ -empty -delete; \
     install --directory --mode=0555 --owner=0 --group=0 /opt/rapido-eval; \
     printf '%s\n' "${EVAL_BUILD_SHA}" > /opt/rapido-eval/build.sha; \
     printf '%s\n' "${RAPIDO_SOURCE_SHA}" > /opt/rapido-eval/source.sha; \

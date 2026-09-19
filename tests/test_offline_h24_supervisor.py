@@ -120,11 +120,13 @@ class DockerFake:
         output: Path,
         *,
         keep_soak_running: bool = False,
+        keep_h24_running: bool = False,
         oom: bool = False,
         clock: FakeClock | None = None,
     ) -> None:
         self.output = output
         self.keep_soak_running = keep_soak_running
+        self.keep_h24_running = keep_h24_running
         self.oom = oom
         self.clock = clock
         self.commands: list[tuple[str, ...]] = []
@@ -165,7 +167,9 @@ class DockerFake:
         if command[:3] == ("docker", "container", "inspect"):
             name = command[-1]
             running = name in self.running
-            if name.endswith("eval") or not self.keep_soak_running:
+            if (name.endswith("eval") and not self.keep_h24_running) or (
+                name.endswith("soak") and not self.keep_soak_running
+            ):
                 running = False
                 self.running.discard(name)
             return SUPERVISOR.CommandResult(
@@ -234,6 +238,9 @@ def test_wrapper_dockerfile_is_separate_pinned_and_minimal() -> None:
     assert "USER 10001:10001" in text
     assert "ENTRYPOINT" not in text
     assert "chmod 0444" in text
+    assert "-name '*.pyc' -o -name '*.pyo'" in text
+    assert "-name __pycache__ -empty -delete" in text
+    assert text.index("-name '*.pyc'") < text.rindex("USER 10001:10001")
     copies = [line for line in text.splitlines() if line.startswith("COPY ")]
     assert len(copies) == 3
     assert any("offline_oracle_pilot.py" in line for line in copies)
@@ -381,12 +388,12 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
         def __init__(
             self,
             *,
-            mutate: bool = False,
+            mutation: str | None = None,
             remove_fails: bool = False,
             create_fails: bool = False,
             malformed_id: bool = False,
         ) -> None:
-            self.mutate = mutate
+            self.mutation = mutation
             self.remove_fails = remove_fails
             self.create_fails = create_fails
             self.malformed_id = malformed_id
@@ -397,6 +404,11 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
             del timeout
             command = tuple(argv)
             self.commands.append(command)
+            if command[:3] == ("git", "-C", str(ROOT)) and "ls-files" in command:
+                tracked = sorted(
+                    path.relative_to(ROOT).as_posix() for path in (ROOT / "rapido").rglob("*.py")
+                )
+                return SUPERVISOR.CommandResult(0, "\0".join(tracked) + "\0")
             if command[:3] == ("docker", "ps", "--all"):
                 filter_value = command[command.index("--filter") + 1]
                 value = (
@@ -418,10 +430,18 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
                 source = command[2]
                 destination = Path(command[3])
                 if source.endswith(SUPERVISOR._INSTALLED_RAPIDO):
-                    shutil.copytree(ROOT / "rapido", destination)
-                    if self.mutate:
-                        target = min(destination.rglob("*.py"))
+                    destination.mkdir()
+                    for source_path in (ROOT / "rapido").rglob("*.py"):
+                        copied = destination / source_path.relative_to(ROOT / "rapido")
+                        copied.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_path, copied)
+                    target = min(destination.rglob("*.py"))
+                    if self.mutation == "changed":
                         target.write_bytes(target.read_bytes() + b"\n# drift\n")
+                    elif self.mutation == "missing":
+                        target.unlink()
+                    elif self.mutation in {"pyc", "so"}:
+                        (destination / f"malicious.{self.mutation}").write_bytes(b"drift")
                 else:
                     shutil.copy2(
                         ROOT / SUPERVISOR._WRAPPER_SOURCES[Path(source).name],
@@ -455,18 +475,19 @@ def test_image_source_probe_rejects_mismatched_base_and_always_removes(
     )
     assert matching.existing is False
 
-    mismatched = SourceProbeFake(mutate=True)
-    with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_mismatch"):
-        SUPERVISOR.verify_image_source(
-            protocol,
-            ROOT,
-            paths.output,
-            mismatched,
+    for mutation in ("changed", "missing", "pyc", "so"):
+        mismatched = SourceProbeFake(mutation=mutation)
+        with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_mismatch"):
+            SUPERVISOR.verify_image_source(
+                protocol,
+                ROOT,
+                paths.output,
+                mismatched,
+            )
+        assert mismatched.existing is False
+        assert any(
+            command == ("docker", "rm", "--volumes", PROBE_ID) for command in mismatched.commands
         )
-    assert mismatched.existing is False
-    assert any(
-        command == ("docker", "rm", "--volumes", PROBE_ID) for command in mismatched.commands
-    )
 
     removal_failure = SourceProbeFake(remove_fails=True)
     with pytest.raises(SUPERVISOR.SupervisorError, match="image_source_probe_cleanup"):
@@ -533,6 +554,9 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
         "peak_rss_bytes": 256 * 1024**2,
         "peak_pids": 17,
         "oom_killed": False,
+        "sample_interval_seconds": 0.0,
+        "coverage_complete": True,
+        "observation_status": "observed",
     }
     assert clock.monotonic() == 1_000 + 30 + 19_800
     assert not paths.work.exists()
@@ -540,6 +564,76 @@ def test_evaluation_common_barrier_receipts_resource_peaks_and_cleanup(tmp_path:
     assert paths.auth.exists() and (paths.auth / "auth.json").exists()
     assert paths.output.exists() and (paths.output / SUPERVISOR.SUPERVISOR_RECEIPT).exists()
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths.output.iterdir())
+
+
+def test_resource_cadence_uses_measured_gap_and_terminal_coverage(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, scoring_seconds=20, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=DockerFake(paths.output, keep_h24_running=True, keep_soak_running=True),
+        clock=FakeClock(),
+        finalize=False,
+    )
+
+    resources = receipt["containers"]["h24"]["resources"]
+    maximum = protocol.preregistration["runtime_resource_limits"]["sampling_interval_seconds_max"]
+    assert resources["observation_status"] == "observed"
+    assert resources["coverage_complete"] is True
+    assert resources["sample_interval_seconds"] == 5.0
+    assert resources["sample_interval_seconds"] <= maximum
+
+    early_root = tmp_path / "early"
+    early_root.mkdir()
+    early_paths = _paths(early_root, preregistration, registration)
+    _seed_child_receipts(early_paths.output)
+    early = SUPERVISOR.run_evaluation(
+        protocol,
+        early_paths,
+        runner=DockerFake(early_paths.output),
+        clock=FakeClock(),
+        finalize=False,
+    )
+    early_resources = early["containers"]["h24"]["resources"]
+    assert early_resources["observation_status"] == "observed"
+    assert early_resources["coverage_complete"] is True
+    assert early_resources["sample_interval_seconds"] == 0.0
+
+
+def test_slow_stats_records_over_max_gap_instead_of_nominal_cadence(tmp_path: Path) -> None:
+    protocol, preregistration, registration = _protocol_files(tmp_path)
+    protocol = replace(protocol, scoring_seconds=30, barrier_delay_seconds=1)
+    paths = _paths(tmp_path, preregistration, registration)
+    _seed_child_receipts(paths.output)
+    clock = FakeClock()
+
+    class SlowStats(DockerFake):
+        def __call__(self, argv: Any, *, timeout: float | None = None) -> Any:
+            if tuple(argv)[:2] == ("docker", "stats"):
+                clock.sleep(12)
+            return super().__call__(argv, timeout=timeout)
+
+    receipt = SUPERVISOR.run_evaluation(
+        protocol,
+        paths,
+        runner=SlowStats(
+            paths.output,
+            keep_h24_running=True,
+            keep_soak_running=True,
+            clock=clock,
+        ),
+        clock=clock,
+        finalize=False,
+    )
+
+    resources = receipt["containers"]["h24"]["resources"]
+    maximum = protocol.preregistration["runtime_resource_limits"]["sampling_interval_seconds_max"]
+    assert resources["observation_status"] == "observed"
+    assert resources["sample_interval_seconds"] >= 12
+    assert resources["sample_interval_seconds"] > maximum
 
 
 def test_deadline_stops_only_running_exact_container_without_filler(tmp_path: Path) -> None:
@@ -679,6 +773,20 @@ def test_stats_parser_retains_nulls_instead_of_inventing_values() -> None:
         "peak_rss_bytes": None,
         "peak_pids": None,
         "oom_killed": None,
+        "sample_interval_seconds": None,
+        "coverage_complete": False,
+        "observation_status": "unavailable",
+    }
+    assert SUPERVISOR._runtime_resources(peak)["observation_status"] == "unavailable"
+
+    incomplete = SUPERVISOR.ResourcePeak(100.0, 1024, 4, False, 1)
+    assert SUPERVISOR._runtime_resources(incomplete) == {
+        "observation_status": "partial",
+        "sample_interval_seconds": None,
+        "peak_cpu_percent": 100.0,
+        "peak_rss_bytes": 1024,
+        "peak_pids": 4,
+        "oom_killed": False,
     }
 
 
@@ -763,6 +871,9 @@ def test_finalizer_joins_sanitized_facts_and_writes_private_evaluation(
         lambda *_: {"schema": "rapido-offline-h24-evaluation-v1", "decision": "inconclusive"},
     )
     peak = SUPERVISOR.ResourcePeak(100.0, 1024, 4, False, 2)
+    peak.start_coverage(0)
+    peak.observe({}, 0)
+    peak.end_coverage(10)
     final, evaluation = SUPERVISOR.finalize_evaluation(
         protocol,
         paths,

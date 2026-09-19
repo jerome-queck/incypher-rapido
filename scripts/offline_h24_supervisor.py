@@ -44,7 +44,8 @@ SUPERVISOR_SCHEMA = "rapido-offline-h24-supervisor-v1"
 SCORING_SECONDS = GLOBAL_SCORING_SECONDS
 CLEANUP_SECONDS = CLEANUP_GRACE_SECONDS
 WORKER_DRAIN_SECONDS = 180
-SAMPLE_SECONDS = 10.0
+SAMPLE_TARGET_SECONDS = 5.0
+CLEANUP_POLL_SECONDS = 10.0
 CONTAINER_UID = 10_001
 H24_RECEIPT = "h24-receipt.json"
 SOAK_RECEIPT = "soak-receipt.json"
@@ -183,8 +184,23 @@ class ResourcePeak:
     pids: int | None = None
     oom_killed: bool | None = None
     samples: int = 0
+    coverage_started_at: float | None = None
+    coverage_ended_at: float | None = None
+    last_observed_at: float | None = None
+    max_observed_gap_seconds: float | None = None
 
-    def observe(self, row: Mapping[str, object]) -> None:
+    def start_coverage(self, observed_at: float) -> None:
+        self.coverage_started_at = observed_at
+
+    def _record_gap(self, observed_at: float) -> None:
+        previous = self.last_observed_at
+        if previous is None:
+            previous = self.coverage_started_at
+        if previous is not None and observed_at >= previous:
+            gap = observed_at - previous
+            self.max_observed_gap_seconds = max(self.max_observed_gap_seconds or 0.0, gap)
+
+    def observe(self, row: Mapping[str, object], observed_at: float | None = None) -> None:
         cpu = _percent(row.get("CPUPerc"))
         rss = _memory_bytes(row.get("MemUsage"))
         pids = _integer(row.get("PIDs"))
@@ -195,6 +211,32 @@ class ResourcePeak:
         if pids is not None:
             self.pids = max(self.pids or 0, pids)
         self.samples += 1
+        if observed_at is not None:
+            self._record_gap(observed_at)
+            self.last_observed_at = observed_at
+
+    def end_coverage(self, observed_at: float) -> None:
+        if self.coverage_ended_at is not None:
+            return
+        self.coverage_ended_at = observed_at
+        if self.last_observed_at is not None:
+            self._record_gap(observed_at)
+
+    def coverage_complete(self) -> bool:
+        return (
+            self.coverage_started_at is not None
+            and self.coverage_ended_at is not None
+            and self.last_observed_at is not None
+            and self.max_observed_gap_seconds is not None
+        )
+
+    def observation_status(self) -> str:
+        values = (self.cpu_percent, self.rss_bytes, self.pids, self.oom_killed)
+        if self.coverage_complete() and all(value is not None for value in values):
+            return "observed"
+        if all(value is None for value in values) and self.max_observed_gap_seconds is None:
+            return "unavailable"
+        return "partial"
 
     def public(self) -> dict[str, object]:
         return {
@@ -203,6 +245,9 @@ class ResourcePeak:
             "peak_rss_bytes": self.rss_bytes,
             "peak_pids": self.pids,
             "oom_killed": self.oom_killed,
+            "sample_interval_seconds": self.max_observed_gap_seconds,
+            "coverage_complete": self.coverage_complete(),
+            "observation_status": self.observation_status(),
         }
 
 
@@ -406,8 +451,50 @@ def inspect_image(protocol: Protocol, runner: Runner) -> ImageIdentity:
     return identity
 
 
-def _regular_python_sources(root: Path) -> dict[str, bytes]:
+def _tracked_python_sources(repository: Path, runner: Runner) -> tuple[dict[str, bytes], set[str]]:
+    result = _run(
+        runner,
+        ("git", "-C", str(repository), "ls-files", "-z", "--", "rapido"),
+        "image_source_mismatch",
+    )
     sources: dict[str, bytes] = {}
+    directories = {""}
+    try:
+        for value in result.stdout.split("\0"):
+            if not value:
+                continue
+            relative = Path(value)
+            if relative.suffix != ".py":
+                continue
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or relative.parts[:1] != ("rapido",)
+            ):
+                raise SupervisorError("image_source_mismatch")
+            package_relative = Path(*relative.parts[1:])
+            source = repository / relative
+            metadata = source.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise SupervisorError("image_source_mismatch")
+            key = package_relative.as_posix()
+            sources[key] = source.read_bytes()
+            parent = package_relative.parent
+            while parent != Path("."):
+                directories.add(parent.as_posix())
+                parent = parent.parent
+    except OSError as exc:
+        raise SupervisorError("image_source_mismatch") from exc
+    if not sources:
+        raise SupervisorError("image_source_mismatch")
+    return sources, directories
+
+
+def _installed_python_sources(
+    root: Path, expected_files: set[str], expected_directories: set[str]
+) -> dict[str, bytes]:
+    sources: dict[str, bytes] = {}
+    seen_directories = {""}
     stack = [root]
     try:
         root_metadata = root.lstat()
@@ -419,17 +506,22 @@ def _regular_python_sources(root: Path) -> dict[str, bytes]:
                 for entry in entries:
                     metadata = entry.stat(follow_symlinks=False)
                     path = Path(entry.path)
+                    relative = path.relative_to(root).as_posix()
                     if stat.S_ISLNK(metadata.st_mode):
                         raise SupervisorError("image_source_mismatch")
                     if stat.S_ISDIR(metadata.st_mode):
+                        if relative not in expected_directories:
+                            raise SupervisorError("image_source_mismatch")
+                        seen_directories.add(relative)
                         stack.append(path)
                         continue
-                    if not stat.S_ISREG(metadata.st_mode):
+                    if not stat.S_ISREG(metadata.st_mode) or relative not in expected_files:
                         raise SupervisorError("image_source_mismatch")
-                    if path.suffix == ".py":
-                        sources[path.relative_to(root).as_posix()] = path.read_bytes()
+                    sources[relative] = path.read_bytes()
     except OSError as exc:
         raise SupervisorError("image_source_mismatch") from exc
+    if set(sources) != expected_files or seen_directories != expected_directories:
+        raise SupervisorError("image_source_mismatch")
     return sources
 
 
@@ -489,7 +581,13 @@ def verify_image_source(
                 "image_source_probe_copy",
                 timeout=30,
             )
-        if _regular_python_sources(installed) != _regular_python_sources(repository / "rapido"):
+        expected_sources, expected_directories = _tracked_python_sources(repository, runner)
+        installed_sources = _installed_python_sources(
+            installed,
+            set(expected_sources),
+            expected_directories,
+        )
+        if installed_sources != expected_sources:
             raise SupervisorError("image_source_mismatch")
         for name, relative in _WRAPPER_SOURCES.items():
             copied = wrapper / name
@@ -914,6 +1012,8 @@ def _sample(
     runner: Runner,
     peaks: Mapping[str, ResourcePeak],
     *,
+    clock: Clock | None = None,
+    deadline: float | None = None,
     timeout: float = 30,
 ) -> None:
     if not names:
@@ -930,6 +1030,9 @@ def _sample(
     )
     if result.returncode != 0:
         return
+    observed_at = clock.monotonic() if clock is not None else None
+    if deadline is not None and observed_at is not None and observed_at > deadline:
+        return
     for line in result.stdout.splitlines():
         try:
             row = json.loads(line)
@@ -939,7 +1042,7 @@ def _sample(
             continue
         name = row.get("Name")
         if isinstance(name, str) and name in peaks:
-            peaks[name].observe(row)
+            peaks[name].observe(row, observed_at)
 
 
 def _percent(value: object) -> float | None:
@@ -1049,17 +1152,9 @@ def _load_private_json(path: Path, label: str) -> Mapping[str, object]:
 
 
 def _runtime_resources(peak: ResourcePeak) -> dict[str, object]:
-    values = (peak.cpu_percent, peak.rss_bytes, peak.pids, peak.oom_killed)
-    status = (
-        "observed"
-        if peak.samples and all(value is not None for value in values)
-        else "unavailable"
-        if all(value is None for value in values)
-        else "partial"
-    )
     return {
-        "observation_status": status,
-        "sample_interval_seconds": SAMPLE_SECONDS if peak.samples else None,
+        "observation_status": peak.observation_status(),
+        "sample_interval_seconds": peak.max_observed_gap_seconds,
         "peak_cpu_percent": peak.cpu_percent,
         "peak_rss_bytes": peak.rss_bytes,
         "peak_pids": peak.pids,
@@ -1388,22 +1483,43 @@ def run_evaluation(
                 clock.sleep(remaining)
 
             running = {protocol.h24_name, protocol.soak_name}
+            for peak in peaks.values():
+                peak.start_coverage(barrier_mono)
+            next_sample_mono = barrier_mono
             while clock.monotonic() < scoring_deadline_mono:
-                if running:
+                if not running:
+                    remaining = scoring_deadline_mono - clock.monotonic()
+                    if remaining > 0:
+                        clock.sleep(remaining)
+                    break
+                until_sample = next_sample_mono - clock.monotonic()
+                if until_sample > 0:
+                    remaining = scoring_deadline_mono - clock.monotonic()
+                    if remaining > 0:
+                        clock.sleep(min(until_sample, remaining))
+                    continue
+                timeout = _remaining_timeout(clock, scoring_deadline_mono)
+                if timeout is None:
+                    break
+                _sample(
+                    sorted(running),
+                    runner,
+                    peaks,
+                    clock=clock,
+                    deadline=scoring_deadline_mono,
+                    timeout=timeout,
+                )
+                next_sample_mono += SAMPLE_TARGET_SECONDS
+                for name in tuple(running):
                     timeout = _remaining_timeout(clock, scoring_deadline_mono)
                     if timeout is None:
                         break
-                    _sample(sorted(running), runner, peaks, timeout=timeout)
-                    for name in tuple(running):
-                        timeout = _remaining_timeout(clock, scoring_deadline_mono)
-                        if timeout is None:
-                            break
-                        container = _container_state(name, runner, timeout=timeout)
-                        if container.get("Running") is not True:
-                            running.remove(name)
-                remaining = scoring_deadline_mono - clock.monotonic()
-                if remaining > 0:
-                    clock.sleep(min(SAMPLE_SECONDS, remaining) if running else remaining)
+                    container = _container_state(name, runner, timeout=timeout)
+                    if container.get("Running") is not True:
+                        peaks[name].end_coverage(min(clock.monotonic(), scoring_deadline_mono))
+                        running.remove(name)
+            for peak in peaks.values():
+                peak.end_coverage(scoring_deadline_mono)
 
             cleanup_started_mono = scoring_deadline_mono
             # The registered outer grace reserves its final ten seconds for
@@ -1418,7 +1534,7 @@ def run_evaluation(
                         running.remove(name)
                 remaining = worker_drain_deadline_mono - clock.monotonic()
                 if running and remaining > 0:
-                    clock.sleep(min(SAMPLE_SECONDS, remaining))
+                    clock.sleep(min(CLEANUP_POLL_SECONDS, remaining))
             if running:
                 timeout = _remaining_timeout(clock, cleanup_deadline_mono)
                 if timeout is None:
