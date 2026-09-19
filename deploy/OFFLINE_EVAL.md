@@ -62,8 +62,11 @@ preflight and execute also reject a future registration before any Docker access
 ## Private paths
 
 Prepare disjoint private paths outside the repository. Authentication, fresh work and output are
-mode `0700`; `auth.json` and the fresh oracle seed are mode `0600`; owner is UID 10001. The auth
-home must contain no `config.toml`, `config.json`, or `mcp.json`. Work and output begin empty. The
+mode `0700`; `auth.json` and the fresh oracle seed are mode `0600`; owner is UID 10001. The work
+and seed parents are also UID-10001 mode-`0700` directories so the unprivileged finalizer can
+remove those entries after durable sanitized persistence. This is validated before descriptor or
+scored containers start. The auth home must contain no `config.toml`, `config.json`, or `mcp.json`.
+Work and output begin empty. The
 supervisor refuses a Board/token environment, an existing evaluation name, or another container
 mounting the auth home. Its nonblocking auth lease opens the auth directory and lock relative to a
 no-follow directory descriptor. A lock must be a same-owner, mode-0600, single-link regular file;

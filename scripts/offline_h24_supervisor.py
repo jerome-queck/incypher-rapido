@@ -1070,6 +1070,11 @@ def _private_file(path: Path, label: str, owner_uid: int) -> Path:
     return path.resolve(strict=True)
 
 
+def _private_cleanup_parent(path: Path, label: str, owner_uid: int) -> None:
+    """Require a private parent that the unprivileged finalizer can mutate."""
+    _private_directory(path.parent, label, owner_uid)
+
+
 def _auth_baseline(auth: Path) -> AuthBaseline:
     directory_fd: int | None = None
     auth_fd: int | None = None
@@ -1190,6 +1195,9 @@ def validate_paths(
     work = _private_directory(paths.work, "work_invalid", owner_uid)
     output = _private_directory(paths.output, "output_invalid", owner_uid)
     seed = _private_file(paths.seed, "seed_invalid", owner_uid) if require_seed else paths.seed
+    _private_cleanup_parent(work, "work_cleanup_parent_invalid", owner_uid)
+    if require_seed:
+        _private_cleanup_parent(seed, "seed_cleanup_parent_invalid", owner_uid)
     auth_file = _private_file(auth / "auth.json", "auth_invalid", owner_uid)
     del auth_file
     for name in _CAPABILITY_FILES:
