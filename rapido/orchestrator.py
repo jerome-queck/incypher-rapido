@@ -29,6 +29,7 @@ from .board import (
     Challenge,
     Verdict,
 )
+from .clock import AsyncClock, SystemClock
 from .config import RuntimeConfig
 from .evidence import (
     EvidenceBatch,
@@ -566,11 +567,16 @@ class Orchestrator:
         board: BoardClient,
         state: StateStore,
         runtime: NativeRuntime,
+        *,
+        clock: AsyncClock | None = None,
     ) -> None:
         self.config = config
         self.board = board
         self.state = state
         self.runtime = runtime
+        self._clock = (
+            SystemClock(monotonic=time.monotonic, sleep=asyncio.sleep) if clock is None else clock
+        )
         self._slots = asyncio.Semaphore(config.concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
@@ -634,7 +640,7 @@ class Orchestrator:
                 for effort in self.config.specialist_reasoning_efforts
             )
         for model, effort in sorted(selections):
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
             await asyncio.wait_for(validator(model, effort), timeout=remaining)
@@ -654,7 +660,7 @@ class Orchestrator:
     ) -> Any:
         """Run one bounded Board call without abandoning its worker on cancellation."""
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
-        if deadline - time.monotonic() <= transport_timeout:
+        if deadline - self._clock.monotonic() <= transport_timeout:
             raise RunDeadlineReached
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
@@ -677,9 +683,9 @@ class Orchestrator:
                 if attempt == len(retry_delays):
                     raise
                 delay = retry_delays[attempt]
-                if deadline - time.monotonic() <= transport_timeout + delay:
+                if deadline - self._clock.monotonic() <= transport_timeout + delay:
                     raise
-                await asyncio.sleep(delay)
+                await self._clock.sleep(delay)
         raise AssertionError("unreachable Board read retry state")
 
     def _board_watch_read_guard(self) -> float:
@@ -873,7 +879,7 @@ class Orchestrator:
                 },
             )
             return False
-        while deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
+        while deadline - self._clock.monotonic() > float(getattr(self.board, "timeout", 15.0)):
             try:
                 current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
             except (BoardError, RunDeadlineReached):
@@ -888,7 +894,7 @@ class Orchestrator:
                 return True
             if current.get("success") is not True:
                 break
-            await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+            await self._clock.sleep(min(2.0, max(0.0, deadline - self._clock.monotonic())))
         self.state.event(
             run_id,
             "instance_cleanup",
@@ -901,7 +907,7 @@ class Orchestrator:
     ) -> str:
         """Boundedly recover ownership evidence after a cancelled successful create."""
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
-        while deadline - time.monotonic() > transport_timeout:
+        while deadline - self._clock.monotonic() > transport_timeout:
             current = await self._board_read(deadline, self.board.instance, "GET", challenge_id)
             info = current.get("connection_info")
             if current.get("success") is True and isinstance(info, str) and info:
@@ -915,7 +921,7 @@ class Orchestrator:
                 return receipt
             if current.get("status") in {403, 429}:
                 break
-            await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+            await self._clock.sleep(min(2.0, max(0.0, deadline - self._clock.monotonic())))
         raise BoardError("dynamic instance ownership receipt could not be recovered")
 
     async def _start_instance(
@@ -937,7 +943,7 @@ class Orchestrator:
             run_id, "instance_create_intent", {"challenge_id": challenge.id, "writes": 0}
         )
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
-        if deadline - time.monotonic() <= transport_timeout:
+        if deadline - self._clock.monotonic() <= transport_timeout:
             raise RunDeadlineReached
         if on_create_attempt is not None:
             on_create_attempt()
@@ -983,7 +989,10 @@ class Orchestrator:
                     self._recover_created_instance_receipt(
                         run_id,
                         challenge.id,
-                        min(deadline, time.monotonic() + self.config.instance_cleanup_seconds),
+                        min(
+                            deadline,
+                            self._clock.monotonic() + self.config.instance_cleanup_seconds,
+                        ),
                     )
                 )
                 while not recovery.done():
@@ -1001,8 +1010,10 @@ class Orchestrator:
                     except (BoardError, RunDeadlineReached):
                         self.state.mark_instance(run_id, challenge.id, "cleanup_pending")
             raise cancelled
-        ready_deadline = min(deadline, time.monotonic() + self.config.instance_ready_seconds)
-        while ready_deadline - time.monotonic() > float(getattr(self.board, "timeout", 15.0)):
+        ready_deadline = min(deadline, self._clock.monotonic() + self.config.instance_ready_seconds)
+        while ready_deadline - self._clock.monotonic() > float(
+            getattr(self.board, "timeout", 15.0)
+        ):
             current = await self._board_read(
                 ready_deadline, self.board.instance, "GET", challenge.id
             )
@@ -1033,7 +1044,7 @@ class Orchestrator:
                 return endpoints, receipt
             if current.get("status") in {403, 429}:
                 raise BoardError("dynamic instance readiness was rejected")
-            await asyncio.sleep(min(2.0, max(0.0, ready_deadline - time.monotonic())))
+            await self._clock.sleep(min(2.0, max(0.0, ready_deadline - self._clock.monotonic())))
         raise BoardError("dynamic instance did not become ready before the bounded deadline")
 
     async def _qualified_identity(self, deadline: float) -> tuple[int, int]:
@@ -1141,7 +1152,7 @@ class Orchestrator:
     ) -> tuple[list[Challenge], dict[int, str]] | None:
         """Stay idle until new or refreshed Board work appears, or the run deadline ends."""
         known_ids = {challenge.id for challenge in current}
-        next_full_refresh = time.monotonic() + self.config.board_full_refresh_seconds
+        next_full_refresh = self._clock.monotonic() + self.config.board_full_refresh_seconds
         self.state.event(
             run_id,
             "board_watch_started",
@@ -1151,16 +1162,16 @@ class Orchestrator:
         next_read_delay = float(self.config.board_watch_seconds)
         transport_failures = 0
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= read_guard:
                 if remaining > 0:
-                    await asyncio.sleep(remaining)
+                    await self._clock.sleep(remaining)
                 return None
-            await asyncio.sleep(min(next_read_delay, remaining - read_guard))
-            remaining = deadline - time.monotonic()
+            await self._clock.sleep(min(next_read_delay, remaining - read_guard))
+            remaining = deadline - self._clock.monotonic()
             if remaining <= read_guard:
                 if remaining > 0:
-                    await asyncio.sleep(remaining)
+                    await self._clock.sleep(remaining)
                 return None
             try:
                 first, second = await self._board_watch_challenge_pair(deadline)
@@ -1181,7 +1192,7 @@ class Orchestrator:
                 ):
                     raise BoardError("Board identity changed during idle watch")
                 id_changed = not self.config.challenge_ids and set(first_ids) != known_ids
-                refresh_due = id_changed or time.monotonic() >= next_full_refresh
+                refresh_due = id_changed or self._clock.monotonic() >= next_full_refresh
                 if refresh_due:
                     refreshed = await self._challenge_catalogue(deadline, identity)
                     refreshed_contexts = await self._probe_material_contexts(
@@ -1220,7 +1231,7 @@ class Orchestrator:
                     return refreshed, refreshed_contexts
                 current = refreshed
                 known_ids = {challenge.id for challenge in current}
-                next_full_refresh = time.monotonic() + self.config.board_full_refresh_seconds
+                next_full_refresh = self._clock.monotonic() + self.config.board_full_refresh_seconds
 
     async def _probe_material_contexts(
         self,
@@ -1311,7 +1322,7 @@ class Orchestrator:
         source_sha256s: list[str] = []
         total_bytes = 0
         for index, file_ref in enumerate(challenge.files, 1):
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
             destination = source_root / _artifact_name(file_ref, index)
@@ -1619,7 +1630,7 @@ class Orchestrator:
         stack: list[tuple[Path, bool]] = [(root, False)]
         operations = 0
         while stack:
-            if time.monotonic() >= deadline:
+            if self._clock.monotonic() >= deadline:
                 raise RunDeadlineReached
             path, visited = stack.pop()
             try:
@@ -1634,7 +1645,7 @@ class Orchestrator:
                 continue
             operations += 1
             if operations % 64 == 0:
-                await asyncio.sleep(0)
+                await self._clock.sleep(0)
 
     async def _drain_rmtree(self, root: Path) -> None:
         task = asyncio.create_task(asyncio.to_thread(shutil.rmtree, root, True))
@@ -1943,7 +1954,7 @@ class Orchestrator:
         next_rank = max((rank for rank, _, _ in durable_entries), default=-1) + 1
         unresolved_count = sum(1 for challenge in challenges if not challenge.solved)
         unsolved_values = tuple(challenge.value for challenge in challenges if not challenge.solved)
-        remaining_milliseconds = max(0, int((deadline - time.monotonic()) * 1_000))
+        remaining_milliseconds = max(0, int((deadline - self._clock.monotonic()) * 1_000))
         changed: set[int] = set()
         for challenge in challenges:
             context_sha256 = (
@@ -2064,7 +2075,7 @@ class Orchestrator:
             effort,
             require_control_assignment=self._adaptive_control,
         )
-        started = time.monotonic()
+        started = self._clock.monotonic()
         tool_call_count = 0
         tool_calls: tuple[ToolCallEvidence, ...] = ()
         tool_evidence_complete = False
@@ -2217,7 +2228,7 @@ class Orchestrator:
                         **candidate_memory.public_counts(),
                     },
                 )
-            progress_at = time.monotonic()
+            progress_at = self._clock.monotonic()
             progress_fingerprints: set[str] = set()
             streamed_observations: list[HostObservation] = []
             streamed_tool_call_count = 0
@@ -2248,7 +2259,7 @@ class Orchestrator:
                 if fingerprint in progress_fingerprints:
                     return
                 progress_fingerprints.add(fingerprint)
-                progress_at = time.monotonic()
+                progress_at = self._clock.monotonic()
 
             continuation_round = 0
             last_checkpoint_tool_count = 0
@@ -2476,7 +2487,9 @@ class Orchestrator:
                 solve_task = asyncio.create_task(tracked_solve())
                 try:
                     while True:
-                        quiet_remaining = _NO_PROGRESS_SECONDS - (time.monotonic() - progress_at)
+                        quiet_remaining = _NO_PROGRESS_SECONDS - (
+                            self._clock.monotonic() - progress_at
+                        )
                         done, _ = await asyncio.wait(
                             {solve_task},
                             timeout=max(0.0, quiet_remaining),
@@ -2484,7 +2497,7 @@ class Orchestrator:
                         if done:
                             turn = solve_task.result()
                             break
-                        if time.monotonic() - progress_at < _NO_PROGRESS_SECONDS:
+                        if self._clock.monotonic() - progress_at < _NO_PROGRESS_SECONDS:
                             continue
                         solve_task.cancel()
                         cancelled = (await asyncio.gather(solve_task, return_exceptions=True))[0]
@@ -2737,7 +2750,7 @@ class Orchestrator:
             episode,
             lane,
             started,
-            time.monotonic(),
+            self._clock.monotonic(),
             finding,
             terminal,
             tool_call_count,
@@ -2871,7 +2884,7 @@ class Orchestrator:
                     "candidate_unverified_after_limit_or_wrong_threshold",
                 )
             transport_timeout = float(getattr(self.board, "timeout", 15.0))
-            if deadline - time.monotonic() <= transport_timeout:
+            if deadline - self._clock.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
             current = challenge
             if not unlimited:
@@ -2892,7 +2905,7 @@ class Orchestrator:
                 and current.attempts >= current.max_attempts
             ):
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "board_limit")
-            if deadline - time.monotonic() <= transport_timeout:
+            if deadline - self._clock.monotonic() <= transport_timeout:
                 return self._withhold_candidate(run_id, challenge.id, fingerprint, "run_deadline")
             if not self.state.reserve_submission(
                 run_id,
@@ -3011,7 +3024,7 @@ class Orchestrator:
         self.state.set_challenge_status(challenge.id, "running")
         verifier_route = route is not None and route.role == "verifier"
         attempt_seconds = self.config.attempt_seconds if route is None else route.attempt_seconds
-        now = time.monotonic()
+        now = self._clock.monotonic()
         late_static_verifier = (
             verifier_route
             and challenge.type != "dynamic_iac"
@@ -3069,7 +3082,7 @@ class Orchestrator:
             lane_count = started_lanes
         if on_wave_started is not None:
             on_wave_started()
-        remaining = max(0.0, work_deadline - time.monotonic())
+        remaining = max(0.0, work_deadline - self._clock.monotonic())
         if (
             verifier_route
             and not target_endpoints
@@ -3259,7 +3272,7 @@ class Orchestrator:
                 cleanup = asyncio.create_task(
                     self._cleanup_instance_record(
                         owned_record,
-                        time.monotonic() + self.config.instance_cleanup_seconds,
+                        self._clock.monotonic() + self.config.instance_cleanup_seconds,
                     )
                 )
                 try:
@@ -3290,7 +3303,7 @@ class Orchestrator:
                 lane_count=lane_count,
             )
         finally:
-            cleanup_deadline = time.monotonic() + self.config.instance_cleanup_seconds
+            cleanup_deadline = self._clock.monotonic() + self.config.instance_cleanup_seconds
             cleanup = asyncio.create_task(
                 self._delete_instance(
                     run_id,
@@ -3369,7 +3382,7 @@ class Orchestrator:
         )
 
         def record_queued(challenge: Challenge, episode: int, reason: str) -> float:
-            queued_at = time.monotonic()
+            queued_at = self._clock.monotonic()
             self.state.event(
                 run_id,
                 "challenge_episode_queued",
@@ -3432,7 +3445,9 @@ class Orchestrator:
                 "challenge_admission_closed",
                 {
                     "reason": reason,
-                    "remaining_milliseconds": max(0, int((deadline - time.monotonic()) * 1_000)),
+                    "remaining_milliseconds": max(
+                        0, int((deadline - self._clock.monotonic()) * 1_000)
+                    ),
                 },
             )
 
@@ -3488,10 +3503,10 @@ class Orchestrator:
                 {"known_challenges": len(known_ids)},
             )
             while True:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._clock.monotonic()
                 if remaining <= read_guard:
                     await asyncio.Event().wait()
-                await asyncio.sleep(min(next_read_delay, remaining - read_guard))
+                await self._clock.sleep(min(next_read_delay, remaining - read_guard))
                 try:
                     first, second = await self._board_watch_challenge_pair(deadline)
                     first_ids = [row.get("id") for row in first]
@@ -3567,12 +3582,12 @@ class Orchestrator:
             target_endpoints: tuple[TargetEndpoint, ...],
         ) -> str:
             nonlocal admitted_episodes
-            if time.monotonic() >= deadline:
+            if self._clock.monotonic() >= deadline:
                 raise RunDeadlineReached
             if challenge.id not in active:
                 raise RuntimeError("challenge episode escaped its engagement")
             if route.backoff_policy == "bounded_60_seconds":
-                if deadline - time.monotonic() <= 60:
+                if deadline - self._clock.monotonic() <= 60:
                     raise RunDeadlineReached
                 self.state.event(
                     run_id,
@@ -3583,7 +3598,7 @@ class Orchestrator:
                         "seconds": 60,
                     },
                 )
-                await asyncio.sleep(60)
+                await self._clock.sleep(60)
             elif route.backoff_policy != "none":
                 raise ValueError("unsupported durable backoff policy")
             admitted_episodes += 1
@@ -3598,7 +3613,7 @@ class Orchestrator:
                 {
                     "challenge_id": challenge.id,
                     "episode": episode,
-                    "queue_wait_seconds": round(time.monotonic() - queued_at, 3),
+                    "queue_wait_seconds": round(self._clock.monotonic() - queued_at, 3),
                     "active_challenges": len(active),
                     "auxiliary": route.role in {"recovery", "verifier"},
                     "execution_phase": (
@@ -3710,9 +3725,9 @@ class Orchestrator:
                     async with instance_condition:
                         heapq.heappush(instance_waiters, waiter)
                         while True:
-                            if time.monotonic() >= deadline:
+                            if self._clock.monotonic() >= deadline:
                                 raise RunDeadlineReached
-                            remaining = max(0.0, deadline - time.monotonic())
+                            remaining = max(0.0, deadline - self._clock.monotonic())
                             owns_turn = instance_waiters and instance_waiters[0] == waiter
                             capacity = len(instance_holders) < self.config.dynamic_concurrency
                             threshold = admission_threshold(challenge, route)
@@ -3844,7 +3859,7 @@ class Orchestrator:
                             self._delete_instance(
                                 run_id,
                                 challenge.id,
-                                time.monotonic() + self.config.instance_cleanup_seconds,
+                                self._clock.monotonic() + self.config.instance_cleanup_seconds,
                                 expected_receipt=receipt,
                                 reason="target_wave_complete",
                             )
@@ -3854,7 +3869,7 @@ class Orchestrator:
                         cleanup = asyncio.create_task(
                             self._cleanup_instance_record(
                                 records[0],
-                                time.monotonic() + self.config.instance_cleanup_seconds,
+                                self._clock.monotonic() + self.config.instance_cleanup_seconds,
                             )
                         )
                         clean = await drain_cleanup(cleanup)
@@ -3894,7 +3909,7 @@ class Orchestrator:
             try:
                 while True:
                     threshold = admission_threshold(challenge, route)
-                    if threshold > 0 and deadline - time.monotonic() < threshold:
+                    if threshold > 0 and deadline - self._clock.monotonic() < threshold:
                         raise AdmissionDeferred
                     needs_instance = challenge.type == "dynamic_iac" and (
                         not self._adaptive_control
@@ -3906,7 +3921,7 @@ class Orchestrator:
                         try:
                             await acquire_instance()
                             threshold = admission_threshold(challenge, route)
-                            if threshold > 0 and deadline - time.monotonic() < threshold:
+                            if threshold > 0 and deadline - self._clock.monotonic() < threshold:
                                 if not await release_instance():
                                     raise BoardError("late instance cleanup remained indeterminate")
                                 raise AdmissionDeferred
@@ -3950,7 +3965,9 @@ class Orchestrator:
                             self.state.finish_control_wave(run_id, challenge.id, episode, terminal)
                         outcome = "candidate" if terminal == "resolved" else terminal
                         break
-                    remaining_milliseconds = max(0, int((deadline - time.monotonic()) * 1_000))
+                    remaining_milliseconds = max(
+                        0, int((deadline - self._clock.monotonic()) * 1_000)
+                    )
                     if not persistent_scheduler:
                         recovery_allowance = self.state.recovery_dispatch_count(
                             run_id, challenge.id
@@ -4142,7 +4159,7 @@ class Orchestrator:
                 if (
                     challenge is not None
                     and (threshold := admission_threshold(challenge, route)) > 0
-                    and deadline - time.monotonic() < threshold
+                    and deadline - self._clock.monotonic() < threshold
                 ):
                     queue.task_done()
                     if initial:
@@ -4162,7 +4179,7 @@ class Orchestrator:
                 finally:
                     queue.task_done()
 
-        remaining_seconds = max(1, int(deadline - time.monotonic()))
+        remaining_seconds = max(1, int(deadline - self._clock.monotonic()))
         if not any(
             admission_threshold(challenges_by_id[wave.challenge_id], wave.route)
             <= remaining_seconds
@@ -4177,7 +4194,7 @@ class Orchestrator:
             else None
         )
         finished = asyncio.create_task(all_finished.wait())
-        timer = asyncio.create_task(asyncio.sleep(max(0.0, deadline - time.monotonic())))
+        timer = asyncio.create_task(self._clock.sleep(max(0.0, deadline - self._clock.monotonic())))
         try:
             watched: set[asyncio.Task[Any]] = {finished, timer, *workers}
             if active_watcher is not None:
@@ -4262,21 +4279,21 @@ class Orchestrator:
             self.state.release_supervisor()
             raise RuntimeError("running run has an invalid durable deadline") from exc
         remaining_run_seconds = max(0.0, float(self.config.run_seconds) - max(0.0, elapsed))
-        deadline = time.monotonic() + remaining_run_seconds
+        deadline = self._clock.monotonic() + remaining_run_seconds
         run_root = self.config.work_root / f"run-{run_id}"
         outcomes: dict[int, str] = {}
         challenge_count = 0
         status = "failed"
         try:
             if session.resumed:
-                identity_deadline = time.monotonic() + max(
+                identity_deadline = self._clock.monotonic() + max(
                     float(self.config.instance_cleanup_seconds),
                     float(self.config.board_timeout_seconds * 3 + 1),
                 )
                 try:
                     identity = await self._qualified_identity(identity_deadline)
                     await self._cleanup_owned_instances(
-                        time.monotonic() + float(self.config.instance_cleanup_seconds)
+                        self._clock.monotonic() + float(self.config.instance_cleanup_seconds)
                     )
                 except BoardError as exc:
                     raise RecoveryBlocked(
@@ -4297,7 +4314,7 @@ class Orchestrator:
                     status = "completed"
                     self.state.finish_run(run_id, status)
                     return self._run_report(run_id, status, challenge_count, outcomes)
-                if pending_effects and deadline - time.monotonic() <= 0:
+                if pending_effects and deadline - self._clock.monotonic() <= 0:
                     raise RecoveryBlocked(
                         "pending submission effect requires explicit reconciliation"
                     )
@@ -4308,19 +4325,19 @@ class Orchestrator:
             if session.resumed and run_root.exists():
                 await self._remove_tree_before(
                     run_root,
-                    time.monotonic() + float(self.config.instance_cleanup_seconds),
+                    self._clock.monotonic() + float(self.config.instance_cleanup_seconds),
                 )
             run_root.mkdir(mode=0o700, exist_ok=False)
             self._run_evidence = RunEvidence.open(self.state, run_id)
             await self._cleanup_stale_workspaces(
                 (
-                    time.monotonic() + float(self.config.instance_cleanup_seconds)
+                    self._clock.monotonic() + float(self.config.instance_cleanup_seconds)
                     if session.resumed
                     else deadline
                 ),
                 run_root,
             )
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
                 raise RunDeadlineReached
             if not self._adaptive_control:
@@ -4432,7 +4449,7 @@ class Orchestrator:
                     )
                     if executable and not challenge.solved
                 )
-                remaining_milliseconds = max(0, int((deadline - time.monotonic()) * 1_000))
+                remaining_milliseconds = max(0, int((deadline - self._clock.monotonic()) * 1_000))
                 initial_routes = {
                     challenge.id: baseline_route(
                         model=self.config.model,
@@ -4471,7 +4488,7 @@ class Orchestrator:
             if session.resumed:
                 self.state.resume_control_waves(
                     run_id,
-                    max(0, int((deadline - time.monotonic()) * 1000)),
+                    max(0, int((deadline - self._clock.monotonic()) * 1000)),
                 )
             runtime_started = not self._adaptive_control
             queue_resumed = session.resumed and bool(durable_catalogue)
@@ -4505,7 +4522,7 @@ class Orchestrator:
                 eligible = [challenge for challenge in challenges if challenge.id in queued_ids]
                 if eligible and queued_waves:
                     if not runtime_started:
-                        remaining = deadline - time.monotonic()
+                        remaining = deadline - self._clock.monotonic()
                         if remaining <= 0:
                             raise RunDeadlineReached
                         try:

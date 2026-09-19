@@ -127,6 +127,11 @@ and isolation limits are documented in
 [`notes/research/offline-h24-fixtures.md`](notes/research/offline-h24-fixtures.md). This fixture
 contract does not authorize live targets or change production routing.
 
+The [benign Board-contract simulator](notes/research/board-contract-simulator.md) exercises ten
+no-socket controller/state scenarios through scripted Board method shapes. Its accelerated results
+and separately labelled real-clock soak are reliability evidence, never H24 correctness or
+real-target success.
+
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
 `submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200
