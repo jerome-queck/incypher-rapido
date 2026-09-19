@@ -666,8 +666,6 @@ class _PeakProbe:
 def _load_offline_pilot() -> Any:
     name = "_rapido_board_contract_offline_pilot"
     existing = sys.modules.get(name)
-    if existing is not None:
-        return existing
     module_source = Path(__file__).resolve()
     installed = any(
         part.casefold() in {"site-packages", "dist-packages"} for part in module_source.parts
@@ -682,6 +680,11 @@ def _load_offline_pilot() -> Any:
             missing_ok=False,
         )
     assert source is not None
+    if existing is not None:
+        existing_source = getattr(existing, "__file__", None)
+        if type(existing_source) is not str or Path(existing_source) != source:
+            raise RuntimeError("offline pilot module is unavailable")
+        return existing
     specification = importlib.util.spec_from_file_location(name, source)
     if specification is None or specification.loader is None:
         raise RuntimeError("offline pilot module is unavailable")

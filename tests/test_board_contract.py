@@ -140,6 +140,28 @@ def test_offline_pilot_loader_removes_partial_module_before_retry(
         sys.modules.pop(OFFLINE_PILOT_MODULE, None)
 
 
+def test_offline_pilot_loader_rejects_cached_module_from_other_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_package = tmp_path / "venv" / "site-packages" / "rapido"
+    installed_package.mkdir(parents=True)
+    packaged = tmp_path / "rapido-eval"
+    packaged.mkdir()
+    (packaged / "offline_oracle_pilot.py").write_text("PACKAGED_MARKER = 'sealed'\n")
+    injected = mock.Mock()
+    injected.__file__ = str(tmp_path / "injected.py")
+    monkeypatch.setattr(BOARD_CONTRACT, "__file__", str(installed_package / "board_contract.py"))
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", packaged)
+    sys.modules[OFFLINE_PILOT_MODULE] = injected
+
+    try:
+        with pytest.raises(RuntimeError, match="offline pilot module is unavailable"):
+            BOARD_CONTRACT._load_offline_pilot()
+    finally:
+        sys.modules.pop(OFFLINE_PILOT_MODULE, None)
+
+
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(
     tmp_path: Path,
 ) -> None:
