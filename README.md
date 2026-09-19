@@ -137,6 +137,12 @@ provider usage, cumulative repair deltas, correlated monotonic intervals, fair b
 argument-repair outcomes. It is receipt-only observability: no metric feeds model prompts, routing,
 proof acceptance or live control.
 
+The [offline H24 pilot protocol](notes/research/offline-h24-pilot.md) wires that frozen catalogue to
+two exact Daybreak/xhigh arms under one fair deadline. It preflights all private fixtures before
+native startup, exposes only copied local artifacts, retains all 48 terminal rows and keeps oracle
+material outside the repository, authentication home, workspaces and public receipt. This is an
+offline-only runner; it grants no live Board, target, network or production-autonomy authority.
+
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
 `submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200
