@@ -23,6 +23,8 @@ tracked fixture directory. No path-name inference, environment, CLI, or arbitrar
 exists. Both the selected directory boundary and source must be non-symlink directory and
 regular-file objects. A cached pilot is reused only by identity after this loader executed it
 successfully; pre-execution or foreign cache objects fail closed.
+The packaged benign contract supplies the adjacent bounded `source.sha` to the pilot, which then
+enforces its root-owned, immutable metadata contract; repository execution retains Git identity.
 
 Before execution, publish/register the exact protocol ID, clean source SHA, immutable wrapper
 reference, image ID, `linux/amd64` or `linux/arm64` platform, OCI revision and source label. The

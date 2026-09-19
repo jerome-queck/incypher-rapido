@@ -183,6 +183,21 @@ def test_offline_pilot_loader_reuses_validated_real_module() -> None:
     assert BOARD_CONTRACT._load_offline_pilot() is loaded
 
 
+def test_offline_pilot_source_sha_uses_bounded_regular_sealed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(BOARD_CONTRACT, "_PACKAGED_OFFLINE_PILOT_DIRECTORY", tmp_path)
+    assert BOARD_CONTRACT._offline_pilot_source_sha() is None
+    source = tmp_path / "source.sha"
+    source.write_text("a" * 40 + "\n", encoding="ascii")
+    assert BOARD_CONTRACT._offline_pilot_source_sha() == "a" * 40 + "\n"
+    source.unlink()
+    source.symlink_to(tmp_path / "missing")
+    with pytest.raises(RuntimeError, match="source identity is unavailable"):
+        BOARD_CONTRACT._offline_pilot_source_sha()
+
+
 def test_accelerated_contract_covers_exact_ten_scenarios_without_sockets(
     tmp_path: Path,
 ) -> None:

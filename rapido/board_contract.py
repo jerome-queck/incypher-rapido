@@ -646,6 +646,26 @@ def _regular_offline_pilot_source(source: Path) -> Path:
     return source
 
 
+def _offline_pilot_source_sha() -> str | None:
+    source = _PACKAGED_OFFLINE_PILOT_DIRECTORY / "source.sha"
+    try:
+        metadata = source.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("offline pilot source identity is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > 128
+    ):
+        raise RuntimeError("offline pilot source identity is unavailable")
+    try:
+        return source.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("offline pilot source identity is unavailable") from exc
+
+
 class _PeakProbe:
     def __init__(self) -> None:
         self.active = 0
@@ -738,7 +758,13 @@ async def _run_offline_pilot_contract(root: Path, private_seed: bytes) -> tuple[
         async def close(self) -> None:
             return None
 
-    config = pilot.PilotConfig("codex", codex_home, work_root, key_file)
+    config = pilot.PilotConfig(
+        "codex",
+        codex_home,
+        work_root,
+        key_file,
+        source_sha=_offline_pilot_source_sha(),
+    )
     receipt = await pilot.run_verifier_repair_pilot(
         config, client_factory=lambda **_: ModelFreeClient()
     )
