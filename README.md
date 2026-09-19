@@ -116,6 +116,11 @@ unverified `already_solved` candidate remains private and queued for a fresh Ver
 resubmitted. Only same-run independent verification may close it, and it is never reported as a new
 HTTP `correct`.
 
+Finalized archives can be reconciled without opening the live state writer. The versioned,
+candidate-free reporting contract keeps accepted post-run correctness, new Board correctness,
+account-history responses, runtime-current verification, and stricter evaluator results separate;
+see [`notes/research/reporting-contract.md`](notes/research/reporting-contract.md).
+
 The final run report keeps these axes separate. `submission_correct`,
 `submission_already_solved`, and `submission_incorrect` are Board outcomes;
 `submission_http_200_correct` and `submission_reconciled_correct` distinguish direct HTTP-200
