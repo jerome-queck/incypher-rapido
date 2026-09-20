@@ -79,16 +79,6 @@ class _PinnedDirectory:
     descriptor: int
     identity: tuple[int, int, int, int]
 
-    @property
-    def path(self) -> Path:
-        prefix = "/proc" if os.path.isdir("/proc/self/fd") else "/dev"
-        return (
-            Path(prefix)
-            / (str(os.getpid()) if prefix == "/proc" else "fd")
-            / ("fd" if prefix == "/proc" else str(self.descriptor))
-            / (str(self.descriptor) if prefix == "/proc" else "")
-        )
-
     def revalidate(self, label: str) -> None:
         _reject_symlink_components(self.source, label)
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
