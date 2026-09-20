@@ -74,8 +74,9 @@
 - Freshness/privacy: two independent fresh runs had distinct identities and empty initial
   solved/cache/service state. Sanitized receipts contain no candidate, candidate digest, private
   path, target authority, credential, raw model output, or raw tool output.
-- Implementation checkpoints: `0349768a7b5e554d14996cea7ba756dab610139f`; Linux cleanup fix
-  `05e8c7db02a055b01448a656c16c31282932f00d`.
+- Implementation checkpoints: `0349768a7b5e554d14996cea7ba756dab610139f`; Linux cleanup fixes
+  `05e8c7db02a055b01448a656c16c31282932f00d` and
+  `8074f365202007fc9d3e8d6b541ef3232ad62911`.
 - Current evidence: 117 CAP-02 focused tests; 46 Board-contract tests; 316 affected
   Board/CLI/config/container/control/orchestrator/target tests; 1,528 full-suite passes with four
   documented skips; Ruff and format clean. One earlier full-suite
@@ -94,6 +95,10 @@
   exact `/proc/self/fd` display suffix. The failure cascaded into retained run roots and dependent
   receipt tests. Linux now uses the inode unlink proof; Darwin retains `F_GETPATH`. Container jobs
   were still running when the focused fix was pushed.
+- Second PR #83 CI run retained the same 12 cascading failures: the GitHub filesystem preserves the
+  original descriptor path without the conventional `(deleted)` suffix. Linux proof now accepts
+  either kernel display only after descriptor-relative ENOENT, while rejecting a moved descriptor;
+  the registered Linux image probe passed exact owned-tree removal.
 - Next ready node: commit the bound sanitized receipt, PR/CI/merge; then
   continue CAP-03/CAP-04 private trust-zone work and CAP-05 runner work. Stage 4 remains blocked on
   the fresh-task readiness quorum.

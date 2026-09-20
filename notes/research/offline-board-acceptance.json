@@ -3,7 +3,7 @@
   "evidence_level": "synthetic_controller_acceptance",
   "source": {
     "base_git_commit": "0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3",
-    "implementation_git_commit": "05e8c7db02a055b01448a656c16c31282932f00d",
+    "implementation_git_commit": "8074f365202007fc9d3e8d6b541ef3232ad62911",
     "implementation_version": "offline-board-v1",
     "production_authority_logic_changed": false,
     "production_cli_changed": false,
