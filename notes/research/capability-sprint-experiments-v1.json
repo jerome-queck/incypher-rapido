@@ -1,0 +1,243 @@
+{
+  "authority": {
+    "capability_handoff_sha256": "126af723c718faf9abe3a906f41ae155d49351674b6789721036324109ff8416",
+    "candidate_manifest_sha256": "14a5dbd43fac8df0703b22a2cb258f458a7319c000f95e15b8ef5984a573981b",
+    "handoff_validation": "passed",
+    "locked_facts_policy": "R7_and_H24_not_rerun_or_regraded",
+    "urgent_handoff_sha256": "c00db23dea137afc9a2eb80256bd97403d6a71c01c6c975ab513100488b51fcc"
+  },
+  "cleanup": {
+    "inventory": [
+      "processes",
+      "containers",
+      "volumes",
+      "networks",
+      "workspaces",
+      "services",
+      "state_objects",
+      "run_ids"
+    ],
+    "outer_grace_seconds": 190,
+    "private_parent_preflight": "passed",
+    "settlement_seconds": 180
+  },
+  "experiments": [
+    {
+      "checker_policy": "none_preflight_only",
+      "decision_rule": "all_experiment_contracts_complete_and_descriptor_preflight_exact",
+      "denominator": "all_registered_experiments_and_task_namespaces",
+      "experiment_id": "STAGE1-FREEZE",
+      "model_policy": "catalogue_only_no_scored_task",
+      "per_task_budget": {"attempt_seconds": 0, "scored_episodes": 0},
+      "stage": 1,
+      "status": "mandatory",
+      "stop_rule": "stop_on_contract_or_descriptor_mismatch",
+      "tasks": [],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 0, "null_policy": "preserve_null", "output_cap": 0, "reasoning_cap": 0},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate",
+      "decision_rule": "EAS-005_EAS-006_and_OB-01_through_OB-10_pass_with_exact_cleanup",
+      "denominator": "EAS-005_EAS-006_and_OB-01_through_OB-10",
+      "experiment_id": "BOARD-ACCEPT",
+      "model_policy": "unchanged_orchestration_exact_descriptor_when_required",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 2,
+      "status": "mandatory",
+      "stop_rule": "completion_driven_or_global_cap",
+      "tasks": ["EAS-005", "EAS-006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 1000000, "null_policy": "preserve_null", "output_cap": 50000, "reasoning_cap": 30000},
+      "wall_cap_seconds": 1800
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "select_at_most_three_repeated_actionable_losses",
+      "denominator": "frozen_12_to_18_Tier_A_tasks_four_or_more_categories_plus_six_sentinels_including_unstarted",
+      "experiment_id": "HARD-BASELINE",
+      "model_policy": "RTE-MIXED_exact_no_fallback",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 4,
+      "status": "mandatory",
+      "stop_rule": "completion_driven_3600s_cap_one_frozen_harder_reserve_switch_only_if_difficulty_gate_fails",
+      "tasks": ["CAL-*", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 20000000, "null_policy": "preserve_null", "output_cap": 1000000, "reasoning_cap": 600000},
+      "wall_cap_seconds": 3600
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "retain_only_with_one_added_checked_family_or_exact_failure_removed_everywhere_without_raw_loss_and_all_boundaries_pass",
+      "denominator": "preregistered_affected_fresh_siblings_plus_six_sentinels_including_unstarted",
+      "experiment_id": "FIX-1",
+      "model_policy": "baseline_roster_exact_unless_preregistered_loss_is_routing_independent",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 5,
+      "status": "conditional",
+      "stop_rule": "completion_driven_or_2700s_cap",
+      "tasks": ["frozen_FX_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 12000000, "null_policy": "preserve_null", "output_cap": 600000, "reasoning_cap": 360000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "retain_only_with_one_added_checked_family_or_exact_failure_removed_everywhere_without_raw_loss_and_all_boundaries_pass",
+      "denominator": "preregistered_affected_fresh_siblings_plus_six_sentinels_including_unstarted",
+      "experiment_id": "FIX-2",
+      "model_policy": "baseline_roster_exact_unless_preregistered_loss_is_routing_independent",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 5,
+      "status": "conditional",
+      "stop_rule": "completion_driven_or_2700s_cap",
+      "tasks": ["frozen_FX_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 12000000, "null_policy": "preserve_null", "output_cap": 600000, "reasoning_cap": 360000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "retain_only_with_one_added_checked_family_or_exact_failure_removed_everywhere_without_raw_loss_and_all_boundaries_pass",
+      "denominator": "preregistered_affected_fresh_siblings_plus_six_sentinels_including_unstarted",
+      "experiment_id": "FIX-3",
+      "model_policy": "baseline_roster_exact_unless_preregistered_loss_is_routing_independent",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 5,
+      "status": "conditional",
+      "stop_rule": "completion_driven_or_2700s_cap",
+      "tasks": ["frozen_FX_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 12000000, "null_policy": "preserve_null", "output_cap": 600000, "reasoning_cap": 360000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "comparison_baseline_and_ties_retain_mixed",
+      "denominator": "18_fresh_difficult_tasks_nine_core_families_plus_six_fresh_sentinels",
+      "experiment_id": "RTE-MIXED",
+      "model_policy": "two_DAYBREAK_XHIGH_one_LUNA_MAX_one_LUNA_XHIGH",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 6,
+      "status": "mandatory",
+      "stop_rule": "completion_driven_or_2700s_cap_exact_unavailable_descriptor_fails_arm",
+      "tasks": ["18_counterbalanced_RTE_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 15000000, "null_policy": "preserve_null", "output_cap": 750000, "reasoning_cap": 450000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "adopt_offline_only_at_plus_two_checked_families_all_sentinels_no_new_boundary_failure_and_usage_observed_within_cap",
+      "denominator": "18_matched_distinct_fresh_difficult_tasks_nine_core_families_plus_six_fresh_sentinels",
+      "experiment_id": "RTE-DAYBREAK",
+      "model_policy": "four_DAYBREAK_XHIGH",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 6,
+      "status": "mandatory",
+      "stop_rule": "completion_driven_or_2700s_cap_exact_unavailable_descriptor_fails_arm",
+      "tasks": ["18_matched_distinct_RTE_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 15000000, "null_policy": "preserve_null", "output_cap": 750000, "reasoning_cap": 450000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "beat_best_mandatory_arm_by_two_checked_families_with_all_boundaries_or_ignore",
+      "denominator": "preregistered_matched_fresh_optional_siblings_plus_six_sentinels",
+      "experiment_id": "RTE-OPTIONAL-STAGE-CATEGORY",
+      "model_policy": "simple_frozen_policy_only_after_three_tasks_two_families_trigger",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 6,
+      "status": "conditional",
+      "stop_rule": "no_trigger_no_arm_otherwise_completion_driven_or_2700s_cap",
+      "tasks": ["fresh_optional_RTE_siblings", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 15000000, "null_policy": "preserve_null", "output_cap": 750000, "reasoning_cap": 450000},
+      "wall_cap_seconds": 2700
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "claimed_gains_reproduce_without_boundary_regression_or_are_reverted_or_disabled",
+      "denominator": "all_18_frozen_heldout_rows_confirmation_requires_12_valid_and_four_categories_plus_six_sentinels",
+      "experiment_id": "HELDOUT-CONFIRM",
+      "model_policy": "selected_integrated_roster_exact_no_fallback",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 7,
+      "status": "mandatory",
+      "stop_rule": "completion_driven_or_4500s_cap_no_replacement_after_unseal",
+      "tasks": ["18_frozen_HLD_tasks", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 25000000, "null_policy": "preserve_null", "output_cap": 1250000, "reasoning_cap": 750000},
+      "wall_cap_seconds": 4500
+    },
+    {
+      "checker_policy": "deterministic_once_per_unique_candidate_then_separate_qualification_projection",
+      "decision_rule": "measurement_only_each_production_delta_requires_explicit_human_approve_reject_or_defer",
+      "denominator": "full_frozen_selected_reservoir_plus_six_sentinels_including_all_invalid_failed_inconclusive_and_unstarted_rows",
+      "experiment_id": "FINAL-CAPACITY",
+      "model_policy": "heldout_confirmed_selected_roster_exact_no_fallback",
+      "per_task_budget": {"attempt_seconds": 800, "scored_episodes": 3},
+      "stage": 8,
+      "status": "mandatory",
+      "stop_rule": "early_drain_is_undersized_else_close_at_19800s_settle_deterministic_checks_180s_cleanup_190s",
+      "tasks": ["frozen_selected_RES_subset", "EAS-001..006"],
+      "usage_budget": {"cached_input": "reported_separately", "input_cap": 100000000, "null_policy": "preserve_null", "output_cap": 5000000, "reasoning_cap": 3000000},
+      "wall_cap_seconds": 19800
+    }
+  ],
+  "models": {
+    "DAYBREAK_XHIGH": {"effective_model": "gpt-daybreak-blue-latest", "fallback": "forbidden", "requested_effort": "xhigh", "requested_model": "gpt-daybreak-blue-latest", "supported_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]},
+    "LUNA_MAX": {"effective_model": "gpt-5.6-luna", "fallback": "forbidden", "requested_effort": "max", "requested_model": "gpt-5.6-luna", "supported_efforts": ["low", "medium", "high", "xhigh", "max"]},
+    "LUNA_XHIGH": {"effective_model": "gpt-5.6-luna", "fallback": "forbidden", "requested_effort": "xhigh", "requested_model": "gpt-5.6-luna", "supported_efforts": ["low", "medium", "high", "xhigh", "max"]}
+  },
+  "prepared_date": "2026-09-20",
+  "privacy": {
+    "candidate_public_identity": "ordinal_only",
+    "forbidden_public_fields": ["candidate_value", "candidate_digest", "answer", "oracle_key", "credential", "target_authority", "host_path", "raw_private_payload", "raw_model_output", "raw_tool_payload"],
+    "path_classes": ["private_curator_root", "private_runner_root", "private_oracle_root", "private_output_root"],
+    "production_board_access": "forbidden",
+    "scored_runner_exclusions": ["repository_history", "solutions", "writeups", "attempt_trees", "prior_candidates", "reference_corpus", "generator_seed", "checker_source", "oracle_key", "arbitrary_egress"]
+  },
+  "registration_state": "frozen_pre_outcome",
+  "resources": {
+    "controller": {"cpu": 8, "ram_gib": 16, "pids": 512, "run_root_gib": 64},
+    "dynamic_service": {"cpu": 1, "network": "isolated_internal_only", "pids": 128, "ram_gib": 2},
+    "hostile_worker": {"command_seconds": 120, "cpu": 2, "network": "none", "pids": 256, "ram_gib": 6},
+    "task_capsule": {"download_mib": 128, "unpacked_gib": 1}
+  },
+  "runtime": {
+    "descriptor_preflight_passed": true,
+    "host_native_client": "codex-cli-0.153.2_incompatible_with_current_strict_flags",
+    "image_id": "sha256:0eef1ceb74759bf64e9a89ca0dd1cf722bd1f6967a9b53666577164ee4d71c52",
+    "image_native_client": "codex-cli-0.154.0",
+    "platform": "linux/arm64",
+    "tool_acceptance_identity": "e23787d48001cd0318832ce5ce4d770eb198287d8e668c9c4e487d867bba4453"
+  },
+  "scheduler": {
+    "active_challenges": 5,
+    "dynamic_leases": 1,
+    "lane_admissions": 20
+  },
+  "schema": "rapido-capability-experiment-registry-v1",
+  "score_axes": ["raw_oracle_correctness", "fresh_family_capability", "qualification_projection", "actual_independent_verification", "elapsed_and_time_to_first_correct", "provider_usage", "tool_behavior", "resource_lifecycle", "ecological_lane", "transformation_lane"],
+  "source": {
+    "base_sha": "6aa26147c35fbc46affeeb77d93d6b88640564a8",
+    "dirty": false,
+    "dockerfile_sha256": "1010c573452e4698b13ff28fe4c1c8e83bf93ae355f5333f2bf70773c0f8eb29",
+    "offline_eval_dockerfile_sha256": "4898cd29e5f4088752035a9e650057f02b0cedd0ce71678bdbc56174ed374e29",
+    "origin_main_sha": "6aa26147c35fbc46affeeb77d93d6b88640564a8",
+    "source_archive_sha256": "194392eca8fe91eed26d7076648ac8eba0966468106992ccf25cd097b7c1a55f",
+    "tool_acceptance_sha256": "e23787d48001cd0318832ce5ce4d770eb198287d8e668c9c4e487d867bba4453"
+  },
+  "source_delta": {
+    "design_local_checkout_used": false,
+    "design_remote_main_matches_expected": true,
+    "historical_remote_main_matches_expected": true,
+    "rapido_main_moved": false,
+    "runtime_delta": "host_cli_0.153.2_rejected_current_feature_flag_exact_image_0.154.0_passed"
+  },
+  "task_manifest": {
+    "assignment_counts": {"calibration": 18, "capacity-reserve": 720, "focused-sibling": 72, "heldout": 18, "routing": 36, "sentinel": 6},
+    "assignment_freeze": "full_private_manifest_committed_before_relevant_outcome",
+    "candidate_manifest_sha256": "14a5dbd43fac8df0703b22a2cb258f458a7319c000f95e15b8ef5984a573981b",
+    "family_count": 12,
+    "generator_checker_versions": "private-unassigned-v1_until_family_admission",
+    "sentinel_ids": ["EAS-001", "EAS-002", "EAS-003", "EAS-004", "EAS-005", "EAS-006"],
+    "sentinel_tier": "sentinel",
+    "status": "planned_not_admitted",
+    "task_count": 870
+  },
+  "terminal_labels": ["correct", "incorrect", "already_terminal", "unstarted_at_cap", "queued_at_cap", "attempt_timeout", "global_cap", "no_unique_candidate", "repeated_candidate_only", "no_new_durable_observation", "tool_absent", "dependency_absent", "unsupported_format", "parser_failure", "tool_argument_schema", "tool_runtime", "sandbox_failure", "policy_refusal", "context_loss", "method_replay_failure", "oracle_inconclusive", "provider_unavailable", "provider_failure", "descriptor_mismatch", "usage_cap", "service_start_failure", "service_unready", "service_lost", "cleanup_failure", "privacy_boundary", "source_drift", "fixture_invalid"]
+}
