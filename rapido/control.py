@@ -256,10 +256,18 @@ class DurableJobControl:
         board: BoardLike,
         runtime: NativeRuntime,
         clock: AsyncClock | None = None,
+        absolute_deadline: float | None = None,
     ) -> RunReport:
         state = StateStore(config.state_path)
         try:
-            return await _AdaptiveOrchestrator(config, board, state, runtime, clock=clock).run()
+            return await _AdaptiveOrchestrator(
+                config,
+                board,
+                state,
+                runtime,
+                clock=clock,
+                absolute_deadline=absolute_deadline,
+            ).run()
         finally:
             state.close()
 

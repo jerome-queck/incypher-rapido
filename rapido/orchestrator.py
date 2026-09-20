@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import heapq
 import json
+import math
 import os
 import re
 import shutil
@@ -569,6 +570,7 @@ class Orchestrator:
         runtime: NativeRuntime,
         *,
         clock: AsyncClock | None = None,
+        absolute_deadline: float | None = None,
     ) -> None:
         self.config = config
         self.board = board
@@ -577,6 +579,13 @@ class Orchestrator:
         self._clock = (
             SystemClock(monotonic=time.monotonic, sleep=asyncio.sleep) if clock is None else clock
         )
+        if absolute_deadline is not None and (
+            isinstance(absolute_deadline, bool)
+            or not isinstance(absolute_deadline, (int, float))
+            or not math.isfinite(float(absolute_deadline))
+        ):
+            raise ValueError("absolute monotonic deadline is invalid")
+        self._absolute_deadline = None if absolute_deadline is None else float(absolute_deadline)
         self._slots = asyncio.Semaphore(config.concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
@@ -4280,6 +4289,8 @@ class Orchestrator:
             raise RuntimeError("running run has an invalid durable deadline") from exc
         remaining_run_seconds = max(0.0, float(self.config.run_seconds) - max(0.0, elapsed))
         deadline = self._clock.monotonic() + remaining_run_seconds
+        if self._absolute_deadline is not None:
+            deadline = min(deadline, self._absolute_deadline)
         run_root = self.config.work_root / f"run-{run_id}"
         outcomes: dict[int, str] = {}
         challenge_count = 0

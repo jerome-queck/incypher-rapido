@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 import urllib.parse
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
@@ -957,6 +958,27 @@ def test_drive_inspect_round_trip_exposes_only_sanitized_run_contract(tmp_path: 
     assert monitor.status == "completed"
     assert monitor.terminal_challenge_ids == (1,)
     assert monitor.tool_call_count == 2
+
+
+def test_absolute_outer_deadline_prevents_runtime_start_and_admission(tmp_path: Path) -> None:
+    board = BoundaryBoard([_challenge(1)])
+    runtime = BoundaryRuntime("INCYPHER{must-not-run}")
+    config = _config(tmp_path)
+
+    report = asyncio.run(
+        DurableJobControl.drive(
+            config,
+            board=board,
+            runtime=runtime,
+            absolute_deadline=time.monotonic(),
+        )
+    )
+
+    assert report.status == "deadline"
+    assert runtime.started is False
+    assert runtime.calls == []
+    assert runtime.closed is True
+    assert board.submissions == []
 
 
 def test_monitor_does_not_report_a_finished_attempt_as_running(tmp_path: Path) -> None:
