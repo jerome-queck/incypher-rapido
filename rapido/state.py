@@ -962,6 +962,22 @@ class StateStore:
             raise RuntimeError("run ownership requires the supervisor lease")
         encoded_config = json.dumps(config, sort_keys=True, separators=(",", ":"))
         with self.transaction() as connection:
+            # Ownership, unresolved effects and challenge IDs also have database-wide
+            # projections. A finished run does not make them safe to reuse in another
+            # Board/phase. Preserve the old state for reconciliation; require a new one.
+            requested_scope = self._run_scope(config)
+            for history in connection.execute("SELECT DISTINCT config_json FROM runs"):
+                try:
+                    previous = json.loads(history["config_json"])
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError("state has an unreadable Board/phase scope") from exc
+                if not isinstance(previous, dict):
+                    # Persisted corruption is an operational failure, not a caller type error.
+                    raise RuntimeError("state has an unreadable Board/phase scope")  # noqa: TRY004
+                if self._run_scope(previous) != requested_scope:
+                    raise RuntimeError(
+                        "state is bound to a different Board or phase; use a new empty state"
+                    )
             active = connection.execute(
                 "SELECT id, started_at, config_json FROM runs WHERE status='running' "
                 "ORDER BY started_at, id"
@@ -1076,6 +1092,15 @@ class StateStore:
                 started_at=str(row["started_at"]),
                 resumed=True,
             )
+
+    @staticmethod
+    def _run_scope(config: dict[str, object]) -> tuple[object, object]:
+        scope = (config.get("board_url"), config.get("profile"))
+        # Fully unscoped synthetic/legacy runs can only continue with unscoped runs.
+        # Production RuntimeConfig always supplies both fields.
+        if scope != (None, None) and not all(isinstance(part, str) and part for part in scope):
+            raise RuntimeError("run has an incomplete Board/phase scope; use a new empty state")
+        return scope
 
     def bind_board_identity(self, user_id: int, team_id: int) -> None:
         """Bind durable ownership and submission accounting to one Board identity."""

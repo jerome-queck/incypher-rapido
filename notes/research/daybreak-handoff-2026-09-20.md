@@ -7,7 +7,10 @@ competition readiness. All new execution evidence is local and synthetic unless 
 
 - Rapido baseline: `350d4229add2d8e55b279b64cbba1eeadef494cc`, default branch `main`.
 - Read-only reference: `892c764ba65751af31c59386e27fdf05523e162e`, default branch `main`.
-- Fresh isolated checkouts had no pre-existing edits. No open Rapido PRs were returned at inspection.
+- Fresh isolated checkouts had no pre-existing edits. No open Rapido PRs were returned initially.
+  Before the state slice, PR #86 appeared: documentation for a solver-tooling pivot. It merged
+  during validation as `d93e090e4d10fa7a179b8bb270d69ed670b60b48`. It changes no runtime behavior;
+  the patch sequence must also be checked against those current documentation changes.
 - GitHub CLI and connector both identify `n0nsense00`; repository permission is `READ`.
   Local commits and patch delivery are possible; upstream feature-branch writes are unavailable.
 - Requested Daybreak/xhigh audit lanes failed with missing `access_programs.cyber=daybreak_blue`,
@@ -49,7 +52,7 @@ and version-specific schema generator.
 
 | Requirement | Implementation and covering tests | Observed behavior / verified gap |
 | --- | --- | --- |
-| Board ingestion and read-only preflight | `rapido/board.py`, `rapido/cli.py::_preflight`; `tests/test_board.py`, `tests/test_cli.py` | Fixed official origin; repeated identity/catalogue qualification. Preflight code uses reads only. Full fake-preflight mutation tripwires are a useful remaining check. |
+| Board ingestion and read-only preflight | `rapido/board.py`, `rapido/cli.py::_preflight`; `tests/test_board.py`, `tests/test_cli.py` | Fixed official origin; repeated identity/catalogue qualification. The added full fake-preflight test traps Board mutations, native startup and state-writer creation. |
 | Native authentication and model selection | `rapido/config.py::validate_codex_home`, `rapido/cli.py::_codex_child_env`, `rapido/codex_app.py::validate_model`; config/CLI/native tests | Dedicated writable native home, allowlisted environment, exact catalogue/effort and no provider fallback. Competition account/model entitlement remains unverified. |
 | Native RPC lifecycle | `rapido/codex_app.py`; `tests/test_codex_app.py` | Existing 121 tests pass. New fakes reproduce unbounded write-lock/drain waiting before the RPC timeout and unbounded silent initialization. Interrupt writes can stall process fencing. |
 | Container / tools | `Dockerfile`, `deploy/CONTAINER.md`, `scripts/setup_container.sh`, `.github/workflows/ci.yml`; container/tool tests | Digest-pinned bases and Codex 0.154.0, non-root runtime, external state/auth. Docker unavailable on this host: no build or image startup claim. Windows CRLF conversion breaks immutable fixture hashes and shell portability. |
@@ -57,7 +60,7 @@ and version-specific schema generator.
 | Instance identity and recovery | `rapido/orchestrator.py`, `rapido/state.py`; stale-generation, owned-instance and supervisor tests | Durable create/cleanup intents and generation receipts; replacement mismatch fails closed. Undocumented inactive responses remain unresolved; no new live validation. |
 | Candidate provenance | `rapido/evidence.py`, `rapido/codex_app.py`, `rapido/state.py`; evidence/taint/integration tests | Source-bound evidence and independent verification already exist. Candidate/model assertions alone do not become Board acceptance. |
 | Durable submissions | `StateStore.reserve_submission`, `BoardClient.submit`, `_submit_candidate`; state/orchestrator/Board-contract tests | Intent precedes send; settled verdicts require matching body/status; ambiguous outcomes remain pending and require explicit reconciliation. No exactly-once guarantee or invented server idempotency. |
-| Phase and content identity | `RuntimeConfig.profile`, `StateStore.start_or_resume_run`, control catalogue material hashes; state/control tests | Same running run compares full config and material generations. Cross-run phase reuse needs scrutiny because state also contains global ownership and pending effects. |
+| Phase and content identity | `RuntimeConfig.profile`, `StateStore.start_or_resume_run`, control catalogue material hashes; state/control and `test_state_phase.py` | Reproduced prior-phase pending intents visible after a terminal run allowed another phase to start. The new guard checks every recorded Board/profile before recovery or Board calls, preserves old evidence and requires fresh state for a different scope. |
 | Scheduling / compact memory | `rapido/orchestrator.py`, `rapido/routing.py`, `rapido/memory.py`; scheduler/control/memory tests | Initial coverage, bounded lanes, original deadline and material-scoped notes already exist. Default P20 is established repository policy; this work has no measurement authorizing a larger framework or different roster. |
 | Quota / access errors | failure classes in `rapido/codex_app.py`, routing and supervisor; routing/runtime tests | Classified usage/auth failures and bounded replacement already exist. Reset-aware scheduling via actual account limits is not implemented or validated by this slice. |
 | Evaluation | `rapido/board_contract.py`, offline H24 and sustainability scripts; synthetic harness tests | Existing fake Board and held-out fixture infrastructure is reusable. Synthetic correctness is not real CTF solving ability. Model/target evaluation remains unmeasured. |
@@ -83,6 +86,28 @@ cover invalid deadlines, concurrent close, bounded notifications and read-only p
 The supervisor shutdown test now waits for its durable terminal record before sending SIGTERM;
 its previous 200 ms import-speed assumption produced exit -15 in this WSL checkout.
 Git attributes preserve LF in text, including shell scripts and hashed protocol fixtures.
+
+The state slice reuses stored run configuration instead of adding a database migration. The
+scope check executes transactionally before recovery changes or new run insertion. Terminal
+practice state cannot be reused for competition, even when Board URL and challenge IDs match.
+Unknown, partial or mixed legacy scope fails closed; same-scope crash recovery retains its
+original run identity and start time. The operator must configure the correct profile: this
+does not discover an organizer's phase automatically or identify a new event within one label.
+Nine initial synthetic regressions yielded eight failures before the guard and all passed after
+it; the focused state suite passed 73 tests. Full-suite and final results are in the handoff.
+
+Full clean-baseline validation completed with 1,606 passed, 31 skipped and seven failures in
+176.31 seconds using temporary in-memory fixture storage. Five failures require unavailable
+Docker, one is the existing media in-place source-change test, and one is the supervisor test
+race fixed here. This storage choice avoids WSL journal latency; it does not prove power-loss
+durability, container readiness or solving performance. Scheduling changes remain deferred
+until the core loop, environment and independent review gates are dependable.
+
+The combined runtime/state suite completed with 1,630 passed, 31 skipped and six failures in
+218.67 seconds; all six also failed on the clean baseline. No new test failure was observed.
+The media failure was independently reproduced: a same-size rewrite left metadata unchanged,
+so returned parser output carried the old content hash. This remains an integrity gap requiring
+a bounded follow-up. Ruff and format checks pass for the combined sequence.
 
 Exact final commands/results and commit identities accompany the delivered handoff report.
 No live solve/point, model-token, model-call, competition-duration, or intervention improvement
