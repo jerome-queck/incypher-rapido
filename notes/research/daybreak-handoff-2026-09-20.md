@@ -59,6 +59,7 @@ and version-specific schema generator.
 | Target and credential boundary | `rapido/target.py`, artifact/analysis worker modules; target, artifact-sandbox and worker tests | Exact Board-issued target registry; supervisor retains team key; bounded PoW and isolated parsers. Compatibility with the newly released official helper remains unverified. |
 | Instance identity and recovery | `rapido/orchestrator.py`, `rapido/state.py`; stale-generation, owned-instance and supervisor tests | Durable create/cleanup intents and generation receipts; replacement mismatch fails closed. Undocumented inactive responses remain unresolved; no new live validation. |
 | Candidate provenance | `rapido/evidence.py`, `rapido/codex_app.py`, `rapido/state.py`; evidence/taint/integration tests | Source-bound evidence and independent verification already exist. Candidate/model assertions alone do not become Board acceptance. |
+| Artifact content identity | `rapido/artifact_inspector.py::_verified_source`; artifact inspector/worker tests | Same-size rewrites can leave metadata unchanged. Added a streamed content recheck before returning any successful view; changed bytes now fail with `source_changed`. |
 | Durable submissions | `StateStore.reserve_submission`, `BoardClient.submit`, `_submit_candidate`; state/orchestrator/Board-contract tests | Intent precedes send; settled verdicts require matching body/status; ambiguous outcomes remain pending and require explicit reconciliation. No exactly-once guarantee or invented server idempotency. |
 | Phase and content identity | `RuntimeConfig.profile`, `StateStore.start_or_resume_run`, control catalogue material hashes; state/control and `test_state_phase.py` | Reproduced prior-phase pending intents visible after a terminal run allowed another phase to start. The new guard checks every recorded Board/profile before recovery or Board calls, preserves old evidence and requires fresh state for a different scope. |
 | Scheduling / compact memory | `rapido/orchestrator.py`, `rapido/routing.py`, `rapido/memory.py`; scheduler/control/memory tests | Initial coverage, bounded lanes, original deadline and material-scoped notes already exist. Default P20 is established repository policy; this work has no measurement authorizing a larger framework or different roster. |
@@ -106,8 +107,14 @@ until the core loop, environment and independent review gates are dependable.
 The combined runtime/state suite completed with 1,630 passed, 31 skipped and six failures in
 218.67 seconds; all six also failed on the clean baseline. No new test failure was observed.
 The media failure was independently reproduced: a same-size rewrite left metadata unchanged,
-so returned parser output carried the old content hash. This remains an integrity gap requiring
-a bounded follow-up. Ruff and format checks pass for the combined sequence.
+so returned parser output carried the old content hash. The artifact follow-up verifies bytes
+and metadata at the end of every successful view, including byte/text views and isolated parser
+results. Three deterministic regressions fail before the fix; all 96 artifact inspector/worker
+tests pass after it. This adds one streaming hash pass per successful inspection, bounded by the
+existing 256 MiB source ceiling. It detects the reproduced persistent mutation; it is not an
+immutable snapshot or a guarantee against an adversarial writer that changes and restores bytes
+between checks. Artifact tooling performance is unmeasured. No category tooling or scheduler
+change was made. Ruff and format checks pass for the combined sequence.
 
 Exact final commands/results and commit identities accompany the delivered handoff report.
 No live solve/point, model-token, model-call, competition-duration, or intervention improvement

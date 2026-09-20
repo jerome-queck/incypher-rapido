@@ -1073,6 +1073,30 @@ def test_media_in_place_change_after_hash_fails_source_changed(tmp_path, monkeyp
     assert error.value.code == "source_changed"
 
 
+@pytest.mark.parametrize("view", ["summary", "text", "bytes"])
+def test_changed_bytes_cannot_keep_old_hash_with_unchanged_metadata(tmp_path, monkeypatch, view):
+    path = tmp_path / "synthetic.txt"
+    path.write_bytes(b"SYNTHETIC ORIGINAL\n")
+    original_identity = artifact_inspector._identity
+    hashes = 0
+
+    def mutate_after_first_hash(descriptor, size):
+        nonlocal hashes
+        digest = original_identity(descriptor, size)
+        hashes += 1
+        if hashes == 1:
+            path.write_bytes(b"SYNTHETIC MODIFIED\n")
+        return digest
+
+    # Model coarse metadata: a same-size rewrite need not change observed timestamps.
+    size = path.stat().st_size
+    monkeypatch.setattr(artifact_inspector, "_source_facts", lambda _descriptor: (1, 1, size, 1, 1))
+    monkeypatch.setattr(artifact_inspector, "_identity", mutate_after_first_hash)
+    with pytest.raises(ToolError) as error:
+        isolated_inspect_artifact(Workspace(tmp_path), {"path": path.name, "view": view})
+    assert error.value.code == "source_changed"
+
+
 def test_unknown_binary_is_unsupported_but_bytes_and_fixed_strings_remain_available(tmp_path):
     (tmp_path / "blob").write_bytes(b"\x00\x01\x02VISIBLE_STRING\x00\xff")
     summary = inspect_artifact(Workspace(tmp_path), {"path": "blob"})
