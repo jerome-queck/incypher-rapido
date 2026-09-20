@@ -990,7 +990,6 @@ def test_service_evidence_is_bound_to_task_and_readiness_lifecycle() -> None:
     receipt["service_attempts"] = [
         {
             "ordinal": 1,
-            "service_id": "synthetic-service",
             "task_id": "EAS-001",
             "status": "stopped",
             "started_ms": 5,
@@ -1137,6 +1136,12 @@ def test_public_scan_rejects_private_fields_and_paths() -> None:
     )
     with pytest.raises(CapabilitySchemaError, match="forbidden public value"):
         validate_receipt(receipt)
+
+    for fingerprint in ("a" * 40, "b" * 64, "run-" + "c" * 40):
+        receipt = _receipt()
+        receipt["tasks"][0]["provider_attempts"][0]["effective_revision_build"] = fingerprint
+        with pytest.raises(CapabilitySchemaError, match="forbidden public value"):
+            validate_receipt(receipt)
 
     for authority in ("target.example.com", "10.20.30.40", "2001:db8::1"):
         receipt = _receipt()

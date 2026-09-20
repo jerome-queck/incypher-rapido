@@ -1428,10 +1428,6 @@
         "ready_ms": {
           "$ref": "#/$defs/nullableNonnegativeInt"
         },
-        "service_id": {
-          "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$",
-          "type": "string"
-        },
         "started_ms": {
           "minimum": 0,
           "type": "integer"
@@ -1452,7 +1448,6 @@
       },
       "required": [
         "ordinal",
-        "service_id",
         "task_id",
         "status",
         "started_ms",

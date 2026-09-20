@@ -53,6 +53,7 @@ _MAX_SUPERVISOR_RESPONSE_BYTES = 4_194_304
 _SUPERVISOR_POLL_SECONDS = 0.01
 _SUPERVISOR_TERM_SECONDS = 0.25
 _SUPERVISOR_EXIT_SECONDS = 0.25
+_WORKER_READY_SECONDS = 30.0
 _DURABLE_FACTORY_PATH = "rapido.offline_capability_runtime:registered_durable_flow_factory"
 _LOCAL_PROBE_FACTORY_PATH = "tests.test_offline_capability_runner:registered_probe_flow_factory"
 _APPROVED_PROVIDER_AUTH_FACTORIES = frozenset({_DURABLE_FACTORY_PATH})
@@ -87,7 +88,8 @@ _FORBIDDEN_PUBLIC_VALUE = re.compile(
     r"(?<![<A-Za-z0-9])/(?!/)[^\s>`'\"]+|"
     r"(?:^|\s)[A-Za-z]:[\\/][^\s>`'\"]+|(?:^|\s)(?:\\\\|//)[^\s>`'\"]+|"
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?::[0-9]{2,5})?\b|"
-    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{2,5})?\b)",
+    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{2,5})?\b|"
+    r"(?<![A-Za-z0-9_:])[0-9a-f]{40,64}(?![A-Za-z0-9_]))",
     re.IGNORECASE,
 )
 _CHECK_RESULTS = frozenset({"correct", "incorrect", "inconclusive"})
@@ -881,7 +883,6 @@ class ServiceAttempt:
     def public(self, ordinal: int) -> dict[str, object]:
         return {
             "ordinal": ordinal,
-            "service_id": self.service_id,
             "task_id": self.task_id,
             "status": self.status,
             "started_ms": self.started_ms,
@@ -2212,7 +2213,7 @@ def validate_runner_receipt(receipt: Mapping[str, object]) -> None:
             raise CapabilityRunnerError("service ordinal is invalid")
         services.append(
             ServiceAttempt(
-                service_id=row["service_id"],  # type: ignore[arg-type]
+                service_id=f"private-service-{ordinal}",
                 task_id=row["task_id"],  # type: ignore[arg-type]
                 status=row["status"],  # type: ignore[arg-type]
                 started_ms=row["started_ms"],  # type: ignore[arg-type]
@@ -2571,6 +2572,10 @@ def _subprocess_worker_main(result_descriptor: int) -> None:
             raise CapabilityRunnerError("registered flow factory returned an invalid flow")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        _worker_response(
+            result_descriptor,
+            {"schema": SUPERVISOR_MESSAGE_SCHEMA, "kind": "ready"},
+        )
         receipt = loop.run_until_complete(_run_completion_driven_worker(contract, flow))
         validate_runner_receipt(receipt)
         if not _receipt_matches_contract(receipt, contract):
@@ -2796,6 +2801,10 @@ def _linux_containment_main(result_descriptor: int, proof_descriptor: int) -> No
             os.close(proof_descriptor)
         except OSError:
             pass
+        try:
+            os.close(result_descriptor)
+        except OSError:
+            pass
         os._exit(246)
 
 
@@ -2916,19 +2925,32 @@ class _ParentDeadline:
     """A real-monotonic deadline whose expiry does not depend on asyncio dispatch."""
 
     def __init__(self, deadline: float) -> None:
-        self.deadline = deadline
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._expired = False
         self._claimed = False
-        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self.deadline = deadline
+        self._thread = threading.Thread(target=self._watch, args=(self._stop,), daemon=True)
         self._thread.start()
 
-    def _watch(self) -> None:
-        if not self._stop.wait(max(0.0, self.deadline - time.monotonic())):
+    def _watch(self, stop: threading.Event) -> None:
+        if not stop.wait(max(0.0, self.deadline - time.monotonic())):
             with self._lock:
-                if not self._claimed:
+                if self._stop is stop and not self._claimed:
                     self._expired = True
+
+    def reset(self, deadline: float) -> None:
+        """Move the default deadline after worker setup has signalled readiness."""
+
+        with self._lock:
+            if self._claimed:
+                return
+            self._stop.set()
+            self.deadline = deadline
+            self._expired = False
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._watch, args=(self._stop,), daemon=True)
+            self._thread.start()
 
     def expired(self) -> bool:
         with self._lock:
@@ -2994,57 +3016,76 @@ async def run_completion_driven(
     if len(request_bytes) > _MAX_SUPERVISOR_REQUEST_BYTES:
         raise CapabilityRunnerError("supervisor request exceeds its bound")
 
-    read_descriptor, write_descriptor = os.pipe()
-    os.set_blocking(read_descriptor, False)
+    read_descriptor = -1
+    write_descriptor = -1
     linux_containment = sys.platform.startswith("linux")
     linux_parent_boundary = False
     linux_parent_previous = False
+    linux_parent_configured = False
     proof_read_descriptor = -1
     proof_write_descriptor = -1
-    if linux_containment:
-        if not _LINUX_SUPERVISOR_LOCK.acquire(blocking=False):
-            raise CapabilitySupervisorError(
-                "containment_unavailable",
-                terminated=False,
-                killed=False,
-                child_reaped=True,
-                child_absent=True,
-            )
-        linux_parent_boundary = True
-        try:
+    process: subprocess.Popen[bytes] | None = None
+    parent_deadline = _ParentDeadline(supervisor_start + min(float(timeout), _WORKER_READY_SECONDS))
+    try:
+        read_descriptor, write_descriptor = os.pipe()
+        os.set_blocking(read_descriptor, False)
+        if linux_containment:
+            if not _LINUX_SUPERVISOR_LOCK.acquire(blocking=False):
+                raise CapabilitySupervisorError(
+                    "containment_unavailable",
+                    terminated=False,
+                    killed=False,
+                    child_reaped=True,
+                    child_absent=True,
+                )
+            linux_parent_boundary = True
             if _linux_owned_descendants():
                 raise CapabilityRunnerError("Linux supervisor child set is not dedicated")
             linux_parent_previous = _enable_linux_child_adoption()
+            linux_parent_configured = True
             if _linux_owned_descendants():
                 raise CapabilityRunnerError("Linux supervisor child set changed")
-        except BaseException:
-            _LINUX_SUPERVISOR_LOCK.release()
-            linux_parent_boundary = False
-            raise
-        proof_read_descriptor, proof_write_descriptor = os.pipe()
-        os.set_blocking(proof_read_descriptor, False)
-    command = (
-        sys.executable,
-        "-c",
-        (
-            "from rapido.offline_capability_runner import "
-            + (
-                "_linux_containment_main as entrypoint"
-                if linux_containment
-                else "_subprocess_worker_main as entrypoint"
-            )
-            + (
-                "; import sys; entrypoint(int(sys.argv[1]), int(sys.argv[2]))"
-                if linux_containment
-                else "; import sys; entrypoint(int(sys.argv[1]))"
-            )
-        ),
-        str(write_descriptor),
-        *((str(proof_write_descriptor),) if linux_containment else ()),
-    )
-    process: subprocess.Popen[bytes] | None = None
-    deadline = supervisor_start + float(timeout)
-    parent_deadline = _ParentDeadline(deadline)
+            proof_read_descriptor, proof_write_descriptor = os.pipe()
+            os.set_blocking(proof_read_descriptor, False)
+        command = (
+            sys.executable,
+            "-c",
+            (
+                "from rapido.offline_capability_runner import "
+                + (
+                    "_linux_containment_main as entrypoint"
+                    if linux_containment
+                    else "_subprocess_worker_main as entrypoint"
+                )
+                + (
+                    "; import sys; entrypoint(int(sys.argv[1]), int(sys.argv[2]))"
+                    if linux_containment
+                    else "; import sys; entrypoint(int(sys.argv[1]))"
+                )
+            ),
+            str(write_descriptor),
+            *((str(proof_write_descriptor),) if linux_containment else ()),
+        )
+    except BaseException:
+        parent_deadline.close()
+        for descriptor in (
+            write_descriptor,
+            read_descriptor,
+            proof_write_descriptor,
+            proof_read_descriptor,
+        ):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if linux_parent_boundary:
+            try:
+                if linux_parent_configured:
+                    _restore_linux_child_adoption(linux_parent_previous)
+            finally:
+                _LINUX_SUPERVISOR_LOCK.release()
+        raise
     try:
         try:
             process = subprocess.Popen(  # noqa: ASYNC220 - cancellation needs synchronous exact reap
@@ -3085,7 +3126,9 @@ async def run_completion_driven(
         buffer = bytearray()
         expected: int | None = None
         failure_label: str | None = None
-        while True:
+        ready_received = False
+        message_row: Mapping[str, object] | None = None
+        while message_row is None:
             if parent_deadline.expired():
                 failure_label = "outer_deadline"
                 break
@@ -3095,15 +3138,47 @@ async def run_completion_driven(
                 chunk = None
             if chunk:
                 buffer.extend(chunk)
-                if len(buffer) > _MAX_SUPERVISOR_RESPONSE_BYTES + 4:
+                if len(buffer) > (_MAX_SUPERVISOR_RESPONSE_BYTES * 2) + 8:
                     failure_label = "worker_response_oversize"
                     break
-                if expected is None and len(buffer) >= 4:
-                    expected = int.from_bytes(buffer[:4], "big")
-                    if expected > _MAX_SUPERVISOR_RESPONSE_BYTES:
-                        failure_label = "worker_response_oversize"
+                while message_row is None:
+                    if expected is None:
+                        if len(buffer) < 4:
+                            break
+                        expected = int.from_bytes(buffer[:4], "big")
+                        if expected > _MAX_SUPERVISOR_RESPONSE_BYTES:
+                            failure_label = "worker_response_oversize"
+                            break
+                    if len(buffer) < expected + 4:
                         break
-                if expected is not None and len(buffer) >= expected + 4:
+                    frame = bytes(buffer[4 : expected + 4])
+                    del buffer[: expected + 4]
+                    expected = None
+                    try:
+                        parsed = _mapping(json.loads(frame), "worker response")
+                        if parsed.get("schema") != SUPERVISOR_MESSAGE_SCHEMA:
+                            raise CapabilityRunnerError("worker response envelope is invalid")
+                        _public_scan(parsed, "worker_response")
+                    except (CapabilityRunnerError, json.JSONDecodeError, UnicodeError):
+                        failure_label = "worker_protocol"
+                        break
+                    kind = parsed.get("kind")
+                    if not ready_received:
+                        if set(parsed) != {"schema", "kind"} or kind != "ready":
+                            message_row = parsed
+                            break
+                        if parent_deadline.expired():
+                            failure_label = "outer_deadline"
+                            break
+                        ready_received = True
+                        if outer_deadline_seconds is None:
+                            parent_deadline.reset(time.monotonic() + maximum)
+                        continue
+                    if kind == "ready":
+                        failure_label = "worker_protocol"
+                        break
+                    message_row = parsed
+                if failure_label is not None:
                     break
             if process.poll() is not None and chunk == b"":
                 failure_label = "worker_no_response"
@@ -3121,19 +3196,13 @@ async def run_completion_driven(
             failure_label = "outer_deadline"
         if failure_label is not None:
             raise _closed_supervisor_error(failure_label, process_evidence)
-        if expected is None or len(buffer) != expected + 4:
+        if message_row is None or expected is not None or buffer:
             raise _closed_supervisor_error("worker_protocol", process_evidence)
         try:
-            message = json.loads(bytes(buffer[4:]))
-        except (json.JSONDecodeError, UnicodeError):
-            raise _closed_supervisor_error("worker_protocol", process_evidence) from None
-        try:
-            message_row = _mapping(message, "worker response")
             if message_row.get("schema") != SUPERVISOR_MESSAGE_SCHEMA or message_row.get(
                 "kind"
             ) not in {"receipt", "error"}:
                 raise CapabilityRunnerError("worker response envelope is invalid")
-            _public_scan(message_row, "worker_response")
         except CapabilityRunnerError:
             raise _closed_supervisor_error("worker_protocol", process_evidence) from None
         if message_row["kind"] == "error":
@@ -3179,6 +3248,11 @@ async def run_completion_driven(
             os.close(proof_write_descriptor)
         os.close(read_descriptor)
         if process is not None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
             _terminate_and_reap(
                 process,
                 linux_containment=linux_containment,

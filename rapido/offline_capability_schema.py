@@ -229,6 +229,7 @@ PROVIDER_ATTEMPT_STATUSES: Final = frozenset(
 
 _SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_HEX_FINGERPRINT = re.compile(r"[0-9a-f]{40,64}\Z", re.IGNORECASE)
 _IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TASK_ID = re.compile(r"[A-Z0-9-]{3,80}\Z")
 _FORBIDDEN_KEYS = frozenset(
@@ -261,8 +262,21 @@ _FORBIDDEN_VALUE = re.compile(
     r"(?<![<A-Za-z0-9])/(?!/)[^\s>`'\"]+|"
     r"(?:^|\s)[A-Za-z]:[\\/][^\s>`'\"]+|(?:^|\s)(?:\\\\|//)[^\s>`'\"]+|"
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?::[0-9]{2,5})?\b|"
-    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{2,5})?\b)",
+    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{2,5})?\b|"
+    r"(?<![A-Za-z0-9_:])[0-9a-f]{40,64}(?![A-Za-z0-9_]))",
     re.IGNORECASE,
+)
+_PUBLIC_COMMITMENT_KEYS = frozenset(
+    {
+        "sha",
+        "sha256",
+        "digest",
+        "commitment",
+        "registration_sha256",
+        "task_manifest_sha256",
+        "tool_acceptance_identity",
+        "base_sha",
+    }
 )
 
 
@@ -342,12 +356,19 @@ def _validate_resources(value: Any, label: str) -> None:
         raise CapabilitySchemaError(f"{label} null resource sample/reason mismatch")
 
 
-def _public_scan(value: Any, where: str = "root") -> None:
+def _public_scan(value: Any, where: str = "root", *, allow_hex: bool = False) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str) or key.lower() in _FORBIDDEN_KEYS:
                 raise CapabilitySchemaError(f"forbidden public key at {where}")
-            _public_scan(item, f"{where}.{key}")
+            _public_scan(
+                item,
+                f"{where}.{key}",
+                allow_hex=(
+                    key.lower() in _PUBLIC_COMMITMENT_KEYS
+                    or key.lower().endswith(("_sha", "_sha256", "_digest", "_commitment"))
+                ),
+            )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, item in enumerate(value):
             _public_scan(item, f"{where}[{index}]")
@@ -358,7 +379,9 @@ def _public_scan(value: Any, where: str = "root") -> None:
             )
         except ValueError:
             ipv6_authority = False
-        if _FORBIDDEN_VALUE.search(value) or ipv6_authority:
+        if (
+            _FORBIDDEN_VALUE.search(value) and not (allow_hex and _HEX_FINGERPRINT.fullmatch(value))
+        ) or ipv6_authority:
             raise CapabilitySchemaError(f"forbidden public value at {where}")
 
 
@@ -1695,7 +1718,6 @@ def validate_receipt(document: Mapping[str, Any], *, allow_historical_v1: bool =
     ]
     service_attempt_fields = {
         "ordinal",
-        "service_id",
         "task_id",
         "status",
         "started_ms",
@@ -1713,10 +1735,6 @@ def validate_receipt(document: Mapping[str, Any], *, allow_historical_v1: bool =
         _exact_fields(service_attempt, service_attempt_fields, service_label)
         if service_attempt["ordinal"] != service_index:
             raise CapabilitySchemaError(f"{service_label} ordinal is invalid")
-        if not isinstance(service_attempt["service_id"], str) or not re.fullmatch(
-            r"[a-z0-9][a-z0-9_-]{0,79}", service_attempt["service_id"]
-        ):
-            raise CapabilitySchemaError(f"{service_label} service ID is invalid")
         if service_attempt["task_id"] not in task_by_id:
             raise CapabilitySchemaError(f"{service_label} task ID is outside the denominator")
         started_ms = _nonnegative_integer(

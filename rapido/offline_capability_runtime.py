@@ -143,23 +143,33 @@ class _PinnedDurableFlow:
     def __init__(
         self,
         flow: CapabilityFlow,
+        board: OfflineBoard,
         probe: Callable[[], Awaitable[bool] | bool],
         runtime_root: _PinnedDirectory,
+        private_roots: tuple[_PinnedDirectory, ...],
         capsule_files: tuple[_PinnedFile, ...],
         codex_home: _PinnedDirectory | None,
         auth_file: _PinnedFile | None,
         owned_runtime_cleanup: Callable[[], Awaitable[Mapping[str, object]]] | None,
+        state_path: Path,
+        work_root: Path,
     ) -> None:
         self._flow = flow
+        self._board = board
         self._probe = probe
         self._runtime_root = runtime_root
+        self._private_roots = private_roots
         self._capsule_files = capsule_files
         self._codex_home = codex_home
         self._auth_file = auth_file
         self._owned_runtime_cleanup = owned_runtime_cleanup
+        self._state_path = state_path
+        self._work_root = work_root
 
     def _revalidate(self) -> None:
         self._runtime_root.revalidate("private runtime root")
+        for pinned in self._private_roots:
+            pinned.revalidate("private runtime isolation root")
         for pinned in self._capsule_files:
             pinned.revalidate("private capsule projection")
         if self._codex_home is not None:
@@ -187,11 +197,17 @@ class _PinnedDurableFlow:
     async def cleanup(self, deadline: float) -> CleanupInventory:
         result = CleanupInventory.unavailable()
         boundary_record: Mapping[str, object] | None = None
+        board_cleanup_passed = False
         try:
             self._revalidate()
             result = await self._flow.cleanup(deadline)
             self._revalidate()
         finally:
+            try:
+                OfflineBoard.close(self._board)
+                board_cleanup_passed = getattr(self._board, "_closed", False) is True
+            except BaseException:  # noqa: BLE001 - exact Board cleanup fails closed
+                board_cleanup_passed = False
             if self._owned_runtime_cleanup is not None:
                 try:
                     boundary_record = await self._owned_runtime_cleanup()
@@ -203,9 +219,23 @@ class _PinnedDurableFlow:
                 self._codex_home.close()
             for pinned in self._capsule_files:
                 pinned.close()
+            for pinned in self._private_roots:
+                pinned.close()
             self._runtime_root.close()
+        if not board_cleanup_passed:
+            return CleanupInventory(
+                result.processes,
+                result.containers,
+                result.volumes,
+                result.networks,
+                result.services,
+                result.workspaces,
+                result.state_objects,
+                result.run_ids,
+                failure_label="offline_board_cleanup_failed",
+            )
         if self._owned_runtime_cleanup is None:
-            return result
+            return _with_run_path_cleanup(result, self._state_path, self._work_root)
         active = None if boundary_record is None else boundary_record.get("active_process_count")
         absent = None if boundary_record is None else boundary_record.get("process_absent")
         if type(active) is not int or active < 0 or absent is not True or active != 0:
@@ -220,7 +250,32 @@ class _PinnedDurableFlow:
                 result.run_ids,
                 failure_label="owned_runtime_cleanup_failed",
             )
-        return result
+        return _with_run_path_cleanup(result, self._state_path, self._work_root)
+
+
+def _with_run_path_cleanup(
+    result: CleanupInventory, state_path: Path, work_root: Path
+) -> CleanupInventory:
+    state_artifacts = (
+        state_path,
+        state_path.with_name(state_path.name + "-wal"),
+        state_path.with_name(state_path.name + "-shm"),
+        state_path.with_name(state_path.name + "-journal"),
+        state_path.with_name(state_path.name + ".journal"),
+    )
+    if any(os.path.lexists(path) for path in (*state_artifacts, work_root)):
+        return CleanupInventory(
+            result.processes,
+            result.containers,
+            result.volumes,
+            result.networks,
+            result.services,
+            result.workspaces,
+            result.state_objects,
+            result.run_ids,
+            failure_label=result.failure_label or "run_path_cleanup_failed",
+        )
+    return result
 
 
 def _reject_symlink_components(path: Path, label: str) -> None:
@@ -259,10 +314,13 @@ def _pin_owner_only_directory(path: Path, label: str) -> _PinnedDirectory:
     identity = _owner_only_directory(path, label)
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
     try:
         descriptor = os.open(path, flags)
         metadata = os.fstat(descriptor)
     except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise CapabilityRunnerError(f"{label} is unavailable") from None
     observed = (
         metadata.st_dev,
@@ -273,6 +331,7 @@ def _pin_owner_only_directory(path: Path, label: str) -> _PinnedDirectory:
     if observed != identity:
         os.close(descriptor)
         raise CapabilityRunnerError(f"{label} changed")
+    # Ownership transfers to the pinned object only after every validation succeeds.
     return _PinnedDirectory(path, descriptor, identity)
 
 
@@ -284,6 +343,8 @@ def _pin_owner_only_file(
         descriptor = os.open(name, flags, dir_fd=parent.descriptor)
         metadata = os.fstat(descriptor)
     except OSError:
+        if "descriptor" in locals():
+            os.close(descriptor)
         raise CapabilityRunnerError(f"{label} is unavailable") from None
     identity = (
         metadata.st_dev,
@@ -304,7 +365,11 @@ def _pin_owner_only_file(
         os.close(descriptor)
         raise CapabilityRunnerError(f"{label} is not owner-only")
     pinned = _PinnedFile(name, descriptor, identity, parent)
-    pinned.revalidate(label)
+    try:
+        pinned.revalidate(label)
+    except BaseException:
+        pinned.close()
+        raise
     return pinned
 
 
@@ -441,7 +506,7 @@ def _load_registry(root: Path, expected_digest: str) -> tuple[dict[str, object],
         if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_digest):
             raise OSError("private runtime registry commitment changed")
         value = json.loads(payload)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except BaseException:  # noqa: BLE001 - registry errors always close the root descriptor
         pinned.close()
         raise CapabilityRunnerError("private runtime registry is invalid") from None
     if not isinstance(value, dict):
@@ -527,6 +592,7 @@ def _validate_capsule_binding(
         "assignment",
         "description_commitment",
         "files_commitment",
+        "file_bytes_commitments",
         "resource_profile_id",
         "generator_version",
         "checker_version",
@@ -639,6 +705,20 @@ def _validate_capsule_binding(
             or raw_binding.get("files_commitment") != _canonical_sha256(catalogue_row["files"])
         ):
             raise CapabilityRunnerError("private capsule content binding changed")
+        file_bytes = raw_binding.get("file_bytes_commitments")
+        if (
+            not isinstance(file_bytes, list)
+            or len(file_bytes) != len(catalogue_row["files"])
+            or any(
+                not isinstance(item, Mapping)
+                or set(item) != {"path", "sha256"}
+                or item.get("path") != path
+                or type(item.get("sha256")) is not str
+                or _SHA256.fullmatch(item["sha256"]) is None
+                for item, path in zip(file_bytes, catalogue_row["files"], strict=True)
+            )
+        ):
+            raise CapabilityRunnerError("private capsule file commitment is invalid")
         task_binding = dict(raw_binding)
         task_commitment = task_binding.pop("task_commitment")
         if type(task_commitment) is not str or not hmac.compare_digest(
@@ -687,16 +767,19 @@ def _validate_registry(
         or registry.get("contract") != _contract_binding(contract)
     ):
         raise CapabilityRunnerError("private runtime registration binding changed")
-    capsule_files: tuple[_PinnedFile, ...] = ()
+    pinned_files: list[_PinnedFile] = []
     try:
-        capsule_files = (
+        pinned_files.append(
             _pin_owner_only_file(
                 root, _CATALOGUE_NAME, "private capsule catalogue", limit=_REGISTRY_LIMIT
-            ),
+            )
+        )
+        pinned_files.append(
             _pin_owner_only_file(
                 root, _MANIFEST_NAME, "private capsule manifest", limit=_REGISTRY_LIMIT
-            ),
+            )
         )
+        capsule_files = tuple(pinned_files)
         capsule_tasks = _validate_capsule_binding(
             registry.get("capsule_binding"),
             _read_pinned_file(capsule_files[0], limit=_REGISTRY_LIMIT),
@@ -704,62 +787,60 @@ def _validate_registry(
             contract,
             configuration,
         )
-    except BaseException:
-        for pinned in capsule_files:
-            pinned.close()
-        raise
-    raw_offline_tasks = registry.get("offline_task_registrations")
-    if not isinstance(raw_offline_tasks, list) or len(raw_offline_tasks) != len(contract.tasks):
-        raise CapabilityRunnerError("private offline task registration is invalid")
-    offline_tasks: list[Mapping[str, object]] = []
-    board_ids: set[int] = set()
-    for raw, task in zip(raw_offline_tasks, contract.tasks, strict=True):
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "board_id",
-            "task_id",
-            "generator_version",
-            "checker_version",
-            "service_version",
-        }:
+        raw_offline_tasks = registry.get("offline_task_registrations")
+        if not isinstance(raw_offline_tasks, list) or len(raw_offline_tasks) != len(contract.tasks):
             raise CapabilityRunnerError("private offline task registration is invalid")
-        board_id = raw.get("board_id")
-        if type(board_id) is not int or board_id <= 0 or board_id in board_ids:
-            raise CapabilityRunnerError("private offline task registration is invalid")
-        board_ids.add(board_id)
-        if tuple(
-            raw.get(name)
-            for name in (
+        offline_tasks: list[Mapping[str, object]] = []
+        board_ids: set[int] = set()
+        for raw, task in zip(raw_offline_tasks, contract.tasks, strict=True):
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "board_id",
                 "task_id",
                 "generator_version",
                 "checker_version",
                 "service_version",
-            )
-        ) != (
-            task.task_id,
-            task.generator_version,
-            task.checker_version,
-            task.service_version,
+            }:
+                raise CapabilityRunnerError("private offline task registration is invalid")
+            board_id = raw.get("board_id")
+            if type(board_id) is not int or board_id <= 0 or board_id in board_ids:
+                raise CapabilityRunnerError("private offline task registration is invalid")
+            board_ids.add(board_id)
+            if tuple(
+                raw.get(name)
+                for name in (
+                    "task_id",
+                    "generator_version",
+                    "checker_version",
+                    "service_version",
+                )
+            ) != (
+                task.task_id,
+                task.generator_version,
+                task.checker_version,
+                task.service_version,
+            ):
+                raise CapabilityRunnerError("private offline task registration binding changed")
+            offline_tasks.append(dict(raw))
+        adapter = registry.get("adapter")
+        if not isinstance(adapter, Mapping) or set(adapter) != {"module", "sha256", "callable"}:
+            raise CapabilityRunnerError("private runtime adapter registration is invalid")
+        if (
+            type(adapter["module"]) is not str
+            or _COMPONENT.fullmatch(adapter["module"]) is None
+            or not adapter["module"].endswith(".py")
+            or type(adapter["callable"]) is not str
+            or _COMPONENT.fullmatch(adapter["callable"]) is None
+            or type(adapter["sha256"]) is not str
+            or _SHA256.fullmatch(adapter["sha256"]) is None
         ):
-            raise CapabilityRunnerError("private offline task registration binding changed")
-        offline_tasks.append(dict(raw))
-    adapter = registry.get("adapter")
-    if not isinstance(adapter, Mapping) or set(adapter) != {"module", "sha256", "callable"}:
-        raise CapabilityRunnerError("private runtime adapter registration is invalid")
-    if (
-        type(adapter["module"]) is not str
-        or _COMPONENT.fullmatch(adapter["module"]) is None
-        or not adapter["module"].endswith(".py")
-        or type(adapter["callable"]) is not str
-        or _COMPONENT.fullmatch(adapter["callable"]) is None
-        or type(adapter["sha256"]) is not str
-        or _SHA256.fullmatch(adapter["sha256"]) is None
-    ):
-        raise CapabilityRunnerError("private runtime adapter registration is invalid")
-    if tuple(offline_tasks) != capsule_tasks:
-        for pinned in capsule_files:
+            raise CapabilityRunnerError("private runtime adapter registration is invalid")
+        if tuple(offline_tasks) != capsule_tasks:
+            raise CapabilityRunnerError("private capsule registration binding changed")
+        return adapter, tuple(offline_tasks), capsule_files
+    except BaseException:
+        for pinned in pinned_files:
             pinned.close()
-        raise CapabilityRunnerError("private capsule registration binding changed")
-    return adapter, tuple(offline_tasks), capsule_files
+        raise
 
 
 def _load_adapter(
@@ -827,6 +908,206 @@ def _owner_only_boundary(path: Path, label: str) -> None:
         raise CapabilityRunnerError(f"{label} is not owner-only")
 
 
+def _validate_fresh_run_paths(state_path: Path, work_root: Path) -> None:
+    if not isinstance(state_path, Path) or not isinstance(work_root, Path):
+        raise CapabilityRunnerError("offline run paths are invalid")
+    if not state_path.is_absolute() or not work_root.is_absolute():
+        raise CapabilityRunnerError("offline run paths are invalid")
+    if not state_path.name or state_path.name in {".", ".."}:
+        raise CapabilityRunnerError("offline state path is invalid")
+    try:
+        state_parent = state_path.parent.resolve(strict=True)
+        resolved_work_root = work_root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CapabilityRunnerError("offline run paths are unavailable") from None
+    _owner_only_directory(state_parent, "offline state parent")
+    _owner_only_directory(resolved_work_root, "offline work root")
+    if os.path.lexists(state_path):
+        raise CapabilityRunnerError("offline state path is not fresh")
+    try:
+        with os.scandir(resolved_work_root) as entries:
+            if next(entries, None) is not None:
+                raise CapabilityRunnerError("offline work root is not fresh")
+    except OSError:
+        raise CapabilityRunnerError("offline work root is unavailable") from None
+
+
+def _pin_additional_private_roots(
+    roots: tuple[Path, ...], runtime_root: Path
+) -> tuple[_PinnedDirectory, ...]:
+    normalized_root = _resolve_boundary_or_fail(runtime_root, "private runtime root")
+    pinned: list[_PinnedDirectory] = []
+    try:
+        for path in roots:
+            resolved = _resolve_boundary_or_fail(path, "private runtime isolation root")
+            if resolved == normalized_root:
+                continue
+            pinned.append(_pin_owner_only_directory(path, "private runtime isolation root"))
+        return tuple(pinned)
+    except BaseException:
+        for descriptor in pinned:
+            descriptor.close()
+        raise
+
+
+def _exact_bound_method(instance: object, owner: type[object], name: str) -> bool:
+    method = getattr(instance, name, None)
+    expected = getattr(owner, name, None)
+    return (
+        callable(method)
+        and getattr(method, "__self__", None) is instance
+        and getattr(method, "__func__", None) is expected
+    )
+
+
+def _validate_board_projection(
+    board: OfflineBoard,
+    runtime_root: Path,
+    catalogue_payload: bytes,
+    offline_task_registrations: tuple[Mapping[str, object], ...],
+    capsule_binding: Mapping[str, object],
+    artifact_limit: int,
+) -> None:
+    if type(board) is not OfflineBoard:
+        raise CapabilityRunnerError("offline Board implementation is not concrete")
+    for method_name in (
+        "public_snapshot",
+        "registration_record",
+        "isolation_roots",
+        "is_process_isolated",
+        "preflight",
+        "_open_source",
+        "_snapshot_source",
+    ):
+        if not _exact_bound_method(board, OfflineBoard, method_name):
+            raise CapabilityRunnerError("offline Board implementation was overridden")
+    bank_root = getattr(board, "_bank_root", None)
+    if not isinstance(bank_root, Path) or _resolve_boundary_or_fail(
+        bank_root, "offline Board bank root"
+    ) != _resolve_boundary_or_fail(runtime_root, "private runtime root"):
+        raise CapabilityRunnerError("offline Board bank root changed")
+    try:
+        catalogue = json.loads(catalogue_payload)
+    except (UnicodeError, json.JSONDecodeError):
+        raise CapabilityRunnerError("private capsule catalogue is invalid") from None
+    if not isinstance(catalogue, Mapping) or not isinstance(catalogue.get("tasks"), list):
+        raise CapabilityRunnerError("private capsule catalogue is invalid")
+    catalogue_rows = {
+        row.get("task_id"): row
+        for row in catalogue["tasks"]
+        if isinstance(row, Mapping) and isinstance(row.get("task_id"), str)
+    }
+    tasks = getattr(board, "_tasks", None)
+    files = getattr(board, "_files", None)
+    if not isinstance(tasks, Mapping) or not isinstance(files, Mapping):
+        raise CapabilityRunnerError("offline Board projection is unavailable")
+    if len(tasks) != len(offline_task_registrations):
+        raise CapabilityRunnerError("offline Board catalogue count changed")
+    raw_bindings = capsule_binding.get("tasks")
+    if not isinstance(raw_bindings, list) or len(raw_bindings) != len(offline_task_registrations):
+        raise CapabilityRunnerError("private capsule task binding is invalid")
+    bindings = {row.get("task_id"): row for row in raw_bindings if isinstance(row, Mapping)}
+    for registration in offline_task_registrations:
+        task_id = registration.get("task_id")
+        board_id = registration.get("board_id")
+        row = catalogue_rows.get(task_id)
+        binding = bindings.get(task_id)
+        task = tasks.get(board_id)
+        if (
+            not isinstance(task_id, str)
+            or type(board_id) is not int
+            or not isinstance(row, Mapping)
+            or not isinstance(binding, Mapping)
+            or task is None
+        ):
+            raise CapabilityRunnerError("offline Board catalogue projection changed")
+        challenge = getattr(task, "challenge", None)
+        actual = {
+            "board_id": getattr(challenge, "id", None),
+            "task_id": getattr(task, "task_id", None),
+            "name": getattr(challenge, "name", None),
+            "category": getattr(challenge, "category", None),
+            "type": getattr(challenge, "type", None),
+            "description": getattr(challenge, "description", None),
+            "value": getattr(challenge, "value", None),
+            "files": list(getattr(challenge, "files", ())),
+            "solved": getattr(challenge, "solved", None),
+            "attempts": getattr(challenge, "attempts", None),
+            "max_attempts": getattr(challenge, "max_attempts", None),
+            "timeout": getattr(challenge, "timeout", None),
+            "shared": getattr(challenge, "shared", None),
+            "service_required": getattr(task, "service_required", None),
+            "resource_profile_id": getattr(task, "resource_profile_id", None),
+            "generator_version": getattr(task, "generator_version", None),
+            "checker_version": getattr(task, "checker_version", None),
+            "service_version": getattr(task, "service_version", None),
+        }
+        expected = {
+            name: row.get(name, default)
+            for name, default in (
+                ("name", task_id),
+                ("value", 0),
+                ("files", []),
+                ("solved", False),
+                ("attempts", 0),
+                ("max_attempts", None),
+                ("timeout", None),
+                ("shared", None),
+                ("service_required", False),
+                ("resource_profile_id", "none"),
+                ("generator_version", None),
+                ("checker_version", None),
+                ("service_version", "none"),
+            )
+        }
+        expected.update(
+            {
+                "board_id": row.get("board_id"),
+                "task_id": task_id,
+                "category": row.get("category"),
+                "type": row.get("type"),
+                "description": row.get("description"),
+            }
+        )
+        if expected["files"] is None:
+            expected["files"] = []
+        if actual != expected:
+            raise CapabilityRunnerError("offline Board catalogue projection changed")
+        file_bytes = binding.get("file_bytes_commitments")
+        if not isinstance(file_bytes, list) or len(file_bytes) != len(actual["files"]):
+            raise CapabilityRunnerError("private capsule file commitment is invalid")
+        by_path = {item.get("path"): item for item in file_bytes if isinstance(item, Mapping)}
+        if set(by_path) != set(actual["files"]):
+            raise CapabilityRunnerError("private capsule file commitment is invalid")
+        for file_ref in actual["files"]:
+            owned = files.get(file_ref)
+            if not isinstance(owned, tuple) or len(owned) != 2 or owned[0] != board_id:
+                raise CapabilityRunnerError("offline Board source inventory changed")
+            descriptor = board._open_source(task, file_ref)
+            digest = hashlib.sha256()
+            total = 0
+            try:
+                while True:
+                    chunk = os.read(descriptor, 65_536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > artifact_limit:
+                        raise CapabilityRunnerError("offline Board source exceeds its bound")
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+            identity = owned[1]
+            expected_digest = by_path[file_ref].get("sha256")
+            if (
+                not isinstance(expected_digest, str)
+                or _SHA256.fullmatch(expected_digest) is None
+                or expected_digest != digest.hexdigest()
+                or getattr(identity, "digest", b"") != digest.digest()
+            ):
+                raise CapabilityRunnerError("offline Board source commitment changed")
+
+
 def _validate_adapter_result(
     result: object,
     contract: RunnerContract,
@@ -834,6 +1115,10 @@ def _validate_adapter_result(
     runtime_root: Path,
     codex_home: Path | None,
     offline_task_registrations: tuple[Mapping[str, object], ...],
+    *,
+    catalogue_payload: bytes | None = None,
+    capsule_binding: Mapping[str, object] | None = None,
+    adapter_module_name: str,
 ) -> tuple[
     RegisteredDurableRuntime,
     Callable[[], Awaitable[Mapping[str, object]]] | None,
@@ -841,8 +1126,21 @@ def _validate_adapter_result(
     if type(result) is not RegisteredDurableRuntime:
         raise CapabilityRunnerError("private runtime adapter returned an invalid registration")
     config = result.config
-    if type(config) is not OfflineRuntimeConfig or not isinstance(result.board, OfflineBoard):
+    if type(config) is not OfflineRuntimeConfig or type(result.board) is not OfflineBoard:
         raise CapabilityRunnerError("private runtime adapter returned an invalid runtime")
+    if any(
+        not _exact_bound_method(result.board, OfflineBoard, name)
+        for name in (
+            "public_snapshot",
+            "registration_record",
+            "isolation_roots",
+            "is_process_isolated",
+            "preflight",
+            "_open_source",
+            "_snapshot_source",
+        )
+    ):
+        raise CapabilityRunnerError("offline Board implementation was overridden")
     if configuration["requires_provider_auth"] is True:
         if codex_home is None or config.codex_home != codex_home:
             raise CapabilityRunnerError("private runtime provider authentication binding changed")
@@ -856,6 +1154,17 @@ def _validate_adapter_result(
         or float(config.run_seconds) != float(contract.scoring_seconds)
     ):
         raise CapabilityRunnerError("private runtime public configuration changed")
+    _validate_fresh_run_paths(config.state_path, config.work_root)
+    if catalogue_payload is None or capsule_binding is None:
+        raise CapabilityRunnerError("private capsule evidence is incomplete")
+    _validate_board_projection(
+        result.board,
+        runtime_root,
+        catalogue_payload,
+        offline_task_registrations,
+        capsule_binding,
+        config.max_challenge_bytes,
+    )
     frozen = tuple(
         (
             task.task_id,
@@ -887,6 +1196,13 @@ def _validate_adapter_result(
         for port in (result.evidence_source, result.cleanup, result.isolation_probe)
     ):
         raise CapabilityRunnerError("private runtime ports are invalid")
+    if (
+        type(adapter_module_name) is not str
+        or not adapter_module_name
+        or getattr(result.evidence_source, "__module__", None) != adapter_module_name
+        or getattr(result.cleanup, "__module__", None) != adapter_module_name
+    ):
+        raise CapabilityRunnerError("private runtime evidence boundary changed")
     roots = tuple(result.private_roots)
     if not roots:
         raise CapabilityRunnerError("private runtime roots are absent")
@@ -997,6 +1313,7 @@ def registered_durable_flow_factory(
     registry, pinned_root = _load_registry(runtime_root, expected_registry_digest)
     pinned_codex: _PinnedDirectory | None = None
     pinned_auth: _PinnedFile | None = None
+    pinned_private_roots: tuple[_PinnedDirectory, ...] = ()
     capsule_files: tuple[_PinnedFile, ...] = ()
     try:
         if public_configuration["requires_provider_auth"] is True:
@@ -1034,6 +1351,12 @@ def registered_durable_flow_factory(
             runtime_root,
             codex_home_source,
             offline_task_registrations,
+            catalogue_payload=_read_pinned_file(capsule_files[0], limit=_REGISTRY_LIMIT),
+            capsule_binding=registry["capsule_binding"],  # type: ignore[arg-type]
+            adapter_module_name=getattr(adapter, "__module__", ""),
+        )
+        pinned_private_roots = _pin_additional_private_roots(
+            tuple(registration.private_roots), runtime_root
         )
         flow = durable_job_control_flow(
             contract=contract,
@@ -1045,12 +1368,16 @@ def registered_durable_flow_factory(
         )
         return _PinnedDurableFlow(
             flow,
+            registration.board,
             registration.isolation_probe,
             pinned_root,
+            pinned_private_roots,
             capsule_files,
             pinned_codex,
             pinned_auth,
             owned_runtime_cleanup,
+            registration.config.state_path,
+            registration.config.work_root,
         )
     except BaseException as exc:  # private details stay inside the worker
         if pinned_auth is not None:
@@ -1058,6 +1385,8 @@ def registered_durable_flow_factory(
         if pinned_codex is not None:
             pinned_codex.close()
         for pinned in capsule_files:
+            pinned.close()
+        for pinned in pinned_private_roots:
             pinned.close()
         pinned_root.close()
         if isinstance(exc, CapabilityRunnerError):

@@ -588,7 +588,6 @@ def test_service_attempts_are_ordinal_closed_and_bound_to_registered_tasks() -> 
     assert receipt["service_attempts"] == [
         {
             "ordinal": 1,
-            "service_id": "owned-service-1",
             "task_id": "EAS-001",
             "status": "stopped",
             "started_ms": 1,
@@ -597,6 +596,7 @@ def test_service_attempts_are_ordinal_closed_and_bound_to_registered_tasks() -> 
             "failure_label": None,
         }
     ]
+    assert service.service_id not in json.dumps(receipt, sort_keys=True)
     with pytest.raises(CapabilityRunnerError, match="status/failure"):
         ServiceAttempt(
             service_id="owned-service-2",
@@ -1762,6 +1762,69 @@ def test_parent_deadline_dominates_receipt_after_event_loop_stall() -> None:
     asyncio.run(exercise())
 
 
+def test_default_parent_deadline_reanchors_only_after_worker_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resets: list[float] = []
+    original = capability_runner._ParentDeadline.reset
+
+    def tracked_reset(self: object, deadline: float) -> None:
+        resets.append(deadline)
+        original(self, deadline)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(capability_runner._ParentDeadline, "reset", tracked_reset)
+    started = time.monotonic()
+    receipt = asyncio.run(run_completion_driven(_contract(), _registered_probe_factory("normal")))
+
+    assert receipt["status"] == "completed"
+    assert len(resets) == 1
+    assert resets[0] >= started + 3600 + 190
+
+
+def test_linux_partial_setup_releases_lock_restores_subreaper_and_closes_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_pipe = os.pipe
+    opened: list[int] = []
+    calls = 0
+
+    def failing_pipe() -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("proof pipe failed")
+        pair = real_pipe()
+        opened.extend(pair)
+        return pair
+
+    restored: list[bool] = []
+    monkeypatch.setattr(capability_runner.sys, "platform", "linux")
+    monkeypatch.setattr(capability_runner.os, "pipe", failing_pipe)
+    monkeypatch.setattr(capability_runner, "_linux_owned_descendants", lambda: set())
+    monkeypatch.setattr(capability_runner, "_enable_linux_child_adoption", lambda: False)
+    monkeypatch.setattr(
+        capability_runner,
+        "_restore_linux_child_adoption",
+        lambda previous: restored.append(previous),
+    )
+
+    with pytest.raises(OSError, match="proof pipe failed"):
+        asyncio.run(
+            run_completion_driven(
+                _contract(),
+                _registered_probe_factory("normal"),
+                outer_deadline_seconds=1.0,
+            )
+        )
+
+    assert restored == [False]
+    assert capability_runner._LINUX_SUPERVISOR_LOCK.acquire(blocking=False)
+    capability_runner._LINUX_SUPERVISOR_LOCK.release()
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper contract")
 def test_linux_containment_reaps_setsid_descendant_before_absence_claim() -> None:
     marker_name = f"cap05-setsid-{uuid.uuid4().hex}"
@@ -1922,11 +1985,54 @@ def test_provider_auth_validation_uses_concrete_boundary_without_provider_call(
         max_challenge_bytes=2048,
         max_workspace_bytes=1024 * 1024,
     )
-    board = object.__new__(OfflineBoard)
-    board.registration_record = lambda: config.offline_board_registration()  # type: ignore[attr-defined]
-    board.isolation_roots = lambda: (runtime_root,)  # type: ignore[attr-defined]
-    board.is_process_isolated = lambda: True  # type: ignore[attr-defined]
-    board.preflight = lambda: True  # type: ignore[attr-defined]
+    first_task = contract.tasks[0]
+    first_visible = runtime_root / "capsules" / first_task.task_id / "visible"
+    first_visible.mkdir(mode=0o700, parents=True)
+    first_file = first_visible / "evidence.txt"
+    first_file.write_bytes(b"provider-authenticated capsule evidence")
+    catalogue = {
+        "catalogue_version": "catalogue-v1",
+        "tasks": [
+            {
+                "board_id": registration.board_id,
+                "task_id": registration.task_id,
+                "name": registration.task_id,
+                "category": task.category,
+                "type": "standard",
+                "description": f"Provider-auth boundary test {task.task_id}",
+                "value": 100,
+                "files": ["evidence.txt"] if task.task_id == first_task.task_id else [],
+                "solved": False,
+                "attempts": 0,
+                "max_attempts": None,
+                "timeout": None,
+                "shared": False,
+                "service_required": False,
+                "resource_profile_id": "none",
+                "generator_version": registration.generator_version,
+                "checker_version": registration.checker_version,
+                "service_version": registration.service_version,
+            }
+            for registration, task in zip(registrations, contract.tasks, strict=True)
+        ],
+    }
+    (runtime_root / "public-catalogue.json").write_text(json.dumps(catalogue), encoding="utf-8")
+
+    def checker(_task_id: str, _candidate: bytes) -> bool:
+        return False
+
+    checker.process_isolated = True  # type: ignore[attr-defined]
+    checker.descendant_confined = True  # type: ignore[attr-defined]
+    board = OfflineBoard(
+        runtime_root,
+        work_root,
+        checker,
+        offline_profile_id=config.offline_profile_id,
+        timeout=config.board_timeout_seconds,
+        artifact_limit=config.max_artifact_bytes,
+        capsule_limit=config.max_challenge_bytes,
+        synthetic_in_process=True,
+    )
     monkeypatch.setattr(offline_run_module.shutil, "which", lambda _name: "/usr/bin/true")
     boundary = _DockerRuntimeBoundary(
         workspace_root=work_root,
@@ -1963,6 +2069,24 @@ def test_provider_auth_validation_uses_concrete_boundary_without_provider_call(
         isolation_probe=boundary.verify,
     )
     offline_task_registrations = tuple(task.public_record() for task in registrations)
+    capsule_binding = {
+        "tasks": [
+            {
+                "task_id": task.task_id,
+                "file_bytes_commitments": (
+                    [
+                        {
+                            "path": "evidence.txt",
+                            "sha256": hashlib.sha256(first_file.read_bytes()).hexdigest(),
+                        }
+                    ]
+                    if task.task_id == first_task.task_id
+                    else []
+                ),
+            }
+            for task in contract.tasks
+        ]
+    }
     validated, owned_cleanup = _validate_adapter_result(
         result,
         contract,
@@ -1970,10 +2094,43 @@ def test_provider_auth_validation_uses_concrete_boundary_without_provider_call(
         runtime_root,
         codex_home,
         offline_task_registrations,
+        catalogue_payload=(runtime_root / "public-catalogue.json").read_bytes(),
+        capsule_binding=capsule_binding,
+        adapter_module_name=__name__,
     )
     assert validated is result
     assert owned_cleanup == boundary.cleanup_record
     assert cleanup_calls == 0
+
+    changed_catalogue = copy.deepcopy(catalogue)
+    changed_catalogue["tasks"][0]["description"] = "uncommitted alternate capsule"
+    with pytest.raises(CapabilityRunnerError, match="catalogue projection changed"):
+        _validate_adapter_result(
+            result,
+            contract,
+            configuration,
+            runtime_root,
+            codex_home,
+            offline_task_registrations,
+            catalogue_payload=json.dumps(changed_catalogue).encode(),
+            capsule_binding=capsule_binding,
+            adapter_module_name=__name__,
+        )
+
+    foreign_evidence = lambda: None
+    foreign_evidence.__module__ = "untrusted_runtime"
+    with pytest.raises(CapabilityRunnerError, match="evidence boundary changed"):
+        _validate_adapter_result(
+            replace(result, evidence_source=foreign_evidence),  # type: ignore[arg-type]
+            contract,
+            configuration,
+            runtime_root,
+            codex_home,
+            offline_task_registrations,
+            catalogue_payload=(runtime_root / "public-catalogue.json").read_bytes(),
+            capsule_binding=capsule_binding,
+            adapter_module_name=__name__,
+        )
 
     provider_calls: list[str] = []
     rejected = replace(
@@ -1988,10 +2145,49 @@ def test_provider_auth_validation_uses_concrete_boundary_without_provider_call(
             runtime_root,
             codex_home,
             offline_task_registrations,
+            catalogue_payload=(runtime_root / "public-catalogue.json").read_bytes(),
+            capsule_binding=capsule_binding,
+            adapter_module_name=__name__,
         )
     assert provider_calls == []
     cleanup_record = asyncio.run(boundary.cleanup_record())
     assert cleanup_record == {"process_absent": True, "active_process_count": 0}
+
+
+def test_registered_runtime_rejects_stale_state_and_work_paths(tmp_path: Path) -> None:
+    from rapido.offline_capability_runtime import _validate_fresh_run_paths
+
+    state_path = tmp_path / "state.sqlite3"
+    work_root = tmp_path / "work"
+    work_root.mkdir(mode=0o700)
+    _validate_fresh_run_paths(state_path, work_root)
+
+    state_path.write_bytes(b"stale")
+    with pytest.raises(CapabilityRunnerError, match="state path is not fresh"):
+        _validate_fresh_run_paths(state_path, work_root)
+
+    state_path.unlink()
+    (work_root / "stale-artifact").write_bytes(b"stale")
+    with pytest.raises(CapabilityRunnerError, match="work root is not fresh"):
+        _validate_fresh_run_paths(state_path, work_root)
+
+
+def test_registered_runtime_pins_every_additional_private_root(tmp_path: Path) -> None:
+    from rapido.offline_capability_runtime import _pin_additional_private_roots
+
+    runtime_root = tmp_path / "runtime"
+    private_root = runtime_root / "checker"
+    private_root.mkdir(mode=0o700, parents=True)
+    pinned = _pin_additional_private_roots((runtime_root, private_root), runtime_root)
+    displaced = runtime_root / "checker-old"
+    try:
+        private_root.rename(displaced)
+        private_root.mkdir(mode=0o700)
+        with pytest.raises(CapabilityRunnerError, match="isolation root changed"):
+            pinned[0].revalidate("private runtime isolation root")
+    finally:
+        for boundary in pinned:
+            boundary.close()
 
 
 def test_registered_durable_factory_runs_actual_model_free_offline_flow(
@@ -2191,7 +2387,6 @@ def test_registered_durable_factory_runs_actual_model_free_offline_flow(
                 )
 
             async def cleanup(_deadline):
-                board.close()
                 shutil.rmtree(run_root)
                 return CleanupInventory(0, 0, 0, 0, 0, 0, 0, 0)
 
@@ -2228,6 +2423,7 @@ def test_registered_durable_factory_runs_actual_model_free_offline_flow(
             "assignment": manifest_row["assignment"],
             "description_commitment": _sha256_json(catalogue_row["description"]),
             "files_commitment": _sha256_json(catalogue_row["files"]),
+            "file_bytes_commitments": [],
             "resource_profile_id": catalogue_row["resource_profile_id"],
             "generator_version": task.generator_version,
             "checker_version": task.checker_version,
