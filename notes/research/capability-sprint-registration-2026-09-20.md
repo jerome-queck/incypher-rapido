@@ -1,5 +1,8 @@
 # Capability sprint CAP-01 registration
 
+> **Status: frozen historical registration.** The sprint is parked; this is evidence, not current
+> authorization or an active execution plan.
+
 **State:** frozen before capability outcomes. **Base source:**
 `6aa26147c35fbc46affeeb77d93d6b88640564a8`, clean and equal to `origin/main`.
 

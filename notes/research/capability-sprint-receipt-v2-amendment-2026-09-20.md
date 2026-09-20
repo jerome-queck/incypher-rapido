@@ -1,5 +1,8 @@
 # Capability receipt v2 pre-outcome amendment — 2026-09-20
 
+> **Status: frozen historical contract.** No later scored sprint run used this amendment. It is not
+> a current execution instruction.
+
 `rapido-capability-public-receipt-v2` supersedes v1 before execution. No scored outcome was
 produced or accepted under v1. The v1 JSON Schema remains unchanged as historical pre-outcome
 evidence; new and scored receipts must use v2.

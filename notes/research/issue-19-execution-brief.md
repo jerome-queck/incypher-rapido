@@ -1,5 +1,8 @@
 # Issue 19 execution brief
 
+> **Status: historical execution record.** This is not a current task plan. The current prompt and
+> production documentation govern new work.
+
 > Retrospective correction (2026-09-19): later post-calibration and full-run sections
 > that reuse three as the then-current cumulative baseline are stale. Issue #11's
 > cumulative-three amendment and earlier registered targets remain historical facts.
