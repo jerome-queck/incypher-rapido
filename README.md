@@ -96,7 +96,7 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 | `RAPIDO_MAX_ARTIFACT_BYTES` | `67108864` | One artifact ceiling. |
 | `RAPIDO_MAX_CHALLENGE_BYTES` | `134217728` | Aggregate source-byte ceiling. |
 | `RAPIDO_MAX_WORKSPACE_BYTES` | `536870912000` | Run-wide ceiling; active challenges partition it. |
-| `RAPIDO_PROFILE` | `practice` | Accepted label; currently configuration metadata only. |
+| `RAPIDO_PROFILE` | `practice` | Durable Board/phase namespace. Use a new empty state directory when switching it. |
 | `RAPIDO_MEMORY_ARM` | `typed_challenge_v1` | Shares sanitized typed earlier-episode host/controller facts across peers; Verifier `same_run_memory` remains empty. `lane_local_v1` is the comparison arm. |
 | `RAPIDO_CHALLENGE_IDS` | empty | Unique qualified IDs; empty means catalogue. |
 | `RAPIDO_FOCUS_CHALLENGE_IDS` | empty | Ordered priority prefix without narrowing full-catalogue coverage. |
@@ -259,6 +259,13 @@ start a second supervisor against the same state, work root, or Codex home.
 An intentional `docker stop` forwards SIGTERM, drains cleanup, and terminalizes the Run as
 `interrupted`; restarting that container is inspection-only. Same-Run recovery applies to abrupt
 worker, container, or daemon loss that leaves the durable Run `running`.
+
+Preserve the original phase's state and reconcile its unresolved effects in that phase.
+Starting a different `RAPIDO_PROFILE`
+or Board against an existing database is refused, including after a terminal run. Legacy state
+without a Board/phase identity cannot be silently adopted by a scoped run. The same phase can
+still resume its original running run and deadline. A fresh competition uses fresh empty state;
+changing the label does not authorize Board operations or import practice results.
 
 For an ambiguous submission, inspect the Board independently, then record the exact outcome; never
 blindly retry:
