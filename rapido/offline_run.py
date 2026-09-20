@@ -1596,11 +1596,8 @@ def _directory_descriptor_path(descriptor: int) -> str | None:
 def _directory_descriptor_was_removed(descriptor: int, original_path: str | None) -> bool:
     """Prove the pinned directory, rather than a substituted pathname, was removed."""
     current_path = _directory_descriptor_path(descriptor)
-    if original_path is not None and current_path is not None:
-        if sys.platform == "darwin":
-            return current_path == original_path
-        if sys.platform.startswith("linux"):
-            return current_path == f"{original_path} (deleted)"
+    if sys.platform == "darwin":
+        return original_path is not None and current_path == original_path
     return os.fstat(descriptor).st_nlink == 0
 
 
