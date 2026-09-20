@@ -15,6 +15,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -108,6 +109,7 @@ MAX_TURN_ITEMS = 100
 MAX_TURN_ITEM_BYTES = 2 * 1024 * 1024
 MAX_TURN_TOOL_CALLS = 512
 MAX_ACTIVE_SERVER_TASKS = 128
+RPC_TIMEOUT_SECONDS = 30.0
 MAX_PROVENANCE_BYTES = 2 * 1024 * 1024
 INTERRUPT_TIMEOUT_SECONDS = 2.0
 MAX_TAINT_DECODE_DEPTH = 4
@@ -1300,30 +1302,53 @@ class CodexAppClient:
             raise CodexAppError("app-server is not running")
         if not isinstance(method, str) or not method or len(method) > 200:
             raise ValueError("method must be bounded text")
+        budget = RPC_TIMEOUT_SECONDS if timeout is None else timeout
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or budget <= 0
+        ):
+            raise ValueError("RPC timeout must be positive and finite")
         loop = asyncio.get_running_loop()
         self._request_id += 1
         request_id = self._request_id
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
         try:
-            await self._send({"id": request_id, "method": method, "params": dict(params or {})})
-            if timeout is None:
+            # The lock and pipe drain consume the same budget as the response.
+            # In particular, a stalled interrupt write must still reach process fencing.
+            async with asyncio.timeout(budget):
+                await self._send({"id": request_id, "method": method, "params": dict(params or {})})
                 return await future
-            return await asyncio.wait_for(asyncio.shield(future), timeout)
+        except TimeoutError as exc:
+            if timeout is None:
+                # A local RPC deadline is not the caller's overall run deadline.
+                raise CodexAppError("app-server RPC deadline exceeded") from exc
+            raise
         finally:
             self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                # The reader can fail this future while the writer is still draining.
+                future.exception()
 
     async def _send(self, message: Mapping[str, Any]) -> None:
         if self.process is None or self.process.stdin is None or self._closed:
             raise CodexAppError("app-server is not running")
         encoded = _json_text(message, limit=self.max_line_bytes - 1).encode("utf-8") + b"\n"
-        async with self._write_lock:
-            self.process.stdin.write(encoded)
-            drain = getattr(self.process.stdin, "drain", None)
-            if drain is not None:
-                await drain()
+        try:
+            async with asyncio.timeout(RPC_TIMEOUT_SECONDS), self._write_lock:
+                # A concurrent close can finish while this writer waits for the lock.
+                if self.process is None or self.process.stdin is None or self._closed:
+                    raise CodexAppError("app-server is not running")
+                self.process.stdin.write(encoded)
+                drain = getattr(self.process.stdin, "drain", None)
+                if drain is not None:
+                    await drain()
+        except TimeoutError as exc:
+            raise CodexAppError("app-server write deadline exceeded") from exc
 
     async def _read_stdout(self) -> None:
         assert self.process is not None
@@ -2199,7 +2224,7 @@ class CodexAppClient:
             await self._terminate_turn(state)
             exc.result = _cancelled_turn_evidence(state)
             raise
-        except ModelValidationError:
+        except CodexAppError:
             await self._terminate_turn(state)
             raise
         finally:
