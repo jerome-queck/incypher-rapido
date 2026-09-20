@@ -128,7 +128,10 @@ def _challenge_id(value: int) -> int:
 
 
 def _https_url(value: str, *, origin_only: bool = False) -> urllib.parse.SplitResult:
-    parsed = urllib.parse.urlsplit(value)
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError as exc:
+        raise BoardError("Board URL is malformed") from exc
     try:
         port = parsed.port
     except ValueError as exc:
@@ -331,13 +334,19 @@ class BoardClient:
         raw = self._document(
             self._request("GET", f"/api/v1/challenges/{challenge_id}"), "challenge detail"
         )
-        if not isinstance(raw, dict) or raw.get("id") != challenge_id:
+        if not isinstance(raw, dict) or type(raw.get("id")) is not int or raw["id"] != challenge_id:
             raise BoardError("challenge detail returned an invalid shape")
 
         def text(name: str, default: str = "") -> str:
             value = raw.get(name, default)
             limit = MAX_CHALLENGE_DESCRIPTION_BYTES if name == "description" else 4096
-            if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
+            if not isinstance(value, str):
+                raise BoardError(f"challenge {name} is invalid")
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeError as exc:
+                raise BoardError(f"challenge {name} is invalid") from exc
+            if len(encoded) > limit:
                 raise BoardError(f"challenge {name} is invalid")
             return value
 
@@ -476,7 +485,10 @@ class BoardClient:
     ) -> dict[str, Any]:
         if not isinstance(file_ref, str) or not file_ref or len(file_ref) > 8192:
             raise BoardError("challenge file reference is invalid")
-        url = urllib.parse.urljoin(self.origin + "/", file_ref)
+        try:
+            url = urllib.parse.urljoin(self.origin + "/", file_ref)
+        except ValueError as exc:
+            raise BoardError("challenge file reference is invalid") from exc
         _https_url(url)
         if not self._same_origin(url):
             raise BoardError("initial challenge file URL must use the Board origin")
@@ -492,7 +504,10 @@ class BoardClient:
             if response.status in {301, 302, 303, 307, 308}:
                 if not response.location:
                     raise BoardError("challenge file redirect lacked a destination")
-                url = urllib.parse.urljoin(url, response.location)
+                try:
+                    url = urllib.parse.urljoin(url, response.location)
+                except ValueError as exc:
+                    raise BoardError("challenge file redirect is invalid") from exc
                 _https_url(url)
                 if not self._same_origin(url):
                     raise BoardError("off-origin challenge file redirect is not permitted")
