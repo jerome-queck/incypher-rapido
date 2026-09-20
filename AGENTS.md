@@ -10,10 +10,10 @@
 
 ## Coordination
 
-- The main agent owns requirements, architecture decisions, shared edits, Board effects, GitHub state, integration, and merges.
-- Delegate bounded, non-overlapping lanes for research, alternatives, implementation, focused tests, and independent review. Give each lane an evidence-based completion criterion and explicit file ownership; wait for and distill all results before deciding.
-- Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-daybreak-blue-latest` at `xhigh` for demanding bounded implementation and review. Pre-register every live run's exact OpenAI roster: at least one Daybreak/xhigh peer per challenge, with Luna/xhigh or Luna/max specialist peers allowed and extra Daybreak peers earned by expected difficulty or evidence.
-- For Codex coding-agent delegation, if Astra or any selected model other than `gpt-daybreak-blue-latest` cannot be selected or started, reroute that same lane to `gpt-daybreak-blue-latest` at `xhigh`. Record the requested and effective model and effort plus the fallback reason. Never fall back silently. If Daybreak/xhigh itself cannot run, record a failure instead of looping or changing models again. This does not alter an experiment's frozen exact-model/no-fallback solver roster.
+- The main session owns requirements, investigation, architecture, ambiguous or cross-discipline judgment, task decomposition, shared edits, Board effects, GitHub state, integration, and merges. It does the substantive thinking and makes every final decision.
+- Codex subagents are implementation assistants only: bounded code changes, focused tests, mechanical research, and code review. Give each lane explicit file ownership and an evidence-based completion criterion; the main session independently evaluates and integrates the result.
+- Run every Codex subagent as `gpt-5.6-luna` at `xhigh` or `max`. Prefer `xhigh`; use `max` for the hardest bounded implementation or review. If the requested Luna effort cannot start, retry the same lane once at the other allowed Luna effort and record requested/effective descriptors plus the reason. If neither works, record failure and return the lane to the main session. Do not route Codex subagent work to another model.
+- Solver experiments are separate: preserve each pre-registered exact roster and its no-fallback policy. These Codex delegation rules never change a scored solver model, effort, or routing arm.
 
 ## Delivery
 
