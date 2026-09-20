@@ -1598,6 +1598,11 @@ def _directory_descriptor_was_removed(descriptor: int, original_path: str | None
     current_path = _directory_descriptor_path(descriptor)
     if sys.platform == "darwin":
         return original_path is not None and current_path == original_path
+    if sys.platform.startswith("linux") and original_path is not None:
+        return os.fstat(descriptor).st_nlink == 0 or current_path in {
+            original_path,
+            f"{original_path} (deleted)",
+        }
     return os.fstat(descriptor).st_nlink == 0
 
 
