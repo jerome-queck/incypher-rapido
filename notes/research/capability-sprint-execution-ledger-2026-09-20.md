@@ -43,7 +43,7 @@
   `0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3`. The retained production ARM64 image identity is
   recorded in the CAP-01 registration; no container remained running.
 
-## CAP-02 — active
+## CAP-02 — complete
 
 - Branch: `codex/capability-sprint-cap02`; base
   `0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3`.
@@ -96,6 +96,56 @@
   end-to-end acceptance tests had no digest-availability skip. The image-dependent cases now record
   a documented skip when that exact image is absent; local registered-image acceptance remains
   117/117. Both container architectures passed in the first completed CI run.
-- Next ready node: commit the bound sanitized receipt, PR/CI/merge; then
-  continue CAP-03/CAP-04 private trust-zone work and CAP-05 runner work. Stage 4 remains blocked on
-  the fresh-task readiness quorum.
+- PR #83 passed Python 3.11/3.12 and amd64/arm64 container gates and was squash-merged to `main` as
+  `735d295ee078a0ce728613800b715cc458f6869f`.
+
+## CAP-03/CAP-04/CAP-05 — active
+
+- CAP-03 public capsule/exporter and CAP-05 completion-runner seams were implemented on focused
+  additive files with independent Daybreak/xhigh review. First review rounds rejected both rather
+  than accepting green synthetic tests: CAP-03 had archive/assignment/bounded-parser/cleanup issues;
+  CAP-05 lacked concrete unchanged-flow integration, enforced caps, deep receipt validation, and
+  bounded settlement/cleanup semantics.
+- Later CAP-03 reviews rejected successive green suites: a host subprocess could not prove kernel
+  network/filesystem isolation; malformed, high-ratio, concatenated, and arbitrary-prefix polyglot
+  archives could false-pass; ancestor and final-name substitutions could redirect or delete foreign
+  objects; public metadata could expose private markers; incomplete registry rows admitted mutated
+  task behavior; and ambiguous OCI creation could hide residue. The final exact-source implementation
+  (`b22ab76670a8b6f1e78a7e9be494a1b86122ad6c756f968692d2b434ef944ccd`; tests
+  `bca931e2d0d2f385994ac223170c23c79a4793392bc6c68858211b166651c79c`) requires a disposable
+  networkless OCI worker, full private task bindings, operation-labelled ID-only OCI reconciliation,
+  bounded recursive archive classification, and descriptor/quarantine cleanup. Independent review
+  replayed every prior bypass and passed 105/105 tests against exact image
+  `sha256:89300f5c36167e77cd5292e2fb5bdde1841eb2a8bd0f0854a39811d575454d34`; CAP-02/CAP-03
+  integration passed 152/152. Ruff, format, compilation, diff, labelled-container/volume absence,
+  and private PWN preservation passed. POSIX deletion cannot be inode-atomic against arbitrary
+  synchronous same-EUID syscall interposition; the registered boundary therefore excludes untrusted
+  same-EUID host execution, runs hostile bytes only in OCI, and preserves/fails closed on every
+  injected substitution hook. CAP-05's later passes addressed an outer/inner deadline split,
+  repeated cancellation cleanup, exact experiment binding, lower-bound usage caps, privacy
+  patterns, terminal/evidence biconditionals, and finally a disposable process supervisor.
+- Private CAP-04B admitted fresh owned `REV-A` and `REV-B`: six V1–V3 validations and four Tier-A
+  calibration siblings passed independent references; 40 wrong/near-miss/decoy/canary cases
+  rejected; four capsules passed candidate-free CAP-03/CAP-02 integration; residue and leak counts
+  are zero. No historical material, model call, scored solver, official Board, or network was used.
+- Private CAP-04D admitted fresh owned `CRY-A` and `CRY-B` under the same boundaries: six V1–V3
+  validations and four Tier-A siblings passed exact/unique and hardness-band checks; 40 negative
+  cases rejected; candidate-free capsule/Board integration and exact cleanup passed with zero leak
+  or residue.
+- Private CAP-04E admitted fresh owned `FOR-A`: three V1–V3 validations and two Tier-A
+  calibration siblings passed references, rebuild/scanner/tool gates, 20 negative cases, and
+  hostile bounded archive/media/packet/log/time/record tests. Six fresh `EAS-001..006` sentinels
+  passed two generations each, freshness, 12 references, 48 negatives, candidate-free capsule
+  integration, and the merged CAP-02 unchanged static/dynamic flows. EAS-006 service lifecycle,
+  deterministic checking, Docker cleanup, and absence proof passed with zero owned residue.
+- Private CAP-04F admitted fresh owned `PWN-A`: V1–V3 plus two Tier-A calibration siblings passed
+  independent and native references 5/5, 20 candidate negatives, 20 hostile native rejects, and
+  exact/unique deterministic build, tool, and scanner gates. Exact-source real-OCI CAP-03 plus
+  `ProcessChecker`/`OfflineBoard` rejected 2/2 wrong values, accepted 2/2 correct values, and reaped
+  4/4 workers; all owned container, image, bank, scratch, nonregular, leak, and residue counts are
+  zero. No historical material, internet, model, official Board, or scored solver was used.
+- Early readiness quorum is admitted: 12 Tier-A difficult tasks across four categories and six
+  families (`REV-A/B`, `CRY-A/B`, `FOR-A`, `PWN-A`), plus all six candidate-free sentinels. Private
+  evidence remains owner-only; only closed version IDs, counts, and outcomes enter this public
+  ledger. Stage 4 remains blocked only on reviewed/merged CAP-03 and CAP-05 plus a pre-outcome schema
+  correction and immutable experiment registration.
