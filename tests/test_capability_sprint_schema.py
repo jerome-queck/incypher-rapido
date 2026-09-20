@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -19,7 +20,8 @@ from rapido.offline_capability_schema import (
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRATION = ROOT / "notes/research/capability-sprint-experiments-v1.json"
-RECEIPT_SCHEMA = ROOT / "notes/research/capability-sprint-receipt-schema-v1.json"
+RECEIPT_SCHEMA_V1 = ROOT / "notes/research/capability-sprint-receipt-schema-v1.json"
+RECEIPT_SCHEMA = ROOT / "notes/research/capability-sprint-receipt-schema-v2.json"
 
 
 def _resource() -> dict[str, object]:
@@ -103,7 +105,7 @@ def _receipt() -> dict[str, object]:
         for task_id in task_ids
     ]
     return {
-        "schema": "rapido-capability-public-receipt-v1",
+        "schema": "rapido-capability-public-receipt-v2",
         "run_id": "synthetic-capability-receipt",
         "experiment_id": "BOARD-ACCEPT",
         "source": {
@@ -222,6 +224,7 @@ def _receipt() -> dict[str, object]:
         "resources": _resource(),
         "cleanup": {
             "passed": True,
+            "inventory_complete": True,
             "failure_label": None,
             "owned_processes_remaining": 0,
             "owned_containers_remaining": 0,
@@ -241,6 +244,12 @@ def _receipt() -> dict[str, object]:
         },
         "human_decisions": [],
     }
+
+
+def _historical_v1(receipt: dict[str, object]) -> dict[str, object]:
+    receipt["schema"] = "rapido-capability-public-receipt-v1"
+    del receipt["cleanup"]["inventory_complete"]
+    return receipt
 
 
 def _task_manifest() -> dict[str, object]:
@@ -327,7 +336,7 @@ def _as_final_capacity(receipt: dict[str, object]) -> None:
     receipt["time_series"][0].update({"queued": 6, "unstarted": 89})
     receipt["time_series"][-1].update({"terminal": 89, "unstarted": 0})
     receipt["aggregate"].update({"terminal": 89, "unstarted": 83})
-    receipt["capacity"].update({"scoring_cap_ms": 19_800_000, "unstarted_at_cap": 83})
+    receipt["capacity"].update({"scoring_cap_ms": 19_800_000, "unstarted_at_cap": 0})
 
 
 def test_canonical_registration_is_complete_and_frozen() -> None:
@@ -403,6 +412,10 @@ def test_receipt_schema_declares_closed_nonempty_privacy_and_cleanup_gates() -> 
     assert schema["properties"]["time_series"]["minItems"] == 1
     assert schema["properties"]["sentinels"]["uniqueItems"] is True
     assert schema["properties"]["privacy"]["properties"]["scan_passed"] == {"const": True}
+    assert schema["properties"]["schema"] == {"const": "rapido-capability-public-receipt-v2"}
+    assert schema["properties"]["cleanup"]["properties"]["inventory_complete"] == {
+        "type": "boolean"
+    }
     assert schema["allOf"][0]["then"]["properties"]["cleanup"]["properties"][
         "owned_processes_remaining"
     ] == {"const": 0}
@@ -441,6 +454,90 @@ def test_receipt_schema_declares_closed_nonempty_privacy_and_cleanup_gates() -> 
     missing_start["tasks"][0]["started_ms"] = None
     with pytest.raises(ValidationError):
         validator.validate(missing_start)
+
+
+def test_v1_requires_explicit_historical_opt_in_and_remains_unchanged() -> None:
+    historical = _historical_v1(_receipt())
+
+    with pytest.raises(CapabilitySchemaError, match="identity"):
+        validate_receipt(historical)
+    validate_receipt(historical, allow_historical_v1=True)
+
+    v1_schema = json.loads(RECEIPT_SCHEMA_V1.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(v1_schema)
+    Draft202012Validator(v1_schema).validate(historical)
+    assert hashlib.sha256(RECEIPT_SCHEMA_V1.read_bytes()).hexdigest() == (
+        "fdf8a5a2f87a09a5bd847be779ccc644b1d527d48ba44d0b6dbe07770f2f8e74"
+    )
+
+
+def test_historical_v1_retains_closed_cap_snapshot_semantics() -> None:
+    historical = _historical_v1(_receipt())
+    historical["tasks"][0]["terminal_ms"] = 1000
+    historical["capacity"]["active_at_cap"] = 1
+
+    with pytest.raises(CapabilitySchemaError, match="identity"):
+        validate_receipt(historical)
+    validate_receipt(historical, allow_historical_v1=True)
+
+    current = _receipt()
+    current["tasks"][0]["terminal_ms"] = 1000
+    current["capacity"]["active_at_cap"] = 1
+    with pytest.raises(CapabilitySchemaError, match="cap snapshot"):
+        validate_receipt(current)
+
+
+def test_historical_v1_does_not_inherit_v2_usage_lower_bound_rule() -> None:
+    historical = _historical_v1(_receipt())
+    task = historical["tasks"][0]
+    task["provider_attempts"][0]["usage"].update({"input": 1_000_001, "output": None})
+    task["usage"].update({"input": 1_000_001, "output": None})
+    historical["time_series"][-1]["usage"].update({"input": 1_000_001, "output": None})
+    validate_receipt(historical, allow_historical_v1=True)
+
+    current = copy.deepcopy(historical)
+    current["schema"] = "rapido-capability-public-receipt-v2"
+    current["cleanup"]["inventory_complete"] = True
+    with pytest.raises(CapabilitySchemaError, match="requires usage_cap terminal"):
+        validate_receipt(current)
+
+
+def test_v2_cleanup_requires_complete_zero_inventory_to_pass() -> None:
+    schema = json.loads(RECEIPT_SCHEMA.read_text(encoding="utf-8"))
+    validator = Draft202012Validator(schema)
+
+    false_pass = _receipt()
+    false_pass["cleanup"]["inventory_complete"] = False
+    false_pass["cleanup"]["owned_processes_remaining"] = None
+    with pytest.raises(ValidationError):
+        validator.validate(false_pass)
+    with pytest.raises(CapabilitySchemaError, match="cleanup cannot pass"):
+        validate_receipt(false_pass)
+
+    failed = _receipt()
+    failed["cleanup"].update(
+        {
+            "passed": False,
+            "inventory_complete": False,
+            "failure_label": "cleanup_failure",
+            "owned_processes_remaining": None,
+            "owned_containers_remaining": None,
+            "owned_volumes_remaining": None,
+            "owned_networks_remaining": None,
+            "owned_services_remaining": None,
+            "owned_workspaces_remaining": None,
+            "owned_state_objects_remaining": None,
+            "owned_run_ids_remaining": None,
+        }
+    )
+    failed["failure_counts"]["cleanup"] = 1
+    validator.validate(failed)
+    validate_receipt(failed)
+
+    contradictory = copy.deepcopy(failed)
+    contradictory["cleanup"]["inventory_complete"] = True
+    with pytest.raises(CapabilitySchemaError, match="contradicts nullable"):
+        validate_receipt(contradictory)
 
 
 def test_receipt_semantics_accept_canonical_and_reject_cross_field_mismatch() -> None:
@@ -654,6 +751,48 @@ def test_receipt_preserves_transient_provider_invocation_failures() -> None:
     receipt["time_series"][-1]["provider_failures"] = 1
     receipt["aggregate"]["provider_failures"] = 1
     receipt["failure_counts"]["provider"] = 1
+    validate_receipt(receipt)
+
+
+def test_known_usage_lower_bound_over_cap_survives_other_nulls() -> None:
+    receipt = _receipt()
+    task = receipt["tasks"][0]
+    task["provider_attempts"][0]["usage"].update({"input": 1_000_001, "output": None})
+    task["usage"].update({"input": 1_000_001, "output": None})
+    receipt["time_series"][-1]["usage"].update({"input": 1_000_001, "output": None})
+
+    with pytest.raises(CapabilitySchemaError, match="requires usage_cap terminal"):
+        validate_receipt(receipt)
+
+    task.update(
+        {
+            "terminal_label": "usage_cap",
+            "raw_correct": None,
+            "first_correct_ms": None,
+            "qualification": "inconclusive",
+            "qualification_ms": None,
+            "independent_check": "not_invoked",
+            "independent_verification": None,
+        }
+    )
+    task["candidate_checks"][0]["result"] = "incorrect"
+    receipt["sentinels"][0].update({"passed": False, "terminal_label": "usage_cap"})
+    with pytest.raises(CapabilitySchemaError, match="invalidates demonstrated/projected"):
+        validate_receipt(receipt)
+
+    receipt["classification"].update(
+        {"capability_status": "inconclusive", "conversion_status": "inconclusive"}
+    )
+    validate_receipt(receipt)
+
+
+def test_empty_provider_attempts_aggregate_to_exact_zero() -> None:
+    receipt = _receipt()
+    _as_final_capacity(receipt)
+    receipt["aggregate"]["undersized_reservoir"] = True
+    empty = receipt["tasks"][-1]
+    assert empty["provider_attempts"] == []
+    assert empty["usage"] == _usage()
     validate_receipt(receipt)
 
 
@@ -899,6 +1038,22 @@ def test_final_capacity_requires_exact_cap_or_explicit_early_drain() -> None:
 
     receipt["aggregate"]["undersized_reservoir"] = True
     validate_receipt(receipt)
+
+    closed_at_boundary = copy.deepcopy(receipt)
+    closed_at_boundary["capacity"]["unstarted_at_cap"] = 83
+    with pytest.raises(CapabilitySchemaError, match="cap snapshot"):
+        validate_receipt(closed_at_boundary)
+
+
+def test_cap_snapshot_is_half_open_at_terminal_boundary() -> None:
+    receipt = _receipt()
+    receipt["tasks"][0]["terminal_ms"] = 1000
+    validate_receipt(receipt)
+
+    false_active = copy.deepcopy(receipt)
+    false_active["capacity"]["active_at_cap"] = 1
+    with pytest.raises(CapabilitySchemaError, match="cap snapshot"):
+        validate_receipt(false_active)
 
 
 def test_cap_snapshot_excludes_already_terminal_unstarted_tasks() -> None:
