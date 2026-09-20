@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e . pytest ruff
+      - run: python -m pip install -e . pytest ruff jsonschema==4.25.1
       - run: ruff check rapido tests scripts
       - run: ruff format --check rapido tests scripts
       - run: pytest -q

@@ -1,0 +1,450 @@
+{
+  "$id": "rapido-capability-public-receipt-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Consumers must also run rapido.offline_capability_schema.validate_receipt for cross-field and privacy invariants.",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"cleanup": {"properties": {"passed": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "cleanup": {
+            "properties": {
+              "failure_label": {"type": "null"},
+              "owned_containers_remaining": {"const": 0},
+              "owned_networks_remaining": {"const": 0},
+              "owned_processes_remaining": {"const": 0},
+              "owned_run_ids_remaining": {"const": 0},
+              "owned_services_remaining": {"const": 0},
+              "owned_state_objects_remaining": {"const": 0},
+              "owned_volumes_remaining": {"const": 0},
+              "owned_workspaces_remaining": {"const": 0}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "cleanup": {
+            "properties": {
+              "failure_label": {"const": "cleanup_failure"}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "aggregate": {
+      "additionalProperties": false,
+      "properties": {
+        "fresh_family_solves": {"minimum": 0, "type": "integer"},
+        "global_active_wall_ms": {"minimum": 0, "type": "integer"},
+        "independently_checked": {"minimum": 0, "type": "integer"},
+        "lane_time_ms": {"minimum": 0, "type": "integer"},
+        "provider_failures": {"minimum": 0, "type": "integer"},
+        "qualification_projected": {"minimum": 0, "type": "integer"},
+        "raw_correct_tasks": {"minimum": 0, "type": "integer"},
+        "terminal": {"minimum": 0, "type": "integer"},
+        "tool_failures": {"minimum": 0, "type": "integer"},
+        "undersized_reservoir": {"type": "boolean"},
+        "unstarted": {"minimum": 0, "type": "integer"}
+      },
+      "required": ["raw_correct_tasks", "fresh_family_solves", "qualification_projected", "independently_checked", "provider_failures", "tool_failures", "lane_time_ms", "global_active_wall_ms", "terminal", "unstarted", "undersized_reservoir"],
+      "type": "object"
+    },
+    "capacity": {
+      "additionalProperties": false,
+      "properties": {
+        "active_at_cap": {"minimum": 0, "type": "integer"},
+        "admissions_closed_ms": {"minimum": 0, "type": "integer"},
+        "cleanup_end_ms": {"minimum": 0, "type": "integer"},
+        "dynamic_instances_created": {"minimum": 0, "type": "integer"},
+        "dynamic_instances_deleted": {"minimum": 0, "type": "integer"},
+        "global_active_wall_ms": {"minimum": 0, "type": "integer"},
+        "global_wall_ms": {"minimum": 0, "type": "integer"},
+        "lane_time_ms": {"minimum": 0, "type": "integer"},
+        "overlap_method": {"const": "monotonic_union_v1"},
+        "queue_at_cap": {"minimum": 0, "type": "integer"},
+        "scoring_cap_ms": {"minimum": 1, "type": "integer"},
+        "settlement_end_ms": {"minimum": 0, "type": "integer"},
+        "unstarted_at_cap": {"minimum": 0, "type": "integer"}
+      },
+      "required": ["lane_time_ms", "global_active_wall_ms", "global_wall_ms", "overlap_method", "admissions_closed_ms", "scoring_cap_ms", "settlement_end_ms", "cleanup_end_ms", "queue_at_cap", "active_at_cap", "unstarted_at_cap", "dynamic_instances_created", "dynamic_instances_deleted"],
+      "type": "object"
+    },
+    "classification": {
+      "additionalProperties": false,
+      "properties": {
+        "capability_status": {"enum": ["demonstrated", "not_demonstrated", "inconclusive"]},
+        "conversion_status": {"enum": ["projected", "not_projected", "inconclusive"]},
+        "limitations": {"items": {"pattern": "^[a-z0-9][a-z0-9_-]{0,119}$", "type": "string"}, "type": "array", "uniqueItems": true},
+        "regression_risks": {"items": {"pattern": "^[a-z0-9][a-z0-9_-]{0,119}$", "type": "string"}, "type": "array", "uniqueItems": true}
+      },
+      "required": ["capability_status", "conversion_status", "limitations", "regression_risks"],
+      "type": "object"
+    },
+    "cleanup": {
+      "additionalProperties": false,
+      "properties": {
+        "failure_label": {"maxLength": 80, "type": ["string", "null"]},
+        "owned_processes_remaining": {"minimum": 0, "type": "integer"},
+        "owned_containers_remaining": {"minimum": 0, "type": "integer"},
+        "owned_networks_remaining": {"minimum": 0, "type": "integer"},
+        "owned_run_ids_remaining": {"minimum": 0, "type": "integer"},
+        "owned_services_remaining": {"minimum": 0, "type": "integer"},
+        "owned_state_objects_remaining": {"minimum": 0, "type": "integer"},
+        "owned_volumes_remaining": {"minimum": 0, "type": "integer"},
+        "owned_workspaces_remaining": {"minimum": 0, "type": "integer"},
+        "passed": {"type": "boolean"}
+      },
+      "required": ["passed", "failure_label", "owned_processes_remaining", "owned_containers_remaining", "owned_volumes_remaining", "owned_networks_remaining", "owned_services_remaining", "owned_workspaces_remaining", "owned_state_objects_remaining", "owned_run_ids_remaining"],
+      "type": "object"
+    },
+    "configuration": {
+      "additionalProperties": false,
+      "properties": {
+        "active_challenges": {"const": 5},
+        "attempt_seconds": {"maximum": 7200, "minimum": 1, "type": "integer"},
+        "dynamic_leases": {"const": 1},
+        "effective_descriptors_match": {"type": "boolean"},
+        "episodes_per_task": {"maximum": 8, "minimum": 1, "type": "integer"},
+        "lane_descriptors": {"items": {"enum": ["DAYBREAK_XHIGH", "LUNA_MAX", "LUNA_XHIGH"]}, "maxItems": 64, "minItems": 1, "type": "array"},
+        "lane_admissions": {"const": 20},
+        "requested_descriptors": {"items": {"maxLength": 120, "type": "string"}, "maxItems": 8, "minItems": 1, "type": "array"},
+        "routing_profile": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": "string"},
+        "usage_caps": {
+          "additionalProperties": false,
+          "properties": {
+            "input": {"minimum": 0, "type": "integer"},
+            "output": {"minimum": 0, "type": "integer"},
+            "reasoning": {"minimum": 0, "type": "integer"}
+          },
+          "required": ["input", "output", "reasoning"],
+          "type": "object"
+        },
+        "wall_cap_seconds": {"maximum": 19800, "minimum": 1, "type": "integer"}
+      },
+      "required": ["routing_profile", "requested_descriptors", "lane_descriptors", "effective_descriptors_match", "active_challenges", "lane_admissions", "dynamic_leases", "attempt_seconds", "episodes_per_task", "wall_cap_seconds", "usage_caps"],
+      "type": "object"
+    },
+    "denominator": {
+      "additionalProperties": false,
+      "properties": {
+        "category_count": {"minimum": 0, "type": "integer"},
+        "difficult_count": {"minimum": 0, "type": "integer"},
+        "family_count": {"minimum": 0, "type": "integer"},
+        "task_count": {"minimum": 6, "type": "integer"},
+        "task_ids": {"items": {"pattern": "^[A-Z0-9-]{3,80}$", "type": "string"}, "minItems": 6, "type": "array", "uniqueItems": true}
+      },
+      "required": ["task_count", "difficult_count", "family_count", "category_count", "task_ids"],
+      "type": "object"
+    },
+    "experiment_id": {"pattern": "^[A-Z0-9][A-Z0-9_-]{0,79}$", "type": "string"},
+    "failure_counts": {
+      "additionalProperties": false,
+      "properties": {
+        "cleanup": {"minimum": 0, "type": "integer"},
+        "privacy": {"minimum": 0, "type": "integer"},
+        "provider": {"minimum": 0, "type": "integer"},
+        "service": {"minimum": 0, "type": "integer"},
+        "tool": {"minimum": 0, "type": "integer"}
+      },
+      "required": ["provider", "tool", "service", "privacy", "cleanup"],
+      "type": "object"
+    },
+    "human_decisions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "approver": {"pattern": "^[A-Za-z0-9_.-]{1,120}$", "type": "string"},
+          "decided_at": {"pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "type": "string"},
+          "decision": {"enum": ["approve", "reject", "defer"]},
+          "delta_id": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": "string"},
+          "evidence_ids": {"items": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$", "type": "string"}, "minItems": 1, "type": "array", "uniqueItems": true},
+          "regression_risks": {"items": {"pattern": "^[a-z0-9][a-z0-9_-]{0,119}$", "type": "string"}, "type": "array", "uniqueItems": true},
+          "rollback": {"pattern": "^[a-z0-9][a-z0-9_-]{0,119}$", "type": "string"},
+          "uncertainty": {"items": {"pattern": "^[a-z0-9][a-z0-9_-]{0,119}$", "type": "string"}, "type": "array", "uniqueItems": true}
+        },
+        "required": ["delta_id", "decision", "approver", "decided_at", "evidence_ids", "uncertainty", "regression_risks", "rollback"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "privacy": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_derived_digests_published": {"const": false},
+        "candidate_values_published": {"const": false},
+        "private_paths_published": {"const": false},
+        "scan_passed": {"const": true},
+        "target_authorities_published": {"const": false}
+      },
+      "required": ["scan_passed", "candidate_values_published", "candidate_derived_digests_published", "private_paths_published", "target_authorities_published"],
+      "type": "object"
+    },
+    "resources": {"$ref": "#/$defs/resources"},
+    "run_id": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": "string"},
+    "schema": {"const": "rapido-capability-public-receipt-v1"},
+    "sentinels": {
+      "allOf": [
+        {"contains": {"properties": {"task_id": {"const": "EAS-001"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1},
+        {"contains": {"properties": {"task_id": {"const": "EAS-002"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1},
+        {"contains": {"properties": {"task_id": {"const": "EAS-003"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1},
+        {"contains": {"properties": {"task_id": {"const": "EAS-004"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1},
+        {"contains": {"properties": {"task_id": {"const": "EAS-005"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1},
+        {"contains": {"properties": {"task_id": {"const": "EAS-006"}}, "required": ["task_id"]}, "maxContains": 1, "minContains": 1}
+      ],
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "passed": {"type": "boolean"},
+          "task_id": {"pattern": "^EAS-00[1-6]$", "type": "string"},
+          "terminal_label": {"$ref": "#/$defs/terminalLabel"}
+        },
+        "required": ["task_id", "passed", "terminal_label"],
+        "type": "object"
+      },
+      "maxItems": 6,
+      "minItems": 6,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "dirty": {"const": false},
+        "image_id": {"const": "sha256:0eef1ceb74759bf64e9a89ca0dd1cf722bd1f6967a9b53666577164ee4d71c52"},
+        "registration_sha256": {"const": "f74810e1c43c0a1cbdebd196af6f76b1d96bfb6572b344129662dd9f2657ffd1"},
+        "sha": {"const": "6aa26147c35fbc46affeeb77d93d6b88640564a8"},
+        "task_manifest_sha256": {"const": "14a5dbd43fac8df0703b22a2cb258f458a7319c000f95e15b8ef5984a573981b"}
+      },
+      "required": ["sha", "image_id", "dirty", "registration_sha256", "task_manifest_sha256"],
+      "type": "object"
+    },
+    "service_attempts": {"items": {"$ref": "#/$defs/serviceAttempt"}, "type": "array"},
+    "tasks": {"items": {"$ref": "#/$defs/task"}, "minItems": 6, "type": "array"},
+    "time_series": {"items": {"$ref": "#/$defs/timepoint"}, "minItems": 1, "type": "array"}
+  },
+  "required": ["schema", "run_id", "experiment_id", "source", "configuration", "denominator", "tasks", "time_series", "sentinels", "aggregate", "failure_counts", "capacity", "service_attempts", "classification", "resources", "cleanup", "privacy", "human_decisions"],
+  "title": "Sanitized Rapido capability run receipt",
+  "type": "object",
+  "$defs": {
+    "nullableNonnegativeInt": {"minimum": 0, "type": ["integer", "null"]},
+    "terminalLabel": {
+      "enum": [
+        "correct",
+        "incorrect",
+        "already_terminal",
+        "unstarted_at_cap",
+        "queued_at_cap",
+        "attempt_timeout",
+        "global_cap",
+        "no_unique_candidate",
+        "repeated_candidate_only",
+        "no_new_durable_observation",
+        "tool_absent",
+        "dependency_absent",
+        "unsupported_format",
+        "parser_failure",
+        "tool_argument_schema",
+        "tool_runtime",
+        "sandbox_failure",
+        "policy_refusal",
+        "context_loss",
+        "method_replay_failure",
+        "oracle_inconclusive",
+        "provider_unavailable",
+        "provider_failure",
+        "descriptor_mismatch",
+        "usage_cap",
+        "service_start_failure",
+        "service_unready",
+        "service_lost",
+        "cleanup_failure",
+        "privacy_boundary",
+        "source_drift",
+        "fixture_invalid"
+      ]
+    },
+    "resources": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {"properties": {"cpu_peak_cores": {"type": "null"}}, "required": ["cpu_peak_cores"]},
+              {"properties": {"memory_peak_bytes": {"type": "null"}}, "required": ["memory_peak_bytes"]},
+              {"properties": {"pids_peak": {"type": "null"}}, "required": ["pids_peak"]},
+              {"properties": {"disk_peak_bytes": {"type": "null"}}, "required": ["disk_peak_bytes"]}
+            ]
+          },
+          "then": {"properties": {"unavailable_reason": {"type": "string"}}},
+          "else": {"properties": {"unavailable_reason": {"type": "null"}}}
+        }
+      ],
+      "properties": {
+        "cpu_peak_cores": {"minimum": 0, "type": ["number", "null"]},
+        "disk_peak_bytes": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "memory_peak_bytes": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "pids_peak": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "unavailable_reason": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": ["string", "null"]}
+      },
+      "required": ["cpu_peak_cores", "memory_peak_bytes", "pids_peak", "disk_peak_bytes", "unavailable_reason"],
+      "type": "object"
+    },
+    "task": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"started": {"const": true}}, "required": ["started"]},
+          "then": {"properties": {"admitted_ms": {"minimum": 0, "type": "integer"}, "started_ms": {"minimum": 0, "type": "integer"}}}
+        },
+        {
+          "if": {"properties": {"raw_correct": {"const": true}}, "required": ["raw_correct"]},
+          "then": {"properties": {"first_correct_ms": {"minimum": 0, "type": "integer"}, "terminal_label": {"const": "correct"}}}
+        },
+        {
+          "if": {"properties": {"terminal_label": {"const": "correct"}}, "required": ["terminal_label"]},
+          "then": {"properties": {"raw_correct": {"const": true}}}
+        }
+      ],
+      "properties": {
+        "admitted_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "candidate_repeat_count": {"minimum": 0, "type": "integer"},
+        "candidate_checks": {"items": {"$ref": "#/$defs/candidateCheck"}, "type": "array"},
+        "candidate_unique_count": {"minimum": 0, "type": "integer"},
+        "category": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$", "type": "string"},
+        "checker_call_count": {"minimum": 0, "type": "integer"},
+        "checker_version": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$", "type": "string"},
+        "cleanup_passed": {"type": ["boolean", "null"]},
+        "family_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$", "type": "string"},
+        "first_correct_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "first_unique_candidate_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "independent_check": {"enum": ["correct", "incorrect", "inconclusive", "not_invoked"]},
+        "independent_verification": {"anyOf": [{"$ref": "#/$defs/independentVerification"}, {"type": "null"}]},
+        "provider_failure_count": {"minimum": 0, "type": "integer"},
+        "provider_invocation_count": {"minimum": 0, "type": "integer"},
+        "provider_attempts": {"items": {"$ref": "#/$defs/providerAttempt"}, "maxItems": 64, "type": "array"},
+        "qualification": {"enum": ["accepted", "rejected", "not_applicable", "inconclusive"]},
+        "qualification_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "qualification_rejection_stage": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": ["string", "null"]},
+        "raw_correct": {"type": ["boolean", "null"]},
+        "resources": {"$ref": "#/$defs/resources"},
+        "started": {"type": "boolean"},
+        "started_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "task_id": {"pattern": "^[A-Z0-9-]{3,80}$", "type": "string"},
+        "terminal_label": {"$ref": "#/$defs/terminalLabel"},
+        "terminal_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "tier": {"enum": ["A", "B", "C", "sentinel"]},
+        "tool_call_count": {"minimum": 0, "type": "integer"},
+        "tool_attempts": {"items": {"$ref": "#/$defs/toolAttempt"}, "type": "array"},
+        "tool_failure_labels": {"items": {"enum": ["tool_absent", "dependency_absent", "unsupported_format", "parser_failure", "tool_argument_schema", "tool_runtime", "sandbox_failure", "policy_refusal", "context_loss"]}, "type": "array"},
+        "usage": {"$ref": "#/$defs/usage"}
+      },
+      "required": ["task_id", "family_id", "category", "tier", "started", "admitted_ms", "started_ms", "first_unique_candidate_ms", "first_correct_ms", "terminal_ms", "terminal_label", "raw_correct", "qualification", "qualification_ms", "qualification_rejection_stage", "independent_check", "independent_verification", "candidate_unique_count", "candidate_repeat_count", "checker_call_count", "candidate_checks", "provider_invocation_count", "provider_failure_count", "provider_attempts", "checker_version", "usage", "resources", "tool_call_count", "tool_attempts", "tool_failure_labels", "cleanup_passed"],
+      "type": "object"
+    },
+    "candidateCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_returned_ms": {"minimum": 0, "type": "integer"},
+        "checker_ended_ms": {"minimum": 0, "type": "integer"},
+        "checker_started_ms": {"minimum": 0, "type": "integer"},
+        "ordinal": {"minimum": 1, "type": "integer"},
+        "result": {"enum": ["correct", "incorrect", "inconclusive"]}
+      },
+      "required": ["ordinal", "candidate_returned_ms", "checker_started_ms", "checker_ended_ms", "result"],
+      "type": "object"
+    },
+    "independentVerification": {
+      "additionalProperties": false,
+      "properties": {
+        "ended_ms": {"minimum": 0, "type": "integer"},
+        "method_version": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]{0,119}$", "type": "string"},
+        "result": {"enum": ["correct", "incorrect", "inconclusive"]},
+        "started_ms": {"minimum": 0, "type": "integer"}
+      },
+      "required": ["started_ms", "ended_ms", "result", "method_version"],
+      "type": "object"
+    },
+    "providerAttempt": {
+      "additionalProperties": false,
+      "properties": {
+        "effective_effort": {"enum": [null, "xhigh", "max"]},
+        "effective_model": {"enum": [null, "gpt-daybreak-blue-latest", "gpt-5.6-luna"]},
+        "effective_revision_build": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,119}$", "type": ["string", "null"]},
+        "ended_ms": {"minimum": 0, "type": "integer"},
+        "lane": {"maximum": 63, "minimum": 0, "type": "integer"},
+        "native_client_version": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,119}$", "type": "string"},
+        "ordinal": {"minimum": 1, "type": "integer"},
+        "requested_effort": {"enum": ["xhigh", "max"]},
+        "requested_model": {"enum": ["gpt-daybreak-blue-latest", "gpt-5.6-luna"]},
+        "started_ms": {"minimum": 0, "type": "integer"},
+        "status": {"enum": ["completed", "provider_failure", "provider_unavailable", "descriptor_mismatch", "cancelled"]},
+        "usage": {"$ref": "#/$defs/usage"}
+      },
+      "required": ["ordinal", "lane", "requested_model", "requested_effort", "effective_model", "effective_effort", "effective_revision_build", "native_client_version", "status", "started_ms", "ended_ms", "usage"],
+      "type": "object"
+    },
+    "serviceAttempt": {
+      "additionalProperties": false,
+      "properties": {
+        "ended_ms": {"minimum": 0, "type": "integer"},
+        "failure_label": {"enum": [null, "service_start_failure", "service_unready", "service_lost"]},
+        "ordinal": {"minimum": 1, "type": "integer"},
+        "ready_ms": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "service_id": {"pattern": "^[a-z0-9][a-z0-9_-]{0,79}$", "type": "string"},
+        "started_ms": {"minimum": 0, "type": "integer"},
+        "status": {"enum": ["stopped", "start_failure", "unready", "lost", "cancelled"]},
+        "task_id": {"pattern": "^[A-Z0-9-]{3,80}$", "type": "string"}
+      },
+      "required": ["ordinal", "service_id", "task_id", "status", "started_ms", "ready_ms", "ended_ms", "failure_label"],
+      "type": "object"
+    },
+    "timepoint": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {"minimum": 0, "type": "integer"},
+        "fresh_family_solves": {"minimum": 0, "type": "integer"},
+        "global_active_wall_ms": {"minimum": 0, "type": "integer"},
+        "independently_checked": {"minimum": 0, "type": "integer"},
+        "lane_time_ms": {"minimum": 0, "type": "integer"},
+        "offset_ms": {"minimum": 0, "type": "integer"},
+        "provider_failures": {"minimum": 0, "type": "integer"},
+        "qualification_projected": {"minimum": 0, "type": "integer"},
+        "queued": {"minimum": 0, "type": "integer"},
+        "raw_correct_tasks": {"minimum": 0, "type": "integer"},
+        "terminal": {"minimum": 0, "type": "integer"},
+        "tool_failures": {"minimum": 0, "type": "integer"},
+        "unstarted": {"minimum": 0, "type": "integer"},
+        "usage": {"$ref": "#/$defs/usage"}
+      },
+      "required": ["offset_ms", "raw_correct_tasks", "fresh_family_solves", "qualification_projected", "independently_checked", "provider_failures", "tool_failures", "lane_time_ms", "global_active_wall_ms", "terminal", "active", "queued", "unstarted", "usage"],
+      "type": "object"
+    },
+    "toolAttempt": {
+      "additionalProperties": false,
+      "properties": {
+        "ended_ms": {"minimum": 0, "type": "integer"},
+        "failure_label": {"enum": [null, "tool_absent", "dependency_absent", "unsupported_format", "parser_failure", "tool_argument_schema", "tool_runtime", "sandbox_failure", "policy_refusal", "context_loss"]},
+        "ordinal": {"minimum": 1, "type": "integer"},
+        "started_ms": {"minimum": 0, "type": "integer"},
+        "status": {"enum": ["completed", "failed", "cancelled"]}
+      },
+      "required": ["ordinal", "status", "started_ms", "ended_ms", "failure_label"],
+      "type": "object"
+    },
+    "usage": {
+      "additionalProperties": false,
+      "properties": {
+        "cached_input": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "input": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "output": {"$ref": "#/$defs/nullableNonnegativeInt"},
+        "reasoning": {"$ref": "#/$defs/nullableNonnegativeInt"}
+      },
+      "required": ["input", "cached_input", "output", "reasoning"],
+      "type": "object"
+    }
+  }
+}
