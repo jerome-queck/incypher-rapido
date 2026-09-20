@@ -1227,10 +1227,20 @@ def test_terminal_supervisor_stays_quiescent_until_stopped(tmp_path: Path) -> No
         [sys.executable, "-c", runner],
         env=dict(os.environ, PYTHONPATH=str(ROOT), TEST_STATE=str(state_path)),
     )
-    time.sleep(0.2)
-    assert process.poll() is None
-    process.send_signal(signal.SIGTERM)
-    assert process.wait(timeout=5) == 0
+    try:
+        # Wait for the supervisor's durable terminal record, not an import-speed guess.
+        record_path = state_path.with_name(f"{state_path.name}.supervisor.json")
+        deadline = time.monotonic() + 5
+        while not record_path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _record(state_path)["phase"] == "terminal"
+        assert process.poll() is None
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def test_live_worker_wait_reaps_other_direct_children_without_reaping_worker(

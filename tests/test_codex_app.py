@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+from rapido import codex_app
 from rapido.codex_app import (
     APP_SERVER_ARGS,
     MAX_AGENT_MESSAGE_BYTES,
@@ -2703,6 +2704,92 @@ async def test_unknown_server_request_is_rejected(
     await client.close()
 
 
+@pytest.mark.parametrize("blocked_at", ["write_lock", "drain", "response"])
+@run_async
+async def test_rpc_deadline_covers_write_and_response(
+    fake_process: FakeProcess, tmp_path: Path, monkeypatch, blocked_at: str
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+
+    async def stalled_drain() -> None:
+        await asyncio.Event().wait()
+
+    if blocked_at == "write_lock":
+        await client._write_lock.acquire()
+    elif blocked_at == "drain":
+        monkeypatch.setattr(fake_process.stdin, "drain", stalled_drain)
+    else:
+        monkeypatch.setattr(fake_process, "handle", lambda message: None)
+    request = asyncio.create_task(client.request("synthetic/no-response", timeout=0.01))
+    try:
+        done, _ = await asyncio.wait({request}, timeout=1)
+        assert request in done, "RPC timeout must also cover a blocked write"
+        with pytest.raises(TimeoutError):
+            request.result()
+        assert not client._pending
+    finally:
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+        if blocked_at == "write_lock":
+            client._write_lock.release()
+        await client.close()
+
+
+@run_async
+async def test_silent_initialization_has_a_default_deadline(tmp_path: Path, monkeypatch) -> None:
+    process = DelayedInitializeProcess()
+    client = make_client(process, tmp_path)
+    monkeypatch.setattr(codex_app, "RPC_TIMEOUT_SECONDS", 0.01, raising=False)
+    startup = asyncio.create_task(client.start())
+    try:
+        done, _ = await asyncio.wait({startup}, timeout=1)
+        assert startup in done, "silent native startup must not consume the entire run"
+        with pytest.raises(CodexAppError, match="RPC deadline"):
+            startup.result()
+        assert client.process is None
+        assert process.returncode is not None
+        assert not client._pending
+        assert client._start_waiter is None
+    finally:
+        startup.cancel()
+        await asyncio.gather(startup, return_exceptions=True)
+        await client.close()
+
+
+@run_async
+async def test_blocked_interrupt_write_fences_the_process(
+    fake_process: FakeProcess, tmp_path: Path, monkeypatch
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+    await client.start_thread(cwd=tmp_path)
+    monkeypatch.setattr(codex_app, "INTERRUPT_TIMEOUT_SECONDS", 0.01)
+
+    async def no_completion(thread_id: str, turn_id: str) -> None:
+        return None
+
+    async def stalled_interrupt() -> None:
+        if fake_process.stdin.writes[-1].get("method") == "turn/interrupt":
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(fake_process, "_complete_turn", no_completion)
+    monkeypatch.setattr(fake_process.stdin, "drain", stalled_interrupt)
+    turn = asyncio.create_task(client.run_turn("synthetic timeout", timeout=0.01))
+    try:
+        done, _ = await asyncio.wait({turn}, timeout=1)
+        assert turn in done, "blocked interruption must reach process fencing"
+        with pytest.raises(TurnTimeoutError) as caught:
+            turn.result()
+        assert caught.value.result.process_fenced
+        assert client.process is None
+        assert fake_process.returncode is not None
+    finally:
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await client.close()
+
+
 @run_async
 async def test_malformed_stdout_fails_pending_request(
     fake_process: FakeProcess, tmp_path: Path
@@ -2713,6 +2800,61 @@ async def test_malformed_stdout_fails_pending_request(
     with pytest.raises(ProtocolError):
         await client.request("waiting", {})
     await client.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "1"])
+@run_async
+async def test_rpc_rejects_invalid_deadlines_before_writing(
+    fake_process: FakeProcess, tmp_path: Path, timeout: Any
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+    before = len(fake_process.stdin.writes)
+    try:
+        with pytest.raises(ValueError, match="positive and finite"):
+            await client.request("synthetic", timeout=timeout)
+        assert len(fake_process.stdin.writes) == before
+        assert not client._pending
+    finally:
+        await client.close()
+
+
+@run_async
+async def test_close_while_waiting_to_write_has_no_orphaned_rpc(
+    fake_process: FakeProcess, tmp_path: Path
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+    await client._write_lock.acquire()
+    request = asyncio.create_task(client.request("synthetic"))
+    try:
+        await asyncio.sleep(0)
+        assert client._pending
+        await client.close()
+    finally:
+        client._write_lock.release()
+    with pytest.raises(CodexAppError, match="not running"):
+        await request
+    assert not client._pending
+
+
+@run_async
+async def test_notification_write_has_a_default_deadline(
+    fake_process: FakeProcess, tmp_path: Path, monkeypatch
+) -> None:
+    client = make_client(fake_process, tmp_path)
+    await client.start()
+    monkeypatch.setattr(codex_app, "RPC_TIMEOUT_SECONDS", 0.01)
+
+    async def stalled_drain() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fake_process.stdin, "drain", stalled_drain)
+    try:
+        with pytest.raises(CodexAppError, match="write deadline"):
+            await asyncio.wait_for(client.notify("synthetic"), 1)
+    finally:
+        await client.close()
 
 
 @run_async

@@ -298,6 +298,9 @@ workspace as authorized. Preserve the dedicated authentication volume.
   changed shape was observed after the issue #11 run and is tracked in issue #19; do not create an
   instance until current Board behavior is established.
 - `pending` output means a submission effect is unresolved. Reconcile explicitly; do not rerun it.
+- Native RPCs have a 30-second default deadline, including write-lock and pipe backpressure.
+  Explicit shorter deadlines also cover the write. A stalled interrupt therefore reaches native
+  process fencing; local RPC expiry is reported separately from exhaustion of the run budget.
 - Keep env files, auth, state, logs, and Docker daemon access private. Docker env metadata is
   visible to the daemon administrator. `.dockerignore` is defense in depth, not a substitute for
   external secret placement.

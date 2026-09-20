@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from rapido import cli
-from rapido.board import BoardError
+from rapido.board import BoardError, Challenge
 from rapido.cli import _codex_child_env, _qualified_challenge_ids, build_parser
 from rapido.config import RuntimeConfig
 from rapido.orchestrator import RunReport
@@ -45,6 +45,47 @@ def test_run_command_exists_and_codex_child_env_excludes_board_credentials() -> 
 def test_preflight_rejects_duplicate_challenge_ids() -> None:
     with pytest.raises(BoardError, match="incoherent"):
         _qualified_challenge_ids([{"id": 7}, {"id": 7}], [{"id": 7}, {"id": 7}])
+
+
+def test_preflight_never_mutates_board_state_or_starts_codex(monkeypatch, capsys) -> None:
+    config = RuntimeConfig.from_env({"CTFD_API_TOKEN": "synthetic-preflight-token"})
+    reads = []
+
+    class ReadOnlyBoard:
+        def anonymous_identity_is_rejected(self):
+            reads.append("anonymous")
+            return True
+
+        def identity(self):
+            reads.append("identity")
+            return {"id": 1, "team_id": 1}
+
+        def list_challenges(self):
+            reads.append("list")
+            return [{"id": 1}]
+
+        def challenge(self, challenge_id):
+            reads.append("detail")
+            assert challenge_id == 1
+            return Challenge(
+                1, "Synthetic preflight", "misc", "standard", "", 0, (), False, None, 0, None, None
+            )
+
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected Board operation: {name}")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preflight must not start native inference or a state writer")
+
+    monkeypatch.setattr(cli.RuntimeConfig, "from_env", classmethod(lambda cls, **kwargs: config))
+    monkeypatch.setattr(cli, "BoardClient", lambda *args, **kwargs: ReadOnlyBoard())
+    monkeypatch.setattr(cli, "CodexAppClient", forbidden)
+    monkeypatch.setattr(cli, "StateStore", forbidden)
+    assert cli._preflight() == 0
+    assert set(reads) == {"anonymous", "identity", "list", "detail"}
+    output = capsys.readouterr().out
+    assert '"writes": 0' in output
+    assert "synthetic-preflight-token" not in output
 
 
 def test_run_command_uses_durable_job_control(monkeypatch, capsys) -> None:
