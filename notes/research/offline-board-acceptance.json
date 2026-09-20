@@ -1,0 +1,137 @@
+{
+  "schema": "rapido-offline-board-stage-acceptance-v1",
+  "evidence_level": "synthetic_controller_acceptance",
+  "source": {
+    "base_git_commit": "0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3",
+    "implementation_git_commit": "0349768a7b5e554d14996cea7ba756dab610139f",
+    "implementation_version": "offline-board-v1",
+    "production_authority_logic_changed": false,
+    "production_cli_changed": false,
+    "production_container_entrypoint_changed": false
+  },
+  "sentinel_ids": [
+    "EAS-005",
+    "EAS-006"
+  ],
+  "method_results": {
+    "identity": "passed",
+    "negative_identity": "passed",
+    "list": "passed",
+    "detail": "passed",
+    "download": "passed",
+    "submit": "passed",
+    "instance": "passed"
+  },
+  "sentinel_results": [
+    {
+      "sentinel_id": "EAS-005",
+      "unchanged_control": true,
+      "source_bound_correct": true,
+      "submission_http_200_correct": 1,
+      "run_local_verified": 1,
+      "exact_cleanup": true
+    },
+    {
+      "sentinel_id": "EAS-006",
+      "unchanged_control": true,
+      "assigned_target_observations": 2,
+      "fresh_service_generations": 2,
+      "submission_http_200_correct": 1,
+      "run_local_verified": 1,
+      "exact_cleanup": true
+    }
+  ],
+  "candidate_economy": {
+    "unique_candidate_count": 2,
+    "repeat_candidate_count": 0,
+    "checker_call_count": 2,
+    "exact_repeat_checker_once_test": true,
+    "public_candidate_values": 0,
+    "public_candidate_digests": 0
+  },
+  "fresh_second_run": {
+    "new_synthetic_identity": true,
+    "zero_initial_solved_state": true,
+    "zero_initial_candidate_cache": true,
+    "zero_initial_service_state": true,
+    "old_run_root_absent": true,
+    "fresh_dynamic_private_state": true,
+    "second_dynamic_run_exact_cleanup": true
+  },
+  "owned_lifecycle": {
+    "peak_dynamic_leases": 1,
+    "sentinel_service_create_count": 2,
+    "sentinel_service_delete_count": 2,
+    "sentinel_post_delete_absence_count": 4,
+    "cancellation_service_create_count": 1,
+    "cancellation_service_delete_count": 1,
+    "owned_process_create_count": 0,
+    "owned_process_delete_count": 0,
+    "run_root_create_count": 5,
+    "run_root_delete_count": 5,
+    "state_create_count": 5,
+    "state_delete_count": 5,
+    "final_owned_service_count": 0,
+    "final_owned_process_count": 0,
+    "final_workspace_count": 0,
+    "final_state_count": 0,
+    "exact_cleanup": true
+  },
+  "existing_board_scenarios": [
+    {"scenario_id": "distinct_submission_outcomes", "passed": true},
+    {"scenario_id": "ambiguous_write_reconciled_once", "passed": true},
+    {"scenario_id": "transient_read_and_permanent_auth", "passed": true},
+    {"scenario_id": "queued_job_unstarted", "passed": true},
+    {"scenario_id": "fresh_generation_exact_answer", "passed": true},
+    {"scenario_id": "different_answer_separate_axes", "passed": true},
+    {"scenario_id": "changed_bytes_reset_context", "passed": true},
+    {"scenario_id": "watch_change_original_deadline", "passed": true},
+    {"scenario_id": "deadline_cancel_cleanup", "passed": true},
+    {"scenario_id": "serialized_startup_independent_turns", "passed": true}
+  ],
+  "offline_cases": [
+    {"case_id": "OB-01", "passed": true},
+    {"case_id": "OB-02", "passed": true},
+    {"case_id": "OB-03", "passed": true},
+    {"case_id": "OB-04", "passed": true},
+    {"case_id": "OB-05", "passed": true},
+    {"case_id": "OB-06", "passed": true},
+    {"case_id": "OB-07", "passed": true},
+    {"case_id": "OB-08", "passed": true},
+    {"case_id": "OB-09", "passed": true},
+    {"case_id": "OB-10", "passed": true}
+  ],
+  "resource_maxima": {
+    "dynamic_leases": 1,
+    "service_cpu_limit_cores": 1.0,
+    "service_memory_limit_bytes": 268435456,
+    "service_pids_limit": 64,
+    "service_writable_storage_limit_bytes": 67108864,
+    "service_hard_lifetime_seconds": 900,
+    "service_internal_network": true,
+    "service_arbitrary_egress_denied": true,
+    "service_published_loopback_only": true
+  },
+  "privacy": {
+    "candidate_values_absent": true,
+    "candidate_digests_absent": true,
+    "private_paths_absent": true,
+    "target_authorities_absent": true,
+    "credentials_absent": true,
+    "raw_model_output_absent": true,
+    "raw_tool_output_absent": true
+  },
+  "limitations": [
+    "synthetic_sentinels_only",
+    "no_official_board_access",
+    "no_scored_model_task",
+    "model_resource_sampling_deferred_to_cap_05"
+  ],
+  "evidence_runs": [
+    {"suite_id": "offline-focused", "passed": 117, "failed": 0, "skipped": 0},
+    {"suite_id": "board-contract", "passed": 46, "failed": 0, "skipped": 0},
+    {"suite_id": "authority-container", "passed": 316, "failed": 0, "skipped": 0},
+    {"suite_id": "full-suite", "passed": 1528, "failed": 0, "skipped": 4}
+  ],
+  "passed": true
+}

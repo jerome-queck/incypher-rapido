@@ -74,8 +74,10 @@
 - Freshness/privacy: two independent fresh runs had distinct identities and empty initial
   solved/cache/service state. Sanitized receipts contain no candidate, candidate digest, private
   path, target authority, credential, raw model output, or raw tool output.
-- Current evidence: 116 CAP-02 focused tests excluding the commit-bound stage receipt; 316 affected
-  Board/CLI/config/container/control/orchestrator/target tests; Ruff and format clean. One full-suite
+- Implementation checkpoint: `0349768a7b5e554d14996cea7ba756dab610139f`.
+- Current evidence: 117 CAP-02 focused tests; 46 Board-contract tests; 316 affected
+  Board/CLI/config/container/control/orchestrator/target tests; 1,528 full-suite passes with four
+  documented skips; Ruff and format clean. One earlier full-suite
   run was deliberately invalidated and interrupted after 732 passes, one skip, and one deselection
   because a cleanup proof changed during the run; it is not counted as verification. Sanitized stage evidence is
   `notes/research/offline-board-acceptance.json`.
@@ -86,7 +88,6 @@
   final Daybreak/xhigh independent review reproduced the real-Docker, cleanup-race, per-task receipt,
   and exact file/directory substitution evidence and found no remaining actionable defect. No
   official Board, scored task, candidate reuse, or answer search.
-- Next ready node: bind the sanitized receipt to the implementation commit, full verification,
-  PR/CI/merge; then
+- Next ready node: commit the bound sanitized receipt, PR/CI/merge; then
   continue CAP-03/CAP-04 private trust-zone work and CAP-05 runner work. Stage 4 remains blocked on
   the fresh-task readiness quorum.
