@@ -1,0 +1,9 @@
+# Publisher-hosted wheels, version- and SHA-256-pinned for the final Python 3.12 image.
+# Binary wheels are selected explicitly for the two supported Linux architectures.
+pydicom @ https://files.pythonhosted.org/packages/27/a6/98651e752a49f341aa99aa3f6c8ba361728dfc064242884355419df63669/pydicom-3.0.1-py3-none-any.whl#sha256=db32f78b2641bd7972096b8289111ddab01fb221610de8d7afa835eb938adb41
+scapy @ https://files.pythonhosted.org/packages/4b/34/8695b43af99d0c796e4b7933a0d7df8925f43a8abdd0ff0f6297beb4de3a/scapy-2.6.1-py3-none-any.whl#sha256=88a998572049b511a1f3e44f4aa7c62dd39c6ea2aa1bb58434f503956641789d
+hl7 @ https://files.pythonhosted.org/packages/8d/2b/024977b044ca3aa79153e0a4ff13cc465064ccf9cf7b60df46e6eab8340e/hl7-0.4.5-py2.py3-none-any.whl#sha256=f46bf7c165801fd40e8fcc9f2be41c5794415039adc97646aee7ee6b20ce8ccd
+yara-python @ https://files.pythonhosted.org/packages/df/7d/e51ecb0db87094976904a52eb521e3faf9c18f7c889b9d5cf996ae3bb680/yara_python-4.5.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl#sha256=d29d0e137e0d77dd110186369276e88381f784bdc45b5932a2fb3463e2a1b1c7 ; platform_machine == "aarch64"
+yara-python @ https://files.pythonhosted.org/packages/52/06/104c4daa22e34a7edb49051798126c37f6280d4f1ea7e8888b043314e72d/yara_python-4.5.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=e5eae935b05a9f8dc71df55a79c38f52abd93f8840310fe4e0d75fbd78284f24 ; platform_machine == "x86_64"
+lief @ https://files.pythonhosted.org/packages/c7/4c/ede797fdaaffd77028c6eddac21f2bb23ea6cfbef7578cda3c1624559d3b/lief-0.17.1-cp312-cp312-manylinux2014_aarch64.whl#sha256=629e92ec77ce7d1c6842f89ee155c61b70aefc02477b9d579da0a5c274aaf84c ; platform_machine == "aarch64"
+lief @ https://files.pythonhosted.org/packages/b1/f8/9dcc8225c3ab39561509f9bf9c94d541e61c624a3509b54d65b1cf987ab6/lief-0.17.1-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b204c1f0dfeb820c7982fe40924cd147bc11b1c598d27acddb1ba64a5c653f1b ; platform_machine == "x86_64"

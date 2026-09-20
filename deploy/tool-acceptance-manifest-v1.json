@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "architectures": ["linux/amd64", "linux/arm64"],
+    "image_user": "10001:10001",
+    "network": "not required",
+    "privileges": "none",
+    "solver_entrypoint": "run_shell with /opt/venv/bin/python",
+    "prompt_contract": "rapido/tools.py:TOOLS.run_shell"
+  },
+  "tools": [
+    {
+      "distribution": "hl7",
+      "version": "0.4.5",
+      "license": "BSD-3-Clause",
+      "capability": "HL7 v2 delimiter-aware parsing and segment/field access",
+      "invocation": "python -c 'import hl7; hl7.parse(message)'",
+      "output": "Python message/segment objects; caller emits bounded JSON/text",
+      "fixture": "parse ADT^A01 and select PID-3",
+      "failure": "reject input without a valid MSH delimiter declaration",
+      "rollback": "revert the solver-toolbase dependency slice"
+    },
+    {
+      "distribution": "lief",
+      "version": "0.17.1",
+      "license": "Apache-2.0",
+      "capability": "uniform ELF, PE, Mach-O and related executable-format parsing",
+      "invocation": "python -c 'import lief; lief.parse(path)'",
+      "output": "Python typed binary object; caller emits bounded JSON/text",
+      "fixture": "parse a compiled inert ELF and identify its format",
+      "failure": "return no binary object for unrecognized opaque bytes",
+      "rollback": "revert the solver-toolbase dependency slice"
+    },
+    {
+      "distribution": "pydicom",
+      "version": "3.0.1",
+      "license": "MIT",
+      "capability": "nested DICOM dataset, sequence, value-representation and pixel metadata parsing",
+      "invocation": "python -c 'from pydicom import dcmread; dcmread(path)'",
+      "output": "Python Dataset; caller emits bounded JSON/text",
+      "fixture": "read an explicit-VR Part-10 CT fixture and patient metadata",
+      "failure": "raise InvalidDicomError for non-Part-10 input",
+      "rollback": "revert the solver-toolbase dependency slice"
+    },
+    {
+      "distribution": "scapy",
+      "version": "2.6.1",
+      "license": "GPL-2.0-only",
+      "capability": "offline packet dissection, stream-field inspection and protocol scaffolding",
+      "invocation": "python -c 'from rapido.scapy_offline import summarize_pcap; summarize_pcap(path)'",
+      "output": "bounded packet summary object with at most 256 rows and 256 payload-preview bytes per row",
+      "fixture": "decode one Ethernet/IPv4/TCP PCAP packet and its bounded transport payload",
+      "failure": "raise a parser error for a truncated capture",
+      "rollback": "revert the solver-toolbase dependency slice"
+    },
+    {
+      "distribution": "yara-python",
+      "version": "4.5.4",
+      "license": "Apache-2.0",
+      "capability": "bounded custom byte/string/structure signatures over supplied artifacts",
+      "invocation": "python -c 'import yara; yara.compile(source=rule).match(path)'",
+      "output": "Python match objects; caller emits bounded JSON/text",
+      "fixture": "compile and match one inert literal rule",
+      "failure": "raise SyntaxError for a malformed rule",
+      "rollback": "revert the solver-toolbase dependency slice"
+    }
+  ]
+}

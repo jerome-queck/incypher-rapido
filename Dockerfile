@@ -47,10 +47,13 @@ RUN apt-get update \
         libmpfr-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml /src/pyproject.toml
+COPY deploy/tool-requirements.txt /src/tool-requirements.txt
 COPY LICENSE /src/LICENSE
 COPY rapido /src/rapido
 RUN python -m venv --copies /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check .
+    && /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check . \
+    && /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check \
+        --no-deps --require-hashes --requirement /src/tool-requirements.txt
 RUN python -m venv --copies /opt/angr \
     && /opt/angr/bin/pip install --no-cache-dir --disable-pip-version-check 'angr[unicorn]==9.3.4'
 RUN python -m venv --copies /opt/math \

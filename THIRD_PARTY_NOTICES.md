@@ -10,8 +10,8 @@ The container image redistributes these principal components:
   `/licenses/NODE_LICENSE` in the image.
 - Pinned Pillow, Capstone, cryptography, dpkt, gmpy2, HTTPX,
   NumPy, OpenCV, pefile, pypdf, pwntools, PyCryptodome, pyelftools, requests,
-  SymPy, Unicorn, and Z3 Python distributions. Their package metadata and
-  license files remain in `/opt/venv`.
+  SymPy, Unicorn, Z3, pydicom, Scapy, HL7, yara-python, and LIEF Python
+  distributions. Their package metadata and license files remain in `/opt/venv`.
 - Pinned angr 9.3.4 and its dependencies in the isolated `/opt/angr` Python
   environment. Package metadata and license files remain beside the code.
 - Pinned cysignals 1.12.5, ecdsa 0.19.2, fpylll 0.6.4, and dependencies in

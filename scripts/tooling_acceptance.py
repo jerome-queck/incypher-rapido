@@ -36,18 +36,23 @@ PINNED_PARSERS = {
     "cryptography": ("cryptography", "50.0.1"),
     "dpkt": ("dpkt", "1.9.8"),
     "gmpy2": ("gmpy2", "2.2.1"),
+    "hl7": ("hl7", "0.4.5"),
     "httpx": ("httpx", "0.28.1"),
+    "lief": ("lief", "0.17.1"),
     "numpy": ("numpy", "2.2.6"),
     "opencv-python-headless": ("cv2", "4.12.0.88"),
     "pefile": ("pefile", "2024.8.26"),
     "pwntools": ("pwnlib", "4.15.0"),
     "pycryptodome": ("Crypto", "3.23.0"),
+    "pydicom": ("pydicom", "3.0.1"),
     "pyelftools": ("elftools", "0.33"),
     "pypdf": ("pypdf", "6.18.1"),
     "requests": ("requests", "2.34.2"),
+    "scapy": ("scapy", "2.6.1"),
     "sympy": ("sympy", "1.14.0"),
     "unicorn": ("unicorn", "2.1.2"),
     "z3-solver": ("z3", "4.15.4.0"),
+    "yara-python": ("yara", "4.5.4"),
 }
 EXPECTED_TOOLS = (
     "list_workspace",
@@ -928,15 +933,23 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 from pwn import ELF
+from pydicom import dcmread
+from pydicom.errors import InvalidDicomError
+from scapy.error import Scapy_Exception
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64
 from unicorn.x86_const import UC_X86_REG_EAX
 import cv2
 import gmpy2
+import hl7
 import httpx
+import io
+import lief
 import numpy
 import requests
 import sympy
+import yara
 import z3
+from rapido.scapy_offline import summarize_pcap
 
 assert AES.new(bytes(16), AES.MODE_ECB).encrypt(bytes(16)).hex().startswith("66e94bd4")
 cbc_key = bytes(range(16)); cbc_iv = bytes(range(16, 32)); cbc_plain = b"cbc-fixture"
@@ -966,12 +979,49 @@ assert cv2.imread("../tiny.png").shape[:2] == (1, 1)
 assert numpy.array([40, 2]).sum() == 42
 assert httpx.Request("GET", "https://example.invalid/").method == "GET"
 assert requests.Request("GET", "https://example.invalid/").method == "GET"
+parsed_elf = lief.parse("tiny")
+assert parsed_elf is not None and parsed_elf.format == lief.Binary.FORMATS.ELF
+rules = yara.compile(source='rule benign { strings: $a = "fixture-marker" condition: $a }')
+assert [match.rule for match in rules.match(data=b"fixture-marker")] == ["benign"]
+dataset = dcmread("../fixture.dcm")
+assert dataset.Modality == "CT" and dataset.PatientName == "OFFLINE^PATIENT"
+message = hl7.parse("MSH|^~\\&|SEND|FAC|RECV|FAC|202609210000||ADT^A01|1|P|2.5\rPID|1||42")
+assert str(message.segment("PID")[3]) == "42"
+packet_summary = summarize_pcap("../fixture.pcap")
+assert packet_summary["packets"][0]["source"] == "192.0.2.1"
+assert packet_summary["packets"][0]["destination_port"] == 80
+assert bytes.fromhex(packet_summary["packets"][0]["payload_hex_preview"]) == b"GET / HTTP/1.0\r\n"
+try:
+    yara.compile(source="rule broken {")
+except yara.SyntaxError:
+    pass
+else:
+    raise AssertionError("YARA accepted malformed syntax")
+try:
+    dcmread(io.BytesIO(b"not-dicom"))
+except InvalidDicomError:
+    pass
+else:
+    raise AssertionError("pydicom accepted an invalid Part-10 file")
+try:
+    hl7.parse("not-hl7")
+except Exception:
+    pass
+else:
+    raise AssertionError("hl7 accepted a message without MSH delimiters")
+try:
+    summarize_pcap(io.BytesIO(b"not-pcap"))
+except Scapy_Exception:
+    pass
+else:
+    raise AssertionError("Scapy accepted a truncated capture")
+assert lief.parse("../opaque.bin") is None
 print("core-shell-ok")
 PY
 python solve.py
 ./tiny
 """,
-            "source_paths": ["tiny.png", "x86_64.elf"],
+            "source_paths": ["tiny.png", "x86_64.elf", "fixture.dcm", "fixture.pcap"],
             "timeout_seconds": 180,
         },
     )
@@ -1213,6 +1263,13 @@ def _workspace_check(root: Path, workspace: Any, before: set[str]) -> dict[str, 
         raise AssertionError("fixture workspace contains a symlink")
     # The harness has no worker pool or live subprocess left at this point.  On
     # Linux, make the absence explicit; other hosts report the check as n/a.
+    while True:
+        try:
+            reaped, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if reaped == 0:
+            break
     children: list[str] = []
     proc = Path("/proc")
     if proc.is_dir():
@@ -1239,6 +1296,13 @@ def _wait_process_gone(process_id: int) -> None:
     deadline = time.monotonic() + 2.0
     process_path = Path(f"/proc/{process_id}")
     while process_path.exists():
+        # The acceptance interpreter is container PID 1 in CI and adopts the
+        # killed worker descendant. Production Rapido has its own subreaper;
+        # this harness must reap its directly adopted zombie as well.
+        try:
+            os.waitpid(process_id, os.WNOHANG)
+        except ChildProcessError:
+            pass
         if time.monotonic() >= deadline:
             raise AssertionError(f"sandbox process remained: {process_id}")
         time.sleep(0.01)
