@@ -13,6 +13,7 @@
 - Use `gpt-daybreak-blue-latest` at `medium` for the main session when selecting its model. The main session owns requirements, investigation, architecture, ambiguous or cross-discipline judgment, task decomposition, shared edits, Board effects, GitHub state, integration, and merges. It does the substantive thinking and makes every final decision.
 - Codex subagents are implementation assistants only: bounded code changes, focused tests, mechanical research, and code review. Give each lane explicit file ownership and an evidence-based completion criterion; the main session independently evaluates and integrates the result.
 - Run every Codex subagent as `gpt-5.6-luna` at `xhigh` or `max`. Prefer `xhigh`; use `max` for the hardest bounded implementation or review. If the requested Luna effort cannot start, retry the same lane once at the other allowed Luna effort and record requested/effective descriptors plus the reason. If neither works, record failure and return the lane to the main session. Do not route Codex subagent work to another model.
+- Subagents work silently to their completion criterion and return one final report. They do not send progress messages into the main task; the main session polls status when needed.
 - Solver experiments are separate: preserve each pre-registered exact roster and its no-fallback policy. These Codex delegation rules never change a scored solver model, effort, or routing arm.
 
 ## Delivery
