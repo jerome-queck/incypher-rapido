@@ -1,6 +1,7 @@
 # Solver toolbase inventory — 2026-09-21
 
-Status: implementation selection for source `d93e090e4d10fa7a179b8bb270d69ed670b60b48`.
+Status: implementation selection compared with source
+`da4234262e9a24fe0f7c042f3374f7ecb5a5d7d2`.
 This is capability research, not Board or solve evidence. No authenticated Board, target, challenge
 answer, write-up, flag, or distinctive challenge text was accessed.
 
