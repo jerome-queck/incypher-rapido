@@ -10,10 +10,11 @@
 
 ## Coordination
 
-- The main agent owns requirements, architecture decisions, shared edits, Board effects, GitHub state, integration, and merges.
-- Delegate bounded, non-overlapping lanes for research, alternatives, implementation, focused tests, and independent review. Give each lane an evidence-based completion criterion and explicit file ownership; wait for and distill all results before deciding.
-- Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-daybreak-blue-latest` at `xhigh` for demanding bounded implementation and review. Pre-register every live run's exact OpenAI roster: at least one Daybreak/xhigh peer per challenge, with Luna/xhigh or Luna/max specialist peers allowed and extra Daybreak peers earned by expected difficulty or evidence.
-- For Codex coding-agent delegation, if Astra or any selected model other than `gpt-daybreak-blue-latest` cannot be selected or started, reroute that same lane to `gpt-daybreak-blue-latest` at `xhigh`. Record the requested and effective model and effort plus the fallback reason. Never fall back silently. If Daybreak/xhigh itself cannot run, record a failure instead of looping or changing models again. This does not alter an experiment's frozen exact-model/no-fallback solver roster.
+- Select `gpt-daybreak-blue-latest` at `medium` for the main session. It owns requirements, research synthesis, architecture, task decomposition, shared edits, Board effects, GitHub state, integration, and merges.
+- Use Codex subagents only for bounded implementation, mechanical research, focused tests, and independent review. Run every subagent as Daybreak Luna (`gpt-5.6-luna`) at `xhigh` or `max`; prefer `xhigh` and reserve `max` for the hardest bounded lane. Give each lane explicit ownership and a checkable completion criterion.
+- Subagents work silently and return one terminal report. The main session polls status, evaluates every result, and makes every final decision.
+- If a Luna lane cannot start, retry it once at the other allowed effort, then return the lane to the main session. If an instruction selects Astra and it cannot run, use `gpt-daybreak-blue-latest` at `xhigh`. Record requested/effective descriptors and fallback reasons.
+- Scored solver runs are separate: preserve every preregistered exact roster and no-fallback policy.
 
 ## Delivery
 
