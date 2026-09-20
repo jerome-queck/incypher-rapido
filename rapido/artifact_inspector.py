@@ -352,6 +352,18 @@ def _source_facts(descriptor: int) -> tuple[int, int, int, int, int]:
     )
 
 
+@contextmanager
+def _verified_source(workspace: Workspace, relative: str) -> Iterator[tuple[int, int, str]]:
+    with _source(workspace, relative) as (descriptor, size):
+        original_facts = _source_facts(descriptor)
+        digest = _identity(descriptor, size)
+        yield descriptor, size, digest
+        # Same-size rewrites can share timestamps. Verify bytes before any successful
+        # view escapes; descriptor anchoring alone does not make the input immutable.
+        if _identity(descriptor, size) != digest or _source_facts(descriptor) != original_facts:
+            raise _error("source_changed", "artifact changed during inspection")
+
+
 def _encode_cursor(
     offset: int, digest: str, format_name: str, view: str, selection: str | None
 ) -> str:
@@ -2521,9 +2533,7 @@ def _inspect_artifact(
 
     path, view, selection, cursor = _arguments(arguments)
     try:
-        with _source(workspace, path) as (descriptor, size):
-            original_facts = _source_facts(descriptor)
-            digest = _identity(descriptor, size)
+        with _verified_source(workspace, path) as (descriptor, size, digest):
             prefix = _pread(descriptor, min(size, 64 * 1024), 0, size)
             format_name, detection = _detect_format(prefix, size, selection)
             _validate_format_request(format_name, view, selection, cursor)
@@ -2547,16 +2557,13 @@ def _inspect_artifact(
             ):
                 operation = "disassembly"
             if isolate_optional and operation is not None:
-                result = run_artifact_worker(
+                return run_artifact_worker(
                     descriptor,
                     operation,
                     size=size,
                     cursor=cursor,
                     base=base,
                 )
-                if _source_facts(descriptor) != original_facts:
-                    raise _error("source_changed", "artifact changed during isolated inspection")
-                return result
             if format_name == "text":
                 return _text_view(
                     descriptor,
@@ -2585,10 +2592,7 @@ def _inspect_artifact(
             if format_name in _IMAGE_FORMATS:
                 return _image_view(descriptor, size, cursor, base)
             if format_name in {"wav", "dicom"}:
-                result = _media_view(descriptor, size, cursor, base)
-                if _source_facts(descriptor) != original_facts:
-                    raise _error("source_changed", "media changed during artifact inspection")
-                return result
+                return _media_view(descriptor, size, cursor, base)
             return _unsupported_view(descriptor, size, cursor, base)
     except ToolError:
         raise
