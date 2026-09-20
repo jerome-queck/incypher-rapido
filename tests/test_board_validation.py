@@ -35,9 +35,12 @@ def test_challenge_detail_requires_exact_integer_identity(response_id: object) -
 
 
 @pytest.mark.parametrize("field", ["name", "category", "type", "description"])
-@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
-def test_challenge_text_rejects_unpaired_surrogates_as_board_error(field: str, surrogate: str) -> None:
+@pytest.mark.parametrize("codepoint", [0xD800, 0xDFFF])
+def test_challenge_text_rejects_unpaired_surrogates_as_board_error(
+    field: str, codepoint: int
+) -> None:
     # json.loads accepts these escaped code points, but UTF-8 encoding must not.
+    surrogate = chr(codepoint)
     fake = FakeTransport([envelope({"id": 1, field: "synthetic-private-marker" + surrogate})])
     board = BoardClient(ORIGIN, "", transport=fake)
     with pytest.raises(BoardError, match=f"^challenge {field} is invalid$") as error:
