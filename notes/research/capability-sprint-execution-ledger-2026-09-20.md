@@ -90,15 +90,12 @@
   final Daybreak/xhigh independent review reproduced the real-Docker, cleanup-race, per-task receipt,
   and exact file/directory substitution evidence and found no remaining actionable defect. No
   official Board, scored task, candidate reuse, or answer search.
-- First PR #83 CI run: both Python jobs failed together (12 failures each, with 15 skips)
-  because Linux reports a removed pinned directory with `st_nlink=0` while the proof required one
-  exact `/proc/self/fd` display suffix. The failure cascaded into retained run roots and dependent
-  receipt tests. Linux now uses the inode unlink proof; Darwin retains `F_GETPATH`. Container jobs
-  were still running when the focused fix was pushed.
-- Second PR #83 CI run retained the same 12 cascading failures: the GitHub filesystem preserves the
-  original descriptor path without the conventional `(deleted)` suffix. Linux proof now accepts
-  either kernel display only after descriptor-relative ENOENT, while rejecting a moved descriptor;
-  the registered Linux image probe passed exact owned-tree removal.
+- Three PR #83 CI attempts exposed the same 12 cascading Python failures. Investigation first
+  hardened Linux directory unlink proof and passed an exact registered-image Linux probe, but the
+  actual CI cause was earlier: GitHub exposes Docker while lacking the frozen image digest, and the
+  end-to-end acceptance tests had no digest-availability skip. The image-dependent cases now record
+  a documented skip when that exact image is absent; local registered-image acceptance remains
+  117/117. Both container architectures passed in the first completed CI run.
 - Next ready node: commit the bound sanitized receipt, PR/CI/merge; then
   continue CAP-03/CAP-04 private trust-zone work and CAP-05 runner work. Stage 4 remains blocked on
   the fresh-task readiness quorum.

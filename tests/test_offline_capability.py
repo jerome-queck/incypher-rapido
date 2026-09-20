@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -40,6 +41,25 @@ _ENTRYPOINT_SPEC.loader.exec_module(offline_capability_run)
 _CANDIDATE = "flag{synthetic-capability-sentinel}"
 _RUNNER_IMAGE = "sha256:0eef1ceb74759bf64e9a89ca0dd1cf722bd1f6967a9b53666577164ee4d71c52"
 _STAGE_RECEIPT = Path(__file__).parents[1] / "notes" / "research" / "offline-board-acceptance.json"
+
+
+def _registered_image_available() -> bool:
+    docker = shutil.which("docker")
+    return (
+        docker is not None
+        and subprocess.run(
+            (docker, "image", "inspect", _RUNNER_IMAGE),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+requires_registered_image = pytest.mark.skipif(
+    not _registered_image_available(), reason="registered offline image unavailable"
+)
 
 
 def _task(board_id: int, task_id: str, *, dynamic: bool) -> dict[str, object]:
@@ -370,6 +390,7 @@ def _plan(
 
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["EAS-005", "EAS-006"])
+@requires_registered_image
 def test_ob02_ob07_static_and_dynamic_sentinels_use_unchanged_control_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -413,6 +434,7 @@ def test_ob02_ob07_static_and_dynamic_sentinels_use_unchanged_control_and_cleanu
 
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@requires_registered_image
 def test_ob06_ob08_ob10_two_fresh_runs_are_private_and_leave_only_sanitized_receipts(
     tmp_path: Path,
     dynamic: bool,
@@ -448,6 +470,7 @@ def test_ob06_ob08_ob10_two_fresh_runs_are_private_and_leave_only_sanitized_rece
         assert second_processes.service.inventory(_process_deadline()) == 0
 
 
+@requires_registered_image
 def test_ob08_cancellation_drains_owned_service_and_exact_run_state(tmp_path: Path) -> None:
     plan, _, processes, _ = _plan(tmp_path, dynamic=True)
     runtime = _BlockingDynamicRuntime()
@@ -471,6 +494,7 @@ def test_ob08_cancellation_drains_owned_service_and_exact_run_state(tmp_path: Pa
     assert not plan.run_root.exists()
 
 
+@requires_registered_image
 def test_ob08_repeated_cancellation_cannot_interrupt_cleanup_or_leave_active_receipt(
     tmp_path: Path,
 ) -> None:
@@ -672,6 +696,7 @@ def test_owned_tree_directory_substitution_cannot_claim_exact_removal(
         ),
     ],
 )
+@requires_registered_image
 def test_acceptance_validator_rejects_empty_active_or_cross_field_inconsistency(
     tmp_path: Path, mutation
 ) -> None:
@@ -684,6 +709,7 @@ def test_acceptance_validator_rejects_empty_active_or_cross_field_inconsistency(
         validate_offline_acceptance_receipt(malformed)
 
 
+@requires_registered_image
 def test_acceptance_validator_binds_multi_task_ordinals_and_attempts(tmp_path: Path) -> None:
     plan, _, _, _ = _plan(tmp_path, dynamic=False)
     receipt = asyncio.run(execute_offline_plan(plan))
