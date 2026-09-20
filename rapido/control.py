@@ -10,8 +10,8 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
+from .board import BoardLike
 from .clock import AsyncClock
 from .config import RuntimeConfig
 from .orchestrator import NativeRuntime, Orchestrator, RunReport
@@ -253,7 +253,7 @@ class DurableJobControl:
     async def drive(
         config: RuntimeConfig,
         *,
-        board: Any,
+        board: BoardLike,
         runtime: NativeRuntime,
         clock: AsyncClock | None = None,
     ) -> RunReport:

@@ -15,7 +15,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .target import _connect_target, _parse_http_response, _send_before
 
@@ -85,6 +85,37 @@ class Verdict:
     @property
     def settled(self) -> bool:
         return self.outcome in {"correct", "incorrect", "already_solved"}
+
+
+class BoardLike(Protocol):
+    """Narrow structural Board surface consumed by orchestration.
+
+    Production authority remains entirely in :class:`BoardClient`.  This
+    protocol documents the existing dependency-injection seam without making
+    either adapter inherit from, register with, or trust the other.
+    """
+
+    timeout: float
+
+    def identity(self) -> dict[str, Any]: ...
+
+    def anonymous_identity_is_rejected(self) -> bool: ...
+
+    def list_challenges(self) -> list[dict[str, Any]]: ...
+
+    def challenge(self, challenge_id: int) -> Challenge: ...
+
+    def download(
+        self,
+        file_ref: str,
+        destination: Path,
+        *,
+        byte_limit: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    def submit(self, challenge_id: int, candidate: str) -> Verdict: ...
+
+    def instance(self, method: str, challenge_id: int) -> dict[str, Any]: ...
 
 
 Transport = Callable[[urllib.request.Request, float, int], HttpResponse]

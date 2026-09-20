@@ -22,8 +22,8 @@ from typing import Any, Protocol
 
 from .board import (
     FLAG_RE,
-    BoardClient,
     BoardError,
+    BoardLike,
     BoardTemporaryResponseError,
     BoardTransportError,
     Challenge,
@@ -564,7 +564,7 @@ class Orchestrator:
     def __init__(
         self,
         config: RuntimeConfig,
-        board: BoardClient,
+        board: BoardLike,
         state: StateStore,
         runtime: NativeRuntime,
         *,
