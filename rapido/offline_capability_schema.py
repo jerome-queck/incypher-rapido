@@ -15,7 +15,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 REGISTRATION_SCHEMA: Final = "rapido-capability-experiment-registry-v1"
-RECEIPT_SCHEMA: Final = "rapido-capability-public-receipt-v1"
+RECEIPT_SCHEMA_V1: Final = "rapido-capability-public-receipt-v1"
+RECEIPT_SCHEMA: Final = "rapido-capability-public-receipt-v2"
 TASK_MANIFEST_SCHEMA: Final = "rapido-capability-candidate-manifest-v1"
 REGISTRATION_CANONICAL_SHA256: Final = (
     "f74810e1c43c0a1cbdebd196af6f76b1d96bfb6572b344129662dd9f2657ffd1"
@@ -755,7 +756,7 @@ def validate_task_manifest(document: Mapping[str, Any]) -> None:
         raise CapabilitySchemaError("task manifest references an unknown family")
 
 
-def validate_receipt(document: Mapping[str, Any]) -> None:
+def validate_receipt(document: Mapping[str, Any], *, allow_historical_v1: bool = False) -> None:
     """Validate one sanitized receipt, including exact-set and aggregate invariants."""
 
     root = _mapping(document, "receipt")
@@ -781,7 +782,11 @@ def validate_receipt(document: Mapping[str, Any]) -> None:
         "human_decisions",
     }
     _exact_fields(root, required, "receipt")
-    if root["schema"] != RECEIPT_SCHEMA or root["experiment_id"] not in EXPERIMENT_IDS:
+    receipt_schema = root["schema"]
+    if (
+        receipt_schema != RECEIPT_SCHEMA
+        and not (allow_historical_v1 and receipt_schema == RECEIPT_SCHEMA_V1)
+    ) or root["experiment_id"] not in EXPERIMENT_IDS:
         raise CapabilitySchemaError("receipt identity is invalid")
 
     run_id = root["run_id"]
@@ -1599,39 +1604,59 @@ def validate_receipt(document: Mapping[str, Any]) -> None:
             raise CapabilitySchemaError(f"final time series usage.{usage_field} mismatch")
 
     cleanup = _mapping(root["cleanup"], "cleanup")
+    cleanup_fields = {
+        "passed",
+        "failure_label",
+        "owned_processes_remaining",
+        "owned_containers_remaining",
+        "owned_volumes_remaining",
+        "owned_networks_remaining",
+        "owned_services_remaining",
+        "owned_workspaces_remaining",
+        "owned_state_objects_remaining",
+        "owned_run_ids_remaining",
+    }
+    if receipt_schema == RECEIPT_SCHEMA:
+        cleanup_fields.add("inventory_complete")
     _exact_fields(
         cleanup,
-        {
-            "passed",
-            "failure_label",
-            "owned_processes_remaining",
-            "owned_containers_remaining",
-            "owned_volumes_remaining",
-            "owned_networks_remaining",
-            "owned_services_remaining",
-            "owned_workspaces_remaining",
-            "owned_state_objects_remaining",
-            "owned_run_ids_remaining",
-        },
+        cleanup_fields,
         "cleanup",
     )
     if type(cleanup["passed"]) is not bool:
         raise CapabilitySchemaError("cleanup.passed must be boolean")
-    residue = sum(
-        _nonnegative_integer(cleanup.get(field), f"cleanup.{field}")
-        for field in (
-            "owned_processes_remaining",
-            "owned_containers_remaining",
-            "owned_volumes_remaining",
-            "owned_networks_remaining",
-            "owned_services_remaining",
-            "owned_workspaces_remaining",
-            "owned_state_objects_remaining",
-            "owned_run_ids_remaining",
-        )
+    inventory_fields = (
+        "owned_processes_remaining",
+        "owned_containers_remaining",
+        "owned_volumes_remaining",
+        "owned_networks_remaining",
+        "owned_services_remaining",
+        "owned_workspaces_remaining",
+        "owned_state_objects_remaining",
+        "owned_run_ids_remaining",
     )
-    if cleanup.get("passed") is True and (residue != 0 or cleanup.get("failure_label") is not None):
-        raise CapabilitySchemaError("cleanup cannot pass with residue or a failure label")
+    for field in inventory_fields:
+        if receipt_schema == RECEIPT_SCHEMA:
+            _nullable_nonnegative_integer(cleanup.get(field), f"cleanup.{field}")
+        else:
+            _nonnegative_integer(cleanup.get(field), f"cleanup.{field}")
+    if receipt_schema == RECEIPT_SCHEMA and type(cleanup["inventory_complete"]) is not bool:
+        raise CapabilitySchemaError("cleanup.inventory_complete must be boolean")
+    cleanup_complete = cleanup.get("inventory_complete", True)
+    if (
+        receipt_schema == RECEIPT_SCHEMA
+        and cleanup_complete is True
+        and any(cleanup.get(field) is None for field in inventory_fields)
+    ):
+        raise CapabilitySchemaError(
+            "cleanup.inventory_complete contradicts nullable inventory counts"
+        )
+    if cleanup.get("passed") is True and (
+        cleanup_complete is not True
+        or any(cleanup.get(field) != 0 for field in inventory_fields)
+        or cleanup.get("failure_label") is not None
+    ):
+        raise CapabilitySchemaError("cleanup cannot pass without a complete zero-residue inventory")
     if cleanup.get("passed") is False and (
         not isinstance(cleanup.get("failure_label"), str) or not cleanup["failure_label"]
     ):
@@ -1799,22 +1824,40 @@ def validate_receipt(document: Mapping[str, Any]) -> None:
     ] != sum(attempt["ended_ms"] is not None for attempt in service_attempts):
         raise CapabilitySchemaError("dynamic instance receipt evidence mismatch")
     cap_offset = capacity["global_wall_ms"]
-    expected_active_at_cap = sum(
-        row["started_ms"] is not None and row["started_ms"] <= cap_offset <= row["terminal_ms"]
-        for row in rows
-    )
-    expected_unstarted_at_cap = sum(
-        row["terminal_ms"] >= cap_offset
-        and (row["started_ms"] is None or row["started_ms"] > cap_offset)
-        for row in rows
-    )
-    expected_queue_at_cap = sum(
-        row["terminal_ms"] >= cap_offset
-        and row["admitted_ms"] is not None
-        and row["admitted_ms"] <= cap_offset
-        and (row["started_ms"] is None or row["started_ms"] > cap_offset)
-        for row in rows
-    )
+    if receipt_schema == RECEIPT_SCHEMA:
+        expected_active_at_cap = sum(
+            row["started_ms"] is not None and row["started_ms"] <= cap_offset < row["terminal_ms"]
+            for row in rows
+        )
+        expected_unstarted_at_cap = sum(
+            row["terminal_ms"] > cap_offset
+            and (row["started_ms"] is None or row["started_ms"] > cap_offset)
+            for row in rows
+        )
+        expected_queue_at_cap = sum(
+            row["terminal_ms"] > cap_offset
+            and row["admitted_ms"] is not None
+            and row["admitted_ms"] <= cap_offset
+            and (row["started_ms"] is None or row["started_ms"] > cap_offset)
+            for row in rows
+        )
+    else:
+        expected_active_at_cap = sum(
+            row["started_ms"] is not None and row["started_ms"] <= cap_offset <= row["terminal_ms"]
+            for row in rows
+        )
+        expected_unstarted_at_cap = sum(
+            row["terminal_ms"] >= cap_offset
+            and (row["started_ms"] is None or row["started_ms"] > cap_offset)
+            for row in rows
+        )
+        expected_queue_at_cap = sum(
+            row["terminal_ms"] >= cap_offset
+            and row["admitted_ms"] is not None
+            and row["admitted_ms"] <= cap_offset
+            and (row["started_ms"] is None or row["started_ms"] > cap_offset)
+            for row in rows
+        )
     if (
         capacity["queue_at_cap"] != expected_queue_at_cap
         or capacity["active_at_cap"] != expected_active_at_cap
@@ -1921,6 +1964,33 @@ def validate_receipt(document: Mapping[str, Any]) -> None:
             for item in labels
         ):
             raise CapabilitySchemaError(f"classification.{field} contains an invalid label")
+    if receipt_schema == RECEIPT_SCHEMA:
+        observed_usage_lower_bound = {
+            field: sum(
+                attempt["usage"][field]
+                for _, attempt in all_provider_attempts
+                if attempt["usage"][field] is not None
+            )
+            for field in ("input", "output", "reasoning")
+        }
+        usage_cap_exceeded = any(
+            observed_usage_lower_bound[field] > usage_caps[field]
+            for field in observed_usage_lower_bound
+        )
+    else:
+        usage_cap_exceeded = False
+    if usage_cap_exceeded:
+        if not any(row["terminal_label"] == "usage_cap" for row in rows):
+            raise CapabilitySchemaError(
+                "observed provider usage above cap requires usage_cap terminal evidence"
+            )
+        if (
+            classification["capability_status"] == "demonstrated"
+            or classification["conversion_status"] == "projected"
+        ):
+            raise CapabilitySchemaError(
+                "observed provider usage above cap invalidates demonstrated/projected classification"
+            )
     decisions = _sequence(root["human_decisions"], "human_decisions")
     for index, raw in enumerate(decisions):
         decision = _mapping(raw, f"human_decisions[{index}]")

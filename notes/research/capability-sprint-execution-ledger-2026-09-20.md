@@ -149,3 +149,21 @@
   evidence remains owner-only; only closed version IDs, counts, and outcomes enter this public
   ledger. Stage 4 remains blocked only on reviewed/merged CAP-03 and CAP-05 plus a pre-outcome schema
   correction and immutable experiment registration.
+- CAP-03 commit `560a09eb58c4a62eaa574469dfe0dde335bbe2ec` was published as PR #84. Its
+  independent review was clean; Python 3.11/3.12 and both container-architecture CI gates passed;
+  it was squash-merged to `main` as `661fe11ba1eb948ffd5fbd4724a74c6dc6821f83`. After durable
+  evidence and merge, the exact review image tag/identity was removed; the registered capsule
+  container and volume inventories remained empty.
+- CAP-05 independent rereview rejected the first disposable supervisor despite 140 focused and 70
+  orchestrator passes. Three P1 blockers remain: frame acceptance can beat an already-expired
+  parent deadline after event-loop delay; a descendant that creates a new session survives while
+  the PGID-only proof reports absence; and the sole provider-authenticated factory import does not
+  exist. CAP-05 cannot merge or authorize scored work until an OS-owned descendant boundary,
+  deadline-dominant acceptance, and concrete unchanged-flow factory all pass independent replay.
+- Public receipt schema v2 corrects the pre-outcome v1 ambiguity without modifying the frozen v1
+  artifact. Default validation accepts v2 only; v1 needs explicit historical opt-in. V2 uses
+  half-open cap snapshots, rejects a known usage lower bound above cap even when another usage
+  field is unavailable, requires exact zero for empty provider attempts, and makes cleanup
+  inventory completeness explicit with nullable counts on failure. Independent no-edit review
+  passed 22 focused tests, paired v1/v2 probes, the eight-case cleanup truth table, JSON/schema
+  consistency, Ruff/format/diff checks, and the frozen v1 SHA-256.
