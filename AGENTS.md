@@ -13,7 +13,7 @@
 - The main agent owns requirements, architecture decisions, shared edits, Board effects, GitHub state, integration, and merges.
 - Delegate bounded, non-overlapping lanes for research, alternatives, implementation, focused tests, and independent review. Give each lane an evidence-based completion criterion and explicit file ownership; wait for and distill all results before deciding.
 - Use `gpt-6-astra` at `xhigh` for lead orchestration, ambiguous architecture, and the hardest cross-discipline judgment. Use `gpt-daybreak-blue-latest` at `xhigh` for demanding bounded implementation and review. Pre-register every live run's exact OpenAI roster: at least one Daybreak/xhigh peer per challenge, with Luna/xhigh or Luna/max specialist peers allowed and extra Daybreak peers earned by expected difficulty or evidence.
-- Record effective model and effort. Treat unavailable selections as failures; never silently fall back.
+- If Astra or any selected model other than `gpt-daybreak-blue-latest` cannot be selected or started, reroute that same lane to `gpt-daybreak-blue-latest` at `xhigh`. Record the requested and effective model and effort plus the fallback reason. Never fall back silently. If Daybreak/xhigh itself cannot run, record a failure instead of looping or changing models again.
 
 ## Delivery
 

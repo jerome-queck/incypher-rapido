@@ -1,6 +1,6 @@
 # Capability sprint execution ledger
 
-## CAP-01 — active
+## CAP-01 — complete
 
 - Branch: `codex/capability-sprint-cap01`; base `6aa26147c35fbc46affeeb77d93d6b88640564a8`.
 - Handoff validation: pass. Exact archive/task-manifest commitments are in the CAP-01 registration.
@@ -39,5 +39,63 @@
   passes with four documented skips; full Ruff lint/format; PR80 private-parent tests; clean
   diff/secret/privacy scan. Exact image remains ARM64 with `rapido run` as entrypoint and zero
   retained run containers.
-- Next ready node after review: CAP-02. CAP-03 may proceed only with strict curator/runner/oracle
-  isolation. Scored Stage 4 remains blocked on Board sentinels and fresh-task readiness quorum.
+- PR #82 passed all required CI and was squash-merged to `main` as
+  `0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3`. The retained production ARM64 image identity is
+  recorded in the CAP-01 registration; no container remained running.
+
+## CAP-02 — active
+
+- Branch: `codex/capability-sprint-cap02`; base
+  `0c63ae1ba2fd4ee1d2aace97842fc242ed6ab0b3`.
+- Registered implementation lane and independent review lane: exact
+  `gpt-daybreak-blue-latest` / `xhigh`; no fallback.
+- Added a structural `BoardLike` annotation over the already-existing dependency-injection seam.
+  Production `BoardClient`, origin parsing, target parsing, CLI, defaults, and Dockerfile remain
+  behaviorally unchanged.
+- Added a separate folder-backed `OfflineBoard`, explicit offline config adapter, credential-free
+  native-runtime builder, direct-injection runner, and dedicated offline script. No loopback Board
+  transport shim was needed.
+- File boundary: descriptor-relative source reads; pinned bank/workspace roots; traversal,
+  alternate-root, symlink, hard-link, FIFO, socket, device, mutation, size, and destination-race
+  rejection; bounded same-directory atomic copy.
+- Candidate boundary: exact-byte private run cache, monotonic public ordinal, one deterministic
+  checker call per unique value, cached repeats, and closed `oracle_inconclusive` on checker failure.
+  Candidate bytes are erased on close and never projected publicly.
+- Service boundary: controller-generated loopback-IP endpoints only, one global lease,
+  GET/POST/PATCH/DELETE normalized six-key records, partial-create cleanup fencing, retry-on-close,
+  and post-delete absence proof.
+- EAS-005: unchanged durable controller, source-bound two-stage verification, one deterministic
+  correct submission, `submission_http_200_correct=1`, `run_local_verified=1`, exact cleanup.
+- EAS-006: unchanged durable controller, two fresh service generations, two actual assigned-target
+  HTTP observations, one deterministic correct submission, create/delete/absence proof, one-lease
+  peak, exact cleanup.
+- Cancellation acceptance: active dynamic work was cancelled; native runtime closed; service,
+  workspace, SQLite state/sidecars, and native lock were absent afterward.
+- Freshness/privacy: two independent fresh runs had distinct identities and empty initial
+  solved/cache/service state. Sanitized receipts contain no candidate, candidate digest, private
+  path, target authority, credential, raw model output, or raw tool output.
+- Implementation checkpoints: `0349768a7b5e554d14996cea7ba756dab610139f`; Linux cleanup fixes
+  `05e8c7db02a055b01448a656c16c31282932f00d` and
+  `8074f365202007fc9d3e8d6b541ef3232ad62911`.
+- Current evidence: 117 CAP-02 focused tests; 46 Board-contract tests; 316 affected
+  Board/CLI/config/container/control/orchestrator/target tests; 1,528 full-suite passes with four
+  documented skips; Ruff and format clean. One earlier full-suite
+  run was deliberately invalidated and interrupted after 732 passes, one skip, and one deselection
+  because a cleanup proof changed during the run; it is not counted as verification. Sanitized stage evidence is
+  `notes/research/offline-board-acceptance.json`.
+- Failures retained: the first local command used unavailable `python`; `.venv/bin/python` was used.
+  Intermediate test failures exposed and fixed unsafe partial-service cleanup, non-loopback service
+  acceptance, candidate-result constructor drift, the 600-second admission floor in synthetic
+  tests, fixture portability, Docker kill/reap races, and Darwin directory unlink semantics. The
+  final Daybreak/xhigh independent review reproduced the real-Docker, cleanup-race, per-task receipt,
+  and exact file/directory substitution evidence and found no remaining actionable defect. No
+  official Board, scored task, candidate reuse, or answer search.
+- Three PR #83 CI attempts exposed the same 12 cascading Python failures. Investigation first
+  hardened Linux directory unlink proof and passed an exact registered-image Linux probe, but the
+  actual CI cause was earlier: GitHub exposes Docker while lacking the frozen image digest, and the
+  end-to-end acceptance tests had no digest-availability skip. The image-dependent cases now record
+  a documented skip when that exact image is absent; local registered-image acceptance remains
+  117/117. Both container architectures passed in the first completed CI run.
+- Next ready node: commit the bound sanitized receipt, PR/CI/merge; then
+  continue CAP-03/CAP-04 private trust-zone work and CAP-05 runner work. Stage 4 remains blocked on
+  the fresh-task readiness quorum.
