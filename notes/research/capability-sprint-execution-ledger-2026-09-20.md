@@ -173,8 +173,20 @@
   left an escaped descendant running; the private registry and credential roots were not pinned
   across adapter/flow use; arbitrary factory/config values could bypass the intended IPC privacy
   boundary; isolation/cleanup remained adapter self-attestation; and the registry omitted the full
-  capsule/task commitment. Remediation is active. CAP-05 cannot merge or authorize scored work until
-  every exact exploit and the authenticated-boundary acceptance pass independent rereview.
+  capsule/task commitment. A later checkpoint closed those paths, then independent standards/spec
+  review found eight more blocking gaps: stale run paths, registry-to-Board byte binding, setup time
+  consuming the scored window, public service identities, partial Linux-setup leaks, callable-only
+  cleanup trust, replaceable secondary private roots, and incomplete descriptor/error closure. Exact
+  integration commit `d5cecfa` now uses a worker-ready barrier, exact fresh-path and cleanup proof,
+  digest-pinned adapter evidence, exact `OfflineBoard` cleanup, full catalogue/file-byte commitments,
+  all-root descriptor pinning, closed public service evidence, and early-failure containment cleanup.
+  Main-agent replay passes 75 focused and 334 expanded tests with two expected Linux-only tests
+  skipped on macOS; Ruff, format, compilation, and diff checks pass. Spec rereview of exact commit
+  `d5cecfa` still rejected merge: assignment/admission semantics are not fully bound, cleanup does
+  not dominate every run-owned object, provider-auth mode can still admit a synthetic in-process
+  checker, and per-task provider-attempt count/duration caps are not receipt-enforced. The owner
+  stopped this sprint before PR/CI/scored work and moved the solver/tooling pivot to a new session.
+  CAP-05 is parked on its dedicated branch with these four findings unresolved; none is waived.
 - Public receipt schema v2 corrects the pre-outcome v1 ambiguity without modifying the frozen v1
   artifact. Default validation accepts v2 only; v1 needs explicit historical opt-in. V2 uses
   half-open cap snapshots, rejects a known usage lower bound above cap even when another usage
