@@ -108,6 +108,9 @@ Manual mount, Compose, resource, and platform details stay in the single advance
 
 ## Evaluation and persistent Board state
 
+> The evaluation protocols and dated results referenced below are optional historical evidence, not
+> standing work. Start at [`notes/research/README.md`](notes/research/README.md) before using them.
+
 Every live run starts with fresh solver state and a run-local 0/15, but the authenticated Board
 account persists. Board-solved challenges are still analyzed, and freshly derived qualified
 candidates are still submitted. A generic `already_solved` response proves only account history;

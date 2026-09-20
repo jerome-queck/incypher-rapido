@@ -75,8 +75,8 @@ ports. Optional artifact-parser workers deny networking entirely.
 
 ## Resources and shutdown
 
-The portable launch profile assigns 8 CPUs, 24 GiB RAM, and 256 PIDs. Issue #19 acceptance on the
-current 14-CPU host uses `--cpus=12`, leaving two host CPUs. The default
+The portable launch profile assigns 8 CPUs, 24 GiB RAM, and 256 PIDs. The measured 14-CPU host
+profile uses `--cpus=12`, leaving two host CPUs. The default
 `RAPIDO_MAX_WORKSPACE_BYTES=536870912000` is a run-wide ceiling partitioned across configured
 active challenges; it is not a host filesystem quota. Per-artifact, aggregate-source, per-lane,
 tool-output, deadline, and PID bounds remain. SQLite/WAL growth, auth-home refresh files, and

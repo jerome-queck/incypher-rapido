@@ -1,5 +1,9 @@
 # Sealed offline H24 evaluation
 
+> **Status: archived optional protocol.** This is not part of the production build or run and is not
+> a prerequisite for solver-tooling work. Use it only when the current user prompt explicitly asks
+> for an H24 replay.
+
 This is a separate evaluation wrapper and host supervisor. It does not replace or modify the
 production `Dockerfile`, image entrypoint, live model routing, Board authority, or target tools.
 No native, H24, Board, or soak result is collected by building or testing these files.

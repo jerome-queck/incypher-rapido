@@ -1,5 +1,8 @@
 # Capability sprint execution ledger
 
+> **Status: parked historical record.** CAP-01 through CAP-04 landed as additive offline seams.
+> CAP-05 remains unmerged, no scored CAP-04+ evaluation ran, and this ledger is not a current plan.
+
 ## CAP-01 — complete
 
 - Branch: `codex/capability-sprint-cap01`; base `6aa26147c35fbc46affeeb77d93d6b88640564a8`.
@@ -99,7 +102,7 @@
 - PR #83 passed Python 3.11/3.12 and amd64/arm64 container gates and was squash-merged to `main` as
   `735d295ee078a0ce728613800b715cc458f6869f`.
 
-## CAP-03/CAP-04/CAP-05 — active
+## CAP-03/CAP-04 — complete; CAP-05 — parked unmerged
 
 - CAP-03 public capsule/exporter and CAP-05 completion-runner seams were implemented on focused
   additive files with independent Daybreak/xhigh review. First review rounds rejected both rather
