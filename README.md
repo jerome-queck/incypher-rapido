@@ -24,7 +24,7 @@ run these commands inside WSL2.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -e . pytest ruff
+.venv/bin/pip install -e '.[dev]'
 .venv/bin/ruff check rapido tests scripts
 .venv/bin/ruff format --check rapido tests scripts
 PYTHONPATH=. .venv/bin/pytest -q
