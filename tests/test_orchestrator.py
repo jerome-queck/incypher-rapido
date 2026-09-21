@@ -13,11 +13,13 @@ import pytest
 import rapido.orchestrator as orchestrator_module
 from rapido.board import (
     BoardError,
+    BoardRateLimitError,
     BoardTemporaryResponseError,
     BoardTransportError,
     Challenge,
     Verdict,
 )
+from rapido.clock import ManualClock
 from rapido.config import RuntimeConfig
 from rapido.evidence import EvidenceError, EvidenceLimits, HostObservation, RunEvidence
 from rapido.orchestrator import Orchestrator
@@ -366,6 +368,20 @@ class FlakyIdentityBoard(FakeBoard):
         self.identity_calls += 1
         if self.identity_calls == 1:
             raise BoardTransportError("Board transport failed")
+        return super().identity()
+
+
+class RateLimitedIdentityBoard(FakeBoard):
+    timeout = 0.01
+
+    def __init__(self, challenges: list[Challenge]) -> None:
+        super().__init__(challenges)
+        self.identity_calls = 0
+
+    def identity(self):
+        self.identity_calls += 1
+        if self.identity_calls == 1:
+            raise BoardRateLimitError("identity returned HTTP 429", 0.001)
         return super().identity()
 
 
@@ -2003,6 +2019,15 @@ def test_transient_identity_transport_is_retried_without_operator_restart(tmp_pa
     store.close()
 
 
+def test_rate_limited_identity_recovers_through_controller_run(tmp_path: Path) -> None:
+    board = RateLimitedIdentityBoard([challenge(1)])
+    store = StateStore(tmp_path / "state.sqlite3")
+    report = asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
+    assert report.status == "completed"
+    assert board.identity_calls == 4
+    store.close()
+
+
 @pytest.mark.parametrize("failure_type", [BoardTransportError, BoardTemporaryResponseError])
 def test_board_read_retry_is_bounded_to_three_attempts(
     tmp_path: Path, failure_type: type[BoardError]
@@ -2012,6 +2037,197 @@ def test_board_read_retry_is_bounded_to_three_attempts(
     with pytest.raises(failure_type):
         asyncio.run(Orchestrator(config(tmp_path), board, store, FakeRuntime({})).run())
     assert board.identity_calls == 3
+    store.close()
+
+
+def test_rate_limited_read_uses_guidance_then_recovers(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    calls = 0
+
+    def read():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BoardRateLimitError("throttled", 2.0)
+        return "ok"
+
+    clock = ManualClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+    assert asyncio.run(orchestrator._board_read(10.0, read)) == "ok"
+    assert calls == 2
+    assert clock.sleeps == [2.1]
+    store.close()
+
+
+@pytest.mark.parametrize("guidance", [None, 0.0, -1.0, float("nan"), float("inf")])
+def test_rate_limited_read_uses_nonzero_jittered_fallback(
+    tmp_path: Path, guidance: float | None
+) -> None:
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    calls = 0
+
+    def read():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BoardRateLimitError("throttled", guidance)
+        return "ok"
+
+    clock = ManualClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+    assert asyncio.run(orchestrator._board_read(10.0, read)) == "ok"
+    assert calls == 2
+    assert clock.sleeps == [0.2625]
+    store.close()
+
+
+def test_rate_limit_guidance_cannot_exceed_deadline(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    calls = 0
+
+    def read():
+        nonlocal calls
+        calls += 1
+        raise BoardRateLimitError("throttled", 30.0)
+
+    clock = ManualClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+    with pytest.raises(BoardRateLimitError):
+        asyncio.run(orchestrator._board_read(10.0, read))
+    assert calls == 1
+    assert clock.sleeps == []
+    store.close()
+
+
+def test_repeated_rate_limits_stop_at_attempt_budget(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    calls = 0
+
+    def read():
+        nonlocal calls
+        calls += 1
+        raise BoardRateLimitError("throttled", None)
+
+    clock = ManualClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+    with pytest.raises(BoardRateLimitError):
+        asyncio.run(orchestrator._board_read(10.0, read))
+    assert calls == 3
+    assert len(clock.sleeps) == 2
+    assert all(delay > 0 for delay in clock.sleeps)
+    store.close()
+
+
+def test_concurrent_rate_limited_reads_use_staggered_waits(tmp_path: Path) -> None:
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    calls = {"first": 0, "second": 0}
+
+    def read(name: str):
+        calls[name] += 1
+        if calls[name] == 1:
+            raise BoardRateLimitError("throttled", None)
+        return name
+
+    clock = ManualClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+
+    async def exercise() -> list[str]:
+        return await asyncio.gather(
+            orchestrator._board_read(10.0, read, "first"),
+            orchestrator._board_read(10.0, read, "second"),
+        )
+
+    assert asyncio.run(exercise()) == ["first", "second"]
+    assert sorted(clock.sleeps) == [0.2625, 0.2875]
+    store.close()
+
+
+def test_rate_limited_dynamic_read_does_not_stall_unrelated_eligible_work(
+    tmp_path: Path,
+) -> None:
+    unrelated_completed = threading.Event()
+
+    class RateLimitedReadinessBoard(FakeBoard):
+        timeout = 0.01
+
+        def __init__(self, challenges: list[Challenge]) -> None:
+            super().__init__(challenges)
+            self.dynamic_gets = 0
+
+        def instance(self, method: str, challenge_id: int):
+            if method == "GET" and challenge_id == 1:
+                self.dynamic_gets += 1
+                if self.dynamic_gets == 2:
+                    raise BoardRateLimitError("instance operation returned HTTP 429", 0.2)
+                if self.dynamic_gets == 3:
+                    assert unrelated_completed.is_set()
+            return super().instance(method, challenge_id)
+
+    class ProgressRuntime(FakeRuntime):
+        async def solve(self, workspace, prompt, **kwargs):
+            turn = await super().solve(workspace, prompt, **kwargs)
+            if json.loads(prompt)["challenge"]["id"] == 2:
+                unrelated_completed.set()
+            return turn
+
+    board = RateLimitedReadinessBoard([challenge(1, challenge_type="dynamic_iac"), challenge(2)])
+    runtime = ProgressRuntime({})
+    cfg = replace(
+        config(tmp_path, submit=False),
+        manage_dynamic_instances=True,
+        active_challenges=2,
+        attempts_per_challenge=1,
+        concurrency=2,
+        attempt_seconds=1,
+        run_seconds=5,
+    )
+    store = StateStore(cfg.state_path)
+    report = asyncio.run(Orchestrator(cfg, board, store, runtime).run())
+    assert report.status == "completed"
+    assert unrelated_completed.is_set()
+    assert board.dynamic_gets >= 3
+    store.close()
+
+
+def test_cancellation_interrupts_rate_limit_wait(tmp_path: Path) -> None:
+    class BlockingClock(ManualClock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sleep_started = asyncio.Event()
+
+        async def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.sleep_started.set()
+            await asyncio.Event().wait()
+
+    board = FakeBoard([challenge(1)])
+    board.timeout = 1.0
+    clock = BlockingClock()
+    store = StateStore(tmp_path / "state.sqlite3")
+    orchestrator = Orchestrator(config(tmp_path), board, store, FakeRuntime({}), clock=clock)
+
+    async def exercise() -> None:
+        def read():
+            raise BoardRateLimitError("throttled", 2.0)
+
+        task = asyncio.create_task(orchestrator._board_read(10.0, read))
+        await clock.sleep_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert clock.sleeps == [2.1]
     store.close()
 
 

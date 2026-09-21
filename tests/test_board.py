@@ -8,6 +8,7 @@ import pytest
 from rapido.board import (
     BoardClient,
     BoardError,
+    BoardRateLimitError,
     BoardTemporaryResponseError,
     BoardTransportError,
     HttpResponse,
@@ -88,6 +89,21 @@ def test_default_board_transport_preserves_bounded_long_location() -> None:
     ):
         response = _default_transport(request, 1.0, 1024)
     assert response.location == location
+
+
+def test_default_board_transport_preserves_retry_after() -> None:
+    sock = FakeBoardSocket(
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 12\r\nContent-Length: 0\r\n\r\n"
+    )
+    context = mock.Mock()
+    context.wrap_socket.return_value = sock
+    request = urllib.request.Request("https://hackathon.in-cypher.com/api/v1/challenges")
+    with (
+        mock.patch("rapido.board._connect_target", return_value=sock),
+        mock.patch("rapido.board.ssl.create_default_context", return_value=context),
+    ):
+        response = _default_transport(request, 1.0, 1024)
+    assert response.retry_after == "12"
 
 
 def test_default_board_transport_classifies_retryable_connection_failure() -> None:
@@ -172,6 +188,52 @@ def test_temporary_http_failures_are_retryable_only_for_reads(status: int, tmp_p
         board.instance("POST", 7)
     assert not isinstance(error.value, BoardTemporaryResponseError)
     assert len(fake.requests) == 6
+
+
+@pytest.mark.parametrize(
+    ("guidance", "expected"),
+    [("12", 12.0), ("invalid", None), ("", None)],
+)
+def test_rate_limits_are_retryable_only_for_reads(guidance: str, expected: float | None) -> None:
+    fake = FakeTransport(
+        [
+            HttpResponse(429, b"private", retry_after=guidance),
+            HttpResponse(429, b"private", retry_after=guidance),
+            HttpResponse(429, b"private", retry_after=guidance),
+            HttpResponse(429, b"", retry_after=guidance),
+        ]
+    )
+    board = BoardClient("https://hackathon.in-cypher.com", "secret", transport=fake)
+    with pytest.raises(BoardRateLimitError, match="challenge list returned HTTP 429") as error:
+        board.list_challenges()
+    assert error.value.retry_after_seconds == expected
+    with pytest.raises(BoardRateLimitError, match="instance operation returned HTTP 429"):
+        board.instance("GET", 7)
+    assert board.submit(7, "INCYPHER{candidate}").outcome == "unread"
+    assert board.instance("POST", 7)["status"] == 429
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("operation", ["list", "identity", "detail", "instance"])
+def test_auth_failures_are_not_retryable_authenticated_reads(status: int, operation: str) -> None:
+    board = BoardClient(
+        "https://hackathon.in-cypher.com",
+        "secret",
+        transport=FakeTransport([HttpResponse(status, b"")]),
+    )
+    calls = {
+        "list": board.list_challenges,
+        "identity": board.identity,
+        "detail": lambda: board.challenge(7),
+        "instance": lambda: board.instance("GET", 7),
+    }
+    if operation == "instance" and status == 403:
+        assert calls[operation]()["status"] == 403
+        return
+    with pytest.raises(BoardError) as error:
+        calls[operation]()
+    assert not isinstance(error.value, BoardTemporaryResponseError)
+    assert not isinstance(error.value, BoardRateLimitError)
 
 
 def test_download_rejects_off_origin_redirect_before_request(tmp_path: Path) -> None:
