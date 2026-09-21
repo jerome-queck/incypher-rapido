@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -40,10 +41,41 @@ class BoardTemporaryResponseError(BoardError):
     """A retryable server response to an idempotent Board read."""
 
 
+class BoardRateLimitError(BoardTemporaryResponseError):
+    """A throttled idempotent read with optional validated retry guidance."""
+
+    def __init__(self, message: str, retry_after_seconds: float | None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 _TEMPORARY_READ_STATUSES = frozenset({500, 502, 503, 504})
 
 
+def _retry_after_seconds(value: str) -> float | None:
+    value = value.strip()
+    if not value or len(value) > 128:
+        return None
+    if re.fullmatch(r"[0-9]{1,10}", value):
+        return float(int(value))
+    try:
+        timestamp = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if timestamp.tzinfo is None:
+        return None
+    try:
+        return max(0.0, timestamp.timestamp() - time.time())
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _raise_temporary_read_response(response: HttpResponse, operation: str) -> None:
+    if response.status == 429:
+        raise BoardRateLimitError(
+            f"{operation} returned HTTP 429",
+            _retry_after_seconds(response.retry_after),
+        )
     if response.status in _TEMPORARY_READ_STATUSES:
         raise BoardTemporaryResponseError(f"{operation} returned HTTP {response.status}")
 
@@ -54,6 +86,7 @@ class HttpResponse:
     body: bytes
     location: str = ""
     content_type: str = ""
+    retry_after: str = ""
 
 
 @dataclass(frozen=True)
@@ -205,6 +238,7 @@ def _default_transport(
             body=response_body,
             location=by_name.get("location", ""),
             content_type=by_name.get("content-type", ""),
+            retry_after=by_name.get("retry-after", ""),
         )
     except BoardError:
         raise

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import heapq
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,7 @@ from .board import (
     FLAG_RE,
     BoardError,
     BoardLike,
+    BoardRateLimitError,
     BoardTemporaryResponseError,
     BoardTransportError,
     Challenge,
@@ -580,6 +582,7 @@ class Orchestrator:
         self._slots = asyncio.Semaphore(config.concurrency)
         self._submission_lock = asyncio.Lock()
         self._run_evidence: RunEvidence | None = None
+        self._board_read_sequence = 0
 
     def _run_report(
         self,
@@ -676,13 +679,21 @@ class Orchestrator:
         """Retry only idempotent Board reads after transport or temporary server failures."""
         transport_timeout = float(getattr(self.board, "timeout", 15.0))
         retry_delays = tuple(min(transport_timeout, delay) for delay in _BOARD_READ_RETRY_DELAYS)
+        sequence = self._board_read_sequence
+        self._board_read_sequence += 1
         for attempt in range(len(retry_delays) + 1):
             try:
                 return await self._board_call(deadline, function, *args, **kwargs)
-            except (BoardTransportError, BoardTemporaryResponseError):
+            except (BoardTransportError, BoardTemporaryResponseError) as exc:
                 if attempt == len(retry_delays):
                     raise
                 delay = retry_delays[attempt]
+                if isinstance(exc, BoardRateLimitError):
+                    guidance = exc.retry_after_seconds
+                    if guidance is not None and math.isfinite(guidance) and guidance >= 0:
+                        delay = max(delay, guidance)
+                    jitter_step = ((sequence * 37 + attempt * 17) % 5) + 1
+                    delay *= 1.0 + jitter_step * 0.05
                 if deadline - self._clock.monotonic() <= transport_timeout + delay:
                     raise
                 await self._clock.sleep(delay)
